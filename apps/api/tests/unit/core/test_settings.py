@@ -17,13 +17,23 @@ from tender.core import settings
 _ENV_EXAMPLE = Path(settings.__file__).resolve().parents[3] / ".env.example"
 
 
-@pytest.fixture(autouse=True)
-def _clear_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """每个用例都从「环境里没有 DATABASE_URL」开始。
+# 本文件要覆盖的全部部署参数。新增一个就读一个：漏清某个变量，
+# 开发机上「全局设过它」的测试会话就会得到假绿/假红。
+_DEPLOYMENT_ENV_KEYS = (
+    "DATABASE_URL",
+    "GOTENBERG_URL",
+    "GOTENBERG_USER",
+    "GOTENBERG_PASS",
+    "GOTENBERG_API_BASIC_AUTH_USERNAME",
+    "GOTENBERG_API_BASIC_AUTH_PASSWORD",
+)
 
-    否则开发机上全局设过这个变量的环境跑测试会得到一个假绿/假红。
-    """
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+@pytest.fixture(autouse=True)
+def _clear_deployment_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """每个用例都从「环境里没有这些变量」开始。"""
+    for key in _DEPLOYMENT_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
 
 
 def _point_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
@@ -84,6 +94,7 @@ def test_env_example_is_valid() -> None:
     values = settings._read_env_file(_ENV_EXAMPLE)
 
     assert "DATABASE_URL" in values, ".env.example 里必须有 DATABASE_URL，否则复制过去等于没配"
+    assert "GOTENBERG_URL" in values, "转换服务的地址也要出现在示例里，否则本地跑起来才发现没配"
     url = make_url(values["DATABASE_URL"])
     assert url.drivername == "postgresql+psycopg", "驱动名拼错会导致 alembic 起来就报 no module"
     assert url.database and url.username
@@ -107,3 +118,48 @@ def test_no_env_file_defined_outside_the_app(monkeypatch: pytest.MonkeyPatch) ->
     assert Path(settings._ENV_FILE) == Path(settings.__file__).resolve().parents[3] / ".env"
     assert Path(settings._ENV_FILE).parent.name == "api"
     assert os.path.isabs(settings._ENV_FILE)
+
+def test_gotenberg_url_default_and_trailing_slash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+    assert settings.gotenberg_url() == settings.DEFAULT_GOTENBERG_URL
+
+    # 末尾斜杠必须去掉：拼 /forms/... 时会得到双斜杠，反代上可能直接 404
+    monkeypatch.setenv("GOTENBERG_URL", "http://gotenberg:3000/")
+    assert settings.gotenberg_url() == "http://gotenberg:3000"
+
+
+def test_gotenberg_credentials_none_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+    assert settings.gotenberg_credentials() is None
+
+
+def test_gotenberg_credentials_accept_both_naming_styles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+
+    monkeypatch.setenv("GOTENBERG_USER", "user")
+    monkeypatch.setenv("GOTENBERG_PASS", "pass")
+    assert settings.gotenberg_credentials() == ("user", "pass")
+
+    # compose 里用的是容器的变量名，本地照抄容易混——两个都认
+    monkeypatch.delenv("GOTENBERG_USER")
+    monkeypatch.delenv("GOTENBERG_PASS")
+    monkeypatch.setenv("GOTENBERG_API_BASIC_AUTH_USERNAME", "container-user")
+    monkeypatch.setenv("GOTENBERG_API_BASIC_AUTH_PASSWORD", "container-pass")
+    assert settings.gotenberg_credentials() == ("container-user", "container-pass")
+
+
+def test_gotenberg_credentials_half_configured_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """只配一半必须报错：静默降级成「无鉴权」等于把转换服务对全内网敞开。"""
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+    monkeypatch.setenv("GOTENBERG_USER", "user")
+
+    with pytest.raises(ValueError):
+        settings.gotenberg_credentials()

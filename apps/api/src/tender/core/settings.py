@@ -29,6 +29,7 @@ _ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 
 # 本地开发默认值；生产环境必须由环境变量或 .env 覆盖。
 DEFAULT_DATABASE_URL = "postgresql+psycopg://tender:tender@localhost:5432/tender"
+DEFAULT_GOTENBERG_URL = "http://localhost:3000"
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -51,14 +52,42 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def _setting(name: str) -> str:
+    """按优先级取一个部署参数，返回去空白后的字符串；未配置时返回空串。
+
+    空值一律当作「没写」：compose 里出现 `KEY=` 是常事，让它遮住 .env 会得到
+    「明明配了却不生效」——这类问题的排查成本远高于这几行代码。
+    """
+    raw = os.environ.get(name) or _read_env_file(_ENV_FILE).get(name) or ""
+    return raw.strip()
+
+
 def database_url() -> str:
     """数据库连接串。
 
     故意做成函数而不是模块级常量：常量会在 import 时就把值冻结住，
     测试里改了环境变量却拿不到新值——「读一次就定死」的配置是排查噩梦。
     """
-    return (
-        os.environ.get("DATABASE_URL")
-        or _read_env_file(_ENV_FILE).get("DATABASE_URL")
-        or DEFAULT_DATABASE_URL
-    )
+    return _setting("DATABASE_URL") or DEFAULT_DATABASE_URL
+
+
+def gotenberg_url() -> str:
+    """Gotenberg 基址，末尾不带斜杠（拼路径的地方不再做二次处理）。"""
+    return (_setting("GOTENBERG_URL") or DEFAULT_GOTENBERG_URL).rstrip("/")
+
+
+def gotenberg_credentials() -> tuple[str, str] | None:
+    """Gotenberg Basic Auth 凭据；两边都没配时返回 None（本地开发常不带鉴权）。
+
+    只配一边直接报错、不降级为「无鉴权」：静默降级会让一个能转换任意文档的服务
+    在内网里对所有人敞开，而这类错误不会有人主动发现。
+    同时接受容器风格的名字（GOTENBERG_API_BASIC_AUTH_*）：compose 里就是这两个名字，
+    本地照抄容易混，两个都认比让人记住「到底该写哪个」便宜。
+    """
+    user = _setting("GOTENBERG_USER") or _setting("GOTENBERG_API_BASIC_AUTH_USERNAME")
+    password = _setting("GOTENBERG_PASS") or _setting("GOTENBERG_API_BASIC_AUTH_PASSWORD")
+    if not user and not password:
+        return None
+    if not user or not password:
+        raise ValueError("Gotenberg 凭据只配了一半：GOTENBERG_USER / GOTENBERG_PASS 必须同时提供")
+    return user, password

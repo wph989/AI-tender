@@ -12,9 +12,14 @@ from typing import ClassVar
 
 
 class TenderError(Exception):
-    """领域层唯一基类。带机器可读的 code，前端据此决定重试按钮是否可用。"""
+    """领域层唯一基类。带机器可读的 code 与 retryable 信号（见 docs/设计/05 第 5 节）。
+
+    `retryable` 必须由错误类型自己声明，而不是让 API 层按 HTTP 状态码去猜：
+    「错误该映射成哪个状态码」与「该不该给用户重试按钮」是两件事。
+    """
 
     code: ClassVar[str] = "invalid_argument"
+    retryable: ClassVar[bool] = False
 
     def __init__(self, message: str = "") -> None:
         super().__init__(message or self.code)
@@ -39,3 +44,22 @@ class InvalidRotationError(TenderError):
 
 class AnchorSequenceError(TenderError):
     """锚点序号不是从 1 开始。"""
+
+class ConversionFailed(TenderError):
+    """Gotenberg 判定「文件本身有问题」（400/422），或响应根本不是 PDF。
+
+    重试无意义：同样的字节再转一次还是失败，只会再烧掉一次转换预算。
+    """
+
+    code: ClassVar[str] = "conversion_failed"
+
+
+class ConversionUnavailable(TenderError):
+    """Gotenberg 侧暂时不可用：5xx、网络错误、版本读不到、响应 Trace 串包。
+
+    这类失败重试有意义；`retryable=True` 会让前端把「重试」按钮亮起来
+    （见 docs/设计/05 第 5 节）。
+    """
+
+    code: ClassVar[str] = "conversion_unavailable"
+    retryable: ClassVar[bool] = True

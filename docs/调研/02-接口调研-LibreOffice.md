@@ -77,6 +77,9 @@ curl --request POST http://gotenberg:3000/forms/libreoffice/convert \
 | `landscape`、`singlePageSheets` | — | Excel 附件时评估 | 工程量清单类 Excel 常需横向 + 单页表 |
 
 > **注意**：转换路由可在**同一请求内**叠加 PDF 引擎能力（合并、旋转、水印、加密、PDF/A、扁平化、元数据写入）。这为我们后续"生成带水印的对外版本"提供了现成能力，无需自研。
+> **实现**：`apps/api/src/tender/adapters/gotenberg.py`（含行为测试 `tests/unit/adapters/test_gotenberg.py`）。两处实现细节值得记一笔：
+> ① **先取版本再转换**，`/version` 结果在进程内缓存——`converter_version` 是 `document_version` 的必填项，拿不到版本就没有可信的溯源记录，宁可让这次转换直接可重试失败；
+> ② `Gotenberg-Output-Filename` 会被压成 ASCII（HTTP 头只认 ASCII 字节，中文文件名会直接抛 `UnicodeEncodeError`），原始文件名仍完整放在 multipart 里。
 
 ### 3.3 响应与重试语义（重要）
 
