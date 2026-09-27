@@ -1,0 +1,4 @@
+# 前端工作区。跨语言共享契约放在 packages/contract —— 那里只有 JSON 与文档，不是 npm 包，
+# 前端通过相对路径直接引用它，避免为了一个 JSON 文件再走一层包发布。
+packages:
+  - apps/web

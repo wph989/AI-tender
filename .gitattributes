@@ -1,0 +1,11 @@
+# 全仓库统一 LF。文档与脚本都是按 LF 写的，而 git 在 Windows 上默认会把检出内容转成 CRLF，
+# 结果是每次改动都掺进整篇的行尾噪声，评审时看不出真正改了什么。
+* text=auto eol=lf
+
+# 二进制/生成物不参与换行转换（缺失声明时 git 靠启发式判断，不值得赌）
+*.png  binary
+*.jpg  binary
+*.webp binary
+*.pdf  binary
+*.docx binary
+*.xlsx binary

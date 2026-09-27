@@ -1,0 +1,100 @@
+[build-system]
+# 现在起是可安装包（editable 装进 .venv）。原因是 import-linter 必须真的能 import 到
+# root package 才能扫描依赖方向；靠 PYTHONPATH 手工喂路径的命令没人会记得写。
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tender-api"
+version = "0.0.0"
+description = "AI-Tender 后端：API + Worker + Scheduler 同一代码库（目录约定见 docs/工程/10 第 4.2 节）"
+requires-python = ">=3.12"
+# 依赖随分层落地逐步加入，不提前装用不上的东西（FastAPI / Celery / boto3 等还没到）。
+# 这一批是数据基座的最低需求：迁移（alembic）+ 迁移的 SQL 渲染（sqlalchemy）+ 驱动（psycopg）。
+dependencies = [
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    # ruff 一个工具替代 flake8 + isort + black；版本口径见 docs/工程/10 第 2 节
+    "ruff>=0.9",
+    # 分层依赖方向必须由工具强制：规则一旦靠自觉遵守，三个月后必然破防（docs/工程/10 第 4.4 节）
+    "import-linter>=2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tender"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+# 中文注释按字符数计宽（一个汉字算 1 个字），100 已经是相当宽的一行，再宽就没法并排看 diff 了
+line-length = 100
+target-version = "py312"
+# 必须显式写：不写的话 ruff 会把 apps/api/alembic/（迁移目录）当成第一方包，
+# 因为它和 alembic 库同名——结果是 import 排序把 alembic 与 tender 归到同一组。
+src = ["src"]
+
+[tool.ruff.lint]
+# E/F 是默认规则；I 管 import 顺序，UP 管过时写法，B 是常见陷阱（可变默认参数之类）
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# 迁移里的 SQL 是逐字对应设计文档的，折行会让「文档 ↔ 迁移」的比对变难。
+# 这条豁免是刻意的：让工具迁就事实源，而不是让事实源迁就工具。
+"alembic/versions/*.py" = ["E501"]
+
+[tool.importlinter]
+root_package = "tender"
+
+# 依赖方向见 docs/工程/10 第 4.4 节。四张契约各自管一件事，不要合并成一条——
+# 合并后报错只会说「分层错了」，说不清错在哪一层。
+[[tool.importlinter.contracts]]
+name = "分层只能向内：domain ← ports ← application ← api"
+type = "layers"
+layers = ["tender.api", "tender.application", "tender.ports", "tender.domain"]
+
+[[tool.importlinter.contracts]]
+name = "用例层不依赖具体实现（application 与 adapters 互不引用）"
+type = "independence"
+modules = ["tender.application", "tender.adapters"]
+
+[[tool.importlinter.contracts]]
+name = "api 与 worker 互不依赖，只通过数据库与队列通信"
+type = "independence"
+modules = ["tender.api", "tender.worker"]
+
+[[tool.importlinter.contracts]]
+name = "domain 是纯的：不引入任何其它内部分层"
+type = "forbidden"
+source_modules = ["tender.domain"]
+forbidden_modules = [
+    "tender.ports",
+    "tender.application",
+    "tender.adapters",
+    "tender.api",
+    "tender.worker",
+    "tender.config",
+    "tender.core",
+]
+
+# 装配容器（core/di.py）将来要同时知道所有层，它出现时改成列举式 source_modules，
+# 把 di.py 排除掉即可；在此之前 core 保持「只能被依赖」。
+[[tool.importlinter.contracts]]
+name = "core 只能被依赖：不反向引用任何业务分层"
+type = "forbidden"
+source_modules = ["tender.core"]
+forbidden_modules = [
+    "tender.ports",
+    "tender.application",
+    "tender.adapters",
+    "tender.api",
+    "tender.worker",
+    "tender.config",
+]
