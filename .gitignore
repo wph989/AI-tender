@@ -3,12 +3,22 @@ node_modules/
 .next/
 dist/
 coverage/
+*.tsbuildinfo
+
+# 前端生成物：pdfjs 的 worker/cMaps/字体由 scripts/copy-pdfjs-assets.mjs 从 node_modules 复制
+apps/web/public/pdfjs/
+apps/web/next-env.d.ts
+# E2E 临时截图（人工验收用，不进版本库）
+apps/web/.e2e-*.png
 
 # Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+
+# 命令输出日志（本地排查用，不进版本库）
+*.log
 
 # 环境与编辑器
 .env

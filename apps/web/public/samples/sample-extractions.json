@@ -1,0 +1,405 @@
+{
+  "items": [
+    {
+      "id": 9001,
+      "instance_id": 4102,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "project_name",
+      "field_label": "项目名称",
+      "group_key": "basic_info",
+      "value_text": "××市城市轨道交通 3 号线工程",
+      "confidence": 0.98,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b2",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.14419936096164576,
+            0.6209052607529953,
+            0.15726520091698437
+          ],
+          "char_start": 0,
+          "char_end": 16,
+          "quote": "××市城市轨道交通 3 号线工程",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9002,
+      "instance_id": 4103,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "tender_no",
+      "field_label": "招标编号",
+      "group_key": "basic_info",
+      "value_text": "ZB-2026-0317",
+      "confidence": 0.99,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b3",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.17627005903384052,
+            0.4878409342893045,
+            0.18933589898917913
+          ],
+          "char_start": 0,
+          "char_end": 12,
+          "quote": "ZB-2026-0317",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9003,
+      "instance_id": 4104,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "max_price",
+      "field_label": "最高投标限价",
+      "group_key": "basic_info",
+      "value_text": "人民币贰亿叁仟万元整（¥230,000,000.00）",
+      "confidence": 0.93,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b4",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.20834075710603517,
+            0.7046311290896997,
+            0.22140659706137378
+          ],
+          "char_start": 0,
+          "char_end": 27,
+          "quote": "人民币贰亿叁仟万元整（¥230,000,000.00）",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9004,
+      "instance_id": 4105,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "bid_bond",
+      "field_label": "投标保证金",
+      "group_key": "basic_info",
+      "value_text": "人民币伍拾万元整（¥500,000.00）",
+      "confidence": 0.96,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b5",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.24041145517822993,
+            0.6408959877435005,
+            0.25347729513356854
+          ],
+          "char_start": 0,
+          "char_end": 21,
+          "quote": "人民币伍拾万元整（¥500,000.00）",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9005,
+      "instance_id": 4106,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "bid_validity",
+      "field_label": "投标有效期",
+      "group_key": "basic_info",
+      "value_text": "自投标截止之日起 90 日历天",
+      "confidence": 0.88,
+      "status": "need_review",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b6",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.2724821532504246,
+            0.5960596429219388,
+            0.2855479932057632
+          ],
+          "char_start": 0,
+          "char_end": 15,
+          "quote": "自投标截止之日起 90 日历天",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9006,
+      "instance_id": 4107,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "bid_open_time",
+      "field_label": "开标时间",
+      "group_key": "basic_info",
+      "value_text": "2026 年 4 月 10 日 09 时 30 分",
+      "confidence": 0.95,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b7",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.30455285132261933,
+            0.5999065979478427,
+            0.31761869127795794
+          ],
+          "char_start": 0,
+          "char_end": 25,
+          "quote": "2026 年 4 月 10 日 09 时 30 分",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9007,
+      "instance_id": 4108,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "bid_open_place",
+      "field_label": "开标地点",
+      "group_key": "basic_info",
+      "value_text": "××市公共资源交易中心 3 楼开标 2 厅",
+      "confidence": 0.91,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b8",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.336623549394814,
+            0.6706468932058407,
+            0.3496893893501526
+          ],
+          "char_start": 0,
+          "char_end": 21,
+          "quote": "××市公共资源交易中心 3 楼开标 2 厅",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9008,
+      "instance_id": 4109,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "duration",
+      "field_label": "工期",
+      "group_key": "basic_info",
+      "value_text": "540 日历天",
+      "confidence": 0.9,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b9",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.36869424746700874,
+            0.466724678972443,
+            0.38176008742234735
+          ],
+          "char_start": 0,
+          "char_end": 7,
+          "quote": "540 日历天",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9009,
+      "instance_id": 4110,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "payment",
+      "field_label": "付款方式",
+      "group_key": "basic_info",
+      "value_text": "按月计量支付，进度款支付比例 80%",
+      "confidence": 0.72,
+      "status": "need_review",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p2b10",
+          "page_no": 2,
+          "bbox": [
+            0.38637539561480727,
+            0.4007649455392034,
+            0.6575437276154256,
+            0.413830785494542
+          ],
+          "char_start": 0,
+          "char_end": 18,
+          "quote": "按月计量支付，进度款支付比例 80%",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9010,
+      "instance_id": 4111,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "rejection_clause",
+      "field_label": "废标条款",
+      "group_key": "risk",
+      "value_text": "3.1 评标方法采用综合评估法，评标委员会按下表逐项打分。",
+      "confidence": 0.91,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p3b2",
+          "page_no": 3,
+          "bbox": [
+            0.09407400936708352,
+            0.14368860539975536,
+            0.5613807712724854,
+            0.15740773735286084
+          ],
+          "char_start": 0,
+          "char_end": 29,
+          "quote": "3.1 评标方法采用综合评估法，评标委员会按下表逐项打分。",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9011,
+      "instance_id": 4112,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "star_clause",
+      "field_label": "实质性条款（★）",
+      "group_key": "scoring",
+      "value_text": "3.2 投标文件未按招标文件要求密封或者未加盖投标人公章的，其投标将被否决。",
+      "confidence": 0.94,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p3b3",
+          "page_no": 3,
+          "bbox": [
+            0.09407400936708352,
+            0.1745714998396466,
+            0.7201306620794389,
+            0.18829063179275196
+          ],
+          "char_start": 0,
+          "char_end": 38,
+          "quote": "3.2 投标文件未按招标文件要求密封或者未加盖投标人公章的，其投标将被否决。",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9012,
+      "instance_id": 4113,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "tunnel_method",
+      "field_label": "隧道施工方法",
+      "group_key": "tech",
+      "value_text": "4.1 区间隧道采用盾构法施工，管片外径 6.2 m，内径 5.5 m。",
+      "confidence": 0.89,
+      "status": "auto",
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "anchor": "p4b2",
+          "page_no": 4,
+          "bbox": [
+            0.0665170034089965,
+            0.13602093818665628,
+            0.3994803359108672,
+            0.15542370261861727
+          ],
+          "char_start": 0,
+          "char_end": 36,
+          "quote": "4.1 区间隧道采用盾构法施工，管片外径 6.2 m，内径 5.5 m。",
+          "quote_source": "native",
+          "match_type": "exact"
+        }
+      ]
+    },
+    {
+      "id": 9999,
+      "instance_id": 4999,
+      "machine_attempt_no": 1,
+      "attempt_no": 1,
+      "trigger": "first",
+      "is_current": true,
+      "field_key": "performance_bond",
+      "field_label": "履约保证金",
+      "group_key": "basic_info",
+      "value_text": "",
+      "confidence": 0.0,
+      "status": "not_found",
+      "evidence_count": 0,
+      "evidence": []
+    }
+  ],
+  "total": 13
+}

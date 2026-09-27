@@ -24,6 +24,9 @@ dev = [
     "ruff>=0.9",
     # 分层依赖方向必须由工具强制：规则一旦靠自觉遵守，三个月后必然破防（docs/工程/10 第 4.4 节）
     "import-linter>=2.0",
+    # 只用于生成合成样本（scripts/make_sample_pdf.py）。用 reportlab 而不是内嵌系统字体：
+    # 内嵌宋体/雅黑属于再分发字体程序，而样本 PDF 要进版本库（见 docs/工程/07 第 3 节）。
+    "reportlab>=4.0",
 ]
 
 [tool.hatch.build.targets.wheel]

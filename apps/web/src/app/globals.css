@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+/*
+ * 中文优先的字体栈：不引 next/font。
+ * 为什么：Next 的 Google 字体是在构建期联网拉取，本系统要部署在内网，
+ * 构建机同样出不了网——换成系统字体是唯一不会把构建卡住的做法。
+ */
+@theme {
+  --font-sans: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC",
+    system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/*
+ * 高亮闪烁：连续点同一条结果也要重新闪一次，否则用户以为没响应（见 docs/设计/06 第 5 节第 ⑥ 步）。
+ * JS 只负责自增 pulseKey 让元素重挂载，动画重放交给 CSS，避免在用状态的地方再塞定时器。
+ */
+@keyframes evidence-pulse {
+  0% {
+    opacity: 0.1;
+  }
+  45% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.evidence-pulse {
+  animation: evidence-pulse 600ms ease-out 2;
+}
