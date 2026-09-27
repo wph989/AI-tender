@@ -10,8 +10,9 @@
    文档与本目录的一致性由 tests/contract/test_ddl_matches_docs.py 负责盯住。
 3. 不调用 logging.fileConfig：日志由应用侧统一配置（core/logging.py），迁移不该另起一套。
 
-跑法：在 apps/api 目录下执行（alembic.ini 的 `prepend_sys_path = src` 相对于 cwd 生效，
-换目录跑会 import 不到 tender）。
+跑法：在 apps/api 目录下执行——alembic 只在当前目录找 alembic.ini。
+（tender 已 editable 装进 .venv，不再依赖 `prepend_sys_path` 找包；那一行留着只是为了
+让人不 sync 也能跑迁移。）
 """
 
 from __future__ import annotations
