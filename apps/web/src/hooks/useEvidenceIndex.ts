@@ -13,7 +13,7 @@ import { buildEvidenceIndex, type EvidenceIndex } from "@/lib/viewer/evidenceInd
 import type { WireExtraction } from "@/types/workbench";
 
 export type { EvidenceIndex, EvidenceItem, EvidenceTarget } from "@/lib/viewer/evidenceIndex";
-export { cycleEvidence, toActiveEvidence } from "@/lib/viewer/evidenceIndex";
+export { toActiveEvidence } from "@/lib/viewer/evidenceIndex";
 
 export function useEvidenceIndex(extractions: readonly WireExtraction[]): EvidenceIndex {
   return useMemo(() => buildEvidenceIndex(extractions), [extractions]);

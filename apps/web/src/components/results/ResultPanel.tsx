@@ -1,47 +1,25 @@
 "use client";
 
 /**
- * 结果面板：按分组列出字段结果，顶部给复核进度概览（见 docs/设计/06 第 2 / 11 节）。
+ * 结果面板：分组标签页 + 当前分组的字段卡片（见 docs/设计/06 第 2.1 节）。
  *
- * 分组顺序按业务重要性固定，不按接口返回顺序：接口顺序是抽取顺序，用户核对顺序是业务顺序。
- * 未知分组排在最后并原样显示 key，避免新分组悄悄排到首位抢注意力。
+ * 为什么用标签而不是一列到底：一个项目 500+ 条结果，全部铺开时"找某一组字段"要靠滚动碰运气；
+ * 标签一次只呈现一组，滚动长度可控，也不会出现"翻了二十屏才想起还有个风险条款组"。
+ *
+ * 默认选第一个分组（业务顺序里最靠前的），切标签时滚动位置重置——标签换了还停在半截
+ * 会让用户以为这组内容就在下面。
  */
 
+import { useMemo, useState } from "react";
+
 import type { EvidenceIndex, EvidenceTarget } from "@/lib/viewer/evidenceIndex";
+import { buildResultTabs } from "@/lib/results/grouping";
 import type { WireExtraction } from "@/types/workbench";
 
 import { ResultCard } from "./ResultCard";
-
-const GROUP_LABELS: Record<string, string> = {
-  basic_info: "基本信息",
-  qualification: "资格要求",
-  scoring: "评分办法",
-  commercial: "商务条款",
-  tech: "技术要求",
-  risk: "风险条款",
-};
-
-const GROUP_ORDER = ["basic_info", "qualification", "scoring", "commercial", "tech", "risk"];
+import { ResultGroupTabs } from "./ResultGroupTabs";
 
 const NO_TARGETS: readonly EvidenceTarget[] = [];
-
-function groupRank(key: string): number {
-  const index = GROUP_ORDER.indexOf(key);
-  return index === -1 ? GROUP_ORDER.length : index;
-}
-
-function groupExtractions(
-  extractions: readonly WireExtraction[],
-): [string, WireExtraction[]][] {
-  const groups = new Map<string, WireExtraction[]>();
-  for (const extraction of extractions) {
-    const list = groups.get(extraction.group_key);
-    if (list === undefined) groups.set(extraction.group_key, [extraction]);
-    else list.push(extraction);
-  }
-  // sort 是稳定排序：同组内保持接口给出的顺序
-  return [...groups.entries()].sort(([a], [b]) => groupRank(a) - groupRank(b));
-}
 
 interface Props {
   extractions: readonly WireExtraction[];
@@ -50,7 +28,11 @@ interface Props {
 }
 
 export function ResultPanel({ extractions, index, onLocate }: Props) {
-  const groups = groupExtractions(extractions);
+  const tabs = useMemo(() => buildResultTabs(extractions), [extractions]);
+  const [activeKey, setActiveKey] = useState<string | null>(null);
+  // 数据重载后原分组可能消失：回退到第一个分组，而不是留下一个空白面板
+  const active = tabs.find((tab) => tab.key === activeKey) ?? tabs[0];
+
   const pending = extractions.filter(
     (item) => item.status === "need_review" || item.status === "conflict",
   ).length;
@@ -65,14 +47,22 @@ export function ResultPanel({ extractions, index, onLocate }: Props) {
         </p>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-        {groups.map(([key, items]) => (
-          <section key={key} className="mb-6 last:mb-0">
-            <h4 className="mb-2 text-xs font-semibold tracking-wide text-slate-500">
-              {GROUP_LABELS[key] ?? key}
-            </h4>
+      {active === undefined ? (
+        <div className="flex flex-1 items-center justify-center px-4 text-sm text-slate-500">
+          暂无解析结果
+        </div>
+      ) : (
+        <>
+          <ResultGroupTabs tabs={tabs} activeKey={active.key} onSelect={setActiveKey} />
+          <div
+            key={active.key}
+            role="tabpanel"
+            id={`result-tabpanel-${active.key}`}
+            aria-labelledby={`result-tab-${active.key}`}
+            className="min-h-0 flex-1 overflow-y-auto px-4 py-4"
+          >
             <div className="flex flex-col gap-2">
-              {items.map((item) => (
+              {active.items.map((item) => (
                 <ResultCard
                   key={item.id}
                   extraction={item}
@@ -81,9 +71,9 @@ export function ResultPanel({ extractions, index, onLocate }: Props) {
                 />
               ))}
             </div>
-          </section>
-        ))}
-      </div>
+          </div>
+        </>
+      )}
     </aside>
   );
 }

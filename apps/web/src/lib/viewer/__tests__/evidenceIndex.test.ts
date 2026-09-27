@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { buildEvidenceIndex, cycleEvidence, toActiveEvidence } from "@/lib/viewer/evidenceIndex";
+import { buildEvidenceIndex, toActiveEvidence } from "@/lib/viewer/evidenceIndex";
 import type { WireExtraction } from "@/types/workbench";
 
 function makeExtraction(input: {
@@ -35,7 +35,7 @@ function makeExtraction(input: {
         bbox: [x0, y0, x1, y1] as [number, number, number, number],
         char_start: 0,
         char_end: 1,
-        quote: "q",
+        quote: `引文 ${item.anchor}`,
         quote_source: "native",
         match_type: "exact",
       };
@@ -43,7 +43,7 @@ function makeExtraction(input: {
   };
 }
 
-describe('buildEvidenceIndex', () => {
+describe("buildEvidenceIndex", () => {
   it("按页归组，且只收 bbox 合法的证据", () => {
     const index = buildEvidenceIndex([
       makeExtraction({
@@ -64,6 +64,20 @@ describe('buildEvidenceIndex', () => {
     expect(index.byExtraction.get(1)?.map((item) => item.bbox === null)).toEqual([false, true, false]);
   });
 
+  it("定位目标带着引文：证据列表要显示「这处证据写了什么」", () => {
+    const index = buildEvidenceIndex([
+      makeExtraction({
+        id: 3,
+        fieldKey: "bid_bond",
+        evidence: [
+          { anchor: "p2b5", pageNo: 2, bbox: [0.1, 0.1, 0.3, 0.15] },
+          { anchor: "p5b4", pageNo: 5, bbox: [0.1, 0.2, 0.3, 0.25] },
+        ],
+      }),
+    ]);
+    expect(index.byExtraction.get(3)?.map((item) => item.quote)).toEqual(["引文 p2b5", "引文 p5b4"]);
+  });
+
   it("字段中文名缺失时退回 field_key，方便提示语统一取用", () => {
     const index = buildEvidenceIndex([
       makeExtraction({
@@ -80,22 +94,5 @@ describe('buildEvidenceIndex', () => {
     const index = buildEvidenceIndex([makeExtraction({ id: 9, fieldKey: "x", evidence: [] })]);
     expect(index.byExtraction.get(9)).toEqual([]);
     expect(index.byPage.size).toBe(0);
-  });
-});
-
-describe("cycleEvidence", () => {
-  const targets = [
-    { extractionId: 1, anchor: "p1b1", pageNo: 1, bbox: null, fieldKey: "a", label: "a" },
-    { extractionId: 1, anchor: "p1b2", pageNo: 1, bbox: null, fieldKey: "a", label: "a" },
-  ];
-
-  it("多次点击按证据循环", () => {
-    expect(cycleEvidence(targets, 0)?.anchor).toBe("p1b1");
-    expect(cycleEvidence(targets, 1)?.anchor).toBe("p1b2");
-    expect(cycleEvidence(targets, 2)?.anchor).toBe("p1b1");
-  });
-
-  it("没有证据时返回 null，而不是抛错", () => {
-    expect(cycleEvidence([], 0)).toBeNull();
   });
 });

@@ -286,6 +286,11 @@ class Sample:
         self.text("第五章 合同条款", PAGE_H - 90, 14)
         self.text("5.1 承包人应按监理人指示开工，工期自开工令载明之日起算。", PAGE_H - 130)
         self.text("5.2 质量保证金为结算价款的 3%，缺陷责任期满后无息返还。", PAGE_H - 156)
+        # 与第二章前附表 1.9 的付款比例重复：样本里唯一的「同一字段多处溯源」场景
+        self.text(
+            "5.3 工程进度款按月计量支付，累计支付比例不超过 80%，竣工结算后支付至 97%。",
+            PAGE_H - 182,
+        )
 
     def _formats(self) -> None:
         self.new_page()
@@ -334,31 +339,33 @@ class Sample:
         raise KeyError(f"没有这个块：{anchor}")
 
 
-# field_key / 中文标签 / 分组 / 证据指向的块 / 置信度 / 状态
-FIELDS = [
+# field_key / 中文标签 / 分组 / 证据指向的块（按出现顺序，可多处）/ 置信度 / 状态
+FIELDS: list[tuple[str, str, str, tuple[str, ...], float, str]] = [
     # 注意 p2b1 是页面标题「第二章 投标人须知前附表」，表格里各行的「编列内容」从 p2b2 开始——
     # 证据必须指向真正写着该字段值的那一格，否则演示时「项目名称」旁边显示的是章节标题，一眼假。
-    ("project_name", "项目名称", "basic_info", "p2b2", 0.98, "auto"),
-    ("tender_no", "招标编号", "basic_info", "p2b3", 0.99, "auto"),
-    ("max_price", "最高投标限价", "basic_info", "p2b4", 0.93, "auto"),
-    ("bid_bond", "投标保证金", "basic_info", "p2b5", 0.96, "auto"),
-    ("bid_validity", "投标有效期", "basic_info", "p2b6", 0.88, "need_review"),
-    ("bid_open_time", "开标时间", "basic_info", "p2b7", 0.95, "auto"),
-    ("bid_open_place", "开标地点", "basic_info", "p2b8", 0.91, "auto"),
-    ("duration", "工期", "basic_info", "p2b9", 0.90, "auto"),
-    ("payment", "付款方式", "basic_info", "p2b10", 0.72, "need_review"),
-    ("rejection_clause", "废标条款", "risk", "p3b2", 0.91, "auto"),
-    ("star_clause", "实质性条款（★）", "scoring", "p3b3", 0.94, "auto"),
+    ("project_name", "项目名称", "basic_info", ("p2b2",), 0.98, "auto"),
+    ("tender_no", "招标编号", "basic_info", ("p2b3",), 0.99, "auto"),
+    ("max_price", "最高投标限价", "basic_info", ("p2b4",), 0.93, "auto"),
+    ("bid_bond", "投标保证金", "basic_info", ("p2b5",), 0.96, "auto"),
+    ("bid_validity", "投标有效期", "basic_info", ("p2b6",), 0.88, "need_review"),
+    ("bid_open_time", "开标时间", "basic_info", ("p2b7",), 0.95, "auto"),
+    ("bid_open_place", "开标地点", "basic_info", ("p2b8",), 0.91, "auto"),
+    ("duration", "工期", "basic_info", ("p2b9",), 0.90, "auto"),
+        # 同一字段多处溯源：前附表给了付款比例，合同条款里再次出现——
+    # 这是证据列表（逐条定位）的演示样本，跨页两处
+    ("payment", "付款方式", "basic_info", ("p2b10", "p5b4"), 0.72, "need_review"),
+    ("rejection_clause", "废标条款", "risk", ("p3b2",), 0.91, "auto"),
+    ("star_clause", "实质性条款（★）", "scoring", ("p3b3",), 0.94, "auto"),
     # 旋转页上的证据：高亮框如果落在别处，说明坐标变换错了
-    ("tunnel_method", "隧道施工方法", "tech", "p4b2", 0.89, "auto"),
+    ("tunnel_method", "隧道施工方法", "tech", ("p4b2",), 0.89, "auto"),
 ]
 
 
 def extractions(sample: Sample) -> dict[str, object]:
     items = []
-    for index, (key, label, group, anchor, confidence, status) in enumerate(FIELDS):
-        block = sample.block(anchor)
-        text = str(block["text"])
+    for index, (key, label, group, anchors, confidence, status) in enumerate(FIELDS):
+        blocks = [sample.block(anchor) for anchor in anchors]
+        text = str(blocks[0]["text"])
         items.append(
             {
                 "id": 9001 + index,
@@ -374,18 +381,20 @@ def extractions(sample: Sample) -> dict[str, object]:
                 "value_text": text,
                 "confidence": confidence,
                 "status": status,
-                "evidence_count": 1,
+                "evidence_count": len(blocks),
+                # 证据按出现顺序排列：前端证据列表的序号就是这里的顺序
                 "evidence": [
                     {
-                        "anchor": anchor,
+                        "anchor": str(block["anchor"]),
                         "page_no": block["page_no"],
                         "bbox": block["bbox"],
                         "char_start": 0,
-                        "char_end": len(text),
-                        "quote": text,
+                        "char_end": len(str(block["text"])),
+                        "quote": str(block["text"]),
                         "quote_source": "native",
                         "match_type": "exact",
                     }
+                    for block in blocks
                 ],
             }
         )

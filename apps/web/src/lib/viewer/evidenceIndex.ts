@@ -23,6 +23,8 @@ export interface EvidenceTarget {
   bbox: Bbox | null;
   fieldKey: string;
   label: string;
+  /** 证据引文：结果面板的证据列表要展示"这处证据写了什么"（见 06 第 2.1 节） */
+  quote: string;
 }
 
 /** 能画出来的证据：bbox 一定合法，EvidenceLayer 直接拿它做乘法。 */
@@ -53,6 +55,7 @@ export function buildEvidenceIndex(extractions: readonly WireExtraction[]): Evid
         bbox,
         fieldKey: extraction.field_key,
         label,
+        quote: evidence.quote,
       };
       targets.push(target);
 
@@ -67,17 +70,6 @@ export function buildEvidenceIndex(extractions: readonly WireExtraction[]): Evid
   }
 
   return { byPage, byExtraction };
-}
-
-/** 多证据循环取用：卡片上「证据 2/3」再点一次回到第 1 条。 */
-export function cycleEvidence(
-  targets: readonly EvidenceTarget[],
-  cursor: number,
-): EvidenceTarget | null {
-  if (targets.length === 0) return null;
-  // 取模两次是为了负数游标（不该出现，但出现了也只是回到末尾而不是返回 undefined）
-  const index = ((cursor % targets.length) + targets.length) % targets.length;
-  return targets[index] ?? null;
 }
 
 /** 结果面板 → 定位时序的输入。集中转换，避免面板各处自己拼、漏掉 label 导致提示语为空。 */

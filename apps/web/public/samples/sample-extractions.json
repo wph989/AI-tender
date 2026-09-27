@@ -269,7 +269,7 @@
       "value_text": "按月计量支付，进度款支付比例 80%",
       "confidence": 0.72,
       "status": "need_review",
-      "evidence_count": 1,
+      "evidence_count": 2,
       "evidence": [
         {
           "anchor": "p2b10",
@@ -283,6 +283,21 @@
           "char_start": 0,
           "char_end": 18,
           "quote": "按月计量支付，进度款支付比例 80%",
+          "quote_source": "native",
+          "match_type": "exact"
+        },
+        {
+          "anchor": "p5b4",
+          "page_no": 5,
+          "bbox": [
+            0.09407400936708352,
+            0.2054543942795377,
+            0.7427789798345642,
+            0.2191735262326432
+          ],
+          "char_start": 0,
+          "char_end": 43,
+          "quote": "5.3 工程进度款按月计量支付，累计支付比例不超过 80%，竣工结算后支付至 97%。",
           "quote_source": "native",
           "match_type": "exact"
         }
