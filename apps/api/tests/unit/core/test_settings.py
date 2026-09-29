@@ -26,6 +26,11 @@ _DEPLOYMENT_ENV_KEYS = (
     "GOTENBERG_PASS",
     "GOTENBERG_API_BASIC_AUTH_USERNAME",
     "GOTENBERG_API_BASIC_AUTH_PASSWORD",
+    "LLM_BASE_URL",
+    "LLM_MODEL",
+    "LLM_API_KEY",
+    "LLM_TIMEOUT_SECONDS",
+    "LLM_SECRET_KEYS",
 )
 
 
@@ -118,6 +123,24 @@ def test_no_env_file_defined_outside_the_app(monkeypatch: pytest.MonkeyPatch) ->
     assert Path(settings._ENV_FILE) == Path(settings.__file__).resolve().parents[3] / ".env"
     assert Path(settings._ENV_FILE).parent.name == "api"
     assert os.path.isabs(settings._ENV_FILE)
+
+
+def test_llm_secret_keys_split_in_order_and_ignore_blanks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """顺序就是轮换顺序：第一个加密、其余解密；空项与空格不能混进密钥列表。"""
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+    assert settings.llm_secret_keys() == ()
+
+    monkeypatch.setenv("LLM_SECRET_KEYS", " key-one , key-two ,, ")
+    assert settings.llm_secret_keys() == ("key-one", "key-two")
+
+
+def test_env_example_documents_llm_secret_keys() -> None:
+    values = settings._read_env_file(_ENV_EXAMPLE)
+
+    assert "LLM_SECRET_KEYS" in values, "保存供应商密钥需要主密钥，示例里必须留位置"
+
 
 def test_gotenberg_url_default_and_trailing_slash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

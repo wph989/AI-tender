@@ -48,9 +48,7 @@ def make_converter() -> object:
     """工厂 + 统一收尾：适配器持有连接池，测试结束必须关掉，否则会有未关闭客户端的告警。"""
     created: list[GotenbergConverter] = []
 
-    def factory(
-        handler: Handler, **kwargs: object
-    ) -> tuple[GotenbergConverter, list[float]]:
+    def factory(handler: Handler, **kwargs: object) -> tuple[GotenbergConverter, list[float]]:
         sleeps: list[float] = []
 
         async def fake_sleep(seconds: float) -> None:
@@ -290,6 +288,7 @@ def test_basic_auth_is_sent_only_when_credentials_are_configured(make_converter)
     without_auth, _ = make_converter(handler)
     run(without_auth.to_pdf(io.BytesIO(b"x"), filename="a.docx", trace_id="t"))
     assert seen[-1] is None
+
 
 def test_output_stem_is_ascii_safe() -> None:
     """输出名要能发出去：HTTP 头只认 ASCII，中文名必须有确定的退化路径。"""

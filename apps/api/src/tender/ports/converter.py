@@ -25,6 +25,10 @@ class ConvertResult:
 
 
 class OfficeConverter(Protocol):
+    async def version(self) -> str:
+        """读取转换器版本，供版本去重与溯源快照使用。"""
+        ...
+
     async def to_pdf(self, src: BinaryIO, *, filename: str, trace_id: str) -> ConvertResult:
         """把 Office 文档转成 PDF。
 

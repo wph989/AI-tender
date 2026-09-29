@@ -17,6 +17,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 
+# 本地临时工作目录（诊断脚本、uv/pytest 缓存，不进版本库）
+.tmp/
+
 # 命令输出日志（本地排查用，不进版本库）
 *.log
 

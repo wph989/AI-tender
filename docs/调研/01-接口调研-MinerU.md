@@ -114,6 +114,7 @@
 - 自托管返回**同源** URL：`/v1/uploads/{upload_id}/content`，`upload_method` 为 `PUT`，`upload_headers` 为 `{"Content-Type": "<mime_type>"}`。
 - 同源且服务启用 `--api-key` 时，此 PUT 需带 `Authorization: Bearer <key>`。
 - **跨源（官方云预签名 URL）绝不可附加 MinerU Key**，否则泄漏凭据。
+- 本项目使用自托管 MinerU，适配器只接受与 API 同源的 upload_url，避免把标书交给未配置的存储服务。
 
 ### 步骤 4：提交解析任务
 

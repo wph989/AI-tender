@@ -30,6 +30,11 @@ _ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 # 本地开发默认值；生产环境必须由环境变量或 .env 覆盖。
 DEFAULT_DATABASE_URL = "postgresql+psycopg://tender:tender@localhost:5432/tender"
 DEFAULT_GOTENBERG_URL = "http://localhost:3000"
+DEFAULT_MINERU_URL = "http://localhost:8000"
+DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+DEFAULT_S3_ENDPOINT_URL = "http://localhost:9000"
+DEFAULT_S3_BUCKET = "ai-tender"
+DEFAULT_S3_REGION = "us-east-1"
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -91,3 +96,103 @@ def gotenberg_credentials() -> tuple[str, str] | None:
     if not user or not password:
         raise ValueError("Gotenberg 凭据只配了一半：GOTENBERG_USER / GOTENBERG_PASS 必须同时提供")
     return user, password
+
+
+def mineru_url() -> str:
+    """MinerU API 基址，统一去掉结尾斜杠以固定路径拼接规则。"""
+    return (_setting("MINERU_URL") or DEFAULT_MINERU_URL).rstrip("/")
+
+
+def mineru_api_key() -> str | None:
+    """本地无鉴权开发可留空；生产部署由 MinerU 的 API Key 保护。"""
+    return _setting("MINERU_API_KEY") or None
+
+
+def company_id() -> int:
+    """当前单租户部署的公司 ID；集中读取以便后续接入真实租户上下文。"""
+    raw = _setting("COMPANY_ID") or "1"
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("COMPANY_ID 必须是正整数") from exc
+    if value < 1:
+        raise ValueError("COMPANY_ID 必须是正整数")
+    return value
+
+
+def redis_url() -> str:
+    """Celery broker；Redis 由部署方提供，不在 API 启动时自动创建队列。"""
+    return _setting("REDIS_URL") or DEFAULT_REDIS_URL
+
+
+def s3_endpoint_url() -> str:
+    """MinIO / S3 兼容 API 的内部地址。"""
+    return (_setting("S3_ENDPOINT_URL") or DEFAULT_S3_ENDPOINT_URL).rstrip("/")
+
+
+def s3_access_key() -> str | None:
+    return _setting("S3_ACCESS_KEY") or None
+
+
+def s3_secret_key() -> str | None:
+    return _setting("S3_SECRET_KEY") or None
+
+
+def s3_bucket() -> str:
+    return _setting("S3_BUCKET") or DEFAULT_S3_BUCKET
+
+
+def s3_region() -> str:
+    return _setting("S3_REGION") or DEFAULT_S3_REGION
+
+
+def llm_base_url() -> str | None:
+    """内网结构化模型网关；留空时不构造模型客户端。"""
+    return _setting("LLM_BASE_URL").rstrip("/") or None
+
+
+def llm_model() -> str | None:
+    return _setting("LLM_MODEL") or None
+
+
+def llm_api_key() -> str | None:
+    return _setting("LLM_API_KEY") or None
+
+
+def llm_timeout_seconds() -> float:
+    raw = _setting("LLM_TIMEOUT_SECONDS") or "90"
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError("LLM_TIMEOUT_SECONDS 必须是正数") from exc
+    if value <= 0:
+        raise ValueError("LLM_TIMEOUT_SECONDS 必须是正数")
+    return value
+
+
+def llm_secret_keys() -> tuple[str, ...]:
+    """供应商密钥的加密主密钥：逗号分隔，第一个用于加密，其余用于解密（轮换）。
+
+    未配置时返回空元组而不是抛错：能不能加解密由 core/secrets.py 判断。
+    否则「没配主密钥」会让整个进程起不来，而没启用 LLM 管理模块的部署不该被它阻塞。
+    """
+    raw = _setting("LLM_SECRET_KEYS")
+    if not raw:
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def mineru_bbox_origin() -> str | None:
+    """返回已实测的 MiddleJson bbox 原点；未配置时不生成位置坐标。"""
+    value = _setting("MINERU_BBOX_ORIGIN") or "unknown"
+    if value not in {"unknown", "top_left", "bottom_left"}:
+        raise ValueError("MINERU_BBOX_ORIGIN 必须是 unknown、top_left 或 bottom_left")
+    return None if value == "unknown" else value
+
+
+def mineru_bbox_rotation() -> str | None:
+    """返回已实测的旋转坐标语义；未确认时只对 0 度页面写 bbox。"""
+    value = _setting("MINERU_BBOX_ROTATION") or "unknown"
+    if value not in {"unknown", "visual", "unrotated"}:
+        raise ValueError("MINERU_BBOX_ROTATION 必须是 unknown、visual 或 unrotated")
+    return None if value == "unknown" else value
