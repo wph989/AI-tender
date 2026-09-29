@@ -1,13 +1,5 @@
 "use client";
 
-/**
- * 项目工作台（本切片为单文档最小形态，见 docs/设计/06 第 1 / 2 节）。
- *
- * 数据来源是 public/samples 下的静态样本 + 静态 PDF：阶段 1 的验收标准就是
- * 「先用假结果数据跑通点击定位」（见 docs/工程/07）。接口落地后只需替换 lib/api/client.ts，
- * 本文件一行不用动——这正是把取数收进 client.ts 的原因。
- */
-
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { useCallback, useEffect, useState } from "react";
 
@@ -17,19 +9,30 @@ import { Toolbar } from "@/components/workbench/Toolbar";
 import { useEvidenceIndex } from "@/hooks/useEvidenceIndex";
 import { useLocate } from "@/hooks/useLocate";
 import { usePageRegistry } from "@/hooks/usePageRenderer";
-import { loadSampleWorkbench, type WorkbenchData } from "@/lib/api/client";
+import {
+  loadWorkbenchForCurrentPage,
+  loadAttempts,
+  loadFieldStats,
+  rerunExtraction,
+  submitReview,
+  waitForJob,
+  type ReviewInput,
+  type WorkbenchData,
+} from "@/lib/api/client";
 import { destroyPdfDocument, loadPdfDocument } from "@/lib/pdf/document";
+import { rerunModeByField, type RerunButtonMode } from "@/lib/results/rerun";
 import { useViewerStore } from "@/lib/store/viewerStore";
 import { toActiveEvidence, type EvidenceTarget } from "@/lib/viewer/evidenceIndex";
 import type { WireExtraction } from "@/types/workbench";
 
-/** 共享空数组：加载完成前必须给 useEvidenceIndex 一个稳定引用，否则每渲染一次就重建索引 */
 const EMPTY_EXTRACTIONS: readonly WireExtraction[] = [];
 
 export function DocumentWorkbench() {
   const [data, setData] = useState<WorkbenchData | null>(null);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [busyExtractionId, setBusyExtractionId] = useState<number | null>(null);
+  const [rerunModes, setRerunModes] = useState<Record<string, RerunButtonMode>>({});
 
   const registry = usePageRegistry();
   const { locate } = useLocate(registry);
@@ -38,27 +41,44 @@ export function DocumentWorkbench() {
   const notice = useViewerStore((state) => state.notice);
   const setNotice = useViewerStore((state) => state.setNotice);
 
+  // 统计是旁路：取不到就回落"全部显示重跑按钮"，不能让它挡住结果面板。
+  const refreshStats = useCallback(async () => {
+    try {
+      setRerunModes(rerunModeByField(await loadFieldStats()));
+    } catch {
+      setRerunModes({});
+    }
+  }, []);
+
+  const refreshWorkbench = useCallback(async () => {
+    const loaded = await loadWorkbenchForCurrentPage();
+    setData(loaded);
+    setLoadError(null);
+    void refreshStats();
+    return loaded;
+  }, [refreshStats]);
+
   useEffect(() => {
     let alive = true;
-    loadSampleWorkbench()
+    refreshWorkbench()
       .then((loaded) => {
         if (alive) setData(loaded);
       })
       .catch((error: unknown) => {
-        if (alive) setLoadError(error instanceof Error ? error.message : "样本数据加载失败");
+        if (alive) setLoadError(error instanceof Error ? error.message : "文档数据加载失败");
       });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [refreshWorkbench]);
 
-  // PDF 基座单独加载：文档加载失败时页面其余部分仍可浏览（结果面板照常显示），
-  // 错误只落在原文区，不把整页变成错误页
+  // PDF 基座单独加载：原文区失败时，结果面板仍能呈现可读的接口错误。
+  const pdfUrl = data?.pdfUrl;
   useEffect(() => {
-    if (data === null) return;
+    if (pdfUrl === undefined) return;
     let alive = true;
     let loaded: PDFDocumentProxy | null = null;
-    loadPdfDocument(data.pdfUrl)
+    loadPdfDocument(pdfUrl)
       .then((document) => {
         if (!alive) {
           destroyPdfDocument(document);
@@ -74,7 +94,7 @@ export function DocumentWorkbench() {
       alive = false;
       if (loaded !== null) destroyPdfDocument(loaded);
     };
-  }, [data]);
+  }, [pdfUrl]);
 
   const handleLocate = useCallback(
     (target: EvidenceTarget) => {
@@ -83,8 +103,6 @@ export function DocumentWorkbench() {
     [locate],
   );
 
-  // 传给整棵原文视图的错误回调必须稳定：它进了 CanvasLayer 的 effect 依赖，
-  // 每次渲染换一个新函数会导致 canvas 反复重渲染
   const handleViewerError = useCallback(
     (message: string) => {
       setNotice(message);
@@ -92,9 +110,81 @@ export function DocumentWorkbench() {
     [setNotice],
   );
 
+  const errorMessage = (error: unknown, fallback: string): string =>
+    error instanceof Error ? error.message : fallback;
+
+  const handleReview = useCallback(
+    async (extraction: WireExtraction, input: ReviewInput): Promise<boolean> => {
+      setBusyExtractionId(extraction.id);
+      setNotice(null);
+      try {
+        await submitReview(extraction.instance_id, input);
+        await refreshWorkbench();
+        return true;
+      } catch (error: unknown) {
+        setNotice(errorMessage(error, "复核提交失败"));
+        return false;
+      } finally {
+        setBusyExtractionId(null);
+      }
+    },
+    [refreshWorkbench, setNotice],
+  );
+
+  const handleRerun = useCallback(
+    async (extraction: WireExtraction, hint: string | null): Promise<boolean> => {
+      setBusyExtractionId(extraction.id);
+      setNotice(null);
+      try {
+        const queued = await rerunExtraction(extraction.id, hint);
+        setNotice("字段重跑已提交，正在等待结果…");
+        const job = await waitForJob(queued.job_id);
+        if (job.status === "failed" || job.status === "canceled") {
+          throw new Error(job.error_message ?? "字段重跑失败");
+        }
+        await refreshWorkbench();
+        setNotice(null);
+        return true;
+      } catch (error: unknown) {
+        setNotice(errorMessage(error, "字段重跑失败"));
+        return false;
+      } finally {
+        setBusyExtractionId(null);
+      }
+    },
+    [refreshWorkbench, setNotice],
+  );
+
+  // 批量确认逐条提交（后端是一次一条的复核接口），失败计数而不是中断：
+  // 中途停下会让用户不知道到底确认了哪些，重刷一次就能看到真实状态。
+  const handleBatchConfirm = useCallback(
+    async (items: readonly WireExtraction[]): Promise<void> => {
+      setNotice(`正在批量确认 ${items.length} 项…`);
+      let failed = 0;
+      for (const item of items) {
+        try {
+          await submitReview(item.instance_id, {
+            attempt_id: item.id,
+            action: "confirm",
+            review_mode: "batch",
+          });
+        } catch {
+          failed += 1;
+        }
+      }
+      await refreshWorkbench();
+      setNotice(failed > 0 ? `批量确认完成，${failed} 项失败，请重试` : null);
+    },
+    [refreshWorkbench, setNotice],
+  );
+
   return (
     <div className="flex h-screen flex-col overflow-hidden">
-      <Toolbar pageCount={data?.pages.length ?? 0} />
+      <Toolbar
+        pageCount={data?.pages.length ?? 0}
+        projectId={data?.projectId ?? null}
+        onNotice={setNotice}
+      />
 
       {notice !== null && (
         <div className="flex items-center gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900">
@@ -115,7 +205,7 @@ export function DocumentWorkbench() {
         </div>
       ) : data === null || pdf === null ? (
         <div className="flex flex-1 items-center justify-center p-8 text-sm text-slate-500">
-          正在加载样本文档…
+          正在加载文档…
         </div>
       ) : (
         <div className="flex min-h-0 flex-1">
@@ -128,7 +218,22 @@ export function DocumentWorkbench() {
               onError={handleViewerError}
             />
           </div>
-          <ResultPanel extractions={data.extractions} index={index} onLocate={handleLocate} />
+          <ResultPanel
+            extractions={data.extractions}
+            index={index}
+            rerunModes={rerunModes}
+            projectId={data.projectId}
+            busyExtractionId={busyExtractionId}
+            onLocate={handleLocate}
+            onReview={handleReview}
+            onRerun={handleRerun}
+            onBatchConfirm={handleBatchConfirm}
+            onRefresh={async () => {
+              await refreshWorkbench();
+            }}
+            onNotice={setNotice}
+            onLoadAttempts={loadAttempts}
+          />
         </div>
       )}
     </div>

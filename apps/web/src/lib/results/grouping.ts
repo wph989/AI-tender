@@ -54,3 +54,13 @@ export function buildResultTabs(extractions: readonly WireExtraction[]): ResultT
       notFound: items.filter((item) => item.status === "not_found").length,
     }));
 }
+
+/**
+ * 批量确认的候选：只有「自动抽取」允许批量确认。
+ *
+ * 待复核、冲突、未找到都必须真的被人看过——把它们塞进批量确认，
+ * 等于用一次点击伪造出「有人确认过」的记录，抽检与准确率指标会立刻失真。
+ */
+export function selectBatchConfirmable(items: readonly WireExtraction[]): WireExtraction[] {
+  return items.filter((item) => item.status === "auto");
+}

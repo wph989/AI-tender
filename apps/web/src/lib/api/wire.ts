@@ -26,8 +26,8 @@ export function toPageGeometry(page: WirePageMeta): PageGeometry {
  * 不合法时返回 null 而不是抛错：一条坏坐标不该让整页结果都渲染不出来，
  * 调用方按「仅页级定位」降级处理（见 docs/设计/06 第 5 节）。
  */
-export function toBbox(raw: readonly number[]): Bbox | null {
-  if (raw.length !== 4) return null;
+export function toBbox(raw: readonly number[] | null): Bbox | null {
+  if (raw === null || raw.length !== 4) return null;
   const [x0, y0, x1, y1] = raw;
   if (x0 === undefined || y0 === undefined || x1 === undefined || y1 === undefined) return null;
   const bbox: Bbox = [x0, y0, x1, y1];

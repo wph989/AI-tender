@@ -1,44 +1,61 @@
 "use client";
 
 /**
- * 单条字段结果卡：值 + 置信度 + 状态徽标 + 证据（见 docs/设计/06 第 2 / 2.1 节）。
+ * 单条字段结果卡：值、证据定位和复核操作。
  *
- * 本切片只做「读 + 定位」：复核动作（确认/修正/补充/驳回）、尝试链、重跑入口都依赖后端接口，
- * 留待后续切片（见 06 第 9 节）。但**未找到的字段照常列出、不隐藏**——隐藏会让用户以为系统漏了，
- * 而这恰恰是最需要人工处理的字段（见 06 第 9.2 节）。
- *
- * 证据的呈现分两档（见 06 第 2.1 节）：
- *  - 1 处：行内一个「定位原文」按钮，卡片保持紧凑；
- *  - 多 处：展开成证据列表（页码 + 引文逐条点击定位）——一个结果可能从多处溯源而来，
- *    必须先让用户看到"有哪几处、在哪一页"，才谈得上选择。
+ * 人工修正必须把锚点一起提交：编辑器会预填当前证据，也允许在反向标注模式下
+ * 手动输入当前 run 的锚点，后端仍会再次校验锚点属于该版本。
  */
 
+import { useState } from "react";
+
+import type { ReviewEvidenceInput, ReviewInput } from "@/lib/api/client";
+import { statusBadgeClass, statusLabel, triggerLabel } from "@/lib/results/labels";
+import type { RerunButtonMode } from "@/lib/results/rerun";
 import { useViewerStore } from "@/lib/store/viewerStore";
 import type { EvidenceTarget } from "@/lib/viewer/evidenceIndex";
-import type { ExtractionStatus, WireExtraction } from "@/types/workbench";
+import type { WireAttempt, WireExtraction } from "@/types/workbench";
 
+import { AttemptHistory } from "./AttemptHistory";
 import { EvidenceList } from "./EvidenceList";
-
-/** 与库内枚举一一对应（见 docs/设计/03 表结构）。文案固定在这里，不允许各处自造。 */
-const STATUS_META: Record<ExtractionStatus, { label: string; className: string }> = {
-  auto: { label: "自动抽取", className: "border-emerald-200 bg-emerald-50 text-emerald-700" },
-  need_review: { label: "待复核", className: "border-amber-200 bg-amber-50 text-amber-700" },
-  verified: { label: "已确认", className: "border-sky-200 bg-sky-50 text-sky-700" },
-  rejected: { label: "已驳回", className: "border-slate-200 bg-slate-100 text-slate-500" },
-  conflict: { label: "存在冲突", className: "border-rose-200 bg-rose-50 text-rose-700" },
-  not_found: { label: "未找到", className: "border-slate-300 bg-slate-100 text-slate-600" },
-};
 
 interface Props {
   extraction: WireExtraction;
   targets: readonly EvidenceTarget[];
+  /** 服务端下发的重跑按钮口径（09 第 8 节）；hide 时只保留不占主位的入口。 */
+  rerunButton?: RerunButtonMode;
+  busy: boolean;
   onLocate: (target: EvidenceTarget) => void;
+  onReview: (input: ReviewInput) => Promise<boolean>;
+  onRerun: (hint: string | null) => Promise<boolean>;
+  onLoadAttempts: (extractionId: number) => Promise<WireAttempt[]>;
 }
 
-export function ResultCard({ extraction, targets, onLocate }: Props) {
-  const meta = STATUS_META[extraction.status];
+type EditMode = "correct" | "supplement" | null;
+
+export function ResultCard({
+  extraction,
+  targets,
+  rerunButton = "show",
+  busy,
+  onLocate,
+  onReview,
+  onRerun,
+  onLoadAttempts,
+}: Props) {
+  const badgeClass = statusBadgeClass(extraction.status);
+  const label = statusLabel(extraction.status);
   const isNotFound = extraction.status === "not_found";
-  // 只订阅"本卡是否高亮"这一个布尔值派生量：500 张卡片不会因为别的卡片定位而整体重渲染
+  const [editMode, setEditMode] = useState<EditMode>(null);
+  const [draftValue, setDraftValue] = useState(extraction.value_text);
+  const [draftAnchor, setDraftAnchor] = useState(targets[0]?.anchor ?? "");
+  const [draftQuote, setDraftQuote] = useState(targets[0]?.quote ?? "");
+  const [rerunOpen, setRerunOpen] = useState(false);
+  const [rerunHint, setRerunHint] = useState("");
+  const [attemptsOpen, setAttemptsOpen] = useState(false);
+  const [attempts, setAttempts] = useState<WireAttempt[] | null>(null);
+  const [attemptsLoading, setAttemptsLoading] = useState(false);
+  const [attemptsError, setAttemptsError] = useState<string | null>(null);
   const activeAnchor = useViewerStore((state) =>
     state.activeEvidence !== null && state.activeEvidence.extractionId === extraction.id
       ? state.activeEvidence.anchor
@@ -46,14 +63,83 @@ export function ResultCard({ extraction, targets, onLocate }: Props) {
   );
   const onlyTarget = targets.length === 1 ? targets[0] : undefined;
 
+  const beginEdit = (mode: EditMode) => {
+    setEditMode(mode);
+    setDraftValue(isNotFound ? "" : extraction.value_text);
+    setDraftAnchor(targets[0]?.anchor ?? "");
+    setDraftQuote(targets[0]?.quote ?? "");
+  };
+
+  const submitEdit = async () => {
+    const value = draftValue.trim();
+    const anchor = draftAnchor.trim();
+    if (!value || !anchor) return;
+    const evidence: ReviewEvidenceInput[] = [
+      { anchor, quote: draftQuote.trim() || undefined },
+    ];
+    const succeeded = await onReview({
+      attempt_id: extraction.id,
+      action: editMode === "supplement" ? "supplement" : "correct",
+      review_mode: "item",
+      new_value: value,
+      evidence,
+    });
+    if (succeeded) setEditMode(null);
+  };
+
+  const submitConfirm = async () => {
+    await onReview({
+      attempt_id: extraction.id,
+      action: "confirm",
+      review_mode: "item",
+    });
+  };
+
+  const submitReject = async () => {
+    await onReview({
+      attempt_id: extraction.id,
+      action: "reject",
+      review_mode: "item",
+      comment: "用户在结果面板驳回",
+    });
+  };
+
+  const submitRerun = async () => {
+    const succeeded = await onRerun(rerunHint.trim() || null);
+    if (succeeded) {
+      setRerunOpen(false);
+      setRerunHint("");
+    }
+  };
+
+  const toggleAttempts = () => {
+    if (attemptsOpen) {
+      setAttemptsOpen(false);
+      return;
+    }
+    setAttemptsOpen(true);
+    if (attempts !== null || attemptsLoading) return;
+    setAttemptsLoading(true);
+    setAttemptsError(null);
+    void onLoadAttempts(extraction.id)
+      .then((items) => setAttempts(items))
+      .catch((error: unknown) => {
+        setAttemptsError(error instanceof Error ? error.message : "尝试链加载失败");
+      })
+      .finally(() => setAttemptsLoading(false));
+  };
+
   return (
-    <article data-extraction-id={extraction.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+    <article
+      data-extraction-id={extraction.id}
+      className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm"
+    >
       <header className="flex items-start justify-between gap-2">
         <h4 className="text-sm font-medium text-slate-900">
           {extraction.field_label ?? extraction.field_key}
         </h4>
-        <span className={`shrink-0 rounded border px-1.5 py-0.5 text-xs ${meta.className}`}>
-          {meta.label}
+        <span className={`shrink-0 rounded border px-1.5 py-0.5 text-xs ${badgeClass}`}>
+          {label}
         </span>
       </header>
 
@@ -65,16 +151,27 @@ export function ResultCard({ extraction, targets, onLocate }: Props) {
         </p>
       )}
 
+      {(extraction.machine_attempt_no !== null && extraction.machine_attempt_no !== undefined) ||
+        extraction.trigger === "manual_edit" ? (
+        <p className="mt-2 text-xs text-slate-400">
+          {extraction.machine_attempt_no === null || extraction.machine_attempt_no === undefined
+            ? "人工"
+            : "第 " + extraction.machine_attempt_no + " 次机器尝试"}{" "}
+          · {triggerLabel(extraction.trigger)}
+        </p>
+      ) : null}
+
       {!isNotFound && (
-        <footer className="mt-3 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+        <footer className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-500">
           <span className="tabular-nums">置信度 {(extraction.confidence * 100).toFixed(0)}%</span>
           {onlyTarget !== undefined && (
             <button
               type="button"
               onClick={() => onLocate(onlyTarget)}
-              className="ml-auto rounded border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-700 hover:bg-sky-100"
+              className={buttonClass}
+              disabled={busy}
             >
-              定位原文 · 第 {onlyTarget.pageNo} 页
+              定位第 {onlyTarget.pageNo} 页
             </button>
           )}
         </footer>
@@ -84,20 +181,131 @@ export function ResultCard({ extraction, targets, onLocate }: Props) {
         <EvidenceList targets={targets} activeAnchor={activeAnchor} onLocate={onLocate} />
       )}
 
-      {isNotFound && (
-        <div className="mt-3 flex items-center gap-2 border-t border-dashed border-slate-200 pt-3 text-xs">
-          <button type="button" disabled title="接口落地后启用（本切片只做定位闭环）" className={secondaryAction}>
-            确认没有
+      <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
+        {isNotFound ? (
+          <>
+            <button type="button" className={buttonClass} disabled={busy} onClick={submitConfirm}>
+              确认没有
+            </button>
+            <button type="button" className={buttonClass} disabled={busy} onClick={() => beginEdit("supplement")}>
+              人工补充
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" className={buttonClass} disabled={busy} onClick={submitConfirm}>
+              确认
+            </button>
+            <button type="button" className={buttonClass} disabled={busy} onClick={() => beginEdit("correct")}>
+              修正
+            </button>
+            {rerunButton !== "hide" && (
+              <button
+                type="button"
+                className={buttonClass}
+                disabled={busy}
+                onClick={() => setRerunOpen((open) => !open)}
+              >
+                重跑
+              </button>
+            )}
+            <button type="button" className={buttonClass} disabled={busy} onClick={submitReject}>
+              驳回
+            </button>
+          </>
+        )}
+      </div>
+
+      {!isNotFound && rerunButton === "show_hint" && (
+        <p className="mt-2 text-xs text-emerald-700">重跑一次通常能修好</p>
+      )}
+
+      {rerunButton === "hide" && !isNotFound && !rerunOpen && (
+        <button
+          type="button"
+          className="mt-2 text-xs text-slate-400 hover:text-slate-600 hover:underline"
+          onClick={() => setRerunOpen(true)}
+          disabled={busy}
+        >
+          该字段重跑通常无用，仍要重跑
+        </button>
+      )}
+
+      <button
+        type="button"
+        className="mt-2 text-xs text-slate-500 hover:text-slate-700 hover:underline"
+        onClick={toggleAttempts}
+        disabled={busy}
+      >
+        {attemptsOpen ? "收起尝试链" : "查看尝试链"}
+      </button>
+
+      {attemptsOpen && (
+        <AttemptHistory
+          attempts={attempts ?? []}
+          loading={attemptsLoading}
+          error={attemptsError}
+          onLocate={onLocate}
+        />
+      )}
+
+      {rerunOpen && (
+        <div className="mt-2 flex flex-col gap-2 rounded border border-slate-200 bg-slate-50 p-2">
+          <input
+            value={rerunHint}
+            onChange={(event) => setRerunHint(event.target.value)}
+            placeholder="可选：提示模型重点查看的章节"
+            className={inputClass}
+          />
+          <button type="button" className={primaryClass} disabled={busy} onClick={submitRerun}>
+            提交重跑
           </button>
-          <button type="button" disabled title="接口落地后启用（本切片只做定位闭环）" className={secondaryAction}>
-            人工补充
-          </button>
-          <span className="text-slate-400">接口落地后启用</span>
+        </div>
+      )}
+
+      {editMode !== null && (
+        <div className="mt-2 flex flex-col gap-2 rounded border border-sky-200 bg-sky-50 p-2">
+          <input
+            value={draftValue}
+            onChange={(event) => setDraftValue(event.target.value)}
+            placeholder="填写修正后的值"
+            className={inputClass}
+          />
+          <input
+            value={draftAnchor}
+            onChange={(event) => setDraftAnchor(event.target.value)}
+            placeholder="原文锚点，例如 p12b5"
+            className={inputClass}
+          />
+          <textarea
+            value={draftQuote}
+            onChange={(event) => setDraftQuote(event.target.value)}
+            placeholder="可选：锚点中的原文片段"
+            rows={2}
+            className={inputClass}
+          />
+          <div className="flex gap-2">
+            <button
+              type="button"
+              className={primaryClass}
+              disabled={busy || !draftValue.trim() || !draftAnchor.trim()}
+              onClick={() => void submitEdit()}
+            >
+              提交{editMode === "supplement" ? "补充" : "修正"}
+            </button>
+            <button type="button" className={buttonClass} disabled={busy} onClick={() => setEditMode(null)}>
+              取消
+            </button>
+          </div>
         </div>
       )}
     </article>
   );
 }
 
-const secondaryAction =
-  "rounded border border-slate-300 px-2 py-1 text-slate-600 disabled:cursor-not-allowed disabled:opacity-50";
+const buttonClass =
+  "rounded border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50";
+const primaryClass =
+  "rounded border border-sky-400 bg-sky-600 px-2 py-1 text-xs text-white hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50";
+const inputClass =
+  "w-full rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-800 focus:border-sky-500 focus:outline-none";

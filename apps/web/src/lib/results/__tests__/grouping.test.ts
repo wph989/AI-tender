@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { buildResultTabs } from "@/lib/results/grouping";
+import { buildResultTabs, selectBatchConfirmable } from "@/lib/results/grouping";
 import type { ExtractionStatus, WireExtraction } from "@/types/workbench";
 
 function makeExtraction(id: number, groupKey: string, status: ExtractionStatus = "auto"): WireExtraction {
@@ -58,5 +58,23 @@ describe("buildResultTabs", () => {
 
   it("空列表返回空数组，而不是一个空标签", () => {
     expect(buildResultTabs([])).toEqual([]);
+  });
+});
+
+describe("批量确认候选", () => {
+  it("只挑自动抽取，不把需要人看的状态混进来", () => {
+    const items = [
+      makeExtraction(1, "basic_info", "auto"),
+      makeExtraction(2, "basic_info", "need_review"),
+      makeExtraction(3, "basic_info", "conflict"),
+      makeExtraction(4, "basic_info", "not_found"),
+      makeExtraction(5, "basic_info", "verified"),
+      makeExtraction(6, "basic_info", "rejected"),
+    ];
+    expect(selectBatchConfirmable(items).map((item) => item.id)).toEqual([1]);
+  });
+
+  it("没有自动抽取时不返回任何候选（按钮不该出现）", () => {
+    expect(selectBatchConfirmable([makeExtraction(1, "risk", "not_found")])).toEqual([]);
   });
 });
