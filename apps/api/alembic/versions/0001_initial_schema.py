@@ -321,7 +321,6 @@ CREATE TABLE config_release (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX ux_release_active ON config_release (company_id) WHERE status = 'active';""",
-    """ALTER TABLE config_release ADD CONSTRAINT fk_config_release_regression_run FOREIGN KEY (regression_run_id) REFERENCES regression_run(id);""",
     """-- 任务级配置快照（不可变）
 CREATE TABLE job_config_snapshot (
     id           BIGSERIAL PRIMARY KEY,
@@ -365,6 +364,7 @@ CREATE TABLE regression_run (
     started_at        TIMESTAMPTZ,
     finished_at       TIMESTAMPTZ
 );""",
+    """ALTER TABLE config_release ADD CONSTRAINT fk_config_release_regression_run FOREIGN KEY (regression_run_id) REFERENCES regression_run(id);""",
 )
 
 # 逆序删表；pg_trgm 不删——同一数据库里可能有别的 schema 在用
