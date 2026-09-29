@@ -12,11 +12,7 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/documents` | 上传文档（multipart），返回 document/version/job |
-| `GET` | `/api/v1/documents` | 文档列表（分页、按状态/关键词过滤） |
-| `GET` | `/api/v1/documents/{doc_id}` | 文档详情 + 版本列表 + 当前解析状态 |
-| `DELETE` | `/api/v1/documents/{doc_id}` | 软删除 |
-| `POST` | `/api/v1/documents/{doc_id}/versions` | 上传新版本 |
+| `POST` | `/api/v1/projects/{id}/files` | 批量上传文件（multipart），返回 project_file/job |
 | `GET` | `/api/v1/versions/{vid}` | 版本详情（页数、转换信息、解析运行列表） |
 | `POST` | `/api/v1/versions/{vid}/parse` | 触发解析（可指定 tier、是否强制重跑） |
 | `GET` | `/api/v1/versions/{vid}/file` | 获取 PDF 基座流（支持 Range） |
@@ -50,45 +46,62 @@
 | `GET` | `/api/v1/projects/{id}/export` | 导出 Excel |
 | `POST` | `/api/v1/projects/{id}/rerun` | 项目级批量重跑（按字段类型 / 仅失败项） |
 | `GET` | `/api/v1/projects/{id}/stats` | 项目复核进度统计（**不做考核**，仅展示） |
+| `GET` | `/api/v1/config/items` | 配置项定义 + 当前生效值（按 L1/L2/L3 分组） |
 | `GET` | `/api/v1/config/releases` | 配置版本列表 |
-| `POST` | `/api/v1/config/releases` | 创建 draft 配置 |
+| `POST` | `/api/v1/config/releases` | 创建配置版本（只动 L1 立即生效；含 L2/L3 落 draft） |
+| `GET` | `/api/v1/config/releases/{id}` | 版本详情：全量值 + diff + 影响清单 + 门禁预览 + 审计 |
+| `POST` | `/api/v1/config/releases/{id}/acknowledge` | 变更影响清单逐条确认（谁确认了哪一条） |
 | `POST` | `/api/v1/config/releases/{id}/regression-runs` | 触发**回归回放**（低优先级队列） |
 | `POST` | `/api/v1/config/releases/{id}/activate` | 激活配置（受门禁约束） |
 | `POST` | `/api/v1/config/releases/{id}/rollback` | 回滚到该版本 |
+| `GET` | `/api/v1/config/audit` | 变更审计（谁 / 何时 / 哪个 key / 旧值 / 新值 / 理由） |
 | `GET` | `/api/v1/regression-runs/{id}` | 回归回放报告 + 变更影响清单 |
 | `GET` | `/api/v1/gold-items` | 回归集条目（可按字段过滤） |
 | `GET` | `/api/v1/stats/fields` | 字段类型级统计（首次通过率 / 第 k 次救回率 / 重跑按钮收起建议） |
 | `POST` | `/api/v1/spot-checks` | 生成随机抽检任务（从批量确认通过的实例中抽） |
 
+> 原 `/documents*` 四条已删：版本、解析状态与文件元数据都挂在项目文件下
+> （`/projects/{id}/files`），再留一套文档级入口会出现两条互相漂移的路径；版本详情走 `/versions/{vid}`。
+
 ## 3. 关键接口详述
 
-### 3.1 上传文档
+### 3.1 批量上传项目文件
 
 ```
-POST /api/v1/documents
+POST /api/v1/projects/{id}/files
 Content-Type: multipart/form-data
 
 fields:
-  file        file    必填
+  files       file    必填，可重复多个
+  archive     file    可选，ZIP 压缩包
   auto_parse  bool    可选，默认 true
   tier        string  可选，默认 standard
+  ocr_mode    string  可选，默认 auto
+  role        string  可选，由文件名推断
 ```
 
 响应 `202 Accepted`：
 
 ```json
 {
-  "document_id": 1024,
-  "version_id": 2048,
-  "job_id": "job_01HXZ8Q3",
-  "sha256": "9f2c...e41d",
-  "deduplicated": false,
-  "is_converted": true,
-  "status": "pending"
+  "added": [
+    {
+      "project_file_id": 501,
+      "display_name": "招标文件.pdf",
+      "role": "main",
+      "is_parseable": true,
+      "version_id": null,
+      "job_id": "job_01HXZ8Q3"
+    }
+  ],
+  "jobs": ["job_01HXZ8Q3"],
+  "skipped": []
 }
 ```
 
-**`deduplicated: true`** 表示命中内容哈希，跳过了转换与解析；前端此时应直接进入结果页而不是等待进度。
+上传只确认文件已入项目；可解析文件先返回 `202`，后台完成页面探测后才创建或复用 `document_version`。
+因此响应中的 `version_id` 固定为 `null`，也不承诺 `deduplicated`；版本 ID 与最终状态通过 `GET /api/v1/jobs/{job_id}` 查询。
+不可解析附件会返回 `job_id: null`，仍保留在项目文件清单中。
 
 ### 3.2 页面清单
 
@@ -248,7 +261,7 @@ POST /api/v1/projects/{id}/files
 Content-Type: multipart/form-data
 
 fields:
-  files[]     file    必填，可多个
+  files       file    必填，可重复多个
   archive     file    可选，zip 压缩包（自动解包）
   auto_parse  bool    可选，默认 true
 ```
@@ -258,9 +271,9 @@ fields:
 ```json
 {
   "added": [
-    { "project_file_id": 501, "display_name": "招标文件.pdf", "role": "main", "is_parseable": true, "deduplicated": true },
-    { "project_file_id": 502, "display_name": "工程量清单.xlsx", "role": "boq", "is_parseable": false },
-    { "project_file_id": 503, "display_name": "图纸总平面.dwg", "role": "drawing", "is_parseable": false }
+    { "project_file_id": 501, "display_name": "招标文件.pdf", "role": "main", "is_parseable": true, "version_id": null, "job_id": "job_01HXZ8Q3" },
+    { "project_file_id": 502, "display_name": "工程量清单.xlsx", "role": "boq", "is_parseable": false, "version_id": null, "job_id": null },
+    { "project_file_id": 503, "display_name": "图纸总平面.dwg", "role": "drawing", "is_parseable": false, "version_id": null, "job_id": null }
   ],
   "jobs": ["job_01HXZ8Q3"],
   "skipped": []
@@ -271,7 +284,7 @@ fields:
 
 - **不允许批量创建项目**：项目必须逐个创建，此接口只做"项目内批量加文件"。
 - zip 自动解包后按扩展名分流：可解析的走解析链路，图纸与嵌套压缩包**只入库不解析**（`is_parseable: false`），但仍可下载。
-- `deduplicated: true` 表示命中内容哈希，跳过转换与解析。
+- 可解析文件先返回 `202`，`version_id` 在后台转换与页面探测完成前为 `null`；任务完成后可从 job 资源读取版本 ID。内容哈希复用在 worker 中判定，因此该响应不提前声称是否去重。
 - 一次批量上传若包含多份可解析文件，返回**多个 job_id**（每个文件一个任务），前端需展示多任务进度。
 
 **改元数据与换内容必须走不同接口**，这是刻意的：
@@ -309,6 +322,15 @@ GET /api/v1/projects/{id}/export?format=xlsx&include=all&lot=all
 
 ### 3.9 配置发布与回归门禁
 
+分层与生效语义见 [08-动态配置中心.md](../质量/08-动态配置中心.md) 第 2 节：
+L1（运行参数）改了立刻生效、不进回归；L2/L3 改了会改变结果，必须走"回归回放 + 影响清单逐条确认"。
+
+**创建语义**：`values` 是相对 `based_on`（默认当前 active）的**覆盖补丁**，
+服务端解析成完整值存进 `config_release.values`（表里存全量，保证可独立回放）；
+只改 L1 时返回 `status = "active"`（旧 active 自动归档），含 L2/L3 时返回 `status = "draft"`，
+激活前必须有人逐条确认影响清单。`GET /config/items` 给页面三层编辑用，
+`GET /config/audit` 回答"这个值什么时候被谁改的"。
+
 ```
 POST /api/v1/config/releases                    # 创建 draft
      { "values": {...}, "note": "调整保证金字段提示词", "based_on": 12 }
@@ -343,6 +365,14 @@ POST /api/v1/config/releases/{id}/activate      # 激活
 - 软门槛：首次通过率较当前 active 下降超 2 个百分点 → 需显式传 `{ "force": true, "reason": "..." }`，`reason` 必填且写入审计。
 - 回归集为空（冷启动阶段）时 `gold_total = 0`，只校验影响清单。
 - 报告与确认记录随 release 归档。
+
+**实现口径（2026-09-29）**
+
+- `POST .../regression-runs` 只接受 `draft` 版本；同一版本已有未完成回放时返回 409 `regression_in_flight`（`detail.regression_run_id` 指向在跑的那次）。
+- 回放走独立 `regression` 队列（低优先级、与交互任务隔离），复用 `sha256` 对应的原件与既有 `parse_run`，**只重跑抽取**——重跑 MinerU 属于 09 第 5.3 节"重新解析"这条要二次确认的路径，不在回放里做。
+- 门禁只认 `finished_at` 非空的报告：回放在跑时按"报告未产出"处理（冷启动口径），跑完或失败收口后同一函数自动生效。
+- 整轮回放起不来（模型网关不可用等）时报告写 `failures[].kind = replay_error`，门禁以硬门槛 `regression_run_failed` 拦住激活——"不倒退"这条不能被空报告绕过去。
+- `gold_unavailable`（文档/解析产物已清理）只进失败明细，不计入通过率分母；`extraction_failed`（单条抽取异常）计为失败但不生成影响条目。
 
 **为什么把"确认"做成独立接口，而不是 activate 请求体里的一个布尔值**：门禁事后要能回答「谁、在什么时候、确认了哪一条影响」。塞进 activate 的请求体里，就再也分不清"真看过了"和"顺手点了确定"。
 
@@ -442,6 +472,12 @@ GET /api/v1/stats/fields?scope=all&window=90d
 
 > **样本量不足时一律返回 `show`**：宁可让用户多看到一个可能没用的按钮，也不要因为 3 条样本的噪声把按钮藏掉。
 
+**实现口径（2026-09-29）**：顶层数字只代表「逐条复核」档（`review_mode = item`），
+批量与抽检档原样放在每个字段的 `by_mode` 里——三档合并会把没人真看过的批量确认算成准确率。
+`rerun_button` 也只看逐条档的样本量与第 2 次救回率。响应额外带 `system` 块：
+`anchor_404_rate`（必须恒为 0）与 `bbox_missing_rate`（降级为页级定位的证据比例）。
+`rescue_rate` / `cumulative_pass` 的键是机器解析序号（`"2"`、`"3"`）。
+
 **项目统计不做考核**：`GET /projects/{id}/stats` 只服务于项目内的进度展示，**接口层面不提供跨项目排名**（不提供排序参数、不返回其他项目的数据）。
 
 ### 3.13 随机抽检
@@ -457,6 +493,11 @@ POST /api/v1/spot-checks
 - 结论落 `review_action`（`review_mode = spot_check`），用于**校准 `batch` 档的通过率**，是唯一无偏的准确率估计（见 [09](../质量/09-评测与质量门禁.md) 第 6.1 节）。
 
 **为什么抽检对象是"批量确认通过的"**：逐条复核的实例已经有人真看过了，再抽是浪费。真正需要校准的，恰恰是"没人真看"的那一档。
+
+**实现口径（2026-09-29）**：抽样框是「最后一次复核结论为 `review_mode = batch` 且动作为 `confirm` 的尝试」
+（期间又被逐条复核过的尝试会被排掉），同一个实例在批量确认之后已被抽检过的不重复抽。
+抽样是同步完成的：一次 `ORDER BY random() LIMIT` + 插入 `review_task(reason = spot_check)`，
+所以 `job_id` 只是本次抽样批次号（关联号），明细是响应里的 `review_task_ids`。
 
 ## 4. SSE 进度
 
@@ -507,9 +548,12 @@ data: {"status":"completed","version_id":2048}
 | `unsupported_format` | 400 | 否 | 不在支持矩阵内 |
 | `conversion_failed` | 422 | **否** | Gotenberg 400 → 文件本身问题，重试无意义 |
 | `conversion_unavailable` | 503 | 是 | Gotenberg 500/503 |
+| `upload_size_mismatch` | 422 | 否 | MinerU 400 `bytes_mismatch` 或 413 `upload_size_mismatch` |
 | `parse_failed` | 422 | 有条件 | MinerU 失败；附 `partial` 时的已完成产物 |
+| `parse_unavailable` | 503 | 是 | MinerU 可安全重试的网络或服务故障 |
+| `parse_submission_unknown` | 503 | **否** | 解析任务提交响应丢失；结果未知，不得盲目重放 |
 | `parse_incomplete` | 200 | 是 | MinerU `partial`，**产物可用但需告知前端标记缺失** |
-| `service_restarted` | 409 | 是 | MinerU 服务重启导致 job 丢失，需重新提交 |
+| `service_restarted` | 409 | 是 | 轮询或下载产物时 MinerU 索引 404；调用方从 document_version 取 PDF key/SHA-256 后重新提交 |
 | `llm_unavailable` | 503 | 是 | 抽取模型不可用，解析产物仍可用 |
 | `version_conflict` | 409 | 否 | 并发修改同一条结果 |
 | `anchor_not_found` | 422 | 否 | 复核修正时锚点未指向当前版本的任何 element |
