@@ -80,8 +80,13 @@ def normalize_middle_json(
         if rotation not in {0, 90, 180, 270} or has_text_layer is None:
             raise ParseFailed(f"PDF 第 {page_no} 页缺少有效页面几何")
         raw_blocks = page.get("blocks")
-        if not isinstance(raw_blocks, list):
-            raise ParseFailed(f"MiddleJson 第 {page_no} 页缺少 blocks 数组")
+        # MinerU 用 exclude_defaults 序列化 MiddleJson，而 PageInfo.blocks 的默认值是空列表，
+        # 于是「整页无块」的空白页会把 blocks 键整体省略，而不是写出 []。
+        # 缺字段与空数组语义相同，这里统一补成空列表；只有显式给出非数组值才算数据损坏。
+        if raw_blocks is None:
+            raw_blocks = []
+        elif not isinstance(raw_blocks, list):
+            raise ParseFailed(f"MiddleJson 第 {page_no} 页 blocks 必须是数组")
 
         order_no = 0
         for raw_block_index, raw_block in enumerate(raw_blocks):

@@ -226,6 +226,7 @@ MiddleJson
 | 旧版带 bbox/图片职责的 Line/Span **不会恢复**；`InlineSpan` 只表达行内文字/公式/代码/链接 | 块级定位是官方长期契约，行内级定位不要指望 |
 | `ParseResult.to_dict()` 输出 `schema_version: "2.0"` + MiddleJson 字段，无顶层 `_backend`/`_meta` | 不要依赖非公开字段 |
 | Pipeline / VLM / Hybrid / Office / HTML 各 backend 的 block type 与 span 粒度**存在差异** | 必须记录本次解析的 `backend`，归一化时按 backend 分支处理 |
+| **空页面的 `blocks` 键会被整体省略**（`PageInfo.blocks` 默认空列表，而 `to_dict()` 默认 `skip_defaults=True`） | 「缺 `blocks`」必须与 `blocks: []` 同等处理：把它当数据损坏会让含空白页的整份文档解析失败（实测：137 页样本第 10 页只有 `page_idx`） |
 
 **已实测（2026-10-01，自托管 4.0.7，`standard` 档）**——两项 P0 均已定案，取值写入 `apps/api/.env`：
 
