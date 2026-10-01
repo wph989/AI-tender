@@ -340,7 +340,7 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
       const queued = await reparseVersion(versionId, {
         // 沿用上一次的档位：重新解析的目的是「修好这一次」，不是顺手换档
         tier: (data?.parseTier ?? "standard") as "flash" | "basic" | "standard" | "advanced",
-        ocrMode: "auto",
+        ocrMode: (data?.parseOcrMode ?? "auto") as "auto" | "txt" | "ocr",
         reason: "用户在结果面板发起重新解析",
       });
       // 同「重跑抽取」：先把界面切到进行中，轮询才会接管这段更漫长的等待。

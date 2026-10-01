@@ -84,6 +84,8 @@ export interface WireParseRun {
   id: number;
   status: string;
   tier: string;
+  /** 最近一次解析用的 OCR 模式；重新解析要沿用它，否则 `ocr` 的文件会被静默降回 `auto`。 */
+  ocr_mode?: string | null;
   created_at: string;
   /** 失败原因只在失败时有：工作台的失败态要直接说出来，而不是让用户去翻日志。 */
   error_code?: string | null;

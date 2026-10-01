@@ -16,6 +16,17 @@ export interface WireProject {
   file_count?: number;
   /** 仅列表接口带：项目下所有文件的待复核 + 冲突条数。 */
   review_count?: number;
+  /**
+   * 仅列表接口带：项目下「解析失败或抽取失败」的文件数。
+   * 卷宗脊要用它报警——只有待复核数的话，坏掉的项目会伪装成「没有待办」。
+   */
+  failed_count?: number;
+  /**
+   * 仅列表接口带：建项目、文件入库、任务状态更新三者里最晚的一个。
+   * 列表页的「最近活动」列要它——只拿 created_at 的话，三个月前建、昨天还在跑的
+   * 项目看上去像没人动过，列表也就答不出「哪个项目还有活」。
+   */
+  last_activity_at?: string;
 }
 
 /** 文件在项目里的角色；决定它参不参与解析（见后端 project_files.py 的 _PARSEABLE_ROLES）。 */

@@ -34,6 +34,8 @@ export interface WorkbenchData {
   parseError: string | null;
   /** 最近一次解析用的档位：重新解析要沿用它，不能顺手把档位也换掉。 */
   parseTier: string | null;
+  /** 最近一次解析用的 OCR 模式：重新解析沿用它，理由同 parseTier。 */
+  parseOcrMode: string | null;
   /** 最近一次抽取任务的状态（null = 从没排过队）；null 与 "failed" 是两种不同的空态。 */
   extractionStatus: string | null;
   /** 抽取失败的可读原因；只有失败时才有值。 */
@@ -85,25 +87,65 @@ export interface JobResponse {
   error_message?: string | null;
 }
 
-async function readError(response: Response, fallback: string): Promise<Error> {
-  let message = fallback + " 返回 " + response.status;
-  try {
-    const payload: unknown = await response.json();
+/** 后端的问题响应统一是 {error: {code, message, …}}；代理或网关则可能回一整页 HTML。 */
+function problemFromBody(body: unknown, status: number, fallback: string): Error {
+  if (typeof body === "object" && body !== null && "error" in body) {
+    const problem = body.error;
     if (
-      typeof payload === "object" &&
-      payload !== null &&
-      "error" in payload &&
-      typeof payload.error === "object" &&
-      payload.error !== null &&
-      "message" in payload.error &&
-      typeof payload.error.message === "string"
+      typeof problem === "object" &&
+      problem !== null &&
+      "message" in problem &&
+      typeof problem.message === "string"
     ) {
-      message = payload.error.message;
+      return new Error(problem.message);
     }
-  } catch {
-    // 代理或网关可能返回非 JSON 错误页，保留 HTTP 状态作为可诊断信息。
   }
-  return new Error(message);
+  return new Error(fallback + " 返回 " + status);
+}
+
+/**
+ * 上传失败（整批一个都没入库）时，后端仍会把逐文件原因放进 error.detail.skipped。
+ *
+ * 为什么单独一个错误类型：「没有文件成功入库」这句话没有可行动的信息——用户不知道该改哪个
+ * 文件。把 skipped 带出来，交件台就能把原因摊回对应的那一行。
+ */
+export class UploadRejectedError extends Error {
+  readonly skipped: { name: string; reason: string }[];
+
+  constructor(message: string, skipped: { name: string; reason: string }[]) {
+    super(message);
+    this.name = "UploadRejectedError";
+    this.skipped = skipped;
+  }
+}
+
+/** 从错误体里取出 error.detail.skipped（形状不对就当没有，绝不因此抛错）。 */
+function skippedFromBody(body: unknown): { name: string; reason: string }[] {
+  if (typeof body !== "object" || body === null || !("error" in body)) return [];
+  const problem = body.error;
+  if (typeof problem !== "object" || problem === null || !("detail" in problem)) return [];
+  const detail = problem.detail;
+  if (typeof detail !== "object" || detail === null || !("skipped" in detail)) return [];
+  const rows = detail.skipped;
+  if (!Array.isArray(rows)) return [];
+  const skipped: { name: string; reason: string }[] = [];
+  for (const row of rows) {
+    if (typeof row !== "object" || row === null || !("name" in row) || !("reason" in row)) continue;
+    if (typeof row.name === "string" && typeof row.reason === "string") {
+      skipped.push({ name: row.name, reason: row.reason });
+    }
+  }
+  return skipped;
+}
+
+async function readError(response: Response, fallback: string): Promise<Error> {
+  let payload: unknown = null;
+  try {
+    payload = await response.json();
+  } catch {
+    // 非 JSON 错误页也保留 HTTP 状态：那是唯一能拿到的诊断信息。
+  }
+  return problemFromBody(payload, response.status, fallback);
 }
 
 async function getJson<T>(url: string): Promise<T> {
@@ -163,6 +205,7 @@ export async function loadWorkbench(versionId: number): Promise<WorkbenchData> {
         ? (latestRun.error_message ?? latestRun.error_code ?? "解析失败")
         : null,
     parseTier: latestRun?.tier ?? null,
+    parseOcrMode: latestRun?.ocr_mode ?? null,
     extractionStatus: extractJob?.status ?? null,
     extractionError:
       extractJob !== null && (extractJob.status === "failed" || extractJob.status === "canceled")
@@ -340,6 +383,10 @@ export interface UploadOptions {
  * 不用 fetch 的 JSON 通道：后端收的是 multipart，且同一个字段名 files 可以重复出现，
  * 所以直接交给 FormData——浏览器会自己算 boundary，手拼 multipart 只会引入分号与
  * CRLF 的边界 bug（后端也按标准解析）。
+ *
+ * 也不用 fetch：fetch 至今拿不到请求体的上传进度（只有响应体能读流），而交件台要显示
+ * 「传到哪了」——一份标书几百兆，没有进度的等待看起来就是卡死。XHR 的 upload.onprogress
+ * 是唯一能拿到已发送字节数的通道，其余行为（multipart、错误体解析）与 fetch 版一致。
  */
 export async function uploadProjectFiles(
   projectId: number,
@@ -347,6 +394,8 @@ export async function uploadProjectFiles(
   options: UploadOptions,
   /** ZIP 归档走独立字段：后端会解压后逐个入库，混在 files 里只会被当成一个不参与解析的文件。 */
   archive: File | null = null,
+  /** 已发送比例（0~1）。只在浏览器能算出总长度时回调，取不到就不报数。 */
+  onProgress?: (ratio: number) => void,
 ): Promise<UploadResult> {
   const form = new FormData();
   for (const file of files) form.append("files", file);
@@ -356,12 +405,29 @@ export async function uploadProjectFiles(
   form.append("ocr_mode", options.ocrMode);
   if (options.role) form.append("role", options.role);
 
-  const response = await fetch("/api/v1/projects/" + projectId + "/files", {
-    method: "POST",
-    body: form,
+  return await new Promise<UploadResult>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/v1/projects/" + projectId + "/files");
+    // responseType=json 让浏览器自己解：成功分支直接是 UploadResult，
+    // 失败分支也能走同一套 {error:{message}} 解析。
+    request.responseType = "json";
+    request.upload.addEventListener("progress", (event) => {
+      if (onProgress === undefined || !event.lengthComputable || event.total <= 0) return;
+      onProgress(event.loaded / event.total);
+    });
+    request.addEventListener("load", () => {
+      if (request.status >= 200 && request.status < 300) {
+        resolve(request.response as UploadResult);
+        return;
+      }
+      const problem = problemFromBody(request.response, request.status, "上传失败");
+      const skipped = skippedFromBody(request.response);
+      reject(skipped.length > 0 ? new UploadRejectedError(problem.message, skipped) : problem);
+    });
+    request.addEventListener("error", () => reject(new Error("上传失败：网络中断")));
+    request.addEventListener("abort", () => reject(new Error("上传已取消")));
+    request.send(form);
   });
-  if (!response.ok) throw await readError(response, "上传失败");
-  return (await response.json()) as UploadResult;
 }
 
 export async function loadJob(jobId: string): Promise<JobResponse> {

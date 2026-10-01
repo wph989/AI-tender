@@ -447,6 +447,7 @@ def get_version(version_id: int, request: Request) -> dict[str, object]:
             connection.execute(
                 text(
                     """SELECT id, provider, provider_version, tier, backend, status, page_count,
+                              config_snapshot ->> 'ocr_mode' AS ocr_mode,
                               elapsed_ms, error_code, error_message, started_at, finished_at,
                               created_at
                        FROM parse_run WHERE version_id = :version_id

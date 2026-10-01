@@ -68,7 +68,13 @@ def list_projects(
     query = """SELECT p.id, p.company_id, p.name, p.project_no, p.owner, p.status,
                       p.created_at,
                       COALESCE(agg.file_count, 0) AS file_count,
-                      COALESCE(agg.review_count, 0) AS review_count
+                      COALESCE(agg.review_count, 0) AS review_count,
+                      COALESCE(agg.failed_count, 0) AS failed_count,
+                      -- 「最近活动」= 建项目、文件入库、任务状态更新三者取最大。
+                      -- 只回 created_at 的话，三个月前建、昨天还在跑的项目会排在最后，
+                      -- 而列表页要回答的正是「哪个项目还有活」。GREATEST 忽略 NULL，
+                      -- 所以没有文件或没有任务时自动退回 p.created_at。
+                      GREATEST(p.created_at, agg.last_file_at, act.last_job_at) AS last_activity_at
                FROM project AS p
                LEFT JOIN (
                    -- 子查询里就要按 company_id 过滤：只在外层过滤的话，
@@ -77,16 +83,45 @@ def list_projects(
                           count(DISTINCT pf.id) AS file_count,
                           count(e.id) FILTER (
                               WHERE e.status IN ('need_review', 'conflict')
-                          ) AS review_count
+                          ) AS review_count,
+                          max(pf.created_at) AS last_file_at,
+                          -- 失败计数：卷宗脊要能一眼分出「坏了的项目」。只回待复核数的话，
+                          -- 解析或抽取挂掉的项目会伪装成「没有待办」，那正是列表页最该报警的一种。
+                          count(DISTINCT pf.id) FILTER (
+                              WHERE latest_parse.status = 'failed'
+                                    OR latest_extract.status IN ('failed', 'canceled')
+                          ) AS failed_count
                    FROM project_file AS pf
                    JOIN project AS agg_owner ON agg_owner.id = pf.project_id
                    LEFT JOIN extraction AS e
                        ON e.version_id = pf.version_id AND e.is_current
+                   LEFT JOIN LATERAL (
+                       SELECT pr.status
+                       FROM parse_run AS pr
+                       WHERE pr.version_id = pf.version_id
+                       ORDER BY pr.created_at DESC, pr.id DESC LIMIT 1
+                   ) AS latest_parse ON true
+                   LEFT JOIN LATERAL (
+                       SELECT j.status
+                       FROM job AS j
+                       WHERE j.project_file_id = pf.id AND j.stage = 'extracting'
+                       ORDER BY j.created_at DESC, j.id DESC LIMIT 1
+                   ) AS latest_extract ON true
                    WHERE pf.deleted_at IS NULL
                          AND agg_owner.company_id = :company_id
                          AND agg_owner.deleted_at IS NULL
                    GROUP BY pf.project_id
                ) AS agg ON agg.project_id = p.id
+               LEFT JOIN (
+                   -- job 上没有 company_id，只能经由 project 收窄：不圈定范围的话，
+                   -- 每次刷新列表都会把全部公司的任务整表聚合一遍。
+                   SELECT job.project_id, max(job.updated_at) AS last_job_at
+                   FROM job
+                   JOIN project AS job_owner ON job_owner.id = job.project_id
+                   WHERE job_owner.company_id = :company_id
+                         AND job_owner.deleted_at IS NULL
+                   GROUP BY job.project_id
+               ) AS act ON act.project_id = p.id
                WHERE p.company_id = :company_id AND p.deleted_at IS NULL"""
     params: dict[str, object] = {
         "company_id": settings.company_id(),
@@ -96,7 +131,9 @@ def list_projects(
     if keyword and keyword.strip():
         query += " AND (p.name ILIKE :keyword OR p.project_no ILIKE :keyword)"
         params["keyword"] = f"%{keyword.strip()}%"
-    query += " ORDER BY p.created_at DESC, p.id DESC LIMIT :limit OFFSET :offset"
+    # 按「最近活动」倒序：这一列既然摆在行里，排序就得跟着它走，
+    # 否则用户按那一列找「谁刚动过」时会以为排序坏了。
+    query += " ORDER BY last_activity_at DESC, p.id DESC LIMIT :limit OFFSET :offset"
     with engine(request).connect() as connection:
         rows = connection.execute(text(query), params).mappings().all()
     return {"items": [dict(row) for row in rows], "offset": offset, "limit": limit}
