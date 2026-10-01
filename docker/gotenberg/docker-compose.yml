@@ -1,13 +1,14 @@
-# Gotenberg 单服务编排：Office(docx/doc/xlsx/pptx) → PDF。
+# Gotenberg 编排（自包含单文件）：Office(docx/doc/xlsx/pptx) → PDF。
 # AI-Tender 的关键路径前置服务——MinerU 只吃 PDF，且只有转成 PDF 才有「页 + 块 + bbox」，
 # 溯源定位依赖这套几何（见 docs/调研/02 与 docs/工程/07 第 1 节）。
 #
-# 用法（把 docker/gotenberg 与 docker/gotenberg-lb 两个目录一起拷到目标机器，保持同级）：
+# 用法（本目录拷到目标机器即可，不再依赖别的目录）：
 #   1) cp .env.example .env，至少改掉 GOTENBERG_PASS（其余变量的取舍都写在那份示例的注释里）
 #   2) docker compose up -d --build
-#   3) 验证：curl -u "$GOTENBERG_USER:$GOTENBERG_PASS" http://<主机>:3000/health
-#      字体：docker exec $(docker compose ps -q gotenberg) fc-list :lang=zh | wc -l
-#      AI-Tender 侧把 GOTENBERG_URL 指过来：同机容器部署用 http://host.docker.internal:3000，分机用 http://<主机>:3000
+#   3) 验证：curl -u "$GOTENBERG_USER:$GOTENBERG_PASS" http://<主机>:<GOTENBERG_PORT>/health
+#      字体：docker compose exec gotenberg fc-list :lang=zh | wc -l
+#      AI-Tender 侧把 GOTENBERG_URL 指到 LB 的宿主端口：同机容器部署用
+#      http://host.docker.internal:<GOTENBERG_PORT>，分机用 http://<主机>:<GOTENBERG_PORT>
 #
 # 动态扩缩副本（不用改端口，也不用改客户端地址）：
 #   docker compose up -d --scale gotenberg=3      # 加/减副本，LB 5 秒内跟上；=1 即回到单副本
@@ -18,8 +19,76 @@
 #
 # 为什么必须自建镜像而不是直接用官方镜像：LibreOffice 用「已安装字体」计算分页，
 # 缺字体 → 分页漂移 → page/bbox 与用户手里的原件对不上 → 溯源直接失效。
+#
+# 为什么 LB 的配置内联在本文件里而不是单独一个 nginx.conf：交付时要拷的目录越少越不容易出错
+# （实测漏拷挂载源时，Docker 会把挂载点当目录建出来，nginx 起不来且报错不直观）。
+# 代价是改 nginx 配置要动这个文件——本编排的 nginx 只做「转发 + 大体积关闭缓冲」，改动频率极低。
 
 name: gotenberg
+
+# LB 的 nginx 配置。用 compose configs 内联，省掉一个外部文件。
+#
+# 下面那处 `$$proxy_add_x_forwarded_for` 是**故意**写成两个 $：compose 会把 `$xxx` 当变量插值，
+# `$$` 才是转义后的字面量 `$`。拆成单个 $ 会被替换成空串，nginx 起来后 X-Forwarded-For 就丢了。
+configs:
+  gotenberg_lb_conf:
+    content: |
+      # Gotenberg 副本前面的负载均衡。由 docker-compose.yml 内联注入，不再单独放文件。
+      worker_processes auto;
+
+      events {
+        worker_connections 1024;
+      }
+
+      http {
+        # 必须用 Docker 内嵌 DNS 才能解析 compose 服务名；valid=5s 让副本增删在 5 秒内生效。
+        # upstream 里的 resolve 参数需要 nginx >= 1.27.3（开源版从这一版开始支持），所以镜像钉 1.27-alpine。
+        resolver 127.0.0.11 valid=5s ipv6=off;
+
+        # 默认 1m 会让大标书在 multipart 阶段就被 413 挡掉（发过来的是原始 Office 文件）。
+        client_max_body_size 0;
+
+        # 转换可能十几分钟（docs/调研/02 有实测数据），这里的超时必须大于 Gotenberg 的
+        # API_TIMEOUT，否则会出现「服务端还在转、代理先放弃」，等于白转一遍。
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        # 关掉请求缓冲：大标书的上传（实测最大 1.6 GB）直接流给副本，不在本容器再落一份临时文件。
+        # 代价是「传到一半副本挂掉」时不能在代理层换副本重试——但应用层本来就有重试
+        # （适配器 3 次 + 流回退，见 apps/api/src/tender/adapters/gotenberg.py），
+        # 为一次多余的整盘写入换这点保险不划算。
+        proxy_request_buffering off;
+
+        upstream gotenberg_upstream {
+          # resolve 必须配 zone；max_fails / fail_timeout 决定某个副本被判失败的节奏
+          zone gotenberg_upstream 64k;
+          server gotenberg:3000 resolve max_fails=3 fail_timeout=10s;
+          keepalive 32;
+        }
+
+        server {
+          listen 3000;
+
+          # 只探「nginx 自己活着」：不依赖 Gotenberg 的鉴权配置，也不把上游抖动混进探针
+          # （副本自身的健康由各副本的 healthcheck 与 nginx 的被动探测负责）。
+          location = /lb-health {
+            access_log off;
+            return 200 "ok\n";
+          }
+
+          location / {
+            proxy_pass http://gotenberg_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+
+            # 只在连不上副本时换一个（error）。超时与 5xx 交给应用层判断：
+            # 那说明这次转换可能已经跑了一半，在代理层悄悄重发等于把大文档转两遍。
+            proxy_next_upstream error;
+            proxy_next_upstream_tries 2;
+          }
+        }
+      }
 
 services:
   gotenberg:
@@ -30,6 +99,11 @@ services:
         # 建议钉到具体版本：converter_version 会写进 document_version，升级基础镜像等于改变分页
         # 口径，属于需要评审的变更
         GOTENBERG_IMAGE: "${GOTENBERG_IMAGE:-gotenberg/gotenberg:8}"
+        # 慢网络下把 apt 源换掉（默认空 = 用官方源）。写成 Dockerfile 里的 ARG 而不是硬编码，
+        # 是为了让「构建能不能过」只取决于部署方这边的网，不动镜像内容口径。
+        DEBIAN_MIRROR: "${DEBIAN_MIRROR:-}"
+        # 补装 Noto CJK 扩展集与文泉驿（默认不装，靠基础镜像自带的 Noto CJK + 自有字体）
+        INSTALL_EXTRA_FONTS: "${INSTALL_EXTRA_FONTS:-0}"
     image: "${GOTENBERG_LOCAL_IMAGE:-tender-gotenberg:8}"
     restart: unless-stopped
     environment:
@@ -49,7 +123,7 @@ services:
     # 对外统一走下面的 gotenberg-lb。只有临时单实例直连才需要自己把 ports 加回来。
     healthcheck:
       # start_period 必须留足：LibreOffice 首次初始化慢，早判会误报不健康。
-      # curl 由本目录的 Dockerfile 装上（官方镜像里不一定有）。
+      # curl 实测在官方基础镜像里已经自带（本目录 Dockerfile 也会在缺失时补装）。
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
       interval: 30s
       timeout: 10s
@@ -62,12 +136,13 @@ services:
           memory: "${GOTENBERG_MEMORY:-2g}"
 
   # 副本入口：Gotenberg 可以 --scale 加副本，但副本不能各自占同一个宿主端口，调用方又只认一个 URL，
-  # 所以在前面放一层 nginx。上游解析与超时配置见 docker/gotenberg-lb/nginx.conf（两个目录要一起拷）。
+  # 所以在前面放一层 nginx。上游解析与超时配置内联在本文件顶部的 configs 里。
   gotenberg-lb:
     image: nginx:1.27-alpine
     restart: unless-stopped
-    volumes:
-      - ../gotenberg-lb/nginx.conf:/etc/nginx/nginx.conf:ro
+    configs:
+      - source: gotenberg_lb_conf
+        target: /etc/nginx/nginx.conf
     ports:
       # 默认监听所有网卡，方便 api/worker 从别的机器调用；想只放行本机就写 127.0.0.1
       - "${GOTENBERG_BIND:-0.0.0.0}:${GOTENBERG_PORT:-3000}:3000"

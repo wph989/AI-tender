@@ -134,7 +134,7 @@ Gotenberg 的转换路由是**同步 HTTP 请求**：请求保持到转换完成
 
 ## 5. 部署形态
 
-> **可执行编排在 [`docker/gotenberg/docker-compose.yml`](../../docker/gotenberg/docker-compose.yml)**（含同目录 Dockerfile、字体目录与 `.env.example`；它依赖 [`docker/gotenberg-lb/nginx.conf`](../../docker/gotenberg-lb/nginx.conf)，**两个目录要一起拷**），支持 `docker compose up -d --scale gotenberg=3` 动态扩缩副本。
+> **可执行编排在 [`docker/gotenberg/docker-compose.yml`](../../docker/gotenberg/docker-compose.yml)**（含同目录 Dockerfile、字体目录与 `.env.example`；LB 的 nginx 配置内联在编排文件的 `configs` 里，**整个服务自包含、只拷这一个目录**），支持 `docker compose up -d --scale gotenberg=3` 动态扩缩副本。
 > **它不在仓库根的 `docker-compose.yml` 里**：那份只编排除 Gotenberg 以外的依赖与本体（默认 `up` 起 postgres / redis / minio / minio-init / mineru，加 `--profile app` 才起 api / worker / beat / migrate / web）。api / worker 用 `GOTENBERG_URL` 指向这侧的副本入口：同机部署写 `http://host.docker.internal:3000`（compose 已加 host-gateway 映射），分机部署写 `http://<主机>:3000`。
 > 下面这段是结构摘录，讲的是取舍。
 
@@ -163,13 +163,13 @@ gotenberg:
 # 副本入口：调用方只认一个 URL，副本又不能各自占宿主端口，所以前面放一层 nginx
 gotenberg-lb:
   image: nginx:1.27-alpine
-  volumes: [./docker/gotenberg-lb/nginx.conf:/etc/nginx/nginx.conf:ro]
+  configs: [gotenberg_lb_conf]        # nginx.conf 内联在同文件顶部的 configs 里
   ports: ["127.0.0.1:3000:3000"]
 ```
 
 **要点**
 
-- 服务**无状态**，可水平扩容：`docker compose up -d --scale gotenberg=3`。副本不能各自发布宿主端口（第二个副本 Bind `127.0.0.1:3000` 直接失败），所以入口是 `gotenberg-lb`（配置见 `docker/gotenberg-lb/nginx.conf`）：它用 Docker 内嵌 DNS 解析服务名，**副本增删 5 秒内生效**，客户端 URL 始终不变（同一份编排内的容器用 `http://gotenberg-lb:3000`，宿主与其他编排用 `http://<主机>:3000`）。
+- 服务**无状态**，可水平扩容：`docker compose up -d --scale gotenberg=3`。副本不能各自发布宿主端口（第二个副本 Bind `127.0.0.1:3000` 直接失败），所以入口是 `gotenberg-lb`（配置内联在编排文件的 `configs` 里）：它用 Docker 内嵌 DNS 解析服务名，**副本增删 5 秒内生效**，客户端 URL 始终不变（同一份编排内的容器用 `http://gotenberg-lb:3000`，宿主与其他编排用 `http://<主机>:3000`）。
 - 只加副本、不提并发上限等于没加：配置中心的 `convert.max_inflight` 要跟着调到副本数（它限的是同时在途的请求数），内存按 `副本数 × GOTENBERG_MEMORY` 估。
 - **超时是三层，要按同一量级配**：客户端 `GOTENBERG_TIMEOUT_SECONDS`（默认 1800s）≥ 服务端 `API_TIMEOUT`（默认 1800s，实际硬超时再多 5s）＜ LB 的 `proxy_read_timeout`（3600s）。哪一层更短，都会表现成「转了一半被放弃」。
 - **一个容器同一时刻只转一份**：Gotenberg 里 LibreOffice 的并发度写死为 1（`NewProcessSupervisor(..., 1, ...)`，v8.37 源码），官方参数说明也写着「Does not apply to LibreOffice: scale Gotenberg containers instead」。所以**副本数就是并行度**，单容器内其余请求只能排队（`LIBREOFFICE_MAX_QUEUE_SIZE` 默认 0，即不设上限）。

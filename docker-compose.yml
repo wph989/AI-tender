@@ -15,7 +15,7 @@
 #   没有 NVIDIA GPU 的机器：docker compose up -d --scale mineru=0（跳过 MinerU，其余依赖照常）
 #
 # Gotenberg 不在这份文件里：它单独一条编排（docker/gotenberg/docker-compose.yml，自带自建镜像与副本入口
-#   gotenberg-lb），交付时把 docker/gotenberg 与 docker/gotenberg-lb 两个目录一起拷过去。
+#   gotenberg-lb，配置全在那一个文件里），交付时只拷 docker/gotenberg 一个目录过去。
 #   分开的原因是转换是重资源服务，和 api / 数据库分机部署很常见（见 docs/调研/02 第 5 节）。
 #   本文件里的 api / worker 用 GOTENBERG_URL 指过去：同机部署走 http://host.docker.internal:3000
 #   （下面各服务已加 host-gateway 映射），异地部署覆盖成 http://<主机>:3000。
