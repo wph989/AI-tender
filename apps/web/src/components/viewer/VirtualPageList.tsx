@@ -38,9 +38,20 @@ interface Props {
   registry: PageRegistry;
   scrollRef: RefObject<HTMLElement | null>;
   onError: (message: string) => void;
+  /** 透传给页面上的角标层：点角标要能反向定位回结果卡（见 06 第 11 节）。 */
+  onLocate: (item: EvidenceItem) => void;
 }
 
-export function VirtualPageList({ pdf, pages, scale, index, registry, scrollRef, onError }: Props) {
+export function VirtualPageList({
+  pdf,
+  pages,
+  scale,
+  index,
+  registry,
+  scrollRef,
+  onError,
+  onLocate,
+}: Props) {
   const [nearby, setNearby] = useState<ReadonlySet<number>>(() => new Set<number>());
   const setCurrentPage = useViewerStore((state) => state.setCurrentPage);
 
@@ -138,6 +149,7 @@ export function VirtualPageList({ pdf, pages, scale, index, registry, scrollRef,
               items={index.byPage.get(page.page_no) ?? NO_EVIDENCE}
               registry={registry}
               onError={onError}
+              onLocate={onLocate}
             />
           ) : (
             <div className="rounded-sm bg-white/70 ring-1 ring-slate-200" style={{ width, height }} />

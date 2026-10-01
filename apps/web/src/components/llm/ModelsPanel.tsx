@@ -19,7 +19,7 @@ import type {
   ModelPatchInput,
 } from "@/types/llm";
 
-import { BUTTON_CLASS, DANGER_BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS } from "./ui";
+import { BUTTON_CLASS, DANGER_BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS, SELECT_CLASS } from "./ui";
 
 interface Props {
   providers: LlmProvider[];
@@ -91,11 +91,11 @@ export function ModelsPanel({ providers, models, onChanged }: Props) {
   );
 
   return (
-    <section className="rounded border border-slate-200 bg-white p-4">
+    <section className="border border-slate-200 bg-white px-5 py-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-sm font-semibold text-slate-800">模型</h2>
-          <p className="mt-1 text-xs text-slate-500">
+          <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">模型</h2>
+          <p className="mt-1 text-[13px] leading-5 text-slate-500">
             超时、温度、max tokens 是调用参数，和优先级无关；测试会真实发一次要求 JSON 的请求。
           </p>
         </div>
@@ -110,29 +110,29 @@ export function ModelsPanel({ providers, models, onChanged }: Props) {
       </div>
 
       {error !== null && (
-        <p className="mt-3 rounded bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</p>
+        <p className="mt-3 border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">{error}</p>
       )}
 
       {providers.length === 0 && (
-        <p className="mt-3 text-sm text-slate-500">先建一个供应商，模型必须有归属。</p>
+        <p className="mt-3 text-[14px] leading-6 text-slate-500">先建一个供应商，模型必须有归属。</p>
       )}
 
       {models.length === 0 && providers.length > 0 && editing !== "new" && (
-        <p className="mt-3 text-sm text-slate-500">
+        <p className="mt-3 text-[14px] leading-6 text-slate-500">
           还没有模型。可以在供应商里"拉取模型"批量导入，也可以手工新增。
         </p>
       )}
 
       {models.length > 0 && (
-        <table className="mt-3 w-full border-collapse text-sm">
+        <table className="mt-3 w-full border-collapse text-[14px]">
           <thead>
-            <tr className="text-left text-xs text-slate-500">
-              <th className="py-1 pr-3 font-normal">模型</th>
-              <th className="py-1 pr-3 font-normal">供应商</th>
-              <th className="py-1 pr-3 font-normal">参数</th>
-              <th className="py-1 pr-3 font-normal">状态</th>
-              <th className="py-1 pr-3 font-normal">最近测试</th>
-              <th className="py-1 text-right font-normal">操作</th>
+            <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">模型</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">供应商</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">参数</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">状态</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">最近测试</th>
+              <th className="border-b border-slate-200 py-2 text-right font-normal">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -143,35 +143,41 @@ export function ModelsPanel({ providers, models, onChanged }: Props) {
                   <tr className="border-t border-slate-100 align-top">
                     <td className="py-2 pr-3">
                       <div className="font-medium text-slate-800">{model.display_name}</div>
-                      <div className="text-xs text-slate-500">{model.model_id}</div>
+                      <div className="text-[13px] text-slate-500">{model.model_id}</div>
                     </td>
-                    <td className="py-2 pr-3 text-xs text-slate-600">
+                    <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
                       {model.provider_name ?? "—"}
                     </td>
-                    <td className="py-2 pr-3 text-xs text-slate-600">
+                    <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
                       超时 {model.timeout_seconds}s · 温度{" "}
                       {model.temperature === null ? "默认" : model.temperature} · max{" "}
                       {model.max_tokens === null ? "默认" : model.max_tokens}
                     </td>
-                    <td className="py-2 pr-3 text-xs">
+                    <td className="border-b border-slate-100 py-2 pr-3 text-[13px]">
                       <span
                         className={
-                          model.enabled
-                            ? "rounded bg-emerald-50 px-1.5 py-0.5 text-emerald-700"
-                            : "rounded bg-slate-100 px-1.5 py-0.5 text-slate-500"
+                          "inline-flex items-center gap-1.5 " +
+                          (model.enabled ? "text-emerald-700" : "text-slate-500")
                         }
                       >
+                        <span
+                          aria-hidden
+                          className={
+                            "h-1.5 w-1.5 shrink-0 rounded-full " +
+                            (model.enabled ? "bg-emerald-500" : "bg-slate-400")
+                          }
+                        />
                         {model.enabled ? "启用" : "停用"}
                       </span>
                     </td>
-                    <td className="py-2 pr-3 text-xs text-slate-600">
+                    <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
                       {testLabel(model.last_test_status)}
                       {result !== undefined && (
                         <span className="ml-1 text-slate-400">{result.latency_ms}ms</span>
                       )}
                       <div className="text-slate-400">{formatTime(model.last_test_at)}</div>
                     </td>
-                    <td className="py-2 text-right whitespace-nowrap">
+                    <td className="border-b border-slate-100 py-2 text-right whitespace-nowrap">
                       <button
                         type="button"
                         className={BUTTON_CLASS + " mr-1"}
@@ -201,7 +207,7 @@ export function ModelsPanel({ providers, models, onChanged }: Props) {
 
                   {model.last_test_error !== null && (
                     <tr>
-                      <td colSpan={6} className="pb-2 text-xs text-rose-600">
+                      <td colSpan={6} className="pb-2 text-[13px] text-rose-600">
                         {model.last_test_error}
                       </td>
                     </tr>
@@ -274,13 +280,13 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
   };
 
   return (
-    <div className="flex flex-wrap items-end gap-3 rounded bg-slate-50 p-3">
+    <div className="flex flex-wrap items-end gap-3 border border-slate-200 bg-slate-50 px-4 py-3.5">
       {model === null ? (
         <>
-          <label className="flex flex-col gap-1 text-xs text-slate-600">
+          <label className="flex flex-col gap-1 text-[13px] text-slate-600">
             供应商
             <select
-              className={INPUT_CLASS}
+              className={SELECT_CLASS}
               value={providerId}
               onChange={(event) => setProviderId(Number(event.target.value))}
             >
@@ -292,7 +298,7 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
               ))}
             </select>
           </label>
-          <label className="flex flex-col gap-1 text-xs text-slate-600">
+          <label className="flex flex-col gap-1 text-[13px] text-slate-600">
             模型 ID
             <input
               className={INPUT_CLASS}
@@ -303,11 +309,11 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           </label>
         </>
       ) : (
-        <span className="text-xs text-slate-500">
+        <span className="text-[13px] text-slate-500">
           供应商：{model.provider_name ?? "—"}（模型 ID {model.model_id} 不可改）
         </span>
       )}
-      <label className="flex flex-col gap-1 text-xs text-slate-600">
+      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
         显示名称
         <input
           className={INPUT_CLASS}
@@ -316,7 +322,7 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           placeholder="留空则用模型 ID"
         />
       </label>
-      <label className="flex flex-col gap-1 text-xs text-slate-600">
+      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
         超时（秒）
         <input
           type="number"
@@ -328,7 +334,7 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           placeholder="90"
         />
       </label>
-      <label className="flex flex-col gap-1 text-xs text-slate-600">
+      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
         温度
         <input
           type="number"
@@ -341,7 +347,7 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           placeholder="默认"
         />
       </label>
-      <label className="flex flex-col gap-1 text-xs text-slate-600">
+      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
         max tokens
         <input
           type="number"
@@ -352,7 +358,7 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           placeholder="默认"
         />
       </label>
-      <label className="flex items-center gap-1 text-xs text-slate-600">
+      <label className="flex items-center gap-1 text-[13px] text-slate-600">
         <input
           type="checkbox"
           checked={enabled}

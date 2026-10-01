@@ -9,7 +9,7 @@
 
 import { useState } from "react";
 
-import { BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS } from "@/components/ui";
+import { BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS, SELECT_CLASS } from "@/components/ui";
 import { createRelease } from "@/lib/api/config";
 import { LAYER_HINTS, LAYER_LABELS, buildPatch, formatValue } from "@/lib/config/draft";
 import { message } from "@/lib/errors";
@@ -63,17 +63,17 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
   };
 
   return (
-    <section className="rounded border border-slate-200 bg-white p-4">
+    <section className="border border-slate-200 bg-white px-5 py-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-sm font-semibold text-slate-800">{LAYER_LABELS[layer]}</h2>
-          <p className="mt-1 text-xs text-slate-500">{LAYER_HINTS[layer]}</p>
+          <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">{LAYER_LABELS[layer]}</h2>
+          <p className="mt-1 text-[13px] leading-5 text-slate-500">{LAYER_HINTS[layer]}</p>
         </div>
-        <span className="text-xs text-slate-400">{items.length} 项</span>
+        <span className="text-[13px] text-slate-400">{items.length} 项</span>
       </div>
 
       {!writable && (
-        <p className="mt-3 rounded bg-amber-50 px-2 py-1 text-xs text-amber-700">
+        <p className="mt-3 border border-amber-200 bg-amber-50 px-2 py-1 text-[13px] text-amber-800">
           当前角色只读该层，写操作会被服务端拒绝。
         </p>
       )}
@@ -86,23 +86,23 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
             <div key={item.key} className="flex flex-wrap items-center gap-2 py-2">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <code className="text-xs text-slate-700">{item.key}</code>
+                  <code className="text-[13px] text-slate-700">{item.key}</code>
                   {item.overridden && (
-                    <span className="rounded bg-sky-50 px-1 text-[10px] text-sky-700">
+                    <span className="rounded-[2px] bg-sky-50 px-1 text-[11px] text-sky-700">
                       已覆盖默认值
                     </span>
                   )}
                   {changed && (
-                    <span className="rounded bg-amber-50 px-1 text-[10px] text-amber-700">
+                    <span className="rounded-[2px] bg-amber-50 px-1 text-[11px] text-amber-700">
                       未保存
                     </span>
                   )}
                 </div>
-                <p className="mt-0.5 text-xs text-slate-500">{item.description}</p>
+                <p className="mt-0.5 text-[13px] text-slate-500">{item.description}</p>
               </div>
               {item.value_type === "bool" ? (
                 <select
-                  className={INPUT_CLASS + " w-24"}
+                  className={SELECT_CLASS + " w-24"}
                   value={value}
                   disabled={!writable}
                   onChange={(event) =>
@@ -127,7 +127,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                   }
                 />
               )}
-              <span className="w-28 text-right text-[10px] text-slate-400">
+              <span className="w-28 text-right text-[11px] text-slate-400">
                 默认 {formatValue(item.default)}
               </span>
             </div>
@@ -136,7 +136,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
       </div>
 
       {error !== null && (
-        <p className="mt-3 rounded border border-rose-200 bg-rose-50 p-2 text-xs text-rose-700">
+        <p className="mt-3 rounded-[2px] border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">
           {error}
         </p>
       )}

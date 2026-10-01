@@ -332,3 +332,284 @@ Set-Location G:\aicode\AI-tender; uv run --project apps/api python scripts/make_
 - 必须跑 `api-server` 入口：`webui`（7860）没有 `/v1/*` 那套端点，接不上。
 - 模型目录（`MINERU_HOME`）在 api-server 与 webui 之间**可以共用**（都是只读加载同一份权重）；
   但**显存不能共用**，两个进程各加载一份，单卡同时跑两个要先看显存够不够。
+
+
+## 19. 端到端联调 + 前端路由落地（2026-10-01 晚）
+
+环境：宿主机直接跑进程（本机没有 Docker），后端 `127.0.0.1:8300`、前端 `127.0.0.1:4400`。
+远端的 Postgres / Redis / MinIO / Gotenberg / MinerU 沿用第 18 节那套地址。
+
+### 19.1 端口：8000 与 4321 在本机不可用
+
+`netsh int ipv4 show excludedportrange protocol=tcp` 显示 Windows 保留了 `7981-8080`、`8081-8180`、
+`4247-4346` 三段（Hyper-V / WSL 占用），所以 **8000、8010、8080、8100、8800、4321 全部无法 bind**，
+报错是 WinError 10013「以一种访问权限不允许的方式做了一个访问套接字的尝试」——看起来像权限问题，
+实际是保留端口。实测可用：`8300`（API）、`4400`（前端）。前端不改代码，靠
+`API_PROXY_TARGET=http://127.0.0.1:8300` + `PORT=4400` 两个环境变量对接。
+
+启动命令（都在 `apps/api` 或 `apps/web` 下）：
+
+```powershell
+# API
+.\.venv\Scripts\python.exe -m uvicorn tender.api.app:app --host 127.0.0.1 --port 8300
+# worker（Windows 没有 fork，必须换线程池，否则 prefork 池直接起不来）
+.\.venv\Scripts\python.exe -m celery -A tender.worker.celery_app worker `
+  -Q tender,convert,parse,extract,regression -P threads -c 4 -l info
+# beat
+.\.venv\Scripts\python.exe -m celery -A tender.worker.celery_app beat -l info `
+  --schedule ..\..\.tmp\celerybeat-schedule
+# 前端
+$env:API_PROXY_TARGET = "http://127.0.0.1:8300"; $env:PORT = "4400"; pnpm dev
+```
+
+### 19.2 第三个真机 bug：派发闩锁没有随阶段推进交还（已修 + 已补回归）
+
+**症状**：docx 上传后转换成功（Gotenberg 200、`document_version` 落库、`page_count=1`），
+但解析永远不动——`parse_run` 一直为空，job 停在 `pending` / `stage=submitting`。
+beat 每 5 秒都在跑，返回的却是空字典。
+
+**根因**：`job.dispatched_at` 的语义是「**本阶段**已投递」，闸门的候选条件是 `dispatched_at IS NULL`
+（`worker/dispatch.py` 的 `_PENDING_SQL`）。转换阶段占用了这个闩锁；转换完成把 stage 改成
+`submitting` 交棒给解析时，**没有清掉它**，于是这条 job 永远不满足闸门条件。
+`process_file` 又特意不再自己投递（注释写着「派发交给 beat」），两条路一起把 job 卡死。
+
+**修复**：`worker/tasks.py` 的 `_finish_file_version` 在推进到 `submitting` 时一并
+`dispatched_at = CASE WHEN :should_parse THEN NULL ELSE dispatched_at END`——
+只在真的进入下一阶段时清，直接以 completed 收尾的 job 保持原值。
+修完后 worker 和 beat 都不需要改动，重启 worker 后那条卡住的 job 自己就往下走了。
+补了 `tests/contract/test_job_dispatch_latch.py`（源码级断言：这一行被删掉就变红）。
+
+**验证**：`submit_parse` → `poll_parse` → `extract_fields` 三段任务全部出现在 worker 日志里；
+`element` 表落 16 行（15 个 text + 1 个 table），锚点 `p1b1..p1b16`，bbox 与第 18 节实测的
+`top_left` / `visual` 约定一致（如标题块 `[0.116, 0.109, 0.376, 0.133]`）。
+
+### 19.3 前端：把设计文档 06 的路由矩阵真正落地
+
+此前只有工作台一个页面，且**没带 `versionId` 时静默回落到静态样本**——用户打开系统看到一份
+假标书，分不清是演示数据还是自己的文件没传上去。本轮补齐：
+
+| 路由 | 页面 | 说明 |
+| --- | --- | --- |
+| `/` | 重定向 | 跳到 `/projects` |
+| `/projects` | 项目列表 | 新建项目、按名称/编号搜索、文件数与待复核数列 |
+| `/projects/[id]` | 项目工作台 | 顶部文件切换条 + 左原文 / 右结果；当前文件走 `?file=` |
+| `/projects/[id]/files` | 文件管理 | 拖拽上传（含 ZIP 解包）、角色维护、重解析、软删除、流水线进度 |
+
+配套改动：
+
+- `DocumentWorkbench` 改为接收 `versionId`（不再自己猜），并新增「没有抽取结果」的可解释空状态——
+  当前 `LLM_*` 未配置，抽取必然失败，这个状态就是那件事的落点，而不是丢给用户一个空白面板。
+- 新增 `components/PageShell.tsx`（列表类页面统一外框）、`components/projects/FilePipeline.tsx`
+  （转换 → 解析 → 抽取 三段的进度轨迹）、`lib/projects/pipeline.ts`（阶段推导，纯函数 + 7 条单测）。
+- 后端两处查询补齐列表页要用的聚合：`GET /projects` 加 `file_count` / `review_count`；
+  `GET /projects/{id}` 的 `files[]` 加 `extraction_count` / `review_count` / `extraction_status`。
+  都只统计 `is_current` 的抽取，历史尝试不算——否则待复核数永远清不干净。
+
+### 19.4 视觉：一套「公文」气质的调色板
+
+- 字体栈不变（内网构建不能联网拉字体），新增等宽栈给页码/哈希/报价这类要上下比对的值。
+- 调色板在 `globals.css` 的 `@theme` 里**整站重映射** `slate / amber / sky / rose / emerald`
+  五个色阶，而不是逐个文件改名：22 个组件已经铺满这些类名，改名是一次几百行的纯噪声改动。
+  现在语义是：`slate` 墨（结构）、`amber` 荧光标记黄（全站唯一强调色，对应「证据高亮」）、
+  `sky` 靛蓝（可点）、`rose` 朱红（失败）、`emerald` 墨绿（完成）。
+- 签名元素是 `.mark-ink`（压扁 14% 的荧光笔痕，只用在待复核数字上）与流水线轨迹；
+  主按钮改成实心墨色，一屏里不再出现多个实心彩色按钮。
+
+### 19.5 本轮未验证 / 已知限制
+
+- **LLM 抽取链路仍然缺凭证**：`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` 为空，
+  抽取 job 会以 `extraction_failed` 结束（`extraction` 表为空）。配置入口是
+  `/settings/models` 与 `/settings/config`，但真正能用的地址还没拿到。
+- **无头截图不可靠**：本机 Chrome 的 `--headless=new --virtual-time-budget` 下，
+  客户端 `fetch` 经常在预算耗尽前不返回，截到的是「正在加载…」而不是数据行；
+  带数据的渲染只截到过两次（1680×1000 与 1200×900），不要把它当成稳定的验收手段。
+
+## 20. 前端 UI 重构收口（2026-10-01 深夜）
+
+### 20.1 一眼结论
+
+前端已从「通用后台模板」重做成一套叫**「校对台」**的视觉系统：冷灰墨阶的纸面 +
+荧光笔黄作为全站唯一强调色，宋体做标题与字段名、等宽做数据，签名元素是每一行左侧
+那道 3px「卷宗脊」色条。规范写在 `apps/web/src/app/globals.css` 的 `@theme` 里，
+完整口径见 `docs/设计/06-前端展示与定位.md` 第 12 节。
+
+### 20.2 本轮改了什么
+
+- `components/AppRail.tsx`（新）：左侧深色竖导航，替代已删除的 `AppNav.tsx`。
+- `components/PageShell.tsx` 收口为 `eyebrow / title / description / actions / width`；
+  `ModelSettings` 与 `ConfigCenter` 也改成用它，四类列表页现在共用同一个页头。
+- 结果面板：状态一律「小圆点 + 同色文字」（`lib/results/labels.ts` 的
+  `statusDotClass / statusTextClass / statusSpineClass`），不再用药丸；
+  卡片版式固定为「字段名（宋体）→ 值（等宽 17px）→ 出处 → 动作」。
+- `ModelSettings` / `ConfigCenter` 补了真正的错误态与「重试」，`ConfigCenter` 的
+  刷新按钮现在会走 `reload()`（原先只清提示文案）；`llm/ui.ts` 转发 `SELECT_CLASS`，
+  设置页的下拉框不再露出系统控件外观。
+- `lib/api/client.ts` 修掉了 `rerunMode` 的单参调用（原先漏传 `rerunModes`）。
+
+### 20.3 版式问题（截图发现并修掉）
+
+- 文件清单的行网格 `12rem / 10rem` 不够宽：流水线第三段后面的状态文字会顶到「待复核」
+  列上，操作区三个按钮会折成「打开工作/台」。已放宽为 `15rem / 13rem`，
+  并让 `FilePipeline` 的文字允许换行（`flex-wrap`）。
+- 工作台的 `DocumentWorkbench` 顶栏在窄屏下同样回到「正在加载…」是不对的，
+  实测是 headless 的问题而不是代码问题，见下条。
+
+### 20.4 截图验收：改用 CDP，弃用 `--virtual-time-budget`
+
+§19.5 说的「无头截图不可靠」有可靠解法：**`--virtual-time-budget` 会卡死 PDF.js 的
+worker 通信**，所以带 PDF 的工作台永远停在加载态。改成用 CDP 真等（`.tmp/cdp-shot.mjs`，
+用 `node --remote-debugging-port` 驱动 Edge，`Page.navigate` 后真实 sleep 再
+`Page.captureScreenshot`），本机 5 个页面全部截到带数据的画面。
+
+另外一个坑：**必须用 `http://localhost:<port>` 访问 `next dev`**。用 `127.0.0.1` 会被
+Next 16 判为跨源而拒绝 `/_next` 下的开发资源，页面只出 SSR 的空壳，看起来像「接口挂了」。
+
+### 20.5 本轮未做
+
+- 结果面板不能折叠（核对时无法把原文放到最大）；
+- `/review` 复核队列页、`/settings` 账号与审计页仍是规划状态；
+- 字体仍走系统栈（`Source Han Serif SC / Songti SC / SimSun`），没有内嵌 woff2。
+
+## 21. 前端「校对台 v2」第一段：视觉全换 + 工作台补齐（2026-10-01 深夜）
+
+### 21.1 一眼结论
+
+上一轮（第 20 节）只搭了骨架：配色做了，但**字阶太保守**（239 处字号里 201 处是
+11–13px）、**宽页卡在 1200px**，1600px 屏上就是「中间一条窄带」；界面上还缺一半形态——
+失败态没有出路、原文没有角标、没有章节树、没有复核统计、没有复核队列。
+本轮按用户「视觉全换、力度拉满」的要求重定尺度表，并把缺的形态补齐。
+
+### 21.2 用户两条不满的正面回答
+
+| 不满 | 处理 |
+| --- | --- |
+| 「解析失败也没有重新解析功能」 | 新增版本级端点 `POST /versions/{vid}/extract`（只重跑抽取、复用解析产物），工作台的空态/失败态与文件清单行都把「重跑抽取」给成第一出口 |
+| 「我要求的完全重构 UI，你就给加了一个框架」 | 字阶与结构尺度整体上调（21.3），补齐四种缺失形态（21.4） |
+
+### 21.3 视觉底座：只改 token 与常量，组件里的类名不动
+
+`apps/web/src/app/globals.css` 的 `@theme` 与 `apps/web/src/components/ui.ts`：
+
+- **纸面转暖**：`--color-white: #fdfbf7`（米白暖纸）、`slate-50 #f6f4ef`、`slate-100 #eae6dd`、
+  `slate-200 #dcd7cb`；`.desk` 底色 `#e3ded2`。**`slate-300` 及更深一律保持冷墨不变**——
+  「米白纸 + 冷黑墨」才是印刷配对，结构线的冷调正是墨感的来源。荧光笔黄/靛蓝/印泥红/墨绿四色没动。
+- **尺度表**（字号/行高）：页面标题 26→**34/44**（serif）、区块标题 16→**19/28**（serif）、
+  字段名 13→**15/22**（serif，宋体落在这里才像标书）、结果值 17→**22/30**（mono，全屏最大）、
+  正文 13→**14/22**、次要说明 12→**13/20**、数据小字 11→**13/18**（mono）；
+  `EYEBROW_CLASS` 保留 11/0.18em（它是指路牌不是正文）；`AppRail` 标签 11→12。
+- **结构尺度**：`AppRail` 76→**92px**、卷宗脊 3→**4px**、`RESULT_PANEL_WIDTH` 404→**460px**、
+  `PageShell` 的 wide 1200→**`max-w-[1680px]`**、narrow 900→**1180**、内边距 `px-10` 且
+  ≥1536px 时 `px-14`；原文纸 1100→1240。
+- **按钮不再折行**：`ui.ts` 六个按钮常量都加了 `whitespace-nowrap`（按钮文字折成「打开工作/台」
+  是上一轮就截图发现、但没根治的问题），文件清单行的操作列 13rem→**21rem**，
+  以同时容纳「打开工作台 / 重跑抽取 / 重新解析 / 删除」四个动作
+  （§20.3 里那句「已放宽为 15rem / 13rem」被本条取代）。
+- 签名元素没动：墨线分层、编号、`rounded-[2px]`、全站唯一那处阴影、三段色块流水线。
+
+### 21.4 工作台补齐（本轮的主体）
+
+- **原文角标气泡** `components/viewer/AnnotationLayer.tsx`：按 `evidenceIndex.byPage` 在每页
+  渲染该页证据编号，点角标反向定位并高亮对应结果卡；激活项荧光黄实心、其余墨线空心。
+- **章节树** `components/workbench/OutlineNav.tsx`：接 `GET /versions/{id}/outline`（此前前端零接入），
+  可折叠（折叠留 36px 竖脊，入口不消失），点章节跳页并高亮标题块。
+  当前章用「页码 ≤ 当前页的最后一个」判定 —— level 不保证连续、也可能缺父节点，用不到树的形状。
+- **复核统计条** `components/workbench/ReviewStatsBar.tsx`：接 `GET /projects/{id}/stats`
+  （零后端改动），通栏显示「已复核 / 已修正 / 待复核」，点「待复核」切复核模式。
+- **复核模式**：结果面板顶部两档开关「复核队列 / 全部结果」；复核模式下 conflict → need_review →
+  其余 → not_found 排序（`lib/results/reviewQueue.ts`），冲突项就地展开两侧取值待裁决。
+  **没有新增 `/review` 路由**（用户已确认的取舍），路由矩阵不变。
+- **三态空态/失败态**（都在 `DocumentWorkbench.tsx` 的结果面板里）：
+  未解析 → 指路（去文件管理页），解析失败 → 错误码 + 重新解析，抽取失败/0 条 → **抽取 job 的错误码
+  与消息 + 主按钮「重跑抽取」**+次按钮「重新解析」。
+- **键盘流**：`j/k` 移动、`Enter` 确认、`Shift+Enter` 打开带提示重跑、`Esc` 收起、`/` 聚焦搜索。
+- **三种重跑的文案口径不许混用**：重跑（单字段，秒级）/ **重跑抽取**（复用解析产物、分钟级、
+  不动锚点与已确认结果）/ **重新解析**（重建锚点、已确认打回复核、更久）。重新解析前先出后果横幅，
+  写明「此前 N 条已确认结果需重新复核」。
+
+### 21.5 后端这一轮只加了一个端点、两个响应字段
+
+- `POST /api/v1/versions/{vid}/extract`（`api/parsing.py`）：body `{field_keys?: string[], hint?: string|null}`，
+  空数组 = 全部字段；`hint` 非空 → trigger `hinted_rerun`，否则 `user_rerun`（沿用既有枚举，没扩枚举）。
+  复用最近一次 `completed/partial` 的 parse_run，**不重建锚点、不作废已验证结果**；用
+  `pg_advisory_xact_lock` 做并发互斥。错误口径：`404 not_found` / `409 version_not_parseable` /
+  `409 parse_incomplete` / `409 rerun_in_flight` / `400 invalid_argument`；成功 `202`。
+  为什么必须单独开这个入口：解析与抽取是两个 job，抽取失败时 `parse_run` 往往已经 `completed`、
+  结果却一行都没有，此时 `/projects/{id}/rerun` 是从**已有结果行**里筛候选的 → 必然 0 条；
+  而 `/reparse` 要重建锚点、代价高一个量级。
+  **为什么不复用 `/projects/{id}/rerun`**：它的语义是「项目级批量补跑已有结果」，这次要的是
+  「一个版本一条结果都没有时重新抽」。两者前置条件互斥，硬合并会让 0 结果的项目永远走不通。
+- 响应新增字段（不是新端点，见 `docs/设计/05` 第 3.14 节）：
+  `GET /versions/{vid}` 加 `latest_extraction_job`（失败态的「错误码 + 消息」只能来自 job 行）；
+  `GET /projects/{id}` 的 `files[]` 加 `confirmed_count`（重新解析的二次确认要列出失效条数）。
+- API 层不许 import `tender.worker.*`（import-linter 强制），所以端点走 `TaskQueue` 端口，不直接把
+  `create_extraction_job` 搬进 API。
+
+### 21.6 真机跑通这一环，顺手挖出两个一直躺着的 bug
+
+抽取这一环**此前从没在真机跑通过**（第 18~20 节都是单测与假数据），第一次真跑就连撞两个：
+
+1. `worker/extraction.py` 的 `_load_candidates` 写 `m.api_key_ciphertext`，但该列属于
+   `llm_provider` → 改成 `p.api_key_ciphertext`。报错信息是
+   `column m.api_key_ciphertext does not exist`，只在真机暴露。
+2. `worker/tasks.py` 的 `_finish_file_version` 把 stage 从 `converting` 推进到 `submitting` 时
+   没清 `dispatched_at`。`dispatched_at` 的语义是「**本阶段**已投递」、派发闸门只认
+   `dispatched_at IS NULL`，所以漏清 = job 静默停在 pending，界面表现是「解析永远在排队」。
+   处理：`dispatched_at = CASE WHEN :should_parse THEN NULL ELSE dispatched_at END`。
+
+两个都补了**源码级**契约测试（跑真机太贵，而这两条都是「写法」层面的不变式）：
+
+- `tests/contract/test_worker_sql_columns_exist.py`：从 alembic 全部迁移里解析出
+  表 → 列集合（含 `ALTER TABLE ... ADD COLUMN`），再校验 worker 里所有 `别名.列名`
+  （别名由 `表名 AS 别名` 给出）。已用「把 fix 改回 bug → 测试变红 → 改回 → 变绿」双向验证过。
+- `tests/contract/test_job_dispatch_latch.py`：钉住阶段推进的那条 UPDATE 里
+  `dispatched_at = CASE WHEN ... THEN NULL` 还在，同时钉住 `ELSE dispatched_at END`
+  （不进入下一阶段时不能无条件清）。
+
+真机闭环：项目 1（抽取失败、0 结果）走 `POST /versions/1/extract` → job 落库 → worker 跑完
+**14/14 字段、0 失败**，`GET /projects/1` 的 `extraction_count` 从 0 变 14。
+
+### 21.7 截图验收
+
+用 `apps/web/.tmp/cdp-shot.mjs`（§20.4 那两个坑仍然有效：**必须 `localhost:4400`**、
+**不能加 `--virtual-time-budget`**），1600×1000 逐页截：
+
+| 页面 | 结果 |
+| --- | --- |
+| `/projects` | 通栏卷宗清单（仍是第二段的形态，本轮只跟着换尺度） |
+| `/projects/1/files` | 交件台 + 清单双动作「重跑抽取 / 重新解析」 |
+| `/projects/1`（有结果） | 复核进度条 + 两档开关 + 章节/角标 + 键盘提示 |
+| `/projects/1`（抽取失败） | 错误码 + 消息 + **主按钮「重跑抽取」**（见下） |
+| `/settings/models`、`/settings/config` | 撑满，无中间窄带 |
+
+这两个形态的来源说明：`/projects/1` 的**抽取失败态**与**章节树**在当前样本数据上复现不出来
+（抽取已跑通、不再有失败 job；MinerU 把样本 docx 的四个小节标题判成了普通 `text`，
+`/outline` 返回空数组）。这两个形态用 `apps/web/.tmp/cdp-state-shot.mjs` 截图：
+在页面加载前包装 `window.fetch`，**只替换被验证的那一个响应体**，其余请求走真实接口，
+不改数据库也不改代码。章节树注入的内容就是该文档真实的小节标题（`p1b2/p1b7/p1b10/p1b13`），
+失败消息用的是库里真实记录的那一条。
+
+### 21.8 已知偏离
+
+- **统计条不显示「/ 共 N」分母**：`/projects/{id}/stats` 不返回「项目内结果实例总数」，
+  前端自己拼分母会拼出「分母 < 已复核」这种自相矛盾的数字。宁可少给一个数，也不能给错的。
+- **重新解析的后果确认只在 UI 层**：后端 `/reparse` 目前不接收 `acknowledge_invalidated_count`
+  （`docs/设计/05` 第 3.11 节写的是设计意图），横幅只负责「先摆出数字再让人按下去」，数字不回传核对。
+- **`/review` 路由仍未实现**：复核队列做在工作台内，路由矩阵不变。
+- **`OutlineNav` 在 outline 为空时整块不渲染**（不占 236px 白跑一栏）。样本 docx 目前就属于这种，
+  所以真实数据下工作台看不到左栏——这是有意为之，不是没实现。
+
+### 21.9 第二段待办（等用户看截图确认方向后再推）
+
+`ProjectList` 通栏卷宗清单（列头 + 行高 56px + `/` 聚焦搜索）、`UploadPanel` 拖拽区加高并写明
+支持格式/ZIP/上限/角色推断规则、逐文件上传进度、`settings/models` 与 `settings/config`
+≥1536px 双列网格、`PageShell` 面包屑补全到更多页面。
+
+### 21.10 本轮验证命令与结果
+
+```
+apps/web:  pnpm typecheck   → 通过
+apps/web:  pnpm test        → 66 passed（原 54）
+apps/web:  pnpm build       → 成功，7 条路由
+apps/api:  pytest -q        → 257 passed, 2 skipped
+apps/api:  ruff check / ruff format --check / lint-imports → 通过
+```

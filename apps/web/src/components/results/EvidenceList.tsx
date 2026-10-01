@@ -3,8 +3,8 @@
 /**
  * 证据列表：一个结果可能从多处溯源而来（正文、前附表、附录，甚至跨页、后续还有跨文件）。
  *
- * 为什么逐条列出，而不是「证据 1/3 再点一次换下一个」：用户先要知道"一共有哪几处、分别在第几页"
- * 才能决定看哪一处；循环定位把选择权变成猜谜——点三次才轮到想看的那条。
+ * 为什么逐条列出，而不是「证据 1/3 再点一次换下一个」：用户先要知道「一共有哪几处、
+ * 分别在第几页」才能决定看哪一处；循环定位把选择权变成猜谜——点三次才轮到想看的那条。
  *
  * 为什么超过 3 条要折叠：个别字段（如废标条款）可能命中十几处，全铺开会把面板撑爆；
  * 「展开其余 N 处」把决定权交还给用户。
@@ -15,6 +15,7 @@
 
 import { useState } from "react";
 
+import { DATA_CLASS } from "@/components/ui";
 import type { EvidenceTarget } from "@/lib/viewer/evidenceIndex";
 
 const COLLAPSE_AFTER = 3;
@@ -32,8 +33,12 @@ export function EvidenceList({ targets, activeAnchor, onLocate }: Props) {
   const visible = expanded || hidden <= 0 ? targets : targets.slice(0, COLLAPSE_AFTER);
 
   return (
-    <section className="mt-3 border-t border-slate-100 pt-2">
-      <h5 className="mb-1 text-xs text-slate-500">证据 {targets.length} 处 · 点击逐条定位</h5>
+    <section className="mt-3 border-t border-slate-100 pt-2.5">
+      <h5 className="mb-1.5 flex items-baseline gap-1.5 text-[13px] text-slate-400">
+        <span>证据 {targets.length} 处</span>
+        <span aria-hidden>·</span>
+        <span>点哪条跳哪条</span>
+      </h5>
       <ul className="flex flex-col">
         {visible.map((target, index) => {
           const active = target.anchor === activeAnchor;
@@ -45,18 +50,27 @@ export function EvidenceList({ targets, activeAnchor, onLocate }: Props) {
                 data-evidence-anchor={target.anchor}
                 onClick={() => onLocate(target)}
                 title={target.quote === "" ? undefined : target.quote}
-                className={`flex w-full items-center gap-2 rounded-md border px-1.5 py-1 text-left text-xs ${
-                  active
-                    ? "border-amber-300 bg-amber-50 ring-1 ring-amber-300"
-                    : "border-transparent hover:bg-slate-50"
-                }`}
+                className={
+                  "relative flex w-full items-center gap-2 py-1.5 pr-1.5 pl-2 text-left text-[13px] " +
+                  (active ? "bg-amber-50" : "hover:bg-slate-50")
+                }
               >
-                <span className="w-3 shrink-0 tabular-nums text-slate-400">{index + 1}.</span>
-                <span className="shrink-0 rounded border border-slate-200 bg-slate-50 px-1 tabular-nums text-slate-500">
+                {active && (
+                  <span aria-hidden className="absolute inset-y-0 left-0 w-[4px] bg-amber-400" />
+                )}
+                <span className={DATA_CLASS + " w-3 shrink-0 text-[13px] text-slate-400"}>
+                  {index + 1}
+                </span>
+                <span
+                  className={
+                    DATA_CLASS +
+                    " shrink-0 border border-slate-200 px-1 py-px text-[11px] text-slate-500"
+                  }
+                >
                   第 {target.pageNo} 页
                 </span>
                 {target.bbox === null && (
-                  <span className="shrink-0 rounded bg-slate-100 px-1 text-slate-400">页级</span>
+                  <span className="shrink-0 text-[11px] text-slate-400">页级</span>
                 )}
                 <span className="min-w-0 flex-1 truncate text-slate-600">
                   {target.quote === "" ? "（无引文）" : target.quote}
@@ -70,7 +84,7 @@ export function EvidenceList({ targets, activeAnchor, onLocate }: Props) {
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
-          className="mt-1 text-xs text-sky-700 hover:underline"
+          className="mt-1.5 text-[13px] text-sky-700 hover:underline"
         >
           {expanded ? "收起" : `展开其余 ${hidden} 处`}
         </button>

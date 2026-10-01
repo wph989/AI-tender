@@ -5,12 +5,14 @@
  * 同一套 PDF.js 与定位逻辑可以直接检查上传后的版本。
  */
 
+import type { FileRole, ParseTier, UploadResult, WireProject, WireProjectDetail } from "@/types/projects";
 import type {
   WireAttempt,
   WireBlock,
   WireConflict,
   WireExtraction,
   WireEvidence,
+  WireOutlineItem,
   WirePageMeta,
   WireVersionDetail,
 } from "@/types/workbench";
@@ -22,6 +24,20 @@ export interface WorkbenchData {
   pages: WirePageMeta[];
   blocksByPage: Record<string, WireBlock[]>;
   extractions: WireExtraction[];
+  /**
+   * 最近一次解析运行的终态（null = 还没跑过解析）。
+   * 为什么由工作台自己带：抽取为空时唯一的解释是「解析没成」还是「抽取没成」，
+   * 这个判断必须在结果面板所在的那一层拿得到，否则空态只能写成「暂无数据」。
+   */
+  parseStatus: string | null;
+  /** 解析失败的可读原因（error_message 优先，回落 error_code）。 */
+  parseError: string | null;
+  /** 最近一次解析用的档位：重新解析要沿用它，不能顺手把档位也换掉。 */
+  parseTier: string | null;
+  /** 最近一次抽取任务的状态（null = 从没排过队）；null 与 "failed" 是两种不同的空态。 */
+  extractionStatus: string | null;
+  /** 抽取失败的可读原因；只有失败时才有值。 */
+  extractionError: string | null;
 }
 
 interface PagesResponse {
@@ -59,9 +75,13 @@ interface RerunResponse {
   next_machine_attempt_no: number;
 }
 
-interface JobResponse {
+export interface JobResponse {
   id: string;
   status: string;
+  /** 流水线阶段：converting / submitting / parsing / extracting / exporting 等（见 worker/dispatch.py 的 STREAMS）。 */
+  stage?: string | null;
+  progress?: Record<string, unknown> | null;
+  error_code?: string | null;
   error_message?: string | null;
 }
 
@@ -102,6 +122,16 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   return (await response.json()) as T;
 }
 
+async function patchJson<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw await readError(response, "操作失败：" + url);
+  return (await response.json()) as T;
+}
+
 export async function loadWorkbench(versionId: number): Promise<WorkbenchData> {
   if (!Number.isSafeInteger(versionId) || versionId < 1) {
     throw new Error("versionId 必须是正整数");
@@ -119,41 +149,25 @@ export async function loadWorkbench(versionId: number): Promise<WorkbenchData> {
     if (list === undefined) blocksByPage[String(element.page_no)] = [element];
     else list.push(element);
   }
+  const latestRun = detail.parse_runs[0];
+  const extractJob = detail.latest_extraction_job ?? null;
   return {
     pdfUrl: base + "/file",
     projectId: detail.project_id,
     pages: pages.pages,
     blocksByPage,
     extractions: extractions.items,
-  };
-}
-
-export async function loadWorkbenchForCurrentPage(): Promise<WorkbenchData> {
-  const queryValue = new URLSearchParams(window.location.search).get("versionId");
-  const versionValue = queryValue ?? process.env.NEXT_PUBLIC_WORKBENCH_VERSION_ID;
-  if (versionValue === undefined || versionValue === null || versionValue === "") {
-    return loadSampleWorkbench();
-  }
-  if (!/^[1-9]\d*$/.test(versionValue)) {
-    throw new Error("URL 中的 versionId 格式无效");
-  }
-  return loadWorkbench(Number(versionValue));
-}
-
-export async function loadSampleWorkbench(): Promise<WorkbenchData> {
-  const [document, extractions] = await Promise.all([
-    getJson<{ pages: WirePageMeta[]; blocks_by_page: Record<string, WireBlock[]> }>(
-      "/samples/sample-document.json",
-    ),
-    getJson<{ items: WireExtraction[] }>("/samples/sample-extractions.json"),
-  ]);
-  return {
-    pdfUrl: "/samples/sample-tender.pdf",
-    // 静态样本没有项目：导出与冲突入口按「不可用」处理，而不是指向一个假 ID。
-    projectId: null,
-    pages: document.pages,
-    blocksByPage: document.blocks_by_page,
-    extractions: extractions.items,
+    parseStatus: latestRun?.status ?? null,
+    parseError:
+      latestRun?.status === "failed"
+        ? (latestRun.error_message ?? latestRun.error_code ?? "解析失败")
+        : null,
+    parseTier: latestRun?.tier ?? null,
+    extractionStatus: extractJob?.status ?? null,
+    extractionError:
+      extractJob !== null && (extractJob.status === "failed" || extractJob.status === "canceled")
+        ? (extractJob.error_message ?? extractJob.error_code ?? null)
+        : null,
   };
 }
 
@@ -288,4 +302,198 @@ export function saveBlob(blob: Blob, filename: string): void {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+/* ---------------------------------------------------------------------------
+ * 项目与文件：列表页、文件管理页与工作台的项目入口。
+ * ------------------------------------------------------------------------- */
+
+export async function listProjects(keyword?: string): Promise<WireProject[]> {
+  const query = keyword?.trim() ? "?keyword=" + encodeURIComponent(keyword.trim()) : "";
+  const data = await getJson<{ items: WireProject[] }>("/api/v1/projects" + query);
+  return data.items;
+}
+
+export async function createProject(input: {
+  name: string;
+  project_no?: string | null;
+  owner?: string | null;
+}): Promise<WireProject> {
+  return postJson<WireProject>("/api/v1/projects", input);
+}
+
+export async function loadProject(projectId: number): Promise<WireProjectDetail> {
+  return getJson<WireProjectDetail>("/api/v1/projects/" + projectId);
+}
+
+export interface UploadOptions {
+  tier: ParseTier;
+  ocrMode: "auto" | "txt" | "ocr";
+  autoParse: boolean;
+  /** 不传时由后端按扩展名推断（清单/图纸/其余）。 */
+  role?: FileRole | null;
+}
+
+/**
+ * 上传一批文件。
+ *
+ * 不用 fetch 的 JSON 通道：后端收的是 multipart，且同一个字段名 files 可以重复出现，
+ * 所以直接交给 FormData——浏览器会自己算 boundary，手拼 multipart 只会引入分号与
+ * CRLF 的边界 bug（后端也按标准解析）。
+ */
+export async function uploadProjectFiles(
+  projectId: number,
+  files: readonly File[],
+  options: UploadOptions,
+  /** ZIP 归档走独立字段：后端会解压后逐个入库，混在 files 里只会被当成一个不参与解析的文件。 */
+  archive: File | null = null,
+): Promise<UploadResult> {
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  if (archive !== null) form.append("archive", archive);
+  form.append("auto_parse", String(options.autoParse));
+  form.append("tier", options.tier);
+  form.append("ocr_mode", options.ocrMode);
+  if (options.role) form.append("role", options.role);
+
+  const response = await fetch("/api/v1/projects/" + projectId + "/files", {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) throw await readError(response, "上传失败");
+  return (await response.json()) as UploadResult;
+}
+
+export async function loadJob(jobId: string): Promise<JobResponse> {
+  return getJson<JobResponse>("/api/v1/jobs/" + jobId);
+}
+
+/** 改文件元数据（显示名 / 角色 / 排序）。后端 PATCH 只改传了的字段。 */
+export async function patchProjectFile(
+  projectId: number,
+  fileId: number,
+  patch: { display_name?: string; role?: FileRole; sort_no?: number },
+): Promise<unknown> {
+  return patchJson("/api/v1/projects/" + projectId + "/files/" + fileId, patch);
+}
+
+export async function deleteProjectFile(projectId: number, fileId: number): Promise<void> {
+  const response = await fetch("/api/v1/projects/" + projectId + "/files/" + fileId, {
+    method: "DELETE",
+  });
+  if (!response.ok) throw await readError(response, "删除文件失败");
+}
+
+/** 对已有版本重跑解析。force=true 表示即使已有解析结果也重跑。 */
+export async function parseVersion(
+  versionId: number,
+  options: { tier: ParseTier; ocrMode: "auto" | "txt" | "ocr"; force?: boolean; reason?: string },
+): Promise<{ job_id: string }> {
+  return postJson<{ job_id: string }>("/api/v1/versions/" + versionId + "/parse", {
+    tier: options.tier,
+    ocr_mode: options.ocrMode,
+    force: options.force ?? false,
+    reason: options.reason ?? null,
+  });
+}
+
+/* ---------------------------------------------------------------------------
+ * 重跑与复核进度。
+ *
+ * 三种重跑的代价差一个量级（见 docs/设计/05 第 3.11 节），界面文案必须跟着区分：
+ *   单字段重跑  → 秒级，只换一条结果；
+ *   重新抽取    → 分钟级，复用解析产物，不动已确认；
+ *   重新解析    → 更久，锚点全部重建，已确认结果全部打回复核。
+ * ------------------------------------------------------------------------- */
+
+export interface VersionExtractResult {
+  job_id: string;
+  version_id: number;
+  run_id: number;
+  field_keys: string[];
+  status: string;
+}
+
+/**
+ * 重新抽取：复用最近一次 parse_run，不重建锚点、不动已确认的结果。
+ *
+ * 这是「解析成功、抽取失败（一条结果都没有）」的唯一出口：项目级 rerun 是从已有
+ * 结果行里筛候选的，一条都没有时它只返回 queued = 0（见后端 api/parsing.py 的说明）。
+ */
+export async function rerunExtractionForVersion(
+  versionId: number,
+  options: { fieldKeys?: readonly string[]; hint?: string | null } = {},
+): Promise<VersionExtractResult> {
+  return postJson<VersionExtractResult>("/api/v1/versions/" + versionId + "/extract", {
+    field_keys: options.fieldKeys ?? [],
+    hint: options.hint?.trim() || null,
+  });
+}
+
+export interface ProjectRerunResult {
+  project_id: number;
+  queued: number;
+  skipped: number;
+  items: RerunResponse[];
+}
+
+/** 项目级批量重跑：只给**已有结果**补跑（onlyFailed 时只挑待复核/冲突/未找到）。 */
+export async function rerunProject(
+  projectId: number,
+  options: {
+    fieldKeys?: readonly string[];
+    onlyFailed?: boolean;
+    hint?: string | null;
+    limit?: number;
+  } = {},
+): Promise<ProjectRerunResult> {
+  return postJson<ProjectRerunResult>("/api/v1/projects/" + projectId + "/rerun", {
+    field_keys: options.fieldKeys ?? [],
+    only_failed: options.onlyFailed ?? false,
+    hint: options.hint?.trim() || null,
+    // 上限跟后端默认值一致：一次点到几百条会把队列与模型配额一起打满。
+    limit: options.limit ?? 50,
+  });
+}
+
+/** 项目复核进度（见 docs/设计/06 第 11 节的复核统计条）。 */
+export interface ProjectStats {
+  reviewed: number;
+  confirmed: number;
+  corrected: number;
+  supplemented: number;
+  pending_review: number;
+  cumulative_pass: Record<string, number>;
+  manual_fallback_rate: number;
+  by_review_mode: Record<string, number>;
+}
+
+export async function loadProjectStats(projectId: number): Promise<ProjectStats> {
+  return getJson<ProjectStats>("/api/v1/projects/" + projectId + "/stats");
+}
+
+/** 章节树：解析产出的标题层级。没有解析结果时后端回空数组，不是错误。 */
+export async function loadOutline(versionId: number): Promise<WireOutlineItem[]> {
+  const data = await getJson<{ run_id: number | null; items: WireOutlineItem[] }>(
+    "/api/v1/versions/" + versionId + "/outline",
+  );
+  return data.items;
+}
+
+/**
+ * 重新解析：锚点全部重建、已确认结果全部打回复核。
+ *
+ * 单独包一层而不是复用 parseVersion 的 force：这个调用的后果重得多，调用点必须
+ * 一眼看出自己调的是「重新解析」，而不是顺手把 force 设成了 true。
+ */
+export async function reparseVersion(
+  versionId: number,
+  options: { tier: ParseTier; ocrMode: "auto" | "txt" | "ocr"; reason: string },
+): Promise<{ job_id: string }> {
+  return postJson<{ job_id: string }>("/api/v1/versions/" + versionId + "/reparse", {
+    tier: options.tier,
+    ocr_mode: options.ocrMode,
+    force: true,
+    reason: options.reason,
+  });
 }

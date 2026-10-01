@@ -16,7 +16,7 @@ import type { PageRegistry } from "@/hooks/usePageRenderer";
 import { toPageGeometry } from "@/lib/api/wire";
 import { viewportSize } from "@/lib/coords/page";
 import { useViewerStore } from "@/lib/store/viewerStore";
-import type { EvidenceIndex } from "@/lib/viewer/evidenceIndex";
+import type { EvidenceIndex, EvidenceItem } from "@/lib/viewer/evidenceIndex";
 import type { WirePageMeta } from "@/types/workbench";
 
 interface Props {
@@ -25,9 +25,11 @@ interface Props {
   index: EvidenceIndex;
   registry: PageRegistry;
   onError: (message: string) => void;
+  /** 原文页角标 → 结果卡的反向定位（见 docs/设计/06 第 11 节）。 */
+  onLocate: (item: EvidenceItem) => void;
 }
 
-export function DocumentViewer({ pdf, pages, index, registry, onError }: Props) {
+export function DocumentViewer({ pdf, pages, index, registry, onError, onLocate }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const measureRef = useRef<HTMLDivElement | null>(null);
   const [contentWidth, setContentWidth] = useState(0);
@@ -78,7 +80,7 @@ export function DocumentViewer({ pdf, pages, index, registry, onError }: Props) 
       data-scroll-root
       className="relative h-full overflow-auto bg-slate-200/70 px-6 py-6"
     >
-      <div ref={measureRef} className="mx-auto w-full max-w-[1100px]">
+      <div ref={measureRef} className="mx-auto w-full max-w-[1240px]">
         {fitScale > 0 ? (
           <VirtualPageList
             pdf={pdf}
@@ -88,9 +90,10 @@ export function DocumentViewer({ pdf, pages, index, registry, onError }: Props) 
             registry={registry}
             scrollRef={scrollRef}
             onError={onError}
+            onLocate={onLocate}
           />
         ) : (
-          <div className="py-24 text-center text-sm text-slate-500">正在计算页面尺寸…</div>
+          <div className="py-24 text-center text-[14px] text-slate-500">正在计算页面尺寸…</div>
         )}
       </div>
     </div>

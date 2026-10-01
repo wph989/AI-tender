@@ -30,11 +30,20 @@ interface Props {
   onRollback: (reason: string) => Promise<void>;
 }
 
-const STATUS_CLASS: Record<string, string> = {
-  draft: "bg-amber-50 text-amber-700",
-  active: "bg-emerald-50 text-emerald-700",
-  archived: "bg-slate-100 text-slate-600",
-  rolled_back: "bg-rose-50 text-rose-700",
+/** 状态的圆点色。为什么不用药丸：一列版本号各顶一个填色胶囊，眼睛会被色块带走，
+ *  反而读不到版本号本身；圆点的重量刚好够把六种状态区分开。 */
+const STATUS_DOT_CLASS: Record<string, string> = {
+  draft: "bg-amber-500",
+  active: "bg-emerald-500",
+  archived: "bg-slate-400",
+  rolled_back: "bg-rose-500",
+};
+
+const STATUS_TEXT_CLASS: Record<string, string> = {
+  draft: "text-amber-700",
+  active: "text-emerald-700",
+  archived: "text-slate-500",
+  rolled_back: "text-rose-700",
 };
 
 export function ReleasePanel({
@@ -56,9 +65,9 @@ export function ReleasePanel({
 
   return (
     <div className="flex flex-col gap-4">
-      <section className="rounded border border-slate-200 bg-white p-4">
-        <h2 className="text-sm font-semibold text-slate-800">配置版本</h2>
-        <p className="mt-1 text-xs text-slate-500">
+      <section className="border border-slate-200 bg-white px-5 py-4">
+        <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">配置版本</h2>
+        <p className="mt-1 text-[13px] leading-5 text-slate-500">
           回滚是把历史版本直接置回生效，不重建配置（避免遗漏）。
         </p>
         <ul className="mt-3 flex flex-col divide-y divide-slate-100">
@@ -72,64 +81,77 @@ export function ReleasePanel({
                 }
                 onClick={() => onSelect(release.id)}
               >
-                <span className="w-12 text-xs text-slate-500">v{release.version_no}</span>
+                <span className="w-12 text-[13px] text-slate-500">v{release.version_no}</span>
                 <span
                   className={
-                    "rounded px-1 text-[10px] " +
-                    (STATUS_CLASS[release.status] ?? "bg-slate-100 text-slate-600")
+                    "inline-flex items-center gap-1.5 text-[13px] " +
+                    (STATUS_TEXT_CLASS[release.status] ?? "text-slate-500")
                   }
                 >
+                  <span
+                    aria-hidden
+                    className={
+                      "h-1.5 w-1.5 rounded-full " +
+                      (STATUS_DOT_CLASS[release.status] ?? "bg-slate-400")
+                    }
+                  />
                   {releaseStatusLabel(release.status)}
                 </span>
-                <span className="min-w-0 flex-1 truncate text-xs text-slate-600">
+                <span className="min-w-0 flex-1 truncate text-[13px] text-slate-600">
                   {release.note ?? "—"}
                 </span>
-                <span className="text-[10px] text-slate-400">
+                <span className="text-[11px] text-slate-400">
                   {release.created_by} · {formatTime(release.created_at)}
                 </span>
               </button>
             </li>
           ))}
-          {releases.length === 0 && <li className="py-2 text-xs text-slate-500">还没有配置版本。</li>}
+          {releases.length === 0 && <li className="py-2 text-[13px] text-slate-500">还没有配置版本。</li>}
         </ul>
       </section>
 
       {detail !== null && (
-        <section className="rounded border border-slate-200 bg-white p-4">
+        <section className="border border-slate-200 bg-white px-5 py-4">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-sm font-semibold text-slate-800">v{detail.version_no} 详情</h2>
+            <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">v{detail.version_no} 详情</h2>
             <span
               className={
-                "rounded px-1 text-[10px] " +
-                (STATUS_CLASS[detail.status] ?? "bg-slate-100 text-slate-600")
+                "inline-flex items-center gap-1.5 text-[13px] " +
+                (STATUS_TEXT_CLASS[detail.status] ?? "text-slate-500")
               }
             >
+              <span
+                aria-hidden
+                className={
+                  "h-1.5 w-1.5 rounded-full " + (STATUS_DOT_CLASS[detail.status] ?? "bg-slate-400")
+                }
+              />
               {releaseStatusLabel(detail.status)}
             </span>
             {detail.based_on !== null && (
-              <span className="text-[10px] text-slate-400">基于版本 #{detail.based_on}</span>
+              <span className="text-[11px] text-slate-400">基于版本 #{detail.based_on}</span>
             )}
             {isDraft && unacked > 0 && (
-              <span className="text-[10px] text-amber-700">还有 {unacked} 条影响未确认</span>
+              <span className="text-[11px] text-amber-700">还有 {unacked} 条影响未确认</span>
             )}
           </div>
 
-          <h3 className="mt-3 text-xs font-semibold text-slate-700">与当前生效版本的差异</h3>
+          <h3 className="mt-3 font-serif text-[14px] text-slate-800">与当前生效版本的差异</h3>
           {rows.length === 0 ? (
-            <p className="mt-1 text-xs text-slate-500">没有差异。</p>
+            <p className="mt-1 text-[13px] leading-5 text-slate-500">没有差异。</p>
           ) : (
-            <table className="mt-1 w-full text-xs">
+            <table className="mt-1 w-full text-[13px]">
               <thead>
-                <tr className="text-left text-slate-400">
-                  <th className="py-1">配置项</th>
-                  <th className="py-1">原值</th>
-                  <th className="py-1">新值</th>
+                <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
+                  <th className="border-b border-slate-200 py-2">配置项</th>
+                  <th className="border-b border-slate-200 py-2">原值</th>
+                  <th className="border-b border-slate-200 py-2">新值</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((row) => (
                   <tr key={row.key} className="border-t border-slate-100">
-                    <td className="py-1 pr-2">
+                    <td className="border-b border-slate-100 py-1 pr-2">
                       <code>{row.key}</code>
                     </td>
                     <td className="py-1 pr-2 text-slate-500">{formatValue(row.old)}</td>
@@ -140,22 +162,22 @@ export function ReleasePanel({
             </table>
           )}
 
-          <h3 className="mt-4 text-xs font-semibold text-slate-700">变更影响清单</h3>
-          <p className="mt-1 text-xs text-slate-500">
+          <h3 className="mt-4 font-serif text-[14px] text-slate-800">变更影响清单</h3>
+          <p className="mt-1 text-[13px] leading-5 text-slate-500">
             必须逐条确认"已知悉"，每条单独落一行确认记录（谁、何时、确认了哪一条）。
           </p>
           <ul className="mt-2 flex flex-col gap-1">
             {detail.impact.map((entry) => (
               <li
                 key={entry.kind + "|" + entry.ref}
-                className="flex flex-wrap items-center gap-2 rounded border border-slate-100 px-2 py-1"
+                className="flex flex-wrap items-center gap-2 border border-slate-200 px-2 py-1"
               >
-                <span className="w-24 text-[10px] text-slate-500">
+                <span className="w-24 text-[11px] text-slate-500">
                   {impactKindLabel(entry.kind)}
                 </span>
-                <code className="min-w-0 flex-1 truncate text-xs">{entry.ref}</code>
+                <code className="min-w-0 flex-1 truncate text-[13px]">{entry.ref}</code>
                 {entry.acked ? (
-                  <span className="text-[10px] text-emerald-700">已确认</span>
+                  <span className="text-[11px] text-emerald-700">已确认</span>
                 ) : (
                   <button
                     type="button"
@@ -169,7 +191,7 @@ export function ReleasePanel({
               </li>
             ))}
             {detail.impact.length === 0 && (
-              <li className="text-xs text-slate-500">本次变更没有影响条目。</li>
+              <li className="text-[13px] text-slate-500">本次变更没有影响条目。</li>
             )}
           </ul>
           {detail.impact.length > 0 && (
@@ -181,11 +203,11 @@ export function ReleasePanel({
             />
           )}
 
-          <h3 className="mt-4 text-xs font-semibold text-slate-700">门禁</h3>
+          <h3 className="mt-4 font-serif text-[14px] text-slate-800">门禁</h3>
           {detail.gate.passed ? (
-            <p className="mt-1 text-xs text-emerald-700">当前满足激活条件。</p>
+            <p className="mt-1 text-[13px] text-emerald-700">当前满足激活条件。</p>
           ) : (
-            <ul className="mt-1 flex flex-col gap-0.5 text-xs">
+            <ul className="mt-1 flex flex-col gap-0.5 text-[13px]">
               {detail.gate.blockers.map((code) => (
                 <li key={code} className="text-rose-700">
                   阻断：{blockerLabel(code)}
@@ -243,8 +265,8 @@ export function ReleasePanel({
             </div>
           )}
 
-          <h3 className="mt-4 text-xs font-semibold text-slate-700">审计</h3>
-          <ul className="mt-1 flex flex-col gap-0.5 text-xs text-slate-600">
+          <h3 className="mt-4 font-serif text-[14px] text-slate-800">审计</h3>
+          <ul className="mt-1 flex flex-col gap-0.5 text-[13px] text-slate-600">
             {detail.audit.map((entry) => (
               <li key={entry.id}>
                 {formatTime(entry.created_at)} · {entry.actor} · {entry.action}

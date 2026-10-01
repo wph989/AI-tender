@@ -85,6 +85,34 @@ export interface WireParseRun {
   status: string;
   tier: string;
   created_at: string;
+  /** 失败原因只在失败时有：工作台的失败态要直接说出来，而不是让用户去翻日志。 */
+  error_code?: string | null;
+  error_message?: string | null;
+}
+
+/** 章节树节点（`GET /versions/{vid}/outline`，见 docs/设计/06 第 2 节的 OutlineNav）。 */
+export interface WireOutlineItem {
+  element_id: number;
+  anchor: string;
+  page_no: number;
+  /** 标题层级；后端不改层级也不补缺失父节点，拿到什么画什么（见 application/extraction.py）。 */
+  level: number | null;
+  text: string;
+  children: WireOutlineItem[];
+}
+
+/**
+ * 最近一次抽取任务（`GET /versions/{vid}` 的 latest_extraction_job）。
+ *
+ * 为什么取最近一条而不是历史：界面上要回答的是「这一次为什么一条结果都没有」，
+ * 历史任务对用户没有意义（见后端 api/versions.py 的 get_version）。
+ */
+export interface WireExtractionJob {
+  status: string;
+  error_code?: string | null;
+  error_message?: string | null;
+  created_at?: string | null;
+  finished_at?: string | null;
 }
 
 /** `GET /versions/{vid}` 的版本详情；project_id 是项目级动作（导出、冲突）的定位键。 */
@@ -93,6 +121,8 @@ export interface WireVersionDetail {
   project_id: number | null;
   page_count: number | null;
   parse_runs: WireParseRun[];
+  /** null = 从没排过抽取；旧接口不带这个字段时按 null 处理。 */
+  latest_extraction_job?: WireExtractionJob | null;
 }
 
 /** 跨文件冲突的候选项：每个候选来自一份文件的某一条尝试。 */

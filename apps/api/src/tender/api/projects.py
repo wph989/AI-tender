@@ -63,18 +63,35 @@ def list_projects(
     limit: int = Query(default=50, ge=1, le=100),
     keyword: str | None = None,
 ) -> dict[str, object]:
-    query = """SELECT id, company_id, name, project_no, owner, status, created_at
-               FROM project
-               WHERE company_id = :company_id AND deleted_at IS NULL"""
+    # 文件数与待复核数在列表里是决策信息（「这个项目还有没有活要干」），
+    # 让前端逐个项目再发一次请求去数，列表一屏就是十几个请求。
+    query = """SELECT p.id, p.company_id, p.name, p.project_no, p.owner, p.status,
+                      p.created_at,
+                      COALESCE(agg.file_count, 0) AS file_count,
+                      COALESCE(agg.review_count, 0) AS review_count
+               FROM project AS p
+               LEFT JOIN (
+                   SELECT pf.project_id,
+                          count(DISTINCT pf.id) AS file_count,
+                          count(e.id) FILTER (
+                              WHERE e.status IN ('need_review', 'conflict')
+                          ) AS review_count
+                   FROM project_file AS pf
+                   LEFT JOIN extraction AS e
+                       ON e.version_id = pf.version_id AND e.is_current
+                   WHERE pf.deleted_at IS NULL
+                   GROUP BY pf.project_id
+               ) AS agg ON agg.project_id = p.id
+               WHERE p.company_id = :company_id AND p.deleted_at IS NULL"""
     params: dict[str, object] = {
         "company_id": settings.company_id(),
         "limit": limit,
         "offset": offset,
     }
     if keyword and keyword.strip():
-        query += " AND (name ILIKE :keyword OR project_no ILIKE :keyword)"
+        query += " AND (p.name ILIKE :keyword OR p.project_no ILIKE :keyword)"
         params["keyword"] = f"%{keyword.strip()}%"
-    query += " ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"
+    query += " ORDER BY p.created_at DESC, p.id DESC LIMIT :limit OFFSET :offset"
     with engine(request).connect() as connection:
         rows = connection.execute(text(query), params).mappings().all()
     return {"items": [dict(row) for row in rows], "offset": offset, "limit": limit}
@@ -92,7 +109,13 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
                           pf.role, pf.display_name, pf.is_parseable, pf.replaces_id,
                           pf.sort_no, pf.created_at, pf.sha256, pf.mime, pf.size_bytes,
                           v.page_count, latest.status AS parse_status,
-                          latest.id AS latest_run_id, replacement.id AS replaced_by_id
+                          latest.id AS latest_run_id, replacement.id AS replaced_by_id,
+                          COALESCE(result.total, 0) AS extraction_count,
+                          COALESCE(result.review_count, 0) AS review_count,
+                          -- 已确认条数：重新解析的二次确认要列出「将失效的已确认结果数量」
+                          -- （见 docs/质量/09 第 5.2 节），列表页因此必须拿到它。
+                          COALESCE(result.confirmed_count, 0) AS confirmed_count,
+                          extraction_job.status AS extraction_status
                    FROM project_file AS pf
                    JOIN project AS p ON p.id = pf.project_id
                    LEFT JOIN document_version AS v ON v.id = pf.version_id
@@ -108,6 +131,24 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
                        WHERE newer.replaces_id = pf.id AND newer.deleted_at IS NULL
                        ORDER BY newer.created_at DESC, newer.id DESC LIMIT 1
                    ) AS replacement ON true
+                   -- 只认 is_current：历史尝试是追溯用的，算进待复核数会让列表永远清不干净
+                   LEFT JOIN LATERAL (
+                       SELECT count(*) AS total,
+                              count(*) FILTER (
+                                  WHERE e.status IN ('need_review', 'conflict')
+                              ) AS review_count,
+                              count(*) FILTER (WHERE e.status = 'verified') AS confirmed_count
+                       FROM extraction AS e
+                       WHERE e.version_id = pf.version_id AND e.is_current
+                   ) AS result ON true
+                   -- 抽取是独立 job（stage='extracting'），文件行本身不带状态；
+                   -- 不取它的话，抽取失败的文件在列表上看不出和「还没开始」的区别。
+                   LEFT JOIN LATERAL (
+                       SELECT j.status
+                       FROM job AS j
+                       WHERE j.project_file_id = pf.id AND j.stage = 'extracting'
+                       ORDER BY j.created_at DESC, j.id DESC LIMIT 1
+                   ) AS extraction_job ON true
                    WHERE pf.project_id = :project_id AND pf.deleted_at IS NULL
                      AND p.company_id = :company_id AND p.deleted_at IS NULL
                    ORDER BY pf.sort_no, pf.id"""

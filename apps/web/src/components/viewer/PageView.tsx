@@ -13,6 +13,7 @@
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { AnnotationLayer } from "@/components/viewer/AnnotationLayer";
 import { CanvasLayer } from "@/components/viewer/CanvasLayer";
 import { EvidenceLayer } from "@/components/viewer/EvidenceLayer";
 import type { PageRegistry } from "@/hooks/usePageRenderer";
@@ -30,9 +31,11 @@ interface Props {
   items: readonly EvidenceItem[];
   registry: PageRegistry;
   onError: (message: string) => void;
+  /** 点原文页上的角标 → 反向定位到对应结果卡（见 docs/设计/06 第 11 节）。 */
+  onLocate: (item: EvidenceItem) => void;
 }
 
-export function PageView({ pdf, page, scale, items, registry, onError }: Props) {
+export function PageView({ pdf, page, scale, items, registry, onError, onLocate }: Props) {
   const pageNo = page.page_no;
   const rootRef = useRef<HTMLDivElement | null>(null);
   const evidenceRootRef = useRef<HTMLDivElement | null>(null);
@@ -89,6 +92,14 @@ export function PageView({ pdf, page, scale, items, registry, onError }: Props) 
           activeEvidence={activeEvidence}
           pulseKey={pulseKey}
           viewport={viewport}
+        />
+        {/* 角标层压在证据框之上：它要可点，也必须盖住底框的描边 */}
+        <AnnotationLayer
+          pageNo={pageNo}
+          items={items}
+          activeEvidence={activeEvidence}
+          viewport={viewport}
+          onLocate={onLocate}
         />
       </div>
     </div>

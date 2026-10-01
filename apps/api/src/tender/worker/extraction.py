@@ -223,7 +223,7 @@ def _load_candidates(feature_key: str, purpose: str) -> list[ModelCandidate]:
             connection.execute(
                 text(
                     """SELECT m.id AS model_row_id, m.model_id, m.display_name, m.timeout_seconds,
-                              m.temperature, m.max_tokens, m.api_key_ciphertext,
+                              m.temperature, m.max_tokens, p.api_key_ciphertext,
                               p.id AS provider_id, p.base_url
                        FROM llm_feature_model AS fm
                        JOIN llm_model AS m ON m.id = fm.model_id

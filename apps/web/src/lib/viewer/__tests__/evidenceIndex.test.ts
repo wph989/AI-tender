@@ -96,3 +96,35 @@ describe("buildEvidenceIndex", () => {
     expect(index.byPage.size).toBe(0);
   });
 });
+
+describe("页内角标编号", () => {
+  it("同一页按证据顺序从 1 编，跨页各数各的", () => {
+    const index = buildEvidenceIndex([
+      makeExtraction({
+        id: 1,
+        fieldKey: "tender_no",
+        evidence: [
+          { anchor: "p2b1", pageNo: 2, bbox: [0.1, 0.1, 0.3, 0.15] },
+          { anchor: "p3b1", pageNo: 3, bbox: [0.1, 0.1, 0.3, 0.15] },
+          { anchor: "p2b2", pageNo: 2, bbox: [0.4, 0.1, 0.6, 0.15] },
+        ],
+      }),
+    ]);
+    expect(index.byPage.get(2)?.map((item) => item.badge)).toEqual([1, 2]);
+    expect(index.byPage.get(3)?.map((item) => item.badge)).toEqual([1]);
+  });
+
+  it("画不出框的证据不占号：它在原文页上没有落点", () => {
+    const index = buildEvidenceIndex([
+      makeExtraction({
+        id: 2,
+        fieldKey: "budget",
+        evidence: [
+          { anchor: "p1b1", pageNo: 1, bbox: [0.4, 0.1, 0.3, 0.15] }, // x1 < x0：非法
+          { anchor: "p1b2", pageNo: 1, bbox: [0.1, 0.1, 0.3, 0.15] },
+        ],
+      }),
+    ]);
+    expect(index.byPage.get(1)?.map((item) => item.badge)).toEqual([1]);
+  });
+});

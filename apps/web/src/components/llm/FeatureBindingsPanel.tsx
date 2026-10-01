@@ -14,7 +14,7 @@ import { message } from "@/lib/llm/format";
 import { MAX_BINDINGS, moveToPriority } from "@/lib/llm/priority";
 import type { LlmFeature, LlmModel } from "@/types/llm";
 
-import { BUTTON_CLASS, DANGER_BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS } from "./ui";
+import { BUTTON_CLASS, DANGER_BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS, SELECT_CLASS } from "./ui";
 
 interface Props {
   features: LlmFeature[];
@@ -38,9 +38,9 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
   const active = features.find((feature) => feature.key === activeKey) ?? features[0];
   if (active === undefined) {
     return (
-      <section className="rounded border border-slate-200 bg-white p-4">
-        <h2 className="text-sm font-semibold text-slate-800">功能绑定</h2>
-        <p className="mt-3 text-sm text-slate-500">后端没有返回功能列表。</p>
+      <section className="border border-slate-200 bg-white px-5 py-4">
+        <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">功能绑定</h2>
+        <p className="mt-3 text-[14px] leading-6 text-slate-500">后端没有返回功能列表。</p>
       </section>
     );
   }
@@ -99,15 +99,15 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
   };
 
   return (
-    <section className="rounded border border-slate-200 bg-white p-4">
+    <section className="border border-slate-200 bg-white px-5 py-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-sm font-semibold text-slate-800">功能绑定</h2>
-          <p className="mt-1 text-xs text-slate-500">
+          <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">功能绑定</h2>
+          <p className="mt-1 text-[13px] leading-5 text-slate-500">
             1 级为首选模型，失败后按 2、3… 降级；同一模型不会原地重试。
           </p>
         </div>
-        <div className="flex items-center gap-2 text-xs text-slate-600">
+        <div className="flex items-center gap-2 text-[13px] text-slate-600">
           转移深度
           <input
             type="number"
@@ -133,8 +133,8 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
             }}
             className={
               feature.key === active.key
-                ? "rounded bg-slate-900 px-3 py-1 text-xs text-white"
-                : "rounded border border-slate-300 px-3 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                ? "rounded-[2px] bg-slate-900 px-3 py-1 text-[13px] text-white"
+                : "rounded-[2px] border border-slate-300 px-3 py-1 text-[13px] text-slate-600 hover:bg-slate-50"
             }
           >
             {feature.name}
@@ -144,26 +144,26 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
       </div>
 
       {error !== null && (
-        <p className="mt-3 rounded bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</p>
+        <p className="mt-3 border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">{error}</p>
       )}
 
-      <p className="mt-3 text-xs text-slate-500">
+      <p className="mt-3 text-[13px] text-slate-500">
         共 {ids.length} 个候选，实际前 {effective} 级生效（深度会夹到候选数量以内）。
       </p>
 
       {ids.length === 0 ? (
-        <p className="mt-2 text-sm text-slate-500">
+        <p className="mt-2 text-[14px] leading-6 text-slate-500">
           这个功能还没有绑定模型，抽取会整体回退到 .env 的单模型配置。
         </p>
       ) : (
-        <table className="mt-2 w-full border-collapse text-sm">
+        <table className="mt-2 w-full border-collapse text-[14px]">
           <thead>
-            <tr className="text-left text-xs text-slate-500">
-              <th className="py-1 pr-3 font-normal w-16">级别</th>
-              <th className="py-1 pr-3 font-normal">模型</th>
-              <th className="py-1 pr-3 font-normal">供应商</th>
-              <th className="py-1 pr-3 font-normal">状态</th>
-              <th className="py-1 text-right font-normal">调整</th>
+            <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal w-16">级别</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">模型</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">供应商</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">状态</th>
+              <th className="border-b border-slate-200 py-2 text-right font-normal">调整</th>
             </tr>
           </thead>
           <tbody>
@@ -185,25 +185,27 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
                     <div className="font-medium text-slate-800">
                       {model?.display_name ?? "模型 #" + modelRowId}
                     </div>
-                    <div className="text-xs text-slate-500">{model?.model_id ?? "已不在模型列表中"}</div>
+                    <div className="text-[13px] text-slate-500">{model?.model_id ?? "已不在模型列表中"}</div>
                   </td>
-                  <td className="py-2 pr-3 text-xs text-slate-600">
+                  <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
                     {model?.provider_name ?? "—"}
                   </td>
-                  <td className="py-2 pr-3 text-xs">
+                  <td className="border-b border-slate-100 py-2 pr-3 text-[13px]">
                     {model === undefined ? (
                       "—"
                     ) : model.enabled ? (
-                      <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-emerald-700">
+                      <span className="inline-flex items-center gap-1.5 text-emerald-700">
+                        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
                         启用
                       </span>
                     ) : (
-                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-500">
+                      <span className="inline-flex items-center gap-1.5 text-slate-500">
+                        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-slate-400" />
                         停用
                       </span>
                     )}
                   </td>
-                  <td className="py-2 text-right whitespace-nowrap">
+                  <td className="border-b border-slate-100 py-2 text-right whitespace-nowrap">
                     <button
                       type="button"
                       className={BUTTON_CLASS + " mr-1"}
@@ -237,7 +239,7 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <select
-          className={INPUT_CLASS}
+          className={SELECT_CLASS}
           value={pendingAdd}
           onChange={(event) => setPendingAdd(event.target.value)}
         >
@@ -257,7 +259,7 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
         >
           加到最低级
         </button>
-        <span className="text-xs text-slate-400">最多 {MAX_BINDINGS} 个</span>
+        <span className="text-[13px] text-slate-400">最多 {MAX_BINDINGS} 个</span>
 
         <div className="ml-auto flex gap-2">
           <button

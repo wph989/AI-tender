@@ -98,11 +98,11 @@ export function ProvidersPanel({ providers, onChanged }: Props) {
     });
 
   return (
-    <section className="rounded border border-slate-200 bg-white p-4">
+    <section className="border border-slate-200 bg-white px-5 py-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-sm font-semibold text-slate-800">供应商</h2>
-          <p className="mt-1 text-xs text-slate-500">
+          <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">供应商</h2>
+          <p className="mt-1 text-[13px] leading-5 text-slate-500">
             一次连接所需的全部信息：Base URL、加密密钥、启用状态。测试走远端 GET /v1/models。
           </p>
         </div>
@@ -117,25 +117,25 @@ export function ProvidersPanel({ providers, onChanged }: Props) {
       </div>
 
       {error !== null && (
-        <p className="mt-3 rounded bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</p>
+        <p className="mt-3 border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">{error}</p>
       )}
 
       {providers.length === 0 && editing !== "new" && (
-        <p className="mt-3 text-sm text-slate-500">
+        <p className="mt-3 text-[14px] leading-6 text-slate-500">
           还没有供应商。注册表为空时抽取会整体回退到 .env 里的单模型配置。
         </p>
       )}
 
       {providers.length > 0 && (
-        <table className="mt-3 w-full border-collapse text-sm">
+        <table className="mt-3 w-full border-collapse text-[14px]">
           <thead>
-            <tr className="text-left text-xs text-slate-500">
-              <th className="py-1 pr-3 font-normal">名称</th>
-              <th className="py-1 pr-3 font-normal">Base URL</th>
-              <th className="py-1 pr-3 font-normal">密钥</th>
-              <th className="py-1 pr-3 font-normal">状态</th>
-              <th className="py-1 pr-3 font-normal">最近测试</th>
-              <th className="py-1 text-right font-normal">操作</th>
+            <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">名称</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">Base URL</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">密钥</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">状态</th>
+              <th className="border-b border-slate-200 py-2 pr-3 font-normal">最近测试</th>
+              <th className="border-b border-slate-200 py-2 text-right font-normal">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -145,31 +145,37 @@ export function ProvidersPanel({ providers, onChanged }: Props) {
                 <Fragment key={provider.id}>
                   <tr className="border-t border-slate-100 align-top">
                     <td className="py-2 pr-3 font-medium text-slate-800">{provider.name}</td>
-                    <td className="max-w-xs break-all py-2 pr-3 text-xs text-slate-600">
+                    <td className="max-w-xs break-all py-2 pr-3 text-[13px] text-slate-600">
                       {provider.base_url}
                     </td>
-                    <td className="py-2 pr-3 text-xs text-slate-600">
+                    <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
                       {provider.has_api_key ? "****" + (provider.api_key_hint ?? "") : "未配置"}
                     </td>
-                    <td className="py-2 pr-3 text-xs">
+                    <td className="border-b border-slate-100 py-2 pr-3 text-[13px]">
                       <span
                         className={
-                          provider.enabled
-                            ? "rounded bg-emerald-50 px-1.5 py-0.5 text-emerald-700"
-                            : "rounded bg-slate-100 px-1.5 py-0.5 text-slate-500"
+                          "inline-flex items-center gap-1.5 " +
+                          (provider.enabled ? "text-emerald-700" : "text-slate-500")
                         }
                       >
+                        <span
+                          aria-hidden
+                          className={
+                            "h-1.5 w-1.5 shrink-0 rounded-full " +
+                            (provider.enabled ? "bg-emerald-500" : "bg-slate-400")
+                          }
+                        />
                         {provider.enabled ? "启用" : "停用"}
                       </span>
                     </td>
-                    <td className="py-2 pr-3 text-xs text-slate-600">
+                    <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
                       {testLabel(provider.last_test_status)}
                       {result !== undefined && (
                         <span className="ml-1 text-slate-400">{result.latency_ms}ms</span>
                       )}
                       <div className="text-slate-400">{formatTime(provider.last_test_at)}</div>
                     </td>
-                    <td className="py-2 text-right whitespace-nowrap">
+                    <td className="border-b border-slate-100 py-2 text-right whitespace-nowrap">
                       <button
                         type="button"
                         className={BUTTON_CLASS + " mr-1"}
@@ -207,7 +213,7 @@ export function ProvidersPanel({ providers, onChanged }: Props) {
 
                   {provider.last_test_error !== null && (
                     <tr>
-                      <td colSpan={6} className="pb-2 text-xs text-rose-600">
+                      <td colSpan={6} className="pb-2 text-[13px] text-rose-600">
                         {provider.last_test_error}
                       </td>
                     </tr>
@@ -229,23 +235,23 @@ export function ProvidersPanel({ providers, onChanged }: Props) {
                   {importingId === provider.id && (
                     <tr>
                       <td colSpan={6} className="pb-3">
-                        <div className="rounded bg-slate-50 p-3">
+                        <div className="border border-slate-200 bg-slate-50 px-4 py-3.5">
                           {remote === null ? (
-                            <p className="text-xs text-slate-500">正在拉取远端模型…</p>
+                            <p className="text-[13px] text-slate-500">正在拉取远端模型…</p>
                           ) : remote.length === 0 ? (
-                            <p className="text-xs text-slate-500">
+                            <p className="text-[13px] text-slate-500">
                               远端没有返回模型（部分兼容网关不实现 /v1/models）。
                             </p>
                           ) : (
                             <>
-                              <p className="text-xs text-slate-500">
+                              <p className="text-[13px] text-slate-500">
                                 勾选要导入的模型；已存在的会被重新启用，不会重复建行。
                               </p>
                               <div className="mt-2 grid max-h-56 grid-cols-2 gap-1 overflow-auto">
                                 {remote.map((modelId) => (
                                   <label
                                     key={modelId}
-                                    className="flex items-center gap-2 text-xs text-slate-700"
+                                    className="flex items-center gap-2 text-[13px] text-slate-700"
                                   >
                                     <input
                                       type="checkbox"
@@ -328,8 +334,8 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
   };
 
   return (
-    <div className="flex flex-wrap items-end gap-3 rounded bg-slate-50 p-3">
-      <label className="flex flex-col gap-1 text-xs text-slate-600">
+    <div className="flex flex-wrap items-end gap-3 border border-slate-200 bg-slate-50 px-4 py-3.5">
+      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
         名称
         <input
           className={INPUT_CLASS}
@@ -338,7 +344,7 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
           placeholder="如 内网网关"
         />
       </label>
-      <label className="flex min-w-64 flex-1 flex-col gap-1 text-xs text-slate-600">
+      <label className="flex min-w-64 flex-1 flex-col gap-1 text-[13px] text-slate-600">
         Base URL
         <input
           className={INPUT_CLASS}
@@ -347,7 +353,7 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
           placeholder="https://gateway.example/v1"
         />
       </label>
-      <label className="flex flex-col gap-1 text-xs text-slate-600">
+      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
         API Key
         <input
           type="password"
@@ -357,7 +363,7 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
           placeholder={provider === null ? "可留空，用 .env 的 LLM_API_KEY" : "留空保持不变"}
         />
       </label>
-      <label className="flex items-center gap-1 text-xs text-slate-600">
+      <label className="flex items-center gap-1 text-[13px] text-slate-600">
         <input
           type="checkbox"
           checked={enabled}
@@ -366,7 +372,7 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
         启用
       </label>
       {provider !== null && (
-        <label className="flex items-center gap-1 text-xs text-slate-600">
+        <label className="flex items-center gap-1 text-[13px] text-slate-600">
           <input
             type="checkbox"
             checked={clearKey}
@@ -389,7 +395,7 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
         </button>
       </div>
       {provider !== null && (
-        <p className="w-full text-xs text-slate-500">
+        <p className="w-full text-[13px] text-slate-500">
           当前密钥：
           {provider.has_api_key ? "****" + (provider.api_key_hint ?? "") : "未配置"}
           ；保存后写入加密密文，页面不再回显。

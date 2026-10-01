@@ -10,8 +10,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { AppNav } from "@/components/AppNav";
-import { BUTTON_CLASS } from "@/components/ui";
+import { PageShell } from "@/components/PageShell";
+import { BUTTON_CLASS, DATA_CLASS } from "@/components/ui";
 import {
   acknowledgeRelease,
   activateRelease,
@@ -92,93 +92,118 @@ export function ConfigCenter() {
       setDetail(await getRelease(id));
     });
 
+  const retry = () => {
+    setState("loading");
+    setError(null);
+    void reload()
+      .then(() => setState("ready"))
+      .catch((caught: unknown) => {
+        setError(message(caught, "加载配置失败"));
+        setState("error");
+      });
+  };
+
   return (
-    <div className="min-h-screen bg-slate-100">
-      <header className="flex flex-wrap items-center gap-3 border-b border-slate-200 bg-white px-4 py-2">
-        <AppNav />
-        <span className="text-sm text-slate-500">配置中心</span>
-        <span className="text-xs text-slate-400">
-          角色 {role} · 生效版本 {active === null ? "—" : "v" + active.version_no}
-        </span>
-        <button
-          type="button"
-          className={BUTTON_CLASS + " ml-auto"}
-          onClick={() =>
-            void run("刷新失败", async () => {
-              setInfo(null);
-            })
-          }
-        >
-          刷新
-        </button>
-      </header>
+    <PageShell
+      eyebrow="设置 · 配置"
+      title="配置中心"
+      description="三层配置：L1 改完立即生效，L2/L3 先落成草稿，逐条确认影响清单过门禁后才激活。每次激活与回滚都会写进审计。"
+      actions={
+        <>
+          <span className="text-[13px] text-slate-500">
+            角色 <span className={DATA_CLASS + " text-slate-700"}>{role === "" ? "—" : role}</span>
+          </span>
+          <span className="text-[13px] text-slate-500">
+            生效版本{" "}
+            <span className={DATA_CLASS + " text-slate-700"}>
+              {active === null ? "—" : "v" + active.version_no}
+            </span>
+          </span>
+          <button
+            type="button"
+            className={BUTTON_CLASS}
+            disabled={busy}
+            onClick={() =>
+              void run("刷新失败", async () => {
+                setInfo(null);
+              })
+            }
+          >
+            刷新
+          </button>
+        </>
+      }
+    >
+      {state === "loading" && <p className="text-[14px] text-slate-500">正在加载配置…</p>}
 
-      <main className="mx-auto flex max-w-6xl flex-col gap-4 p-4">
-        {state === "loading" && <p className="text-sm text-slate-500">正在加载配置…</p>}
+      {state === "error" && (
+        <div className="border border-rose-200 bg-rose-50 px-4 py-3 text-[14px] text-rose-700">
+          <p>{error ?? "加载失败"}</p>
+          <p className="mt-1 text-[13px] text-rose-600">
+            配置数据来自后端 /api/v1/config，多半是服务没起来。确认后点下面的重试。
+          </p>
+          <button type="button" className={BUTTON_CLASS + " mt-2"} onClick={retry}>
+            重试
+          </button>
+        </div>
+      )}
 
-        {state === "error" && (
-          <div className="rounded border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
-            {error ?? "加载失败"}
+      {info !== null && (
+        <div className="border border-sky-200 bg-sky-50 px-4 py-3 text-[14px] text-sky-800">
+          {info}
+        </div>
+      )}
+
+      {error !== null && state === "ready" && (
+        <div className="border border-rose-200 bg-rose-50 px-4 py-3 text-[14px] text-rose-700">
+          {error}
+        </div>
+      )}
+
+      {state === "ready" && (
+        <div className="grid gap-6 lg:grid-cols-[3fr_2fr]">
+          <div className="flex flex-col gap-6">
+            {LAYERS.map((layer) => (
+              <LayerEditor
+                key={layer}
+                layer={layer}
+                items={itemsOfLayer(items, layer)}
+                onSaved={async (text) => {
+                  setInfo(text);
+                  await reload();
+                }}
+              />
+            ))}
           </div>
-        )}
-
-        {info !== null && (
-          <div className="rounded border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
-            {info}
-          </div>
-        )}
-
-        {error !== null && state === "ready" && (
-          <div className="rounded border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
-            {error}
-          </div>
-        )}
-
-        {state === "ready" && (
-          <div className="grid gap-4 lg:grid-cols-[3fr_2fr]">
-            <div className="flex flex-col gap-4">
-              {LAYERS.map((layer) => (
-                <LayerEditor
-                  key={layer}
-                  layer={layer}
-                  items={itemsOfLayer(items, layer)}
-                  onSaved={async (text) => {
-                    setInfo(text);
-                    await reload();
-                  }}
-                />
-              ))}
-            </div>
-            <ReleasePanel
-              releases={releases}
-              detail={detail}
-              busy={busy}
-              onSelect={selectRelease}
-              onAcknowledge={(entry: ImpactEntry, comment: string) =>
-                run("确认失败", async () => {
-                  if (detail === null) return;
-                  await acknowledgeRelease(detail.id, [entry], comment || undefined);
-                  setInfo("已记录确认：" + entry.ref);
-                })
-              }
-              onActivate={(force: boolean, reason: string) =>
-                run("激活失败", async () => {
-                  if (detail === null) return;
-                  await activateRelease(detail.id, { force, reason: reason || undefined });
-                  setInfo("版本 v" + detail.version_no + " 已生效");
-                })
-              }
-              onRollback={(reason: string) =>
-                run("回滚失败", async () => {
-                  if (detail === null) return;
-                  await rollbackRelease(detail.id, reason || undefined);
-                  setInfo("已回滚到版本 v" + detail.version_no);
-                })
-              }
-            />
-          </div>
-        )}
-      </main>
-    </div>
+          <ReleasePanel
+            releases={releases}
+            detail={detail}
+            busy={busy}
+            onSelect={selectRelease}
+            onAcknowledge={(entry: ImpactEntry, comment: string) =>
+              run("确认失败", async () => {
+                if (detail === null) return;
+                await acknowledgeRelease(detail.id, [entry], comment || undefined);
+                setInfo("已记录确认：" + entry.ref);
+              })
+            }
+            onActivate={(force: boolean, reason: string) =>
+              run("激活失败", async () => {
+                if (detail === null) return;
+                await activateRelease(detail.id, { force, reason: reason || undefined });
+                setInfo("版本 v" + detail.version_no + " 已生效");
+              })
+            }
+            onRollback={(reason: string) =>
+              run("回滚失败", async () => {
+                if (detail === null) return;
+                await rollbackRelease(detail.id, reason || undefined);
+                setInfo("已回滚到版本 v" + detail.version_no);
+              })
+            }
+          />
+        </div>
+      )}
+    </PageShell>
   );
 }

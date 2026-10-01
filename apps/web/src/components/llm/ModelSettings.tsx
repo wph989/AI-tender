@@ -5,11 +5,15 @@
  *
  * 三份数据互相引用（模型属于供应商、绑定指向模型），分开刷新会出现
  * "模型列表里已有、绑定下拉里还没有"的中间态，所以任何写操作后统一重取。
+ *
+ * 页头交给 PageShell：这一页和项目列表、配置中心是同一个骨架，
+ * 各写一套页头迟早会分叉成"看起来像两个产品"。
  */
 
 import { useCallback, useEffect, useState } from "react";
 
-import { AppNav } from "@/components/AppNav";
+import { PageShell } from "@/components/PageShell";
+import { BUTTON_CLASS } from "@/components/ui";
 import { listFeatures, listModels, listProviders } from "@/lib/api/llm";
 import { message } from "@/lib/llm/format";
 import type { LlmFeature, LlmModel, LlmProvider } from "@/types/llm";
@@ -17,7 +21,6 @@ import type { LlmFeature, LlmModel, LlmProvider } from "@/types/llm";
 import { FeatureBindingsPanel } from "./FeatureBindingsPanel";
 import { ModelsPanel } from "./ModelsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
-import { BUTTON_CLASS } from "./ui";
 
 type LoadState = "loading" | "ready" | "error";
 
@@ -57,37 +60,64 @@ export function ModelSettings() {
     };
   }, [reload]);
 
-  const refresh = () => {
-    void reload().catch((caught: unknown) => setError(message(caught, "刷新失败")));
+  // 刷新失败时不把已经渲染好的面板收回去：能看旧数据总比看一片空白强，
+  // 错误挂在面板上方，用户自己决定要不要重试。
+  const refresh = () =>
+    void reload()
+      .then(() => setError(null))
+      .catch((caught: unknown) => setError(message(caught, "刷新失败")));
+
+  const retry = () => {
+    setState("loading");
+    setError(null);
+    void reload()
+      .then(() => setState("ready"))
+      .catch((caught: unknown) => {
+        setError(message(caught, "加载模型配置失败"));
+        setState("error");
+      });
   };
 
   return (
-    <div className="min-h-screen bg-slate-100">
-      <header className="flex flex-wrap items-center gap-3 border-b border-slate-200 bg-white px-4 py-2">
-        <AppNav />
-        <span className="text-sm text-slate-500">模型管理</span>
-        <button type="button" className={BUTTON_CLASS + " ml-auto"} onClick={refresh}>
+    <PageShell
+      eyebrow="设置 · 模型"
+      title="模型管理"
+      description="供应商、模型、功能绑定三者互相引用：模型属于供应商，功能绑定又指向模型。测试会真实发一次请求，用来判断这条链路到底通不通。"
+      actions={
+        <button type="button" className={BUTTON_CLASS} onClick={refresh}>
           刷新
         </button>
-      </header>
+      }
+    >
+      {state === "loading" && (
+        <p className="text-[14px] text-slate-500">正在加载模型配置…</p>
+      )}
 
-      <main className="mx-auto flex max-w-6xl flex-col gap-4 p-4">
-        {state === "loading" && <p className="text-sm text-slate-500">正在加载模型配置…</p>}
+      {state === "error" && (
+        <div className="border border-rose-200 bg-rose-50 px-4 py-3 text-[14px] text-rose-700">
+          <p>{error ?? "加载失败"}</p>
+          <p className="mt-1 text-[13px] text-rose-600">
+            数据来自后端 /api/v1/llm，多半是服务没起来。确认后点下面的重试。
+          </p>
+          <button type="button" className={BUTTON_CLASS + " mt-2"} onClick={retry}>
+            重试
+          </button>
+        </div>
+      )}
 
-        {state === "error" && (
-          <div className="rounded border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
-            {error ?? "加载失败"}
-          </div>
-        )}
+      {state === "ready" && error !== null && (
+        <div className="border border-rose-200 bg-rose-50 px-4 py-3 text-[14px] text-rose-700">
+          {error}
+        </div>
+      )}
 
-        {state === "ready" && (
-          <>
-            <ProvidersPanel providers={providers} onChanged={reload} />
-            <ModelsPanel providers={providers} models={models} onChanged={reload} />
-            <FeatureBindingsPanel features={features} models={models} onChanged={reload} />
-          </>
-        )}
-      </main>
-    </div>
+      {state === "ready" && (
+        <>
+          <ProvidersPanel providers={providers} onChanged={reload} />
+          <ModelsPanel providers={providers} models={models} onChanged={reload} />
+          <FeatureBindingsPanel features={features} models={models} onChanged={reload} />
+        </>
+      )}
+    </PageShell>
   );
 }

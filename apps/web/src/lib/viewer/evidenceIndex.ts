@@ -30,6 +30,13 @@ export interface EvidenceTarget {
 /** 能画出来的证据：bbox 一定合法，EvidenceLayer 直接拿它做乘法。 */
 export interface EvidenceItem extends EvidenceTarget {
   bbox: Bbox;
+  /**
+   * 页内角标编号（从 1 起）：原文页上那个数字气泡靠它，点角标即反向定位（06 第 11 节）。
+   *
+   * 为什么在建索引时定死、而不是渲染时按数组下标算：虚拟滚动会反复挂载卸载页面，
+   * 渲染时算会在滚动过程中变号，用户刚记住的「第 3 处」就指到别的地方了。
+   */
+  badge: number;
 }
 
 export interface EvidenceIndex {
@@ -60,8 +67,9 @@ export function buildEvidenceIndex(extractions: readonly WireExtraction[]): Evid
       targets.push(target);
 
       if (bbox === null) continue;
-      const item: EvidenceItem = { ...target, bbox };
       const list = byPage.get(evidence.page_no);
+      // 编号只数**画得出来**的证据：画不出框的条目在原文页上没有落点，不该占号。
+      const item: EvidenceItem = { ...target, bbox, badge: (list?.length ?? 0) + 1 };
       if (list === undefined) byPage.set(evidence.page_no, [item]);
       else list.push(item);
     }

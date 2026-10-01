@@ -19,6 +19,7 @@
 | `GET` | `/api/v1/versions/{vid}/original` | 获取原始上传件流 |
 | `GET` | `/api/v1/versions/{vid}/pages` | 页面清单（尺寸、旋转、文本层；不含页图 URL） |
 | `POST` | `/api/v1/versions/{vid}/reparse` | **重新解析**（admin，二次确认；锚点全部重建，确认结果打回） |
+| `POST` | `/api/v1/versions/{vid}/extract` | **重新抽取**（复用既有 parse_run，不重建锚点；抽取失败后的第一出口） |
 | `GET` | `/api/v1/versions/{vid}/pages/{page_no}/elements` | 该页元素（含 bbox、锚点、类型） |
 | `GET` | `/api/v1/versions/{vid}/outline` | 章节树 |
 | `GET` | `/api/v1/versions/{vid}/extractions` | 抽取结果（按 group/field/status 过滤） |
@@ -406,7 +407,7 @@ POST /api/v1/instances/4102/reviews
 
 **为什么 `correct` 的锚点必须硬校验**：锚点是这套系统唯一不可替代的产出。允许不带锚点（或带一个查不到的锚点）的修正，等于允许 gold 集被污染，而且污染是静默的。
 
-### 3.11 重跑（两种，代价差一个量级）
+### 3.11 重跑（三种，代价各差一个量级）
 
 **单字段重跑**
 
@@ -422,6 +423,25 @@ POST /api/v1/extractions/9001/rerun
 - 服务端复用现有 `parse_run` / `element`，**不触发上游任何阶段**；
 - 新尝试以 `is_current = true` 落库，旧尝试自动置 `false`；
 - 同一实例已有进行中的重跑时返回 **409 `rerun_in_flight`**，避免用户连点刷出一堆无意义尝试。
+
+**重新抽取（版本级，复用解析产物）**
+
+```
+POST /api/v1/versions/2048/extract
+{
+  "field_keys": [],                              // 空 = 全部字段类型
+  "hint": null                                   // 非空即 hinted_rerun
+}
+→ 202 { "job_id": "...", "version_id": 2048, "run_id": 77, "field_keys": [...], "status": "pending" }
+```
+
+- 复用最近的 `parse_run` / `element`，**不重建锚点、不动页面上已确认的结果**；
+- 抽取失败（模型不可用、密钥缺失、worker 崩溃）后的第一出口：这种局面下 `parse_run` 多半已是
+  `completed`，而 `/projects/{id}/rerun` 是从**已有结果行**里筛候选的，一条都没有 → 只能走这个入口；
+- 最新 run 不是 `completed` / `partial` 时返回 **409 `parse_incomplete`**（该先走重新解析）；
+- 同版本已有在途抽取任务时返回 **409 `rerun_in_flight`**；
+- 版本不存在返回 **404 `not_found`**，版本下没有可解析文件（主文件已删或标为不可解析）返回
+  **409 `version_not_parseable`**，`field_keys` 含未知字段返回 **400 `invalid_argument`**（空数组合法，= 全部字段）。
 
 **重新解析（管理员）**
 
@@ -499,6 +519,18 @@ POST /api/v1/spot-checks
 抽样是同步完成的：一次 `ORDER BY random() LIMIT` + 插入 `review_task(reason = spot_check)`，
 所以 `job_id` 只是本次抽样批次号（关联号），明细是响应里的 `review_task_ids`。
 
+### 3.14 本轮新增的响应字段（不是新端点）
+
+界面要回答「这一步为什么没有结果」，需要两处已有接口各多带一个字段。**没有新增端点，
+也没有改数据模型（无 DDL 变更）**：
+
+| 端点 | 新增字段 | 用途 |
+| --- | --- | --- |
+| `GET /versions/{vid}` | `latest_extraction_job` | 最近一次 `stage='extracting'` 的 job（`status` / `error_code` / `error_message` / `created_at` / `finished_at`），`null` = 从没排过抽取。工作台的「抽取失败」态要直接说出原因，而这个原因只存在于 `job` 行上 |
+| `GET /projects/{id}` 的 `files[]` | `confirmed_count` | 该版本 `is_current` 且 `status='verified'` 的条数。重新解析前的二次确认必须列出「将失效的已确认结果数量」（见 09 第 5.2 节） |
+
+为什么只取「最近一条」抽取任务：界面要解释的是「这一次为什么一条结果都没有」，
+历史任务对用户没有意义；真需要历史时应走任务列表，而不是把版本详情撑成日志。
 ## 4. SSE 进度
 
 ```

@@ -422,7 +422,13 @@ def get_evidence_map(version_id: int, request: Request) -> dict[str, object]:
 
 @router.get("/{version_id}")
 def get_version(version_id: int, request: Request) -> dict[str, object]:
-    """版本详情：转换信息 + 解析运行列表（不含对象存储 key，流走 /file 与 /original）。"""
+    """版本详情：转换信息 + 解析运行列表 + 最近一次抽取任务。
+
+    为什么要把抽取任务也带上：解析成功而抽取失败时，结果面板原本只能写「暂无数据」，
+    用户看不出是没跑、在跑、还是跑挂了。抽取是独立的 job（stage='extracting'，
+    见 worker/dispatch.py），它的 error_code/error_message 只在 job 行上，
+    版本详情顺手带一条最近的，前端才能把失败原因直接说出来。
+    """
     db = engine(request)
     version = version_row(db, version_id)
     with db.connect() as connection:
@@ -451,6 +457,22 @@ def get_version(version_id: int, request: Request) -> dict[str, object]:
             .mappings()
             .all()
         )
+        # 只取最近一条：界面上要解释的是「这一次为什么没有结果」，不是抽取历史。
+        extraction_job = (
+            connection.execute(
+                text(
+                    """SELECT j.status, j.error_code, j.error_message,
+                              j.progress, j.created_at, j.finished_at
+                       FROM job AS j
+                       WHERE j.version_id = :version_id AND j.stage = 'extracting'
+                       ORDER BY j.created_at DESC, j.id DESC
+                       LIMIT 1"""
+                ),
+                {"version_id": version_id},
+            )
+            .mappings()
+            .first()
+        )
     return {
         "id": version["id"],
         "document_id": version["document_id"],
@@ -467,6 +489,7 @@ def get_version(version_id: int, request: Request) -> dict[str, object]:
         "page_count": version["page_count"],
         "created_at": version["created_at"],
         "parse_runs": [dict(row) for row in runs],
+        "latest_extraction_job": dict(extraction_job) if extraction_job is not None else None,
     }
 
 

@@ -3,18 +3,37 @@
 /**
  * 单条字段结果卡：值、证据定位和复核操作。
  *
+ * 版式按「读的顺序」排：字段名 → 值 → 出处 → 动作。
+ * 值用等宽大字（17px）：用户在这一屏上真正要读的就是这些数字和条款号，
+ * 它们必须比周围的说明文字更响；字段名用宋体，和标书里的章节标题同一种字体，
+ * 提醒用户「这一条来自纸面上的哪一节」。
+ *
  * 人工修正必须把锚点一起提交：编辑器会预填当前证据，也允许在反向标注模式下
  * 手动输入当前 run 的锚点，后端仍会再次校验锚点属于该版本。
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import {
+  BUTTON_CLASS,
+  DATA_CLASS,
+  DANGER_GHOST_BUTTON_CLASS,
+  GHOST_BUTTON_CLASS,
+  INPUT_CLASS,
+  PRIMARY_BUTTON_CLASS,
+} from "@/components/ui";
 import type { ReviewEvidenceInput, ReviewInput } from "@/lib/api/client";
-import { statusBadgeClass, statusLabel, triggerLabel } from "@/lib/results/labels";
+import {
+  statusDotClass,
+  statusLabel,
+  statusSpineClass,
+  statusTextClass,
+  triggerLabel,
+} from "@/lib/results/labels";
 import type { RerunButtonMode } from "@/lib/results/rerun";
 import { useViewerStore } from "@/lib/store/viewerStore";
 import type { EvidenceTarget } from "@/lib/viewer/evidenceIndex";
-import type { WireAttempt, WireExtraction } from "@/types/workbench";
+import type { WireAttempt, WireConflict, WireExtraction } from "@/types/workbench";
 
 import { AttemptHistory } from "./AttemptHistory";
 import { EvidenceList } from "./EvidenceList";
@@ -29,6 +48,15 @@ interface Props {
   onReview: (input: ReviewInput) => Promise<boolean>;
   onRerun: (hint: string | null) => Promise<boolean>;
   onLoadAttempts: (extractionId: number) => Promise<WireAttempt[]>;
+  /** 键盘 j/k 或原文角标选中的那一张：加一圈琥珀色描边并滚进视野。 */
+  highlighted?: boolean;
+  /** 复核模式下强制展开证据：排队处理时不该还要逐条点开才看得到出处。 */
+  forceOpen?: boolean;
+  /** 与这条结果同字段的未裁定冲突；有值时卡片内直接摆出两侧取值待裁决。 */
+  conflict?: WireConflict | null;
+  onResolveConflict?: (conflictId: number, resolvedId: number) => Promise<void>;
+  /** 自增令牌：变化时展开「带提示重跑」并聚焦输入框（结果面板的 Shift+Enter）。 */
+  openRerunToken?: number;
 }
 
 type EditMode = "correct" | "supplement" | null;
@@ -42,8 +70,12 @@ export function ResultCard({
   onReview,
   onRerun,
   onLoadAttempts,
+  highlighted = false,
+  forceOpen = false,
+  conflict = null,
+  onResolveConflict,
+  openRerunToken = 0,
 }: Props) {
-  const badgeClass = statusBadgeClass(extraction.status);
   const label = statusLabel(extraction.status);
   const isNotFound = extraction.status === "not_found";
   const [editMode, setEditMode] = useState<EditMode>(null);
@@ -62,6 +94,35 @@ export function ResultCard({
       : null,
   );
   const onlyTarget = targets.length === 1 ? targets[0] : undefined;
+  const rootRef = useRef<HTMLElement | null>(null);
+  const rerunInputRef = useRef<HTMLInputElement | null>(null);
+  const [conflictBusy, setConflictBusy] = useState(false);
+
+  // Shift+Enter：展开重跑面板并把光标送进提示输入框，用户接着打字即可。
+  // 下一帧再聚焦：输入框是这一帧才挂上去的，同帧 focus 会落空。
+  useEffect(() => {
+    if (openRerunToken === 0) return;
+    setRerunOpen(true);
+    const frame = requestAnimationFrame(() => rerunInputRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [openRerunToken]);
+
+  // 键盘/角标选中时把卡片带回视野。用 nearest 而不是 center：
+  // 连续按 j/k 时 center 会让整屏不停上下翻，读不出一条结果。
+  useEffect(() => {
+    if (!highlighted) return;
+    rootRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [highlighted]);
+
+  const decideConflict = async (resolvedId: number) => {
+    if (conflict === null || onResolveConflict === undefined) return;
+    setConflictBusy(true);
+    try {
+      await onResolveConflict(conflict.id, resolvedId);
+    } finally {
+      setConflictBusy(false);
+    }
+  };
 
   const beginEdit = (mode: EditMode) => {
     setEditMode(mode);
@@ -74,9 +135,7 @@ export function ResultCard({
     const value = draftValue.trim();
     const anchor = draftAnchor.trim();
     if (!value || !anchor) return;
-    const evidence: ReviewEvidenceInput[] = [
-      { anchor, quote: draftQuote.trim() || undefined },
-    ];
+    const evidence: ReviewEvidenceInput[] = [{ anchor, quote: draftQuote.trim() || undefined }];
     const succeeded = await onReview({
       attempt_id: extraction.id,
       action: editMode === "supplement" ? "supplement" : "correct",
@@ -129,87 +188,191 @@ export function ResultCard({
       .finally(() => setAttemptsLoading(false));
   };
 
+  const attemptNote =
+    extraction.machine_attempt_no === null || extraction.machine_attempt_no === undefined
+      ? extraction.trigger === "manual_edit"
+        ? "人工"
+        : null
+      : "第 " + extraction.machine_attempt_no + " 次机器尝试";
+
   return (
     <article
+      ref={rootRef}
       data-extraction-id={extraction.id}
-      className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm"
+      className={
+        "relative border bg-white transition-colors " +
+        (highlighted
+          ? "border-amber-400 ring-2 ring-amber-400"
+          : activeAnchor !== null
+            ? "border-amber-300"
+            : "border-slate-200")
+      }
     >
-      <header className="flex items-start justify-between gap-2">
-        <h4 className="text-sm font-medium text-slate-900">
-          {extraction.field_label ?? extraction.field_key}
-        </h4>
-        <span className={`shrink-0 rounded border px-1.5 py-0.5 text-xs ${badgeClass}`}>
-          {label}
-        </span>
-      </header>
+      {/* 卷宗脊：颜色即这条结果的处置状态，扫一列颜色就知道哪几条还没人管 */}
+      <span
+        aria-hidden
+        className={"absolute inset-y-0 left-0 w-[4px] " + statusSpineClass(extraction.status)}
+      />
 
-      {isNotFound ? (
-        <p className="mt-2 text-sm text-slate-500">未在本文档中找到</p>
-      ) : (
-        <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-900">
-          {extraction.value_text}
-        </p>
-      )}
+      <div className="px-3.5 pt-2.5 pb-2">
+        <header className="flex items-start justify-between gap-2">
+          <h4 className="font-serif text-[15px] leading-[22px] text-slate-900">
+            {extraction.field_label ?? extraction.field_key}
+          </h4>
+          <span className="flex shrink-0 items-center gap-1.5 text-[13px]">
+            <span
+              aria-hidden
+              className={"h-1.5 w-1.5 rounded-full " + statusDotClass(extraction.status)}
+            />
+            <span className={statusTextClass(extraction.status)}>{label}</span>
+          </span>
+        </header>
 
-      {(extraction.machine_attempt_no !== null && extraction.machine_attempt_no !== undefined) ||
-        extraction.trigger === "manual_edit" ? (
-        <p className="mt-2 text-xs text-slate-400">
-          {extraction.machine_attempt_no === null || extraction.machine_attempt_no === undefined
-            ? "人工"
-            : "第 " + extraction.machine_attempt_no + " 次机器尝试"}{" "}
-          · {triggerLabel(extraction.trigger)}
-        </p>
-      ) : null}
+        {isNotFound ? (
+          <p className="mt-2 text-[14px] text-slate-400">本文档中未提及</p>
+        ) : (
+          <p
+            className={
+              DATA_CLASS +
+              " mt-2 text-[22px] leading-[30px] break-words whitespace-pre-wrap text-slate-900"
+            }
+          >
+            {extraction.value_text}
+          </p>
+        )}
 
-      {!isNotFound && (
-        <footer className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-          <span className="tabular-nums">置信度 {(extraction.confidence * 100).toFixed(0)}%</span>
-          {onlyTarget !== undefined && (
-            <button
-              type="button"
-              onClick={() => onLocate(onlyTarget)}
-              className={buttonClass}
-              disabled={busy}
-            >
-              定位第 {onlyTarget.pageNo} 页
-            </button>
+        <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] text-slate-400">
+          {!isNotFound && (
+            <span className={DATA_CLASS}>置信度 {(extraction.confidence * 100).toFixed(0)}%</span>
           )}
-        </footer>
+          {attemptNote !== null && (
+            <>
+              {!isNotFound && <span aria-hidden>·</span>}
+              <span>{attemptNote}</span>
+            </>
+          )}
+          <button
+            type="button"
+            className="ml-auto text-[13px] text-slate-500 hover:text-slate-900 hover:underline"
+            onClick={toggleAttempts}
+            disabled={busy}
+          >
+            {attemptsOpen ? "收起尝试链" : "查看尝试链"}
+          </button>
+        </p>
+
+        {onlyTarget !== undefined && !forceOpen && (
+          <button
+            type="button"
+            onClick={() => onLocate(onlyTarget)}
+            disabled={busy}
+            className={
+              "mt-2 flex items-center gap-2 border border-amber-300 bg-amber-50 px-2 py-1 " +
+              "text-[13px] text-amber-900 hover:border-amber-400 hover:bg-amber-100 disabled:opacity-40"
+            }
+          >
+            <span className={DATA_CLASS}>第 {onlyTarget.pageNo} 页</span>
+            <span aria-hidden>·</span>
+            <span>定位原文</span>
+          </button>
+        )}
+      </div>
+
+      {(targets.length > 1 || (forceOpen && targets.length > 0)) && (
+        <div className="px-3.5 pb-2">
+          <EvidenceList targets={targets} activeAnchor={activeAnchor} onLocate={onLocate} />
+        </div>
       )}
 
-      {targets.length > 1 && (
-        <EvidenceList targets={targets} activeAnchor={activeAnchor} onLocate={onLocate} />
+      {/*
+       * 冲突的两侧取值就地摆开：复核队列里最费时间的动作是「来回切文件比两个值」，
+       * 把候选值、来源文件名、页码一次性列在这里，裁决就能在这张卡内完成。
+       * 系统仍然不替用户选（见 03 第 4.5 节），只负责把选项摆到眼前。
+       */}
+      {conflict !== null && conflict.status === "open" && (
+        <div className="border-t border-rose-200 bg-rose-50 px-3.5 py-2">
+          <p className="text-[13px] font-medium text-rose-800">
+            同一字段在其它文件里抽出了不同的值，需要裁定
+          </p>
+          <ul className="mt-1.5 flex flex-col gap-1.5">
+            {conflict.candidates.map((candidate) => (
+              <li
+                key={candidate.id}
+                className="flex items-start justify-between gap-3 border border-rose-100 bg-white px-2 py-1.5"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className={DATA_CLASS + " block text-[16px] leading-6 break-words text-slate-900"}>
+                    {candidate.value_text || "（空值）"}
+                  </span>
+                  <span className="mt-0.5 block truncate text-[13px] text-slate-500">
+                    {candidate.display_name}
+                    {candidate.page_no !== null ? " · 第 " + candidate.page_no + " 页" : ""}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  disabled={busy || conflictBusy}
+                  onClick={() => void decideConflict(candidate.id)}
+                  className={BUTTON_CLASS + " shrink-0"}
+                >
+                  采用这条
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
 
-      <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
+      {attemptsOpen && (
+        <div className="px-3.5 pb-2.5">
+          <AttemptHistory
+            attempts={attempts ?? []}
+            loading={attemptsLoading}
+            error={attemptsError}
+            onLocate={onLocate}
+          />
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-100 px-3.5 py-2">
         {isNotFound ? (
           <>
-            <button type="button" className={buttonClass} disabled={busy} onClick={submitConfirm}>
+            <button type="button" className={PRIMARY_BUTTON_CLASS} disabled={busy} onClick={submitConfirm}>
               确认没有
             </button>
-            <button type="button" className={buttonClass} disabled={busy} onClick={() => beginEdit("supplement")}>
+            <button
+              type="button"
+              className={BUTTON_CLASS}
+              disabled={busy}
+              onClick={() => beginEdit("supplement")}
+            >
               人工补充
             </button>
           </>
         ) : (
           <>
-            <button type="button" className={buttonClass} disabled={busy} onClick={submitConfirm}>
+            <button type="button" className={PRIMARY_BUTTON_CLASS} disabled={busy} onClick={submitConfirm}>
               确认
             </button>
-            <button type="button" className={buttonClass} disabled={busy} onClick={() => beginEdit("correct")}>
+            <button
+              type="button"
+              className={BUTTON_CLASS}
+              disabled={busy}
+              onClick={() => beginEdit("correct")}
+            >
               修正
             </button>
             {rerunButton !== "hide" && (
               <button
                 type="button"
-                className={buttonClass}
+                className={BUTTON_CLASS}
                 disabled={busy}
                 onClick={() => setRerunOpen((open) => !open)}
               >
                 重跑
               </button>
             )}
-            <button type="button" className={buttonClass} disabled={busy} onClick={submitReject}>
+            <button type="button" className={DANGER_GHOST_BUTTON_CLASS} disabled={busy} onClick={submitReject}>
               驳回
             </button>
           </>
@@ -217,13 +380,15 @@ export function ResultCard({
       </div>
 
       {!isNotFound && rerunButton === "show_hint" && (
-        <p className="mt-2 text-xs text-emerald-700">重跑一次通常能修好</p>
+        <p className="border-t border-amber-100 bg-amber-50 px-3.5 py-1.5 text-[13px] text-amber-800">
+          这个字段重跑一次通常能修好
+        </p>
       )}
 
       {rerunButton === "hide" && !isNotFound && !rerunOpen && (
         <button
           type="button"
-          className="mt-2 text-xs text-slate-400 hover:text-slate-600 hover:underline"
+          className="border-t border-slate-100 px-3.5 py-1.5 text-left text-[13px] text-slate-400 hover:text-slate-600 hover:underline"
           onClick={() => setRerunOpen(true)}
           disabled={busy}
         >
@@ -231,69 +396,83 @@ export function ResultCard({
         </button>
       )}
 
-      <button
-        type="button"
-        className="mt-2 text-xs text-slate-500 hover:text-slate-700 hover:underline"
-        onClick={toggleAttempts}
-        disabled={busy}
-      >
-        {attemptsOpen ? "收起尝试链" : "查看尝试链"}
-      </button>
-
-      {attemptsOpen && (
-        <AttemptHistory
-          attempts={attempts ?? []}
-          loading={attemptsLoading}
-          error={attemptsError}
-          onLocate={onLocate}
-        />
-      )}
-
       {rerunOpen && (
-        <div className="mt-2 flex flex-col gap-2 rounded border border-slate-200 bg-slate-50 p-2">
-          <input
-            value={rerunHint}
-            onChange={(event) => setRerunHint(event.target.value)}
-            placeholder="可选：提示模型重点查看的章节"
-            className={inputClass}
-          />
-          <button type="button" className={primaryClass} disabled={busy} onClick={submitRerun}>
-            提交重跑
-          </button>
+        <div className="flex flex-col gap-2 border-t border-slate-200 bg-slate-50 px-3.5 py-2.5">
+          <label className="flex flex-col gap-1.5">
+            <span className="text-[13px] text-slate-500">
+              重跑时给模型的提示（可留空，留空即普通重跑）
+            </span>
+            <input
+              ref={rerunInputRef}
+              value={rerunHint}
+              onChange={(event) => setRerunHint(event.target.value)}
+              placeholder="例如：该值可能在「投标人须知前附表」或「评标办法」章节"
+              className={INPUT_CLASS}
+            />
+          </label>
+          <div className="flex gap-1.5">
+            <button type="button" className={PRIMARY_BUTTON_CLASS} disabled={busy} onClick={() => void submitRerun()}>
+              提交重跑
+            </button>
+            <button
+              type="button"
+              className={BUTTON_CLASS}
+              disabled={busy}
+              onClick={() => setRerunOpen(false)}
+            >
+              取消
+            </button>
+          </div>
         </div>
       )}
 
       {editMode !== null && (
-        <div className="mt-2 flex flex-col gap-2 rounded border border-sky-200 bg-sky-50 p-2">
-          <input
-            value={draftValue}
-            onChange={(event) => setDraftValue(event.target.value)}
-            placeholder="填写修正后的值"
-            className={inputClass}
-          />
-          <input
-            value={draftAnchor}
-            onChange={(event) => setDraftAnchor(event.target.value)}
-            placeholder="原文锚点，例如 p12b5"
-            className={inputClass}
-          />
-          <textarea
-            value={draftQuote}
-            onChange={(event) => setDraftQuote(event.target.value)}
-            placeholder="可选：锚点中的原文片段"
-            rows={2}
-            className={inputClass}
-          />
-          <div className="flex gap-2">
+        <div className="flex flex-col gap-2.5 border-t border-sky-200 bg-sky-50 px-3.5 py-2.5">
+          <label className="flex flex-col gap-1.5">
+            <span className="text-[13px] text-slate-500">
+              {editMode === "supplement" ? "补充的值" : "修正后的值"}
+            </span>
+            <input
+              autoFocus
+              value={draftValue}
+              onChange={(event) => setDraftValue(event.target.value)}
+              placeholder="填写修正后的值"
+              className={INPUT_CLASS}
+            />
+          </label>
+          <label className="flex flex-col gap-1.5">
+            <span className="text-[13px] text-slate-500">原文位置（锚点，已按当前证据预填）</span>
+            <input
+              value={draftAnchor}
+              onChange={(event) => setDraftAnchor(event.target.value)}
+              placeholder="例如 p12b5"
+              className={INPUT_CLASS + " " + DATA_CLASS}
+            />
+          </label>
+          <label className="flex flex-col gap-1.5">
+            <span className="text-[13px] text-slate-500">该位置的原文片段（选填，便于复核时比对）</span>
+            <textarea
+              value={draftQuote}
+              onChange={(event) => setDraftQuote(event.target.value)}
+              rows={2}
+              className={INPUT_CLASS}
+            />
+          </label>
+          <div className="flex gap-1.5">
             <button
               type="button"
-              className={primaryClass}
+              className={PRIMARY_BUTTON_CLASS}
               disabled={busy || !draftValue.trim() || !draftAnchor.trim()}
               onClick={() => void submitEdit()}
             >
               提交{editMode === "supplement" ? "补充" : "修正"}
             </button>
-            <button type="button" className={buttonClass} disabled={busy} onClick={() => setEditMode(null)}>
+            <button
+              type="button"
+              className={GHOST_BUTTON_CLASS}
+              disabled={busy}
+              onClick={() => setEditMode(null)}
+            >
               取消
             </button>
           </div>
@@ -302,10 +481,3 @@ export function ResultCard({
     </article>
   );
 }
-
-const buttonClass =
-  "rounded border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50";
-const primaryClass =
-  "rounded border border-sky-400 bg-sky-600 px-2 py-1 text-xs text-white hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50";
-const inputClass =
-  "w-full rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-800 focus:border-sky-500 focus:outline-none";

@@ -5,4 +5,5 @@ export {
   DANGER_BUTTON_CLASS,
   INPUT_CLASS,
   PRIMARY_BUTTON_CLASS,
+  SELECT_CLASS,
 } from "@/components/ui";

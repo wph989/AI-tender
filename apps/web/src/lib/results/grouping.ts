@@ -7,6 +7,7 @@
  * 只出「有数据的分组」：空标签会让用户以为系统漏抽了，而不是"这组本来就没有"。
  */
 
+import { needsActionCount } from "@/lib/results/reviewQueue";
 import type { WireExtraction } from "@/types/workbench";
 
 export const GROUP_LABELS: Record<string, string> = {
@@ -49,8 +50,7 @@ export function buildResultTabs(extractions: readonly WireExtraction[]): ResultT
       key,
       label: GROUP_LABELS[key] ?? key,
       items,
-      pending: items.filter((item) => item.status === "need_review" || item.status === "conflict")
-        .length,
+      pending: needsActionCount(items),
       notFound: items.filter((item) => item.status === "not_found").length,
     }));
 }

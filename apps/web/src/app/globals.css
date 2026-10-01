@@ -1,19 +1,187 @@
 @import "tailwindcss";
 
-/*
- * 中文优先的字体栈：不引 next/font。
- * 为什么：Next 的 Google 字体是在构建期联网拉取，本系统要部署在内网，
- * 构建机同样出不了网——换成系统字体是唯一不会把构建卡住的做法。
- */
+/* ============================================================================
+ * AI-Tender 视觉系统 ·「校对台」
+ *
+ * 这个产品的用户每天在读宋体排版的招标文件，界面要让他们觉得「答案」和「原文」
+ * 来自同一份材料，而不是两个不同的软件。整套视觉从这件事推出来：
+ *
+ *   纸与墨   纸面是米白暖白，墨与结构线是冷灰（接近印刷油墨）。冷墨压在暖纸上才是
+ *            印刷品的手感；纸和墨用同一个灰阶时就又变回一张屏幕截图。彩色只出现在
+ *            有信息的地方。
+ *   荧光黄   全站唯一的强调色，只给「证据高亮」和「要你来看」的状态用。
+ *            不换别的颜色，是因为它就是用户拿荧光笔划重点的那支笔。
+ *   靛蓝     只出现在「点下去会发生事情」的地方（主按钮、可点链接、焦点环）。
+ *   印泥红   失败、驳回、删除。取自公章的颜色，天生带「这是否决」的语气。
+ *   墨绿     已完成、已确认。
+ *
+ * 为什么不用圆角卡片 + 阴影做层级：那是通用后台模板的默认长相，一屏里十几张
+ * 浮起来的白卡片，看起来像任何一个 SaaS。这里改用墨线、编号和留白来分层，
+ * 像一份排好版的公文——同一屏里出现两个层次的线，读者就知道该往哪看。
+ *
+ * 为什么覆写 slate/amber/sky/rose/emerald 这五个默认色阶，而不是给颜色改名：
+ * 全站组件已经铺满了这五个名字，改名是几百行的纯噪声改动；覆写色阶等于换掉
+ * 调色板本身，组件代码一行不用动。
+ * ========================================================================== */
 @theme {
+  /* 字体三角色：界面用黑体、标题与字段名用宋体、数据用等宽。
+   * 宋体是中文公文的正文字体——把标题排成宋体，是让界面和标书用同一套字体基因，
+   * 这是这个产品唯一一处「冒险」，也是它一眼不像通用后台的原因。
+   *
+   * 不引 next/font：Next 的 Google 字体在构建期联网拉取，本系统要部署在内网，
+   * 构建机同样出不了网——系统字体栈是唯一不会把构建卡住的做法。 */
   --font-sans: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC",
     system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: "Source Han Serif SC", "Noto Serif SC", "Songti SC", "STSong", "SimSun",
+    "Noto Serif CJK SC", serif;
+  /* 等宽单独列出来：页码、报价、置信度、哈希、版本号都是要上下比对的「数据」，
+   * 等宽能让它们对齐，衬线/无衬线正文里混排数字反而更难核。 */
+  --font-mono: "Cascadia Mono", "JetBrains Mono", Consolas, "SFMono-Regular", ui-monospace,
+    monospace;
+
+  /* ---- 纸：纸面与台面。默认 white 是纯白，和暖灰并置时像贴上去的贴纸；
+   * 覆写成米白后，全站 bg-white 一处不改就整体转成纸。 ---- */
+  --color-white: #fdfbf7;
+
+  /* ---- 墨与台面：50~200 是纸面的衬底与分区底，跟着纸一起转暖；
+   * 300 及更深保持冷调——结构线、正文、页码要有墨的冷劲，
+   * 冷墨压暖纸的对比才是「印刷品」而不是「屏幕」。 ---- */
+  --color-slate-50: #f6f4ef;
+  --color-slate-100: #eae6dd;
+  --color-slate-200: #dcd7cb;
+  --color-slate-300: #c5cbd3;
+  --color-slate-400: #949da9;
+  --color-slate-500: #69727f;
+  --color-slate-600: #4a5260;
+  --color-slate-700: #343b47;
+  --color-slate-800: #212733;
+  --color-slate-900: #12161d;
+  --color-slate-950: #0a0d12;
+
+  /* ---- 荧光笔黄：全站唯一强调色 ---- */
+  --color-amber-50: #fffbe0;
+  --color-amber-100: #fff4b8;
+  --color-amber-200: #ffe98a;
+  --color-amber-300: #ffdc4d;
+  --color-amber-400: #ffd42e;
+  --color-amber-500: #edb800;
+  --color-amber-600: #b98d00;
+  --color-amber-700: #8a6a00;
+  --color-amber-800: #6b5200;
+  --color-amber-900: #4a3900;
+
+  /* ---- 靛蓝：操作色 ---- */
+  --color-sky-50: #eef1fa;
+  --color-sky-100: #dde3f5;
+  --color-sky-200: #c0cbec;
+  --color-sky-300: #9aabe0;
+  --color-sky-400: #7186cf;
+  --color-sky-500: #4f63bf;
+  --color-sky-600: #36479f;
+  --color-sky-700: #2c3a80;
+  --color-sky-800: #253066;
+  --color-sky-900: #1f2852;
+
+  /* ---- 印泥红：失败、驳回、删除 ---- */
+  --color-rose-50: #fdf0ef;
+  --color-rose-100: #fadcd9;
+  --color-rose-200: #f2bbb5;
+  --color-rose-300: #e5918a;
+  --color-rose-500: #c0392b;
+  --color-rose-600: #a92e21;
+  --color-rose-700: #8a261b;
+
+  /* ---- 墨绿：完成、已确认 ---- */
+  --color-emerald-50: #eef5f1;
+  --color-emerald-100: #d7e8de;
+  --color-emerald-200: #b0d3c0;
+  --color-emerald-300: #7fb798;
+  --color-emerald-500: #3d7b57;
+  --color-emerald-600: #2f6b4a;
+  --color-emerald-700: #245339;
 }
 
-/*
- * 高亮闪烁：连续点同一条结果也要重新闪一次，否则用户以为没响应（见 docs/设计/06 第 5 节第 ⑥ 步）。
- * JS 只负责自增 pulseKey 让元素重挂载，动画重放交给 CSS，避免在用状态的地方再塞定时器。
- */
+@layer base {
+  /* 中文在 Windows 上默认按点阵渲染小字号，打开抗锯齿后才像正文而不是像截图。 */
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* 表单控件的默认外观（蓝色勾选框、圆角 select、内嵌箭头）是「看起来像 demo」的
+   * 主要来源之一，统一改成墨色系，箭头交给 .ui-select 自己画。 */
+  input[type="checkbox"],
+  input[type="radio"],
+  progress {
+    accent-color: var(--color-slate-900);
+  }
+
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+
+  /* 键盘可达性：焦点环全站只此一处，不让各组件各画一套。 */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-sky-600);
+    outline-offset: 1px;
+  }
+
+  /* 滚动条也是界面的一部分：系统默认的粗灰条会破坏「一张纸」的整体感。 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-slate-300) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--color-slate-300);
+    background-clip: content-box;
+    border: 3px solid transparent;
+    border-radius: 99px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-slate-400);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 印刷网点：原文区背后那张工作台的底纹。极淡，只是让「纸」浮起来。
+ * ------------------------------------------------------------------------- */
+.desk {
+  background-color: #e3ded2;
+  background-image: radial-gradient(rgba(18, 22, 29, 0.06) 1px, transparent 0);
+  background-size: 14px 14px;
+}
+
+/* 荧光笔痕：全站的签名元素。
+ * 高亮块铺满整行会盖住行高留白，看起来像表格底色；压扁成一条色带（上下各留 14%）
+ * 才是荧光笔划过纸面的样子，也和原文视图里那段证据高亮在视觉上对得上。 */
+.mark-ink {
+  background-image: linear-gradient(
+    transparent 14%,
+    var(--color-amber-200) 14%,
+    var(--color-amber-200) 86%,
+    transparent 86%
+  );
+}
+
+/* 自绘下拉箭头：去掉浏览器默认的圆角控件外观后必须补上，否则 select 看起来像纯文本。 */
+.ui-select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%2369727f' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.4rem center;
+  padding-right: 1.4rem;
+}
+
+/* 高亮闪烁：连续点同一条结果也要重新闪一次，否则用户以为没响应（见 docs/设计/06 第 5 节）。
+ * JS 只负责自增 pulseKey 让元素重挂载，动画重放交给 CSS，避免在用状态的地方再塞定时器。 */
 @keyframes evidence-pulse {
   0% {
     opacity: 0.1;
@@ -28,4 +196,28 @@
 
 .evidence-pulse {
   animation: evidence-pulse 600ms ease-out 2;
+}
+
+/* 换页时主区域淡入 4px。只在路由切换发生一次，用来把「换了一页」说清楚；
+ * 局部重渲染不会触发（不挂在会重挂载的子树上）。 */
+@keyframes sheet-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.sheet-in {
+  animation: sheet-in 220ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .evidence-pulse,
+  .sheet-in {
+    animation: none;
+  }
 }

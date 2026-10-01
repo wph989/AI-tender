@@ -9,6 +9,7 @@
 
 import { useState } from "react";
 
+import { BUTTON_CLASS, DATA_CLASS } from "@/components/ui";
 import { downloadExportJob, exportProject, saveBlob, waitForJob } from "@/lib/api/client";
 
 interface Props {
@@ -49,9 +50,12 @@ export function ExportButton({ projectId, onNotice }: Props) {
       type="button"
       onClick={() => void handleClick()}
       disabled={projectId === null || busy}
-      title={projectId === null ? "静态样本没有项目，导出不可用" : "导出当前项目的抽取结果"}
-      className="rounded border border-slate-300 px-2 py-1 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+      title={projectId === null ? "没有项目，导出不可用" : "导出当前项目的抽取结果（Excel）"}
+      className={BUTTON_CLASS + " py-1"}
     >
+      <span aria-hidden className={DATA_CLASS + " text-[13px]"}>
+        ↓
+      </span>
       {busy ? "导出中…" : "导出 Excel"}
     </button>
   );

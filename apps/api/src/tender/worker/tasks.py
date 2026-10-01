@@ -363,12 +363,16 @@ def _finish_file_version(
         should_parse = auto_parse and not bool(prior_parse)
         status = "pending" if should_parse else "completed"
         stage = "submitting" if should_parse else "geometry"
+        # dispatched_at 是「本阶段已投递」的一次性闩锁，派发闸门只认 dispatched_at IS NULL 的行。
+        # 转换阶段占着这个闩锁，阶段推进到 submitting 时必须一并清掉，
+        # 否则这条 job 永远不满足闸门条件，解析会停在 pending 不动（2026-10-01 实测踩到）。
         connection.execute(
             text(
                 """UPDATE job
                    SET version_id = :version_id, status = :status, stage = :stage,
                        progress = CAST(:progress AS JSONB), error_code = NULL,
                        error_message = NULL, updated_at = now(),
+                       dispatched_at = CASE WHEN :should_parse THEN NULL ELSE dispatched_at END,
                        finished_at = CASE WHEN :should_parse THEN NULL ELSE now() END
                    WHERE id = :job_id AND status <> 'canceled'"""
             ),
