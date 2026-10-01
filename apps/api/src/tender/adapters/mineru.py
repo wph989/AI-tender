@@ -249,7 +249,7 @@ class MinerUParser:
             if status != "pending":
                 raise ParseFailed(f"MinerU 返回不支持的 upload 状态：{status!r}")
 
-            upload_id = _required_string(payload, "upload_id", "MinerU upload 响应")
+            upload_id = _upload_id(payload)
             upload_url = _required_string(payload, "upload_url", "MinerU upload 响应")
             upload_method = _required_string(payload, "upload_method", "MinerU upload 响应")
             upload_headers = _string_headers(payload.get("upload_headers"))
@@ -445,6 +445,20 @@ def _required_string(payload: Mapping[str, object], key: str, context: str) -> s
     if not isinstance(value, str) or not value:
         raise ParseFailed(f"{context}缺少 {key}")
     return value
+
+
+def _upload_id(payload: Mapping[str, object]) -> str:
+    """上传资源的 id。
+
+    实测自托管 4.0.7 返回的是 OpenAI 风格的顶层 `id`（形如 `upload_xxx`），而调研文档里记的是
+    `upload_id`。两个名字都认：字段名差异不该让整条解析链路直接失败。缺了必须报错——没有它
+    拼不出「上传字节」与「complete」的路径。
+    """
+    for key in ("upload_id", "id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    raise ParseFailed("MinerU upload 响应缺少 id")
 
 
 def _string_headers(value: object) -> dict[str, str]:

@@ -121,11 +121,23 @@ class GotenbergConverter:
             raise ConversionUnavailable(
                 f"Gotenberg 版本读取失败：HTTP {response.status_code} {_body_snippet(response)}"
             )
-        # 返回体形状由服务端决定，取不到 version 字段时同样视为不可用，不下发空版本号
-        payload = response.json()
-        version = str(payload.get("version") or "").strip() if isinstance(payload, dict) else ""
+        # 实测 Gotenberg 8.37.0 的 /version 返回的是**纯文本**版本号（"8.37.0"，Content-Type 是
+        # text/plain），不是 JSON。早先只按 JSON 解析，真实部署里表现成「一次转换都没成功，
+        # 报的错却是版本读取失败」，从日志看不出是响应形状的问题。这里两种形状都接受：先试
+        # JSON，不是 JSON 就把整段文本当版本号——版本号马上要写进 document_version，在适配器里
+        # 多这几行比每次升级 Gotenberg 都重踩一遍强。
+        text = response.text.strip()
+        try:
+            payload = response.json()
+        except ValueError:
+            # 纯文本可能被引号包着（有的网关会这么转发），去掉首尾引号再取
+            version = text.strip('"').strip()
+        else:
+            version = str(payload.get("version") or "").strip() if isinstance(payload, dict) else ""
         if not version:
-            raise ConversionUnavailable("Gotenberg 版本响应里没有 version 字段")
+            raise ConversionUnavailable(
+                f"Gotenberg 版本响应无法解析（期望纯文本或含 version 字段的 JSON）：{text[:200]!r}"
+            )
         self._version = version
         return version
 

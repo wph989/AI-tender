@@ -133,7 +133,43 @@ def test_version_is_cached_across_conversions(make_converter) -> None:
     assert version_calls == 1
 
 
+def test_version_accepts_plain_text_body(make_converter) -> None:
+    """Gotenberg 8 的 /version 返回**纯文本**（实测 8.37.0 回 `8.37.0`，Content-Type: text/plain）。
+
+    回归用例：早先只按 JSON 解析，真实部署里表现成「一次转换都没成功，报的错却是版本读取失败」，
+    从日志上完全看不出是响应形状的问题。两种形状都接受后，升级 Gotenberg 不会再踩这一脚。
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(
+                200, text="8.37.0", headers={"Content-Type": "text/plain; charset=UTF-8"}
+            )
+        return pdf_response(request)
+
+    converter, _ = make_converter(handler)
+    result = run(converter.to_pdf(io.BytesIO(b"x"), filename="a.docx", trace_id="t"))
+
+    assert result.converter_version == "8.37.0"
+
+
+def test_version_unparsable_body_still_fails(make_converter) -> None:
+    """形状不认识时要继续失败，不能降级成空版本号：converter_version 是溯源记录的一部分。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"status": "ok"})
+        return pdf_response(request)
+
+    converter, _ = make_converter(handler)
+    with pytest.raises(ConversionUnavailable) as excinfo:
+        run(converter.to_pdf(io.BytesIO(b"x"), filename="a.docx", trace_id="t"))
+
+    assert "无法解析" in str(excinfo.value)
+
+
 def test_version_failure_blocks_conversion(make_converter) -> None:
+
     convert_calls = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
