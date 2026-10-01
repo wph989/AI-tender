@@ -6,10 +6,17 @@
  * 为什么不做常见的虚线圆角框 + 云朵图标：那套外观把「上传」画成了一件抽象的事，
  * 而这里要同时说清三件事——拖进来、能选哪些格式、上传后会跑什么流水线。
  * 一条实底横带 + 左侧荧光黄竖线（和导航字标、列表行是同一道卷宗脊）把注意力
- * 引到「操作」上，格式与限制写在右边，读者顺序是从左到右：先做什么，做完会怎样。
+ * 引到「操作」上，右侧一栏专门写规格与角色推断规则：用户最常问的两个问题就是
+ * 「能传多大」和「为什么这个 Excel 不算解析文件」。
+ *
+ * 为什么拖拽区给到 200px 以上：这块区域越矮，越像页面上一条不起眼的附件输入框；
+ * 它是这一页的主操作，必须一眼看出「东西放这里」。
  *
  * ZIP 单独走 archive 字段：后端会解压后逐个入库（见 api/project_files.py 的
  * _read_archive），混在 files 里只会被当成一个不参与解析的文件。
+ *
+ * 为什么要有逐文件结果：一次请求只回一个汇总，而用户看的是自己挑的那几个文件。
+ * 上传结束后每一行都标出「已入库 / 被拒（原因）/ 未入库」，不必去页面顶部对名字。
  */
 
 import { useRef, useState } from "react";
@@ -17,16 +24,38 @@ import { useRef, useState } from "react";
 import {
   BUTTON_CLASS,
   DATA_CLASS,
+  EYEBROW_CLASS,
   PRIMARY_BUTTON_CLASS,
   SELECT_CLASS,
 } from "@/components/ui";
+import { UploadRejectedError } from "@/lib/api/client";
 import { formatBytes } from "@/lib/format";
-import { FILE_ROLE_LABELS, type FileRole, type ParseTier } from "@/types/projects";
+import { outcomeOf, type UploadOutcome } from "@/lib/projects/upload";
+import {
+  FILE_ROLE_LABELS,
+  type FileRole,
+  type ParseTier,
+  type UploadResult,
+} from "@/types/projects";
 
+/** accept 只影响文件选择框的默认过滤，真正的准入判断在服务端（后端会逐个校验）。 */
 const ACCEPT =
   ".pdf,.doc,.docx,.odt,.rtf,.ppt,.pptx,.odp,.xls,.xlsx,.xlsm,.ods,.dwg,.dxf,.vsd,.vsdx,.zip";
 
 const FORMATS = ["PDF", "Word", "PPT", "Excel", "CAD", "ZIP"];
+
+/**
+ * 上限口径与后端 project_files.py 的常量一一对应（_MAX_UPLOAD_BYTES 等）。
+ * 两处不一致的后果是用户先撞墙、再被告知限制，所以这里写的是服务端的真实数字。
+ */
+const LIMITS = [
+  "单个文件 ≤ 512 MiB",
+  "单次合计 ≤ 1 GiB，最多 100 个文件",
+  "ZIP ≤ 128 MiB，成员 ≤ 500 个、解压后 ≤ 512 MiB",
+];
+
+const ROLE_RULE =
+  "角色按扩展名推断：xls / xlsx / xlsm / ods → 清单，dwg / dxf / vsd / vsdx → 图纸，";
 
 const TIER_OPTIONS: { value: ParseTier; label: string }[] = [
   { value: "flash", label: "flash · 最快" },
@@ -42,13 +71,39 @@ export interface UploadOptionsState {
   role: FileRole | "";
 }
 
+/** 一批已提交的文件和它最后的下场；提交后保留在这里给用户逐个确认。 */
+interface BatchRow {
+  file: File;
+  outcome: UploadOutcome;
+}
+
+const OUTCOME_LABEL: Record<UploadOutcome["state"], string> = {
+  added: "已入库",
+  skipped: "被拒",
+  unknown: "未入库",
+};
+
+const OUTCOME_CLASS: Record<UploadOutcome["state"], string> = {
+  added: "text-emerald-700",
+  skipped: "text-rose-700",
+  unknown: "text-slate-500",
+};
+
 interface Props {
   busy: boolean;
-  onUpload: (files: File[], archive: File | null, options: UploadOptionsState) => Promise<void>;
+  /** 返回服务端的汇总结果：交件台要拿它把结论摊回每一行。 */
+  onUpload: (
+    files: File[],
+    archive: File | null,
+    options: UploadOptionsState,
+    onProgress: (ratio: number) => void,
+  ) => Promise<UploadResult>;
 }
 
 export function UploadPanel({ busy, onUpload }: Props) {
   const [staged, setStaged] = useState<File[]>([]);
+  const [batch, setBatch] = useState<BatchRow[] | null>(null);
+  const [ratio, setRatio] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const [options, setOptions] = useState<UploadOptionsState>({
     tier: "standard",
@@ -68,15 +123,38 @@ export function UploadPanel({ busy, onUpload }: Props) {
       }
     }
     setStaged(next);
+    setBatch(null);
+  };
+
+  const reset = () => {
+    setBatch(null);
+    setStaged([]);
+    setRatio(null);
+    if (inputRef.current) inputRef.current.value = "";
   };
 
   const submit = async () => {
     if (staged.length === 0 || busy) return;
-    const archive = staged.find((file) => file.name.toLowerCase().endsWith(".zip")) ?? null;
-    const files = staged.filter((file) => file !== archive);
-    await onUpload(files, archive, options);
-    setStaged([]);
-    if (inputRef.current) inputRef.current.value = "";
+    const pending = staged;
+    const archive = pending.find((file) => file.name.toLowerCase().endsWith(".zip")) ?? null;
+    const files = pending.filter((file) => file !== archive);
+    setRatio(0);
+    try {
+      const result = await onUpload(files, archive, options, setRatio);
+      setBatch(pending.map((file) => ({ file, outcome: outcomeOf(file.name, result) })));
+      setStaged([]);
+      if (inputRef.current) inputRef.current.value = "";
+    } catch (caught: unknown) {
+      // 整批都没入库时后端仍会回逐文件原因，摊回每一行；其余错误由页面顶部的横幅承接。
+      if (caught instanceof UploadRejectedError) {
+        const rejected: UploadResult = { added: [], jobs: [], skipped: caught.skipped };
+        setBatch(pending.map((file) => ({ file, outcome: outcomeOf(file.name, rejected) })));
+        setStaged([]);
+        if (inputRef.current) inputRef.current.value = "";
+      }
+    } finally {
+      setRatio(null);
+    }
   };
 
   return (
@@ -92,55 +170,79 @@ export function UploadPanel({ busy, onUpload }: Props) {
           setDragging(false);
           stage(event.dataTransfer.files);
         }}
-        className={"flex items-stretch " + (dragging ? "bg-amber-50" : "bg-white")}
+        className={"flex min-h-[208px] items-stretch " + (dragging ? "bg-amber-50" : "bg-white")}
       >
-        <div aria-hidden className={"w-[4px] shrink-0 " + (dragging ? "bg-amber-500" : "bg-amber-400")} />
+        <div
+          aria-hidden
+          className={"w-[4px] shrink-0 " + (dragging ? "bg-amber-500" : "bg-amber-400")}
+        />
         <div
           className={
-            "flex flex-1 flex-wrap items-center gap-x-6 gap-y-4 px-5 py-5 " +
+            "flex flex-1 flex-col gap-y-5 px-6 py-6 lg:flex-row lg:gap-x-10 " +
             (dragging ? "outline-2 -outline-offset-2 outline-dashed outline-amber-400" : "")
           }
         >
           <div className="min-w-0 flex-1">
-            <p className="text-[11px] tracking-[0.18em] text-slate-400 uppercase">交件台</p>
-            <p className="mt-1.5 font-serif text-[19px] leading-7 text-slate-900">
+            <p className={EYEBROW_CLASS}>01 · 交件台</p>
+            <p className="mt-2 font-serif text-[22px] leading-8 text-slate-900">
               {dragging ? "松手即入库" : "把招标文件拖到这里"}
             </p>
-            <p className="mt-1.5 text-[13px] leading-5 text-slate-500">
-              ZIP 会自动解开；清单与图纸按角色归档、不参与文本解析。单次最多 100 个文件，
-              合计不超过 1 GiB。
+            <p className="mt-2 max-w-xl text-[13px] leading-5 text-slate-500">
+              ZIP 会自动解开、按成员逐个入库。只有 PDF 与 Word / PPT 会进入「转换 → 解析 → 抽取」这条
+              流水线；清单与图纸入库备查，不参与文本解析。
             </p>
-            <ul className="mt-2.5 flex flex-wrap items-center gap-1.5">
+            <ul className="mt-3 flex flex-wrap items-center gap-1.5">
               {FORMATS.map((format) => (
                 <li
                   key={format}
-                  className={DATA_CLASS + " border border-slate-200 px-1.5 py-[1px] text-[11px] text-slate-500"}
+                  className={
+                    DATA_CLASS + " border border-slate-200 px-1.5 py-[1px] text-[11px] text-slate-500"
+                  }
                 >
                   {format}
                 </li>
               ))}
             </ul>
           </div>
-          <div className="flex items-center gap-2">
-            <input
-              ref={inputRef}
-              type="file"
-              multiple
-              accept={ACCEPT}
-              className="hidden"
-              onChange={(event) => stage(event.target.files)}
-            />
-            <button type="button" className={BUTTON_CLASS} onClick={() => inputRef.current?.click()}>
-              选择文件
-            </button>
-            <button
-              type="button"
-              className={PRIMARY_BUTTON_CLASS}
-              disabled={staged.length === 0 || busy}
-              onClick={() => void submit()}
-            >
-              {busy ? "正在上传…" : staged.length > 0 ? `上传 ${staged.length} 个文件` : "上传文件"}
-            </button>
+
+          {/*
+           * 右栏专门放「规则」：能传多大、ZIP 怎么算、角色怎么推断。
+           * 这些不是帮助文档——它们决定用户下一步怎么做，放在动作旁边才算说清楚。
+           */}
+          <div className="w-full shrink-0 lg:w-[23rem]">
+            <p className={EYEBROW_CLASS}>规格与角色</p>
+            <dl className="mt-2 flex flex-col gap-1.5 text-[13px] leading-5">
+              {LIMITS.map((line) => (
+                <dd key={line} className="flex gap-2 text-slate-500">
+                  <span aria-hidden className="mt-[7px] h-[4px] w-[4px] shrink-0 bg-slate-400" />
+                  <span>{line}</span>
+                </dd>
+              ))}
+            </dl>
+            <p className="mt-2 text-[13px] leading-5 text-slate-500">
+              {ROLE_RULE}其余 → 主文件。上传后可在文件清单里逐个改角色。
+            </p>
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <input
+                ref={inputRef}
+                type="file"
+                multiple
+                accept={ACCEPT}
+                className="hidden"
+                onChange={(event) => stage(event.target.files)}
+              />
+              <button type="button" className={BUTTON_CLASS} onClick={() => inputRef.current?.click()}>
+                选择文件
+              </button>
+              <button
+                type="button"
+                className={PRIMARY_BUTTON_CLASS}
+                disabled={staged.length === 0 || busy}
+                onClick={() => void submit()}
+              >
+                {busy ? "正在上传…" : staged.length > 0 ? `上传 ${staged.length} 个文件` : "上传文件"}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -203,25 +305,78 @@ export function UploadPanel({ busy, onUpload }: Props) {
       </div>
 
       {staged.length > 0 && (
-        <ul className="border-t border-slate-200">
-          {staged.map((file) => (
-            <li
-              key={file.name + file.size}
-              className="flex items-center gap-3 border-b border-slate-100 px-5 py-1.5 text-[13px] last:border-b-0"
-            >
-              <span className="min-w-0 flex-1 truncate text-slate-700">{file.name}</span>
-              <span className={DATA_CLASS + " text-slate-500"}>{formatBytes(file.size)}</span>
-              <button
-                type="button"
-                className="text-slate-400 hover:text-rose-600"
-                aria-label={"移除 " + file.name}
-                onClick={() => setStaged(staged.filter((item) => item !== file))}
+        <div className="border-t border-slate-200">
+          {ratio !== null && (
+            <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 bg-slate-50 px-5 py-2 text-[13px] text-slate-600">
+              <span>正在上传</span>
+              <progress
+                className="h-1.5 w-48"
+                value={ratio}
+                max={1}
+                aria-label="上传进度"
+              />
+              <span className={DATA_CLASS}>{Math.round(ratio * 100)}%</span>
+              {/* 进度条只走到「字节发完」为止；入库、建版本、派任务都在服务端，还要等一会儿 */}
+              <span className="text-slate-400">传完还要在服务端逐个入库，请稍等</span>
+            </div>
+          )}
+          <ul>
+            {staged.map((file) => (
+              <li
+                key={file.name + "|" + file.size}
+                className="flex items-center gap-3 border-b border-slate-100 px-5 py-1.5 text-[13px] last:border-b-0"
               >
-                移除
-              </button>
-            </li>
-          ))}
-        </ul>
+                <span className="min-w-0 flex-1 truncate text-slate-700">{file.name}</span>
+                <span className={DATA_CLASS + " text-slate-500"}>{formatBytes(file.size)}</span>
+                <span className="w-16 text-right text-slate-400">
+                  {ratio === null ? "待上传" : "上传中"}
+                </span>
+                <button
+                  type="button"
+                  className="text-slate-400 hover:text-rose-600"
+                  aria-label={"移除 " + file.name}
+                  onClick={() => setStaged(staged.filter((item) => item !== file))}
+                >
+                  移除
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {batch !== null && (
+        <div className="border-t border-slate-200">
+          <div className="flex items-center gap-3 border-b border-slate-100 bg-slate-50 px-5 py-2 text-[13px]">
+            <span className="text-slate-600">上次提交</span>
+            <span className="text-slate-400">
+              入库 {batch.filter((row) => row.outcome.state === "added").length} 个，
+              未入库 {batch.filter((row) => row.outcome.state !== "added").length} 个
+            </span>
+            <button type="button" className="ml-auto text-slate-500 hover:text-slate-900" onClick={reset}>
+              清空
+            </button>
+          </div>
+          <ul>
+            {batch.map(({ file, outcome }) => (
+              <li
+                key={file.name + "|" + file.size}
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-slate-100 px-5 py-2 text-[13px] last:border-b-0"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-slate-700">{file.name}</span>
+                  {outcome.reason !== undefined && (
+                    <span className="mt-0.5 block text-rose-700">{outcome.reason}</span>
+                  )}
+                </span>
+                <span className={DATA_CLASS + " shrink-0 text-slate-500"}>{formatBytes(file.size)}</span>
+                <span className={"w-14 shrink-0 text-right " + OUTCOME_CLASS[outcome.state]}>
+                  {OUTCOME_LABEL[outcome.state]}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </section>
   );

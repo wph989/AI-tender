@@ -598,7 +598,7 @@ Next 16 判为跨源而拒绝 `/_next` 下的开发资源，页面只出 SSR 的
 - **`OutlineNav` 在 outline 为空时整块不渲染**（不占 236px 白跑一栏）。样本 docx 目前就属于这种，
   所以真实数据下工作台看不到左栏——这是有意为之，不是没实现。
 
-### 21.9 第二段待办（等用户看截图确认方向后再推）
+### 21.9 第二段待办（等用户看截图确认方向后再推）——已在第 22 节落地
 
 `ProjectList` 通栏卷宗清单（列头 + 行高 56px + `/` 聚焦搜索）、`UploadPanel` 拖拽区加高并写明
 支持格式/ZIP/上限/角色推断规则、逐文件上传进度、`settings/models` 与 `settings/config`
@@ -633,3 +633,94 @@ apps/api:  ruff check / ruff format --check / lint-imports → 通过
 验证：`pnpm typecheck` / `pnpm test`（66 passed）/ `pnpm build`（7 路由）、`pytest`（257 passed, 2 skipped）、
 `ruff check` / `ruff format --check` / `lint-imports` 全绿；另用 `TestClient` 对真实库跑了一遍 `GET /projects` 与
 `GET /projects/1`，确认新 SQL 与 `parse_tier` / `parse_ocr_mode` 的返回值。
+
+## 22. 前端「校对台 v2」第二段：列表 / 文件页 / 交件台 / 设置页（2026-10-01 深夜）
+
+### 22.1 一眼结论
+
+第一段把工作台做成了「校对台」，但列表页与设置页还停在第一轮的窄列形态：`ProjectList` 是居中窄表、
+`settings/*` 是 900px 窄列、交件台没说清规格也没有进度。第二段把这四处补齐，
+顺带把「卷宗脊」从装饰变成信息——为此 `GET /projects` 补了两个字段，这是本轮唯一的后端改动，也是最值得记的一条。
+
+### 22.2 落地内容
+
+| 位置 | 之前 | 现在 |
+| --- | --- | --- |
+| `ProjectList` | 居中窄表、无列头、搜索要等列表出来 | 通栏卷宗清单：列头（项目号 / 项目 / 文件 / 待复核 / 最近活动）、行高 56px、
+页头常驻搜索 + `/` 聚焦（焦点已在输入框内时放行，项目编号里的斜杠不会被吃掉） |
+| 卷宗脊 | 3 色：待复核 / 空项目 / 没有待办 | 4 色，取该项目「最紧急」的一件事：
+**有失败**（rose-600）→ **有待复核**（amber-400）→ **空项目**（slate-300）→ **没有待办**（slate-900）。
+图例常驻，脊上另有 `title` 说明（4px 的东西不配文字，色觉障碍用户就只能猜） |
+| `ProjectFiles` | 交件台与清单挤在一起，「没有入库的文件」另起一块 | 分成 `01 · 交件台` 与 `02 · 文件清单` 两个分区；
+被拒原因移交交件台的逐行结果承担——同一件事不在两处各写一遍 |
+| `UploadPanel` | 一个矮拖拽区 + 一行说明 | 拖拽区 `min-h-[208px]`；右栏「规格与角色」写明支持格式 / ZIP 规则 / 
+单次上限 / 角色推断规则（与后端 `_infer_role` 一致）；staged 列表区分「待上传 / 上传中」，
+`<progress>` 出逐文件进度；提交后逐行给「已入库 / 被拒 + 原因 / 未入库」 |
+| `settings/models` · `settings/config` | 900px 窄列；内联编辑表单标签在上、输入框在下 | 撑满宽页，
+≥1536px 时 2-up（`SETTINGS_GRID_CLASS`）；内联编辑表单改为标签左对齐定宽（`FORM_ROW_CLASS`） |
+| `PageShell` | 面包屑只有工作台 | `设置 ▸ 模型管理`、`设置 ▸ 配置中心` 也补上 |
+
+### 22.3 后端：`GET /projects` 补两个字段（不是新端点，未改数据模型）
+
+`apps/api/src/tender/api/projects.py` 的 `list_projects`：
+
+- **`last_activity_at`** = `GREATEST(p.created_at, agg.last_file_at, act.last_job_at)`，
+排序随之改成 `ORDER BY last_activity_at DESC, p.id DESC`——这一列既然摆在行里，排序就得跟着它走，
+否则用户按那一列找「谁刚动过」时会以为排序坏了。新增的 `job` 聚合子查询按 `company_id` 收窄：
+`job` 上没有 `company_id`，不圈定范围的话每次刷新列表都会把全部公司的任务整表聚合一遍。
+- **`failed_count`**：项目下「解析失败或抽取失败」的文件数，由两个 `LEFT JOIN LATERAL`
+（最近一次 `parse_run.status` / 最近一次 `stage = 'extracting'` 的 `job.status`）算出来。
+
+**为什么非要 `failed_count`**：卷宗脊原本只有「待复核 / 空项目 / 没有待办」三色，于是
+**解析挂掉的项目会显示为「没有待办」**（用户手上那个 `111` 正是这样，`parse_status = failed`）。
+列表页最该报警的一种，被画成了最安全的一种。已用 curl 核对：项目 2 返回 `failed_count: 1`，项目 1 返回 `0`。
+
+### 22.4 上传进度：从 `fetch` 换成 XHR
+
+`uploadProjectFiles` 改用 `XMLHttpRequest`（第 5 个参数 `onProgress`），因为 `fetch` 至今没有
+请求体上传进度事件（只有响应体的 `ReadableStream`），而交件台要回答的正是「这一份传到哪儿了」。
+其余请求仍走 `fetch`。同时新增 `UploadRejectedError` + `skippedFromBody`，把后端
+`error.detail.skipped` 摊开成逐文件结果；`lib/projects/upload.ts` 的 `outcomeOf` 负责
+「已入库 / 被拒 + 原因 / 未入库」三分（ZIP 特判：只要有成员入库就算成功）。
+
+### 22.5 顺带补掉一处同族缺陷：工作台的「重新解析」不再静默降档
+
+第 21.11 节修掉了文件清单页的降档（`GET /projects/{id}` 的 `files[]` 补 `parse_tier` / `parse_ocr_mode`），
+但工作台那条路没修：`DocumentWorkbench` 的 `handleReparse` 把 `ocrMode` 写死成 `"auto"`，
+因为它拿到的 `GET /versions/{vid}` 不带 OCR 模式。也就是说，一个按 `ocr` 解析的文件在结果面板点
+「重新解析」，会被静默降回 `auto`。本轮给 `parse_runs[]` 补了 `ocr_mode`
+（`config_snapshot ->> 'ocr_mode'`），工作台改为 `data?.parseOcrMode ?? "auto"`，
+两条路现在口径一致：重新解析 = 「把这一次修好」，不是顺手换档。
+### 22.6 本轮验证命令与结果
+
+```
+apps/web:  pnpm typecheck   → 通过
+apps/web:  pnpm test        → 71 passed（12 个文件；原 66）
+apps/web:  pnpm build       → 成功，7 条路由
+apps/api:  pytest -q        → 257 passed, 2 skipped
+apps/api:  ruff check / ruff format --check / lint-imports → 通过（5 个契约）
+apps/api:  curl GET /projects?limit=3 → 含 last_activity_at 与 failed_count，且按 last_activity_at 倒序
+apps/api:  curl GET /versions/1 → parse_runs[0].ocr_mode = "auto"（新字段，工作台的重新解析沿用）
+```
+
+### 22.7 目视验收（1600×1000，`localhost:4400`，无 `--virtual-time-budget`）
+
+| 页面 | 截图 | 结论 |
+| --- | --- | --- |
+| `/projects` | `.tmp/s2-projects-v2.png` | 通栏、列头、4 色图例；`111`（解析失败）脊为印泥红、`启动自检` 脊为荧光黄；无中间窄带 |
+| `/projects/1/files` | `.tmp/s2-files.png` | 交件台加高 + 右栏规格；`02 · 文件清单` 分区 |
+| `/settings/models` | `.tmp/s2-models.png` | 面包屑 + 供应商面板通栏 + 模型表与功能绑定表 2-up |
+| `/settings/config` | `.tmp/s2-config.png` | 面包屑 + 3fr/2fr 撑满，无中间窄带 |
+| `/projects/1?file=1`（有结果） | `.tmp/s2-workbench.png` | 复核进度条 + 两档开关 + 原文角标 ①② + 键盘提示 |
+| `/projects/1?file=1`（抽取失败） | `.tmp/s2-workbench-failed.png` | 错误码 + 消息 + **主按钮「重跑抽取」** + 次按钮「重新解析」+ 「配置供应商与模型」 |
+
+抽取失败态在当前样本数据上复现不出来（项目 1 抽取已跑通、项目 2 是解析失败），
+用 `.tmp/cdp-shot2.mjs` + `.tmp/inject-extract-fail.js` 截图：页面加载前包装 `window.fetch`，
+只替换 `GET /versions/1` 与 `/versions/1/extractions` 两个响应体，其余请求走真实接口，
+不改数据库也不改代码。
+
+### 22.8 仍未落地
+
+- 水印与下载权限（未完成项，非本轮范围）。
+- `/review` 路由：复核队列做在工作台内，用户已确认的取舍，路由矩阵不变。
+- `POST /versions/{vid}/extract` 会作废同字段的已确认结果（审查 P1，待产品决策，见第 21.11 节）。

@@ -20,7 +20,14 @@ import {
 import { formatTime, message, testLabel } from "@/lib/llm/format";
 import type { LlmProvider, LlmTestResult, ProviderInput, ProviderPatchInput } from "@/types/llm";
 
-import { BUTTON_CLASS, DANGER_BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS } from "./ui";
+import {
+  BUTTON_CLASS,
+  DANGER_BUTTON_CLASS,
+  FORM_LABEL_CLASS,
+  FORM_ROW_CLASS,
+  INPUT_CLASS,
+  PRIMARY_BUTTON_CLASS,
+} from "./ui";
 
 interface Props {
   providers: LlmProvider[];
@@ -334,9 +341,9 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
   };
 
   return (
-    <div className="flex flex-wrap items-end gap-3 border border-slate-200 bg-slate-50 px-4 py-3.5">
-      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
-        名称
+    <div className="flex flex-col gap-3 border border-slate-200 bg-slate-50 px-5 py-4">
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>名称</span>
         <input
           className={INPUT_CLASS}
           value={name}
@@ -344,8 +351,8 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
           placeholder="如 内网网关"
         />
       </label>
-      <label className="flex min-w-64 flex-1 flex-col gap-1 text-[13px] text-slate-600">
-        Base URL
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>Base URL</span>
         <input
           className={INPUT_CLASS}
           value={baseUrl}
@@ -353,8 +360,8 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
           placeholder="https://gateway.example/v1"
         />
       </label>
-      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
-        API Key
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>API Key</span>
         <input
           type="password"
           className={INPUT_CLASS}
@@ -363,43 +370,50 @@ function ProviderForm({ provider, busy, onSubmit, onCancel }: FormProps) {
           placeholder={provider === null ? "可留空，用 .env 的 LLM_API_KEY" : "留空保持不变"}
         />
       </label>
-      <label className="flex items-center gap-1 text-[13px] text-slate-600">
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>启用</span>
         <input
           type="checkbox"
+          className="justify-self-start"
           checked={enabled}
           onChange={(event) => setEnabled(event.target.checked)}
         />
-        启用
       </label>
       {provider !== null && (
-        <label className="flex items-center gap-1 text-[13px] text-slate-600">
+        <label className={FORM_ROW_CLASS}>
+          <span className={FORM_LABEL_CLASS}>清除已存密钥</span>
           <input
             type="checkbox"
+            className="justify-self-start"
             checked={clearKey}
             onChange={(event) => setClearKey(event.target.checked)}
           />
-          清除已存密钥
         </label>
       )}
-      <div className="flex gap-2">
-        <button
-          type="button"
-          className={PRIMARY_BUTTON_CLASS}
-          disabled={busy || name.trim() === "" || baseUrl.trim() === ""}
-          onClick={submit}
-        >
-          保存
-        </button>
-        <button type="button" className={BUTTON_CLASS} disabled={busy} onClick={onCancel}>
-          取消
-        </button>
+      <div className={FORM_ROW_CLASS}>
+        <span />
+        <div className="flex gap-2">
+          <button
+            type="button"
+            className={PRIMARY_BUTTON_CLASS}
+            disabled={busy || name.trim() === "" || baseUrl.trim() === ""}
+            onClick={submit}
+          >
+            保存
+          </button>
+          <button type="button" className={BUTTON_CLASS} disabled={busy} onClick={onCancel}>
+            取消
+          </button>
+        </div>
       </div>
       {provider !== null && (
-        <p className="w-full text-[13px] text-slate-500">
-          当前密钥：
-          {provider.has_api_key ? "****" + (provider.api_key_hint ?? "") : "未配置"}
-          ；保存后写入加密密文，页面不再回显。
-        </p>
+        <div className={FORM_ROW_CLASS}>
+          <span className={FORM_LABEL_CLASS}>当前密钥</span>
+          <span className="text-[13px] leading-5 text-slate-500">
+            {provider.has_api_key ? "****" + (provider.api_key_hint ?? "") : "未配置"}
+            ；保存后写入加密密文，页面不再回显。
+          </span>
+        </div>
       )}
     </div>
   );

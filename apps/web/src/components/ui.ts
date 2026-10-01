@@ -72,3 +72,23 @@ export const SECTION_TITLE_CLASS = "font-serif text-[19px] leading-[28px] text-s
  * 右栏宽度一变，左边原文的可用宽度就跟着跳，所以这个数字只能有一处定义。
  */
 export const RESULT_PANEL_WIDTH = "w-[460px]";
+
+/**
+ * 表单行：标签在左、定宽对齐，控件在右撑满。
+ *
+ * 为什么不用「标签在上」：设置页一屏十几行字段，标签压在上面时每行都要占两行高，
+ * 输入框的左边缘还各不相同；标签左对齐定宽之后，眼睛沿着一条竖线往下扫就够了。
+ */
+export const FORM_ROW_CLASS =
+  "grid grid-cols-[7.5rem_minmax(0,1fr)] items-center gap-x-4 gap-y-2";
+
+/** 表单行的标签格：浅一档的灰。它是路牌，不是内容。 */
+export const FORM_LABEL_CLASS = "text-[13px] leading-5 text-slate-500";
+
+/**
+ * 设置页在超宽屏（≥1536px）的双列网格。
+ *
+ * 为什么落在 2xl 而不是 lg：这一层是给 1600px 的桌面屏准备的，1400px 的笔记本上
+ * 强行分两栏会把表格挤成竖排——那比通栏更难读。
+ */
+export const SETTINGS_GRID_CLASS = "grid gap-7 2xl:grid-cols-2";

@@ -25,6 +25,7 @@ import {
   BUTTON_CLASS,
   DATA_CLASS,
   DANGER_GHOST_BUTTON_CLASS,
+  EYEBROW_CLASS,
   GHOST_BUTTON_CLASS,
   PRIMARY_BUTTON_CLASS,
   SECTION_TITLE_CLASS,
@@ -85,8 +86,7 @@ export function ProjectFiles({ projectId }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [lastResult, setLastResult] = useState<UploadResult | null>(null);
-  const [busyFileId, setBusyFileId] = useState<number | null>(null);
+ const [busyFileId, setBusyFileId] = useState<number | null>(null);
   const [reparseTarget, setReparseTarget] = useState<ReparseTarget | null>(null);
   const timer = useRef<number | null>(null);
 
@@ -120,11 +120,18 @@ export function ProjectFiles({ projectId }: Props) {
     };
   }, [inFlight, reload]);
 
+  /**
+   * 上传一批文件。
+   *
+   * 出错时既挂横幅、也继续往外抛：横幅是页面级的「这次操作失败了」，交件台还要用这份错误
+   * 把逐文件原因摊回对应的行（整批都被拒时，后端把原因放在 error.detail.skipped 里）。
+   */
   const handleUpload = async (
     files: File[],
     archive: File | null,
     options: UploadOptionsState,
-  ) => {
+    onProgress: (ratio: number) => void,
+  ): Promise<UploadResult> => {
     setBusy(true);
     setNotice(null);
     try {
@@ -138,16 +145,18 @@ export function ProjectFiles({ projectId }: Props) {
           role: options.role === "" ? null : options.role,
         },
         archive,
+        onProgress,
       );
-      setLastResult(result);
       setNotice(
         options.autoParse
           ? `已入库 ${result.added.length} 个文件，正在转换与解析…`
           : `已入库 ${result.added.length} 个文件（未自动解析）`,
       );
       await reload();
+      return result;
     } catch (caught: unknown) {
       setError(caught instanceof Error ? caught.message : "上传失败");
+      throw caught;
     } finally {
       setBusy(false);
     }
@@ -330,25 +339,8 @@ export function ProjectFiles({ projectId }: Props) {
 
       <UploadPanel busy={busy} onUpload={handleUpload} />
 
-      {lastResult !== null && lastResult.skipped.length > 0 && (
-        <section className="border border-rose-200 bg-white">
-          <div aria-hidden className="h-[3px] bg-rose-500" />
-          <div className="px-5 py-4">
-            <h2 className={SECTION_TITLE_CLASS}>没有入库的文件</h2>
-            <p className="mt-1 text-[13px] text-slate-500">
-              这些文件被服务端拒收，需要换格式或改内容后重新上传。
-            </p>
-            <ul className="mt-3 flex flex-col gap-1">
-              {lastResult.skipped.map((item) => (
-                <li key={item.name} className="text-[13px] text-slate-600">
-                  <span className="text-slate-900">{item.name}</span>
-                  <span className="ml-2 text-rose-700">{item.reason}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </section>
-      )}
+      {/* 被拒文件的原因由交件台的逐行结果承接（见 UploadPanel）：同一份信息不写两处，
+          否则两边的名单迟早对不上。 */}
 
       {project === null && <p className="text-[14px] text-slate-500">正在加载文件清单…</p>}
 
@@ -363,11 +355,14 @@ export function ProjectFiles({ projectId }: Props) {
 
       {files.length > 0 && (
         <section className="border border-slate-200 bg-white">
-          <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-slate-200 px-4 py-2.5">
-            <h2 className="text-[14px] font-medium text-slate-700">文件清单</h2>
-            <span className={DATA_CLASS + " text-[13px] text-slate-400"}>{files.length} 个</span>
+          <header className="flex flex-wrap items-end gap-x-4 gap-y-2 border-b border-slate-200 px-5 py-3">
+            <div>
+              <p className={EYEBROW_CLASS}>02 · 文件清单</p>
+              <h2 className={SECTION_TITLE_CLASS + " mt-1"}>文件清单</h2>
+            </div>
+            <span className={DATA_CLASS + " pb-0.5 text-[13px] text-slate-400"}>{files.length} 个</span>
             {/* 图例放在流水线旁边，而不是页脚：读者看到色块的那一刻就能查到它什么意思 */}
-            <ul className="ml-auto flex items-center gap-3 text-[13px] text-slate-400">
+            <ul className="ml-auto flex items-center gap-3 pb-0.5 text-[13px] text-slate-400">
               {(
                 [
                   ["idle", "未开始"],
@@ -384,7 +379,7 @@ export function ProjectFiles({ projectId }: Props) {
             </ul>
           </header>
 
-          <div className="hidden grid-cols-[minmax(0,1fr)_15rem_5.5rem_21rem] items-center gap-x-5 border-b border-slate-100 px-4 py-1.5 text-[13px] text-slate-400 lg:grid">
+          <div className="hidden grid-cols-[minmax(0,1fr)_15rem_5.5rem_21rem] items-center gap-x-5 border-b border-slate-100 px-5 py-1.5 text-[13px] text-slate-400 lg:grid">
             <span>文件</span>
             <span>流水线</span>
             <span className="text-right">待复核</span>
@@ -401,7 +396,7 @@ export function ProjectFiles({ projectId }: Props) {
                   key={file.project_file_id}
                   className="border-b border-slate-100 last:border-b-0 hover:bg-slate-50/70"
                 >
-                  <div className="relative flex flex-col gap-y-3 px-4 py-3.5 lg:grid lg:grid-cols-[minmax(0,1fr)_15rem_5.5rem_21rem] lg:items-center lg:gap-x-5">
+                  <div className="relative flex flex-col gap-y-3 px-5 py-3.5 lg:grid lg:grid-cols-[minmax(0,1fr)_15rem_5.5rem_21rem] lg:items-center lg:gap-x-5">
                     <span
                       aria-hidden
                       className={

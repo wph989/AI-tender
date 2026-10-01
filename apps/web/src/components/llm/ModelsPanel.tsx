@@ -19,7 +19,15 @@ import type {
   ModelPatchInput,
 } from "@/types/llm";
 
-import { BUTTON_CLASS, DANGER_BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS, SELECT_CLASS } from "./ui";
+import {
+  BUTTON_CLASS,
+  DANGER_BUTTON_CLASS,
+  FORM_LABEL_CLASS,
+  FORM_ROW_CLASS,
+  INPUT_CLASS,
+  PRIMARY_BUTTON_CLASS,
+  SELECT_CLASS,
+} from "./ui";
 
 interface Props {
   providers: LlmProvider[];
@@ -280,11 +288,11 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
   };
 
   return (
-    <div className="flex flex-wrap items-end gap-3 border border-slate-200 bg-slate-50 px-4 py-3.5">
+    <div className="flex flex-col gap-3 border border-slate-200 bg-slate-50 px-5 py-4">
       {model === null ? (
         <>
-          <label className="flex flex-col gap-1 text-[13px] text-slate-600">
-            供应商
+          <label className={FORM_ROW_CLASS}>
+            <span className={FORM_LABEL_CLASS}>供应商</span>
             <select
               className={SELECT_CLASS}
               value={providerId}
@@ -298,8 +306,8 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
               ))}
             </select>
           </label>
-          <label className="flex flex-col gap-1 text-[13px] text-slate-600">
-            模型 ID
+          <label className={FORM_ROW_CLASS}>
+            <span className={FORM_LABEL_CLASS}>模型 ID</span>
             <input
               className={INPUT_CLASS}
               value={modelId}
@@ -309,12 +317,15 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           </label>
         </>
       ) : (
-        <span className="text-[13px] text-slate-500">
-          供应商：{model.provider_name ?? "—"}（模型 ID {model.model_id} 不可改）
-        </span>
+        <div className={FORM_ROW_CLASS}>
+          <span className={FORM_LABEL_CLASS}>供应商</span>
+          <span className="text-[13px] leading-5 text-slate-500">
+            {model.provider_name ?? "—"}（模型 ID {model.model_id} 不可改）
+          </span>
+        </div>
       )}
-      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
-        显示名称
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>显示名称</span>
         <input
           className={INPUT_CLASS}
           value={displayName}
@@ -322,8 +333,8 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           placeholder="留空则用模型 ID"
         />
       </label>
-      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
-        超时（秒）
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>超时（秒）</span>
         <input
           type="number"
           min={1}
@@ -334,8 +345,8 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           placeholder="90"
         />
       </label>
-      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
-        温度
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>温度</span>
         <input
           type="number"
           min={0}
@@ -347,8 +358,8 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           placeholder="默认"
         />
       </label>
-      <label className="flex flex-col gap-1 text-[13px] text-slate-600">
-        max tokens
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>max tokens</span>
         <input
           type="number"
           min={1}
@@ -358,30 +369,34 @@ function ModelForm({ providers, model, busy, onSubmit, onCancel }: FormProps) {
           placeholder="默认"
         />
       </label>
-      <label className="flex items-center gap-1 text-[13px] text-slate-600">
+      <label className={FORM_ROW_CLASS}>
+        <span className={FORM_LABEL_CLASS}>启用</span>
         <input
           type="checkbox"
+          className="justify-self-start"
           checked={enabled}
           onChange={(event) => setEnabled(event.target.checked)}
         />
-        启用
       </label>
-      <div className="flex gap-2">
-        <button
-          type="button"
-          className={PRIMARY_BUTTON_CLASS}
-          disabled={
-            busy ||
-            providerId === 0 ||
-            (model === null && modelId.trim() === "")
-          }
-          onClick={submit}
-        >
-          保存
-        </button>
-        <button type="button" className={BUTTON_CLASS} disabled={busy} onClick={onCancel}>
-          取消
-        </button>
+      <div className={FORM_ROW_CLASS}>
+        <span />
+        <div className="flex gap-2">
+          <button
+            type="button"
+            className={PRIMARY_BUTTON_CLASS}
+            disabled={
+              busy ||
+              providerId === 0 ||
+              (model === null && modelId.trim() === "")
+            }
+            onClick={submit}
+          >
+            保存
+          </button>
+          <button type="button" className={BUTTON_CLASS} disabled={busy} onClick={onCancel}>
+            取消
+          </button>
+        </div>
       </div>
     </div>
   );

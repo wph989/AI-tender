@@ -105,6 +105,7 @@ export function ConfigCenter() {
 
   return (
     <PageShell
+      breadcrumb={[<span>设置</span>, <span className="text-slate-600">配置中心</span>]}
       eyebrow="设置 · 配置"
       title="配置中心"
       description="三层配置：L1 改完立即生效，L2/L3 先落成草稿，逐条确认影响清单过门禁后才激活。每次激活与回滚都会写进审计。"
@@ -161,6 +162,10 @@ export function ConfigCenter() {
       )}
 
       {state === "ready" && (
+        /*
+         * 两栏从 lg 起就成立（不像模型页要等到 2xl）：左边是配置项行，右边是版本与门禁，
+         * 右边那栏再宽也只是把一行说明拉长，反而是浪费；1600px 下 3:2 的分配刚好。
+         */
         <div className="grid gap-6 lg:grid-cols-[3fr_2fr]">
           <div className="flex flex-col gap-6">
             {LAYERS.map((layer) => (

@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { PageShell } from "@/components/PageShell";
-import { BUTTON_CLASS } from "@/components/ui";
+import { BUTTON_CLASS, SETTINGS_GRID_CLASS } from "@/components/ui";
 import { listFeatures, listModels, listProviders } from "@/lib/api/llm";
 import { message } from "@/lib/llm/format";
 import type { LlmFeature, LlmModel, LlmProvider } from "@/types/llm";
@@ -80,6 +80,7 @@ export function ModelSettings() {
 
   return (
     <PageShell
+      breadcrumb={[<span>设置</span>, <span className="text-slate-600">模型管理</span>]}
       eyebrow="设置 · 模型"
       title="模型管理"
       description="供应商、模型、功能绑定三者互相引用：模型属于供应商，功能绑定又指向模型。测试会真实发一次请求，用来判断这条链路到底通不通。"
@@ -112,11 +113,18 @@ export function ModelSettings() {
       )}
 
       {state === "ready" && (
-        <>
-          <ProvidersPanel providers={providers} onChanged={reload} />
+        /*
+         * 超宽屏（≥1536px）分两栏：供应商的表格要横跨一整行（Base URL 与四个行内动作），
+         * 模型表与功能绑定表并排——它们被压到 ~680px 时只会让「参数」「最近测试」两列折行，
+         * 仍然读得下去；而供应商表这样并排会连操作按钮都换行。
+         */
+        <div className={SETTINGS_GRID_CLASS}>
+          <div className="2xl:col-span-2">
+            <ProvidersPanel providers={providers} onChanged={reload} />
+          </div>
           <ModelsPanel providers={providers} models={models} onChanged={reload} />
           <FeatureBindingsPanel features={features} models={models} onChanged={reload} />
-        </>
+        </div>
       )}
     </PageShell>
   );
