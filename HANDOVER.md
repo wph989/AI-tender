@@ -97,8 +97,8 @@ Set-Location G:\aicode\AI-tender; uv run --project apps/api python scripts/make_
 
 尚未完成或实测：
 
-1. `scripts/verify_coords.py` 输出原点与旋转语义候选图；需用真实 MinerU `standard` 结果与同一 PDF 目视确认。Gotenberg 真实文档版式与 PDF Range 的 MinIO 联调也待用户部署服务。
-2. MiddleJson → `element` 结构归一化、锚点、标题父子关系和事务写入已实现。bbox 原点/旋转未实测前保持 `NULL`；确认后配置 `MINERU_BBOX_ORIGIN` 与 `MINERU_BBOX_ROTATION`。
+1. ~~`scripts/verify_coords.py` 输出原点与旋转语义候选图，需目视确认~~ ✅ 已实测（2026-10-01，见 §16 补记）：原点 `top_left`、旋转 `visual`。Gotenberg 真实转换与 MinIO 已联调通过。
+2. MiddleJson → `element` 结构归一化、锚点、标题父子关系和事务写入已实现，并已用真实 MinerU 结果跑通（3 页 PDF → 54 个元素）。bbox 取值已确认并写入 `apps/api/.env`。
 3. 阶段 1 全链路验收需要部署 PostgreSQL、MinIO、Redis、Gotenberg 与 MinerU。真实联调前不标记阶段验收完成。
 4. ~~LLM 管理模块缺 `cryptography`~~ ✅ 已解决（2026-09-28）：`uv lock` 已把 `cryptography 50.0.1` 写进 `uv.lock`，`uv sync` 已装入 `.venv`，`tests/unit/core/test_secrets.py` 的 6 条用例实跑通过。
 5. LLM 页面的真实连通性测试、拉取远端模型与降级链未实测，需要真实供应商凭证与已部署的 API。
@@ -127,9 +127,9 @@ Set-Location G:\aicode\AI-tender; uv run --project apps/api python scripts/make_
 - 检查：后端 `uv run ruff check`、`uv run lint-imports` 与坐标脚本 Ruff 检查通过；前端 `pnpm typecheck` 通过。未运行测试，未提交。
 - `process_file` 读取数据库 job 与项目文件记录，PDF 直通、Office 经 Gotenberg；按原件 SHA-256 与转换器版本复用版本，使用 pypdfium2 探测页面并幂等 upsert `page`，最后更新文件/job 并按快照排入 MinerU。
 - MinerU `poll_parse` 已补充重启后 `resubmitting` 的未知结果保护，MiddleJson 对象写入失败可重试。
-- 坐标诊断命令：`uv run --project apps/api python scripts/verify_coords.py <pdf> <middle.json> --page 1 --output-dir coord-check`。普通页输出 top-left/bottom-left 候选，旋转页另输出 visual/unrotated 候选；**真实方向仍未确认**。
+- 坐标诊断命令：`uv run --project apps/api python scripts/verify_coords.py <pdf> <middle.json> --page 1 --output-dir coord-check`。普通页输出 top-left/bottom-left 候选，旋转页另输出 visual/unrotated 候选；**真实方向已于 2026-10-01 实测确认**（见 §16 补记）。
 - 新增 `application/middle_json.py`：校验页与块结构、按页生成 `p{page}b{block}`、生成标题父子关系，并在单个事务内写入元素。页眉页脚只留在原始 MiddleJson 存档中。
-- `MINERU_BBOX_ORIGIN` 与 `MINERU_BBOX_ROTATION` 默认 `unknown`；原点或旋转方向未确认时不写 bbox，防止错误定位。完成诊断后分别配置 `top_left|bottom_left` 与 `visual|unrotated`。
+- `MINERU_BBOX_ORIGIN` 与 `MINERU_BBOX_ROTATION` 默认 `unknown`；原点或旋转方向未确认时不写 bbox，防止错误定位。**2026-10-01 已配置为 `top_left` / `visual`**（判据见 §16 补记）。
 - `docs/设计/05` §3.1 已改为当前项目批量上传接口；去重结果在异步预处理完成后通过 job 查询，不在上传响应中提前承诺。
 ## 11. 当前实现补记（2026-09-28）：LLM 管理模块
 
@@ -237,7 +237,7 @@ Set-Location G:\aicode\AI-tender; uv run --project apps/api python scripts/make_
   **未验证**：本机没有 Docker，镜像构建与 `docker compose config` 未执行，首次部署需实测。
 - 单服务交付：**`docker/gotenberg/docker-compose.yml`** 是「只跑 Gotenberg」的自包含编排（`build: .` + 同目录 Dockerfile +
   `fonts/`；端口/内存/请求预算/鉴权都走同目录 `.env`，照同目录 `.env.example` 抄），同样带 `gotenberg-lb`，所以 `--scale gotenberg=N` 的动态扩缩在这里也能用
-  （交付时要连同 `docker/gotenberg-lb/` 一起拷，它挂的是那个目录里的 nginx.conf）；全栈编排是仓库根 `docker-compose.yml`，共用同一个 Dockerfile。
+  （交付时只拷 `docker/gotenberg/` 一个目录，LB 的 nginx 配置已内联进编排文件）；全栈编排是仓库根 `docker-compose.yml`，共用同一个 Dockerfile。
 - **`docker-compose.deps.yml` 已合并进仓库根 `docker-compose.yml`（2026-10-01）**，两份文件不再需要手工同步：
   默认 `docker compose up -d` 只起依赖（postgres / redis / minio / minio-init / mineru），
   `docker compose --profile app up -d --build` 才把 migrate / api / worker / beat / web 也拉起来；建表（应用在宿主机跑时）走
@@ -246,7 +246,7 @@ Set-Location G:\aicode\AI-tender; uv run --project apps/api python scripts/make_
   `http://localhost:8100`，`MINERU_API_KEY` 也要与容器同名变量一致——不一致只会得到解析全 401，不会启动报错。
   没有 GPU 的机器加 `--scale mineru=0` 跳过它。
 - Gotenberg 扩副本（2026-10-01 补）：在 `docker/gotenberg/` 那侧跑 `docker compose --scale gotenberg=N`，副本入口是
-  **`gotenberg-lb`**（`docker/gotenberg-lb/nginx.conf`：nginx 1.27-alpine + Docker 内嵌 DNS，副本增删 5 秒内生效）。
+  **`gotenberg-lb`**（nginx 配置内联在 `docker/gotenberg/docker-compose.yml` 的 `configs` 里：nginx 1.27-alpine + Docker 内嵌 DNS，副本增删 5 秒内生效）。
   副本不再各自发布宿主端口（第二个副本 Bind `127.0.0.1:3000` 会失败），`GOTENBERG_URL` 始终指向入口，所以加副本不用改
   任何客户端配置；配套要调配置中心的 `convert.max_inflight`（在途上限）与内存预算（`副本数 × GOTENBERG_MEMORY`）。
   超时按三层配齐：客户端 `GOTENBERG_TIMEOUT_SECONDS` ≥ 服务端 `API_TIMEOUT`（两者默认 1800s）＜ LB 的
@@ -259,9 +259,22 @@ Set-Location G:\aicode\AI-tender; uv run --project apps/api python scripts/make_
 - **Gotenberg 移出仓库根 `docker-compose.yml`（2026-10-01 再次调整）**：转换是重资源服务，和 api / 数据库分机部署很常见，
   根编排因此只留依赖与本体（默认 `up` 起 postgres / redis / minio / minio-init / mineru，`--profile app` 再加
   api / worker / beat / migrate / web，共 10 个服务；`gotenberg` 与 `gotenberg-lb` 两段整体删除）。
-  Gotenberg 只用它自己那份 `docker/gotenberg/docker-compose.yml`（自带 `gotenberg-lb`，两个目录一起拷）。跨编排靠
+  Gotenberg 只用它自己那份 `docker/gotenberg/docker-compose.yml`（自带 `gotenberg-lb`，单文件自包含）。跨编排靠
   `GOTENBERG_URL`：api / worker 的默认值改为 `http://host.docker.internal:3000`，并给四个后端服务（共享锚点 `&api-base`）
   加了 `extra_hosts: host.docker.internal:host-gateway`——Linux 上这个域名不会自动解析，必须显式映射到宿主网关。
+- **Gotenberg 编排改为单文件自包含（2026-10-01 再补）**：LB 的 nginx 配置从 `docker/gotenberg-lb/nginx.conf` 内联进
+  `docker/gotenberg/docker-compose.yml` 的 `configs.content`，`docker/gotenberg-lb/` 目录随之删除。动因是实测：漏拷
+  挂载源时 Docker 会把挂载点当目录建出来，nginx 起不来且报错不直观——交付要拷的目录越少越不容易出错。
+  `--scale gotenberg=N` 的能力不受影响（nginx 仍靠 Docker 内嵌 DNS 解析服务名，副本增删 5 秒内生效）。
+  改内联配置时注意 `$$proxy_add_x_forwarded_for` 是 compose 的转义写法（compose 会把 `$xxx` 当变量插值），
+  别把 `$$` 退回成单个 `$`。
+- **Gotenberg 镜像构建：可选字体包与 apt 源（2026-10-01 再补）**：实测官方 `gotenberg:8` **自带 `curl` 与
+  `fonts-noto-cjk`**（apt 输出里只多出 `fonts-noto-cjk-extra` 134MB + `fonts-wqy-zenhei` 8MB）。内网 / 跨境网络下
+  这 142MB 能把构建拖到几十分钟（实测 1000+ 秒仍停在 `Get:1`），因此改为默认不装、用 `INSTALL_EXTRA_FONTS=1`
+  显式开启，并新增 `DEBIAN_MIRROR` 构建参数用于换源。`COPY fonts/` 同时提到 apt 之前，慢网络重试时不必重传
+  167MB 的自有字体。`docker/gotenberg/fonts/` 已放入宋体/黑体/仿宋/楷体/华文中宋/华文楷体/华文仿宋/华文细黑/
+  微软雅黑/等线/SimSun-ExtB/Times/Arial 共 16 个文件（商业字体不进版本库，`.gitignore` 已排除），
+  方正系列仍缺，若发现公文字体替换导致页数漂移再按该目录 README 的清单补。
 - **MinIO 钉版本 + `minio-init` 保留（2026-10-01）**：`minio/minio:latest` 换成 `${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}`
   （该版本是 2025-04-22 的社区版；2025-05-24 起官方把内置 Web 控制台标记为弃用并迁到单独的 object-browser 项目，
   LDAP / OIDC 登录也移出社区版，继续用 latest 会让 9001 白发布），`minio/mc` 同样钉到 `RELEASE.2025-08-13T08-35-41Z`。
@@ -270,3 +283,52 @@ Set-Location G:\aicode\AI-tender; uv run --project apps/api python scripts/make_
   只读写对象、不建桶（`adapters/s3.py`），删掉它首次上传就是 `NoSuchBucket`；版本化是「原件被误覆盖 / 误删还能找回」
   的兜底（对象键是内容哈希，正常不会覆盖）。它幂等、跑完即退，换成外部对象存储时用不到——在对方那边手工执行这两条
   命令即可（`.env.example` 的 MinIO 段已给出）。当时本机仍没有 Docker，镜像切换只做了静态检查，未实跑。
+
+
+## 18. 外部服务真实联调补记（2026-10-01）
+
+环境：远端 `172.29.199.222`（Gotenberg 在 `3456`、MinerU API 在 `8000`，Postgres / Redis / MinIO 同机）。
+本轮把阶段 1 的真实链路跑通了，并且**在真实服务上抓到两个适配器 bug**——都是「本机没有 Docker + 未实测」留下的。
+
+### 18.1 已联调通过
+
+- PostgreSQL 18.6（`postgres` / `ledger_admin`）：`alembic upgrade head` 建出 29 张表，`pg_trgm 1.6` 已装。
+- Redis 7.0.15、MinIO（桶 `ai-tender` + 版本化已建）。
+- Gotenberg 8.37.0：docx → PDF 真实转换成功（3 页、有文本层、中文字形正常，宋体生效）。
+- MinerU 4.0.7（`mineru-kit api-server`）：PDF → MiddleJson 成功，`standard` 档 3 页耗时约 134 s；
+  接着跑 MiddleJson → `element` 归一化，得到 54 个元素，锚点形如 `p1b1`。
+
+### 18.2 抓到的两个 bug（已修 + 已补回归）
+
+1. **`GET /version` 返回纯文本，不是 JSON**（`adapters/gotenberg.py`）。实测 8.37.0 回 `8.37.0`
+   （`Content-Type: text/plain`），而实现按 `{"version": ...}` 解析 → 版本永远读不出来，表现成
+   「转换一次都没成功，报的错却是版本读取失败」。现在两种形状都接受；形状完全不认识时仍然失败，
+   不降级成空值（`converter_version` 是溯源记录的一部分）。
+2. **上传响应的顶层 id 是 `id`，不是 `upload_id`**（`adapters/mineru.py`）。实测 `POST /v1/uploads`
+   返回 OpenAI 风格的 `id`（`upload_...`），调研文档记的是 `upload_id`。现在两个名字都认，都没有则报错。
+   顺带确认对得上的部分：`POST /v1/parse/jobs` 确实回 **202**；SHA-256 去重命中回 `status: completed`
+   并内嵌 `file.id`；`/v1/health` 顶层给 `version` 与 `features.output_formats`。
+   补了 `tests/unit/adapters/test_mineru.py`（此前 MinerU 适配器**一条测试都没有**）。
+
+### 18.3 两项 P0 实测结论（此前一直挂着「未验证」）
+
+- **bbox 原点 = `top_left`**：样本是「顶部一行 + 底部一行、中间大片留白」的单页 PDF，实测最上墨迹 0.0972，
+  `top_left` 预测 0.0940（差值即行高留白），`bottom_left` 预测 0.8890。
+- **旋转语义 = `visual`**：把单页设成 `/Rotate=90` 后提交，横排文字块的 bbox 变成
+  `[0.886, 0.115, 0.908, 0.238]`（落在右侧的纵长条），与视觉坐标系的预测一致。
+
+取值已写入 `apps/api/.env`；`docs/调研/01` §5、`docs/设计/03` §3.2、`docs/工程/07` §6 已同步。
+副带发现：那份 `/Rotate=90` 样本被 MinerU 判成了 `header`——旋转页的块分类可能不准，遇到旋转扫描件要抽检类型。
+
+### 18.4 仍未验证
+
+- 扫描件 OCR 质量（要真实扫描样本）。
+- Gotenberg 转换的页数一致性（要和原件页数对照；本轮只验证了「转换本身可用且中文正常」）。
+- LLM 抽取链路（还没有内网网关地址与凭证；`LLM_SECRET_KEYS` 已生成）。
+- 旋转页的块分类准确度（见 18.3 末尾）。
+
+### 18.5 MinerU 部署要点
+
+- 必须跑 `api-server` 入口：`webui`（7860）没有 `/v1/*` 那套端点，接不上。
+- 模型目录（`MINERU_HOME`）在 api-server 与 webui 之间**可以共用**（都是只读加载同一份权重）；
+  但**显存不能共用**，两个进程各加载一份，单卡同时跑两个要先看显存够不够。

@@ -222,12 +222,22 @@ MiddleJson
 | --- | --- |
 | schema 版本常量 `MIDDLE_JSON_SCHEMA_VERSION = "2.0"`（3.0 从未发布） | 落库时记录 `schema_version`，升级时可判定是否需要重解析 |
 | **public schema 中 bbox 统一为 0–1 归一化坐标或 `null`** | 省去我们自己归一化的步骤，但 `null` 必须处理 |
-| **`PageInfo` 不含 `page_size`** | 无法由 MiddleJson 还原绝对坐标 → 页面尺寸必须由我们自己的 PDF 引擎读出并落库 |
+| **`PageInfo` 不含 `page_size`** | 无法由 MiddleJson 还原绝对坐标 → 页面尺寸必须由我们自己的 PDF 引擎读出并落库（实测补充：页面尺寸确实不在 `pages[]` 对象里，但 `extensions.docvortex_layout.pages[]` 里有 `width_pt`/`height_pt`，可作一致性交叉校验，不作为权威来源） |
 | 旧版带 bbox/图片职责的 Line/Span **不会恢复**；`InlineSpan` 只表达行内文字/公式/代码/链接 | 块级定位是官方长期契约，行内级定位不要指望 |
 | `ParseResult.to_dict()` 输出 `schema_version: "2.0"` + MiddleJson 字段，无顶层 `_backend`/`_meta` | 不要依赖非公开字段 |
 | Pipeline / VLM / Hybrid / Office / HTML 各 backend 的 block type 与 span 粒度**存在差异** | 必须记录本次解析的 `backend`，归一化时按 backend 分支处理 |
 
-**待实测验证（P0）**：bbox 的**原点方向**（左上还是左下）。官方文档只写"0–1 归一化"，未声明原点。→ 用一份已知内容的 PDF 在 `standard` 档跑一次，取首页第一个块的 bbox 与页面位图（一次性调试渲染，不进产品链路）目视比对即可确定，结论写入 [03](../设计/03-数据模型与溯源设计.md) 并锁定。
+**已实测（2026-10-01，自托管 4.0.7，`standard` 档）**——两项 P0 均已定案，取值写入 `apps/api/.env`：
+
+- **原点 = 左上（top_left）**。样本是「顶部一行 + 底部一行、中间大片留白」的单页 PDF：实测最上墨迹落在 0.0972，
+  `top_left` 预测 0.0940（差值就是行高留白），`bottom_left` 预测 0.8890，后者差得离谱。
+- **旋转语义 = visual（已按视觉方向）**。样本把单页设成 `/Rotate=90` 后提交：横排文字块的 bbox 变成
+  `[0.886, 0.115, 0.908, 0.238]`（x 跨度 0.022、y 跨度 0.123，落在右侧），正是视觉坐标系的预测值；
+  若为 `unrotated` 则应仍留在左侧且保持横长条。→ `MINERU_BBOX_ROTATION=visual`，
+  页面 `/Rotate` 由我们自己的 PDF 引擎读出，不要用它再换算一次。
+
+> 顺带发现：上面那份 `/Rotate=90` 样本里，MinerU 把这行文字判成了 `header`（单行贴着页面一侧确实像页眉）。
+> 旋转页的版面分类可能与原件不符，遇到旋转扫描件要抽检块类型，不能默认它准。
 
 ## 6. Locator 规范
 
