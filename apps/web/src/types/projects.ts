@@ -34,6 +34,9 @@ export const FILE_ROLE_LABELS: Record<FileRole, string> = {
 /** 解析档位；与后端 ParseRequest.tier 一致。 */
 export type ParseTier = "flash" | "basic" | "standard" | "advanced";
 
+/** OCR 模式；与后端 parse 接口的 ocr_mode 一致。 */
+export type OcrMode = "auto" | "txt" | "ocr";
+
 /** `GET /projects/{id}` 的 files[] 一条。 */
 export interface WireProjectFile {
   project_file_id: number;
@@ -52,6 +55,12 @@ export interface WireProjectFile {
   page_count: number | null;
   /** 最近一次解析的状态：null 表示还没跑过解析。 */
   parse_status: string | null;
+  /**
+   * 最近一次解析用的档位与 OCR 模式（parse_run.tier 与 config_snapshot.ocr_mode）。
+   * 重新解析要沿用它们，否则文件管理页发出的重新解析会把 advanced / ocr 静默降回默认档。
+   */
+  parse_tier: ParseTier | null;
+  parse_ocr_mode: OcrMode | null;
   latest_run_id: number | null;
   /** 非 null 表示这个文件已被新版本替换（换内容走的是新增一行，不是原地改）。 */
   replaced_by_id: number | null;

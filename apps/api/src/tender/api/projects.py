@@ -71,15 +71,20 @@ def list_projects(
                       COALESCE(agg.review_count, 0) AS review_count
                FROM project AS p
                LEFT JOIN (
+                   -- 子查询里就要按 company_id 过滤：只在外层过滤的话，
+                   -- 这个聚合仍会把其它公司的 project_file 整表扫一遍再丢掉。
                    SELECT pf.project_id,
                           count(DISTINCT pf.id) AS file_count,
                           count(e.id) FILTER (
                               WHERE e.status IN ('need_review', 'conflict')
                           ) AS review_count
                    FROM project_file AS pf
+                   JOIN project AS agg_owner ON agg_owner.id = pf.project_id
                    LEFT JOIN extraction AS e
                        ON e.version_id = pf.version_id AND e.is_current
                    WHERE pf.deleted_at IS NULL
+                         AND agg_owner.company_id = :company_id
+                         AND agg_owner.deleted_at IS NULL
                    GROUP BY pf.project_id
                ) AS agg ON agg.project_id = p.id
                WHERE p.company_id = :company_id AND p.deleted_at IS NULL"""
@@ -109,6 +114,9 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
                           pf.role, pf.display_name, pf.is_parseable, pf.replaces_id,
                           pf.sort_no, pf.created_at, pf.sha256, pf.mime, pf.size_bytes,
                           v.page_count, latest.status AS parse_status,
+                          -- tier 与 ocr_mode 一起带上：重新解析要沿用「上次是怎么跑的」，
+                          -- 否则文件管理页发出的重新解析会把 advanced/ocr 静默降回默认档。
+                          latest.tier AS parse_tier, latest.ocr_mode AS parse_ocr_mode,
                           latest.id AS latest_run_id, replacement.id AS replaced_by_id,
                           COALESCE(result.total, 0) AS extraction_count,
                           COALESCE(result.review_count, 0) AS review_count,
@@ -120,7 +128,8 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
                    JOIN project AS p ON p.id = pf.project_id
                    LEFT JOIN document_version AS v ON v.id = pf.version_id
                    LEFT JOIN LATERAL (
-                       SELECT pr.id, pr.status
+                       SELECT pr.id, pr.status, pr.tier,
+                              pr.config_snapshot ->> 'ocr_mode' AS ocr_mode
                        FROM parse_run AS pr
                        WHERE pr.version_id = v.id
                        ORDER BY pr.created_at DESC, pr.id DESC LIMIT 1

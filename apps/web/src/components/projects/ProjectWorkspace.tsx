@@ -206,7 +206,11 @@ export function ProjectWorkspace({ projectId }: Props) {
                   </span>
                 </div>
                 <div className="min-h-0 flex-1">
-                  <DocumentWorkbench versionId={active.version_id as number} />
+                  <DocumentWorkbench
+                    versionId={active.version_id as number}
+                    /* 复核 / 重跑落定后重取项目：左侧文件栏的流水线与待复核数要跟着动 */
+                    onSettled={() => void reload().catch(() => undefined)}
+                  />
                 </div>
               </>
             )}

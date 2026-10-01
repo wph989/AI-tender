@@ -528,6 +528,7 @@ POST /api/v1/spot-checks
 | --- | --- | --- |
 | `GET /versions/{vid}` | `latest_extraction_job` | 最近一次 `stage='extracting'` 的 job（`status` / `error_code` / `error_message` / `created_at` / `finished_at`），`null` = 从没排过抽取。工作台的「抽取失败」态要直接说出原因，而这个原因只存在于 `job` 行上 |
 | `GET /projects/{id}` 的 `files[]` | `confirmed_count` | 该版本 `is_current` 且 `status='verified'` 的条数。重新解析前的二次确认必须列出「将失效的已确认结果数量」（见 09 第 5.2 节） |
+| `GET /projects/{id}` 的 `files[]` | `parse_tier` / `parse_ocr_mode` | 最近一次 `parse_run` 的档位与 OCR 模式（后者取自 `config_snapshot ->> 'ocr_mode'`）。文件清单页的「重新解析」要沿用它们，否则 `advanced` / `ocr` 的文件会被静默降回默认档 |
 
 为什么只取「最近一条」抽取任务：界面要解释的是「这一次为什么一条结果都没有」，
 历史任务对用户没有意义；真需要历史时应走任务列表，而不是把版本详情撑成日志。

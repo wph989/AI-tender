@@ -4,9 +4,9 @@
  * 单条字段结果卡：值、证据定位和复核操作。
  *
  * 版式按「读的顺序」排：字段名 → 值 → 出处 → 动作。
- * 值用等宽大字（17px）：用户在这一屏上真正要读的就是这些数字和条款号，
- * 它们必须比周围的说明文字更响；字段名用宋体，和标书里的章节标题同一种字体，
- * 提醒用户「这一条来自纸面上的哪一节」。
+ * 值用等宽大字（22px，与 components/ui.ts 的尺度表同源）：用户在这一屏上真正要读的
+ * 就是这些数字与条款号，它们必须比周围的说明文字更响；字段名用宋体，
+ * 和标书里的章节标题同一种字体，提醒用户「这一条来自纸面上的哪一节」。
  *
  * 人工修正必须把锚点一起提交：编辑器会预填当前证据，也允许在反向标注模式下
  * 手动输入当前 run 的锚点，后端仍会再次校验锚点属于该版本。
@@ -28,7 +28,6 @@ import {
   statusLabel,
   statusSpineClass,
   statusTextClass,
-  triggerLabel,
 } from "@/lib/results/labels";
 import type { RerunButtonMode } from "@/lib/results/rerun";
 import { useViewerStore } from "@/lib/store/viewerStore";

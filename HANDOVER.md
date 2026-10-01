@@ -613,3 +613,23 @@ apps/web:  pnpm build       → 成功，7 条路由
 apps/api:  pytest -q        → 257 passed, 2 skipped
 apps/api:  ruff check / ruff format --check / lint-imports → 通过
 ```
+
+### 21.11 按代码审查修复（除 P1）
+
+第一段交付后做了一轮代码审查，除 P1（`POST /versions/{vid}/extract` 会作废已确认结果，与 docstring / 界面文案矛盾，
+需要产品决策）外全部修掉：
+
+- **提交后立刻重取**：重跑抽取 / 重新解析提交成功后先刷一次工作台（文件清单页同理先刷列表），`pipelineRunning`
+  才会立起、5 秒轮询才能接管等待；此前整段等待里界面停在失败态并显示「重跑中…」，自相矛盾。
+  顺带订正两处注释里「任务在跑时会自己轮询」的错误前提（那只对「打开页面时已经在跑」成立）。
+- **重新解析不再静默降档**：`GET /projects/{id}` 的 `files[]` 补 `parse_tier` / `parse_ocr_mode`
+  （取自最近一次 `parse_run.tier` 与 `config_snapshot->>'ocr_mode'`），文件清单页的重新解析沿用它们；
+  此前该页硬编码 `standard` / `auto`，`advanced`（或 `ocr`）上传的文件在这里重解析会被降档。
+- **`list_projects` 的聚合子查询补 `company_id` 过滤**：原来只在外层过滤，聚合仍会把其它公司的 `project_file`
+  整表扫一遍再丢掉（结果正确，纯代价）。
+- **`onSettled`**：工作台复核 / 重跑落定后通知外层重取项目，左侧文件栏的流水线与待复核数不再停在打开页面那一刻。
+- **清理**：`ResultCard` 去掉死 import（`triggerLabel`），注释里的 17px 订正为 22px。
+
+验证：`pnpm typecheck` / `pnpm test`（66 passed）/ `pnpm build`（7 路由）、`pytest`（257 passed, 2 skipped）、
+`ruff check` / `ruff format --check` / `lint-imports` 全绿；另用 `TestClient` 对真实库跑了一遍 `GET /projects` 与
+`GET /projects/1`，确认新 SQL 与 `parse_tier` / `parse_ocr_mode` 的返回值。

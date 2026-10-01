@@ -64,7 +64,8 @@ const EMPTY_EXTRACTIONS: readonly WireExtraction[] = [];
 /**
  * 整份重跑的等待上限。单字段重跑是秒级（默认 120s 够），但整份文档要逐字段过一遍模型：
  * 实测 14 个字段约 9 分钟，所以留 20 分钟的窗口。超时也不会丢结果——
- * 工作台在任务在跑时会自己轮询刷新（见 pipelineRunning），这里只是别让提示先说「失败」。
+ * 提交后界面会立刻刷成「进行中」，pipelineRunning 随之立起、5 秒轮询接管剩下的等待
+ * （见下面两处重跑里的即时刷新），这里只是别让提示先说「失败」。
  */
 const VERSION_JOB_TIMEOUT_MS = 20 * 60 * 1000;
 
@@ -82,9 +83,14 @@ function buildConflictMap(items: readonly WireConflict[]): ReadonlyMap<string, W
 
 interface Props {
   versionId: number;
+  /**
+   * 复核 / 重跑落定后通知外层：项目文件栏的流水线与待复核数由外层取数，
+   * 工作台自己刷不到它（见 ProjectWorkspace）。
+   */
+  onSettled?: () => void;
 }
 
-export function DocumentWorkbench({ versionId }: Props) {
+export function DocumentWorkbench({ versionId, onSettled }: Props) {
   const [data, setData] = useState<WorkbenchData | null>(null);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -144,6 +150,16 @@ export function DocumentWorkbench({ versionId }: Props) {
     }
     return loaded;
   }, [refreshStats, versionId]);
+
+  /**
+   * 变更落定后的统一收尾：重取工作台，再通知外层重取项目。
+   *
+   * 5 秒轮询不经过它——轮询只刷工作台自己，顺带每 5 秒打一遍项目接口没有必要。
+   */
+  const settle = useCallback(async () => {
+    await refreshWorkbench();
+    onSettled?.();
+  }, [onSettled, refreshWorkbench]);
 
   useEffect(() => {
     let alive = true;
@@ -248,7 +264,7 @@ export function DocumentWorkbench({ versionId }: Props) {
       setNotice(null);
       try {
         await submitReview(extraction.instance_id, input);
-        await refreshWorkbench();
+        await settle();
         return true;
       } catch (error: unknown) {
         setNotice(errorMessage(error, "复核提交失败"));
@@ -257,7 +273,7 @@ export function DocumentWorkbench({ versionId }: Props) {
         setBusyExtractionId(null);
       }
     },
-    [refreshWorkbench, setNotice],
+    [settle, setNotice],
   );
 
   const handleRerun = useCallback(
@@ -271,7 +287,7 @@ export function DocumentWorkbench({ versionId }: Props) {
         if (job.status === "failed" || job.status === "canceled") {
           throw new Error(job.error_message ?? "字段重跑失败");
         }
-        await refreshWorkbench();
+        await settle();
         setNotice(null);
         return true;
       } catch (error: unknown) {
@@ -281,7 +297,7 @@ export function DocumentWorkbench({ versionId }: Props) {
         setBusyExtractionId(null);
       }
     },
-    [refreshWorkbench, setNotice],
+    [settle, setNotice],
   );
 
   /**
@@ -295,18 +311,22 @@ export function DocumentWorkbench({ versionId }: Props) {
     setNotice("已提交重跑抽取，正在等待结果…");
     try {
       const queued = await rerunExtractionForVersion(versionId);
+      // 提交后立刻刷一次：界面据此显示「正在抽取」、pipelineRunning 变成真，
+      // 5 秒轮询才会接管剩下的等待；否则整段时间里界面停在失败态。
+      // 刷新失败不判定为提交失败——任务已经落库，下一轮轮询会自愈。
+      void refreshWorkbench().catch(() => undefined);
       const job = await waitForJob(queued.job_id, VERSION_JOB_TIMEOUT_MS);
       if (job.status === "failed" || job.status === "canceled") {
         throw new Error(job.error_message ?? "重跑抽取失败");
       }
-      await refreshWorkbench();
+      await settle();
       setNotice(null);
     } catch (error: unknown) {
       setNotice(errorMessage(error, "重跑抽取失败"));
     } finally {
       setVersionBusy(null);
     }
-  }, [refreshWorkbench, setNotice, versionId]);
+  }, [settle, setNotice, versionId]);
 
   /**
    * 重新解析：锚点全部重建、已确认结果全部打回复核。代价比前者重一个量级，
@@ -323,18 +343,20 @@ export function DocumentWorkbench({ versionId }: Props) {
         ocrMode: "auto",
         reason: "用户在结果面板发起重新解析",
       });
+      // 同「重跑抽取」：先把界面切到进行中，轮询才会接管这段更漫长的等待。
+      void refreshWorkbench().catch(() => undefined);
       const job = await waitForJob(queued.job_id, VERSION_JOB_TIMEOUT_MS);
       if (job.status === "failed" || job.status === "canceled") {
         throw new Error(job.error_message ?? "重新解析失败");
       }
-      await refreshWorkbench();
+      await settle();
       setNotice(null);
     } catch (error: unknown) {
       setNotice(errorMessage(error, "重新解析失败"));
     } finally {
       setVersionBusy(null);
     }
-  }, [data, refreshWorkbench, setNotice, versionId]);
+  }, [data, settle, setNotice, versionId]);
 
   /** 结果卡内的跨文件冲突裁定：裁定完立刻重取，卡片上的候选值随之消失。 */
   const handleResolveConflict = useCallback(
@@ -342,12 +364,12 @@ export function DocumentWorkbench({ versionId }: Props) {
       setNotice(null);
       try {
         await resolveConflict(conflictId, { action: "resolve", resolved_id: resolvedId });
-        await refreshWorkbench();
+        await settle();
       } catch (error: unknown) {
         setNotice(errorMessage(error, "冲突裁定失败"));
       }
     },
-    [refreshWorkbench, setNotice],
+    [settle, setNotice],
   );
 
   // 批量确认逐条提交（后端是一次一条的复核接口），失败计数而不是中断：
@@ -367,10 +389,10 @@ export function DocumentWorkbench({ versionId }: Props) {
           failed += 1;
         }
       }
-      await refreshWorkbench();
+      await settle();
       setNotice(failed > 0 ? `批量确认完成，${failed} 项失败，请重试` : null);
     },
-    [refreshWorkbench, setNotice],
+    [settle, setNotice],
   );
 
   const reloadAll = useCallback(() => {

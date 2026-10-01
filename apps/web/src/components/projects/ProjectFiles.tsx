@@ -44,6 +44,8 @@ import { derivePipeline, needsExtractRerun, needsReparse } from "@/lib/projects/
 import {
   FILE_ROLE_LABELS,
   type FileRole,
+  type OcrMode,
+  type ParseTier,
   type UploadResult,
   type WireProjectDetail,
 } from "@/types/projects";
@@ -65,6 +67,13 @@ interface ReparseTarget {
   fileName: string;
   /** 该版本上已确认的结果条数：横幅里那个 N。 */
   confirmed: number;
+  /**
+   * 上一次解析用的档位与 OCR 模式：重新解析是「把这一次修好」，不是顺手换档。
+   * 不带上这两个值就会把 advanced / ocr 的文件静默降回默认档（档位变了，用户
+   * 比较的前后两次解析结果也就不可比了）。
+   */
+  tier: ParseTier;
+  ocrMode: OcrMode;
 }
 
 interface Props {
@@ -183,10 +192,14 @@ export function ProjectFiles({ projectId }: Props) {
     setNotice("已提交重新解析，锚点将全部重建…");
     try {
       const queued = await reparseVersion(target.versionId, {
-        tier: "standard",
-        ocrMode: "auto",
+        tier: target.tier,
+        ocrMode: target.ocrMode,
         reason: "用户在文件清单发起重新解析",
       });
+      // 提交后立刻重取一次清单：这一行转为「进行中」后轮询才会接管，
+      // 否则整段等待里它还停在提交前的状态，看起来像没提交成功。
+      // 刷新失败不该判定为提交失败——任务已经落库了，下一轮轮询会自愈。
+      void reload().catch(() => undefined);
       const job = await waitForJob(queued.job_id, VERSION_JOB_TIMEOUT_MS);
       if (job.status === "failed" || job.status === "canceled") {
         throw new Error(job.error_message ?? "重新解析失败");
@@ -211,6 +224,8 @@ export function ProjectFiles({ projectId }: Props) {
     setNotice("已提交重跑抽取，正在等待结果…");
     try {
       const queued = await rerunExtractionForVersion(versionId);
+      // 同上：先把行切到「进行中」，列表页的 4 秒轮询才会开始跑。
+      void reload().catch(() => undefined);
       const job = await waitForJob(queued.job_id, VERSION_JOB_TIMEOUT_MS);
       if (job.status === "failed" || job.status === "canceled") {
         throw new Error(job.error_message ?? "重跑抽取失败");
@@ -506,6 +521,8 @@ export function ProjectFiles({ projectId }: Props) {
                                 versionId: file.version_id as number,
                                 fileName: file.display_name,
                                 confirmed: file.confirmed_count,
+                                tier: file.parse_tier ?? "standard",
+                                ocrMode: file.parse_ocr_mode ?? "auto",
                               })
                             }
                           >
