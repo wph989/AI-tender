@@ -26,6 +26,7 @@ _DEPLOYMENT_ENV_KEYS = (
     "GOTENBERG_PASS",
     "GOTENBERG_API_BASIC_AUTH_USERNAME",
     "GOTENBERG_API_BASIC_AUTH_PASSWORD",
+    "GOTENBERG_TIMEOUT_SECONDS",
     "LLM_BASE_URL",
     "LLM_MODEL",
     "LLM_API_KEY",
@@ -100,6 +101,9 @@ def test_env_example_is_valid() -> None:
 
     assert "DATABASE_URL" in values, ".env.example 里必须有 DATABASE_URL，否则复制过去等于没配"
     assert "GOTENBERG_URL" in values, "转换服务的地址也要出现在示例里，否则本地跑起来才发现没配"
+    assert "GOTENBERG_TIMEOUT_SECONDS" in values, (
+        "客户端超时也要进示例：对不上服务端预算就会白转一遍"
+    )
     url = make_url(values["DATABASE_URL"])
     assert url.drivername == "postgresql+psycopg", "驱动名拼错会导致 alembic 起来就报 no module"
     assert url.database and url.username
@@ -175,6 +179,34 @@ def test_gotenberg_credentials_accept_both_naming_styles(
     monkeypatch.setenv("GOTENBERG_API_BASIC_AUTH_USERNAME", "container-user")
     monkeypatch.setenv("GOTENBERG_API_BASIC_AUTH_PASSWORD", "container-pass")
     assert settings.gotenberg_credentials() == ("container-user", "container-pass")
+
+
+def test_gotenberg_timeout_defaults_to_the_server_side_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """默认值是「大文档能转完」的量级，不是 SDK 常用的 180s。
+
+    600 MB 级标书在同为 LibreOffice 内核的 unoserver 上实测要十几分钟（docs/调研/02 第 5 节）：
+    默认值比它小的话，部署方照抄示例就会得到「每份大文档都超时」，而这条路径没有任何启动期提示。
+    """
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+    assert settings.gotenberg_timeout_seconds() == settings.DEFAULT_GOTENBERG_TIMEOUT_SECONDS
+    assert settings.gotenberg_timeout_seconds() >= 1800.0
+
+
+def test_gotenberg_timeout_reads_the_env_and_rejects_non_positive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """0 / 负数 / 非数字一律报错：静默接受会表现成「所有转换都超时」这种最难查的形态。"""
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+
+    monkeypatch.setenv("GOTENBERG_TIMEOUT_SECONDS", "2400")
+    assert settings.gotenberg_timeout_seconds() == 2400.0
+
+    for bad in ("0", "-1", "30m"):
+        monkeypatch.setenv("GOTENBERG_TIMEOUT_SECONDS", bad)
+        with pytest.raises(ValueError):
+            settings.gotenberg_timeout_seconds()
 
 
 def test_gotenberg_credentials_half_configured_is_an_error(

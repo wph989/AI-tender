@@ -1,0 +1,84 @@
+# Gotenberg 单服务编排：Office(docx/doc/xlsx/pptx) → PDF。
+# AI-Tender 的关键路径前置服务——MinerU 只吃 PDF，且只有转成 PDF 才有「页 + 块 + bbox」，
+# 溯源定位依赖这套几何（见 docs/调研/02 与 docs/工程/07 第 1 节）。
+#
+# 用法（把 docker/gotenberg 与 docker/gotenberg-lb 两个目录一起拷到目标机器，保持同级）：
+#   1) cp .env.example .env，至少改掉 GOTENBERG_PASS（其余变量的取舍都写在那份示例的注释里）
+#   2) docker compose up -d --build
+#   3) 验证：curl -u "$GOTENBERG_USER:$GOTENBERG_PASS" http://<主机>:3000/health
+#      字体：docker exec $(docker compose ps -q gotenberg) fc-list :lang=zh | wc -l
+#      AI-Tender 侧把 GOTENBERG_URL 指过来：同机容器部署用 http://host.docker.internal:3000，分机用 http://<主机>:3000
+#
+# 动态扩缩副本（不用改端口，也不用改客户端地址）：
+#   docker compose up -d --scale gotenberg=3      # 加/减副本，LB 5 秒内跟上；=1 即回到单副本
+#   为什么需要 gotenberg-lb 这一层：副本不能各自发布同一个宿主端口（第二个副本会 Bind 失败），
+#   而调用方只认一个 URL。LB 把「一个稳定 URL」与「N 个可增减的副本」解耦。
+#   注意：Gotenberg 里 LibreOffice 的并发度写死为 1（一个副本同一时刻只转一份文档），
+#   所以副本数就是并行度；内存按 副本数 × GOTENBERG_MEMORY 估。
+#
+# 为什么必须自建镜像而不是直接用官方镜像：LibreOffice 用「已安装字体」计算分页，
+# 缺字体 → 分页漂移 → page/bbox 与用户手里的原件对不上 → 溯源直接失效。
+
+name: gotenberg
+
+services:
+  gotenberg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 建议钉到具体版本：converter_version 会写进 document_version，升级基础镜像等于改变分页
+        # 口径，属于需要评审的变更
+        GOTENBERG_IMAGE: "${GOTENBERG_IMAGE:-gotenberg/gotenberg:8}"
+    image: "${GOTENBERG_LOCAL_IMAGE:-tender-gotenberg:8}"
+    restart: unless-stopped
+    environment:
+      # 两项必须成对给出：官方镜像只配一个会以未启用鉴权启动，
+      # 而应用侧（apps/api 的 gotenberg_credentials()）只配一个会直接报错。
+      # 不想启用鉴权就删掉这两行——那就必须靠网络隔离（只允许 api/worker 网段访问）。
+      GOTENBERG_API_BASIC_AUTH_USERNAME: "${GOTENBERG_USER:?请在 .env 里设置 GOTENBERG_USER}"
+      GOTENBERG_API_BASIC_AUTH_PASSWORD: "${GOTENBERG_PASS:?请在 .env 里设置 GOTENBERG_PASS}"
+      # 单次转换的请求预算：官方默认只有 30s，实际硬超时 = 该值 + 5s，带大量图片的标书会超时（503/504）。
+      # 600 MB 级标书按实测要十几分钟（docs/调研/02 第 5 节），所以这里给 30 分钟；
+      # 客户端侧要跟着改 apps/api 的 GOTENBERG_TIMEOUT_SECONDS，短了会白转一遍。
+      # 变量名 = 参数名去前缀大写：--api-timeout → API_TIMEOUT（Gotenberg 8 已没有 --api-timeout-process）
+      API_TIMEOUT: "${GOTENBERG_API_TIMEOUT:-1800s}"
+      # 同理：--log-level → LOG_LEVEL（写 GOTENBERG_LOG_LEVEL 不会生效）
+      LOG_LEVEL: "${GOTENBERG_LOG_LEVEL:-info}"
+    # 故意不发布宿主端口：副本多了会抢同一个宿主端口（第二个副本 Bind 失败），
+    # 对外统一走下面的 gotenberg-lb。只有临时单实例直连才需要自己把 ports 加回来。
+    healthcheck:
+      # start_period 必须留足：LibreOffice 首次初始化慢，早判会误报不健康。
+      # curl 由本目录的 Dockerfile 装上（官方镜像里不一定有）。
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          # 大文档内存压力会以 500 暴露；不够就调大 GOTENBERG_MEMORY 或加副本（副本是独立进程，各占一份上限）
+          memory: "${GOTENBERG_MEMORY:-2g}"
+
+  # 副本入口：Gotenberg 可以 --scale 加副本，但副本不能各自占同一个宿主端口，调用方又只认一个 URL，
+  # 所以在前面放一层 nginx。上游解析与超时配置见 docker/gotenberg-lb/nginx.conf（两个目录要一起拷）。
+  gotenberg-lb:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ../gotenberg-lb/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      # 默认监听所有网卡，方便 api/worker 从别的机器调用；想只放行本机就写 127.0.0.1
+      - "${GOTENBERG_BIND:-0.0.0.0}:${GOTENBERG_PORT:-3000}:3000"
+    healthcheck:
+      # 只探 nginx 自身（/lb-health）：开不开 Basic Auth 都不会让这个探针误判，
+      # 副本健康由各副本的 healthcheck 与 nginx 的被动探测负责。
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/lb-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      gotenberg:
+        condition: service_healthy

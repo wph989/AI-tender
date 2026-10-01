@@ -20,13 +20,13 @@
 | 方案 | 形态 | 接口 | 优点 | 缺点 | 结论 |
 | --- | --- | --- | --- | --- | --- |
 | **Gotenberg** | 官方 Docker 镜像 | **REST**：`POST /forms/libreoffice/convert`，multipart，返回 PDF 字节 | 无状态、HTTP 原生、覆盖 Office/Chromium/PDF 三类；附带 merge/rotate/watermark/PDF-A/metadata 等 PDF 引擎能力；有健康检查与 Prometheus 指标 | 冷启动首次请求较慢（需预热） | **采用** |
-| unoserver | Python 包 | 自定义协议（Socket） | 常驻 LibreOffice 实例，单次转换快；作者与 unoconv 同源 | 非标准 HTTP，需自己做协议封装与进程守护 | 备选 |
+| unoserver | Python 包 + 社区镜像（libreofficedocker/libreoffice-unoserver） | 镜像直接给 **REST**：`POST /request`（multipart，`convert-to` 指定目标格式）；原包本身是 Socket 协议 | 常驻 LibreOffice 实例，单次转换快；镜像自带 HTTP 层，能直接当服务跑；超时与内存都是显式环境变量（实测见 `投标skill/LibreOffice安装.md`） | 只覆盖格式转换：没有 Gotenberg 的 PDF 引擎能力、健康检查与 Prometheus 指标；要并行只能多副本，而它发布固定宿主端口，`--scale` 大于 1 会因端口冲突起不来 | 备选 |
 | JODConverter | Java 库 / 可容器化 | 需自行包一层 HTTP | 成熟稳定，UNO 连接池管理好 | 无官方 HTTP 服务，需自研封装与维护 | 备选 |
 | Collabora Online / LibreOffice Online | 完整在线办公套件 | WOPI | 支持在线编辑 | 体量极大，为"编辑"设计，转换只是副作用 | 不采用 |
 | kkFileView | Java 服务 | REST | 国内常见，内置多种格式预览 | 定位是**在线预览**而非精确转换接口；无法保证版式与页码稳定，且不能提供坐标 | 不采用 |
 | 本机 `soffice` 命令行 | 进程调用 | 无 | 零依赖 | 无隔离、并发差、崩溃影响主进程、无法横向扩容 | 不采用 |
 
-**选 Gotenberg 的核心理由**：它把"容器 + HTTP + 无状态 + 可水平扩容"四件事同时满足了，且不要求我们自研封装。转换是本系统的**关键路径前置步骤**，把它的可用性外包给成熟项目比自己维护 UNO 连接池划算。
+**选 Gotenberg 的核心理由**：HTTP 服务这两家都能提供（unoserver 靠社区镜像补），差别在 Gotenberg 是官方的无状态设计，把"容器 + HTTP + 无状态 + 可水平扩容"四件事一起满足了，还捎带 PDF 引擎能力与 Prometheus 指标，且不要求我们自研封装。转换是本系统的**关键路径前置步骤**，把它的可用性外包给成熟项目比自己维护 UNO 连接池划算。
 
 ## 3. Gotenberg 接口规范
 
@@ -134,17 +134,21 @@ Gotenberg 的转换路由是**同步 HTTP 请求**：请求保持到转换完成
 
 ## 5. 部署形态
 
+> **可执行编排在 [`docker/gotenberg/docker-compose.yml`](../../docker/gotenberg/docker-compose.yml)**（含同目录 Dockerfile、字体目录与 `.env.example`；它依赖 [`docker/gotenberg-lb/nginx.conf`](../../docker/gotenberg-lb/nginx.conf)，**两个目录要一起拷**），支持 `docker compose up -d --scale gotenberg=3` 动态扩缩副本。
+> **它不在仓库根的 `docker-compose.yml` 里**：那份只编排除 Gotenberg 以外的依赖与本体（默认 `up` 起 postgres / redis / minio / minio-init / mineru，加 `--profile app` 才起 api / worker / beat / migrate / web）。api / worker 用 `GOTENBERG_URL` 指向这侧的副本入口：同机部署写 `http://host.docker.internal:3000`（compose 已加 host-gateway 映射），分机部署写 `http://<主机>:3000`。
+> 下面这段是结构摘录，讲的是取舍。
+
 ```yaml
 # docker-compose 片段（详见 07-部署与实施计划.md）
 gotenberg:
   build:
     context: ./docker/gotenberg        # 基于官方镜像 + 中文字体
     dockerfile: Dockerfile
-  ports:
-    - "3000:3000"
+  # 不发布宿主端口：加副本后第二个副本会 Bind 同一个宿主端口失败，对外统一走下面的 gotenberg-lb
   environment:
     - GOTENBERG_API_BASIC_AUTH_USERNAME=${GOTENBERG_USER}
     - GOTENBERG_API_BASIC_AUTH_PASSWORD=${GOTENBERG_PASS}
+    - API_TIMEOUT=${GOTENBERG_API_TIMEOUT:-1800s}   # 容器里用参数名本身，没有 GOTENBERG_ 前缀
   healthcheck:
     test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
     interval: 30s
@@ -155,14 +159,36 @@ gotenberg:
     resources:
       limits:
         memory: 2g               # 大文档内存压力会在 500 暴露，需按实测算
+
+# 副本入口：调用方只认一个 URL，副本又不能各自占宿主端口，所以前面放一层 nginx
+gotenberg-lb:
+  image: nginx:1.27-alpine
+  volumes: [./docker/gotenberg-lb/nginx.conf:/etc/nginx/nginx.conf:ro]
+  ports: ["127.0.0.1:3000:3000"]
 ```
 
 **要点**
 
-- 服务**无状态**，可水平扩容；直接按容器数量扩展。
+- 服务**无状态**，可水平扩容：`docker compose up -d --scale gotenberg=3`。副本不能各自发布宿主端口（第二个副本 Bind `127.0.0.1:3000` 直接失败），所以入口是 `gotenberg-lb`（配置见 `docker/gotenberg-lb/nginx.conf`）：它用 Docker 内嵌 DNS 解析服务名，**副本增删 5 秒内生效**，客户端 URL 始终不变（同一份编排内的容器用 `http://gotenberg-lb:3000`，宿主与其他编排用 `http://<主机>:3000`）。
+- 只加副本、不提并发上限等于没加：配置中心的 `convert.max_inflight` 要跟着调到副本数（它限的是同时在途的请求数），内存按 `副本数 × GOTENBERG_MEMORY` 估。
+- **超时是三层，要按同一量级配**：客户端 `GOTENBERG_TIMEOUT_SECONDS`（默认 1800s）≥ 服务端 `API_TIMEOUT`（默认 1800s，实际硬超时再多 5s）＜ LB 的 `proxy_read_timeout`（3600s）。哪一层更短，都会表现成「转了一半被放弃」。
+- **一个容器同一时刻只转一份**：Gotenberg 里 LibreOffice 的并发度写死为 1（`NewProcessSupervisor(..., 1, ...)`，v8.37 源码），官方参数说明也写着「Does not apply to LibreOffice: scale Gotenberg containers instead」。所以**副本数就是并行度**，单容器内其余请求只能排队（`LIBREOFFICE_MAX_QUEUE_SIZE` 默认 0，即不设上限）。
+- 变量名规则：容器里的环境变量 = 参数名去前缀、大写、连字符转下划线（`--api-timeout` → `API_TIMEOUT`）；只有 Basic Auth 那两个是 `GOTENBERG_` 前缀的特例。
 - 必须设置 `start_period`：LibreOffice 首次启动初始化耗时较长，健康检查过早会误判。
 - 内存上限需实测：大文档（>100 MB 的 PPT/带大量图片的 DOCX）在内存压力下会返回 500，此时应**扩容或重试**而非放弃。
 - 鉴权：以 Basic Auth 启动，内网部署时通过反向代理再加一层网络隔离。
+
+**大文档量级（实测参考）**
+
+下表来自 `投标skill/LibreOffice安装.md` 记录的一组真实标书转换（同为 LibreOffice 内核，可以直接当量级参考）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 600 MB `.doc`（上传 1.6 GB、输出 1 GB） | 6 GB 内存约 **12 分 30 秒**；4 GB 内存**跑不完**；10 GB 内存也会被吃满 |
+| 用 tmpfs 当临时盘 | 反而更慢（10:07 → 11:25），不要开 |
+| 宿主机直接跑 soffice（旧版本） | 1 小时 15 分钟仍未完成 |
+
+两条结论直接决定部署参数：**（1）单份超大文档拼的是内存与超时预算，不是 CPU 核数**——LibreOffice 解析阶段吃单核，只有最后打包才用多核；**（2）提高吞吐只能靠多副本**，也就是上面的 `--scale gotenberg=N` + LB。
 
 ## 6. 我们封装的契约
 
@@ -205,7 +231,7 @@ class ConvertResult:
 1. 仅处理非 PDF 输入；PDF 直通。
 2. 固定转换参数（见 3.2），参数变更需走评审，因为它会改变分页。
 3. 镜像内固化中文字体，字体清单纳入版本管理。
-4. 服务无状态、可水平扩容，属于关键路径，需要独立监控与告警。
+4. 服务无状态：`docker compose --scale gotenberg=3` 即可扩容，入口是 `gotenberg-lb`（客户端 URL 不变，见第 5 节）；属于关键路径，需要独立监控与告警。
 5. 转换结果的 `converter_version` 必须落库——**未来任何一次溯源争议，都要能回答"当时是用哪个版本转的"**。
 6. **调用形态：同步 HTTP + 在途上限**。用 `convert.max_inflight` 限制同时在途的转换请求数，不依赖 Gotenberg 的 webhook 异步模式。
 7. **升级到 webhook 的触发条件**：转换 P95 持续超过 **2 分钟**，或同步调用导致 worker 槽长期被占满。届时再评估异步回调，不提前引入这条复杂度。

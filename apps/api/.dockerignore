@@ -1,0 +1,13 @@
+# 构建上下文只留源码、迁移与依赖清单
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+alembic/__pycache__/
+tests/
+*.log
+# 本地密钥绝不进镜像（compose 用环境变量注入）
+.env

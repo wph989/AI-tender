@@ -30,6 +30,8 @@ _ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 # 本地开发默认值；生产环境必须由环境变量或 .env 覆盖。
 DEFAULT_DATABASE_URL = "postgresql+psycopg://tender:tender@localhost:5432/tender"
 DEFAULT_GOTENBERG_URL = "http://localhost:3000"
+# 单次转换的客户端超时（秒）；适配器构造函数里的 180s 只是没给值时的兜底，部署默认值走这里
+DEFAULT_GOTENBERG_TIMEOUT_SECONDS = 1800.0
 DEFAULT_MINERU_URL = "http://localhost:8000"
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 DEFAULT_S3_ENDPOINT_URL = "http://localhost:9000"
@@ -96,6 +98,25 @@ def gotenberg_credentials() -> tuple[str, str] | None:
     if not user or not password:
         raise ValueError("Gotenberg 凭据只配了一半：GOTENBERG_USER / GOTENBERG_PASS 必须同时提供")
     return user, password
+
+
+def gotenberg_timeout_seconds() -> float:
+    """单次转换的客户端超时（秒）。
+
+    默认 30 分钟而不是 SDK 常用值 180s：这个预算必须 ≥ 服务端的 API_TIMEOUT（Gotenberg 8 里它就是
+    转换的总预算，默认 30s），否则大文档会变成「服务端还在转、客户端已断开」——worker 槽被占着
+    却拿不回结果，两边日志对不上（实测数据见 docs/调研/02 第 5 节）。
+    """
+    raw = _setting("GOTENBERG_TIMEOUT_SECONDS")
+    if not raw:
+        return DEFAULT_GOTENBERG_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError("GOTENBERG_TIMEOUT_SECONDS 必须是正数") from exc
+    if value <= 0:
+        raise ValueError("GOTENBERG_TIMEOUT_SECONDS 必须是正数")
+    return value
 
 
 def mineru_url() -> str:

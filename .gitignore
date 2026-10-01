@@ -27,3 +27,10 @@ __pycache__/
 .env
 .vscode/
 .idea/
+
+# 自有字体（商业授权，由部署方提供）：只保留说明与占位文件
+docker/gotenberg/fonts/*
+!docker/gotenberg/fonts/README.md
+!docker/gotenberg/fonts/.gitkeep
+
+投标skill/

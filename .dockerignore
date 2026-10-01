@@ -1,0 +1,15 @@
+# 前端构建上下文是仓库根（pnpm workspace 需要根锁文件），这里把无关的大目录挡在外面
+.git/
+.tmp/
+**/node_modules/
+**/.next/
+**/.venv/
+**/__pycache__/
+**/*.log
+*.log
+# 后端源码不参与前端构建
+apps/api/
+docs/
+鹈鹕测试/
+# 本地密钥绝不进镜像（compose 用环境变量注入）
+.env

@@ -219,3 +219,54 @@ Set-Location G:\aicode\AI-tender; uv run --project apps/api python scripts/make_
   3. `gold_unavailable` 的条目没有清理入口（文档被删后会一直出现在失败明细里）。
   4. 运营统计报表页没做（前端目前只消费 `rerun_button`）；抽检任务也没有"抽检队列"入口页面。
   5. 回归回放与统计的取数 SQL、门禁 422 都需要 PostgreSQL/Redis/真实模型凭证实测（`docs/工程/07` 待验证清单第 17 项）。
+
+## 17. 部署编排补记（2026-09-29）
+
+- 仓库根新增 **`docker-compose.yml`**（可执行版本；docs/工程/07 第 1 节是结构示意）与根目录 **`.env.example`**
+  （`docker compose` 只读仓库根 `.env`；`apps/api/.env` 仍只服务宿主机直接跑 uvicorn/celery 的场景）。
+- 服务：postgres / redis / minio / minio-init（建桶 + 开版本化）/ mineru 随 `up` 启动；migrate / api / worker / beat / web 挂在 `app` profile 上。
+  （Gotenberg 已在 2026-10-01 移出本文件，见本节末尾。）
+  所有 `ports` 只绑 `127.0.0.1`，由反向代理转发；web 对外 4321（Windows 保留段避让，见 §2）。
+- 镜像：`apps/api/Dockerfile`（uv 装进系统解释器，api/migrate/worker/beat 共用）、`apps/web/Dockerfile`
+  （pnpm workspace 根上下文 + Next standalone 产物）、`docker/gotenberg/Dockerfile`（官方镜像 + 中文字体；
+  版权字体放 `docker/gotenberg/fonts/`，该目录已被 .gitignore 排除）。
+- 前端为此在 `next.config.ts` 开了 `output: "standalone"` 与 `outputFileTracingRoot`（pnpm workspace 必需），
+  `API_PROXY_TARGET` 是**构建参数**（rewrites 在构建期求值，运行时改无效）。
+- 验证：compose 用 PyYAML 解析通过（11 个服务、锚点展开、依赖引用无悬挂）、standalone 产物路径按本地 `pnpm build` 实测核对；
+  前端 47 passed / typecheck、后端 241 passed / 2 skipped 未受影响。
+  **未验证**：本机没有 Docker，镜像构建与 `docker compose config` 未执行，首次部署需实测。
+- 单服务交付：**`docker/gotenberg/docker-compose.yml`** 是「只跑 Gotenberg」的自包含编排（`build: .` + 同目录 Dockerfile +
+  `fonts/`；端口/内存/请求预算/鉴权都走同目录 `.env`，照同目录 `.env.example` 抄），同样带 `gotenberg-lb`，所以 `--scale gotenberg=N` 的动态扩缩在这里也能用
+  （交付时要连同 `docker/gotenberg-lb/` 一起拷，它挂的是那个目录里的 nginx.conf）；全栈编排是仓库根 `docker-compose.yml`，共用同一个 Dockerfile。
+- **`docker-compose.deps.yml` 已合并进仓库根 `docker-compose.yml`（2026-10-01）**，两份文件不再需要手工同步：
+  默认 `docker compose up -d` 只起依赖（postgres / redis / minio / minio-init / mineru），
+  `docker compose --profile app up -d --build` 才把 migrate / api / worker / beat / web 也拉起来；建表（应用在宿主机跑时）走
+  `Set-Location apps/api; uv run alembic upgrade head`。
+  MinerU 发布在 `MINERU_PORT`（默认 8100，避开宿主机 uvicorn 的 8000）：`apps/api/.env` 的 `MINERU_URL` 要跟着改成
+  `http://localhost:8100`，`MINERU_API_KEY` 也要与容器同名变量一致——不一致只会得到解析全 401，不会启动报错。
+  没有 GPU 的机器加 `--scale mineru=0` 跳过它。
+- Gotenberg 扩副本（2026-10-01 补）：在 `docker/gotenberg/` 那侧跑 `docker compose --scale gotenberg=N`，副本入口是
+  **`gotenberg-lb`**（`docker/gotenberg-lb/nginx.conf`：nginx 1.27-alpine + Docker 内嵌 DNS，副本增删 5 秒内生效）。
+  副本不再各自发布宿主端口（第二个副本 Bind `127.0.0.1:3000` 会失败），`GOTENBERG_URL` 始终指向入口，所以加副本不用改
+  任何客户端配置；配套要调配置中心的 `convert.max_inflight`（在途上限）与内存预算（`副本数 × GOTENBERG_MEMORY`）。
+  超时按三层配齐：客户端 `GOTENBERG_TIMEOUT_SECONDS` ≥ 服务端 `API_TIMEOUT`（两者默认 1800s）＜ LB 的
+  `proxy_read_timeout`（3600s）。依据是 `投标skill/LibreOffice安装.md` 的实测：600 MB 标书在 6 GB 内存下要 12 分半，
+  官方默认 30s（硬超时再多 5s）的请求预算根本转不完；`GOTENBERG_TIMEOUT_SECONDS` 由此新增到 `settings.py`（默认 1800，非正数直接报错）。
+  查了 Gotenberg 源码（v8.37.0）才定下这两个名字：v8 已没有 `--api-timeout-process` 参数，容器里的环境变量是 `API_TIMEOUT`
+  （规则是「参数名去前缀大写」，只有 Basic Auth 那两个是 `GOTENBERG_` 前缀的特例）；另外 LibreOffice 模块的进程池
+  `maxConcurrency` 写死为 1 —— 一个容器同一时刻只转一份文档，所以并行度只能靠副本数，这也是官方文档
+  「Does not apply to LibreOffice: scale Gotenberg containers instead」的意思。
+- **Gotenberg 移出仓库根 `docker-compose.yml`（2026-10-01 再次调整）**：转换是重资源服务，和 api / 数据库分机部署很常见，
+  根编排因此只留依赖与本体（默认 `up` 起 postgres / redis / minio / minio-init / mineru，`--profile app` 再加
+  api / worker / beat / migrate / web，共 10 个服务；`gotenberg` 与 `gotenberg-lb` 两段整体删除）。
+  Gotenberg 只用它自己那份 `docker/gotenberg/docker-compose.yml`（自带 `gotenberg-lb`，两个目录一起拷）。跨编排靠
+  `GOTENBERG_URL`：api / worker 的默认值改为 `http://host.docker.internal:3000`，并给四个后端服务（共享锚点 `&api-base`）
+  加了 `extra_hosts: host.docker.internal:host-gateway`——Linux 上这个域名不会自动解析，必须显式映射到宿主网关。
+- **MinIO 钉版本 + `minio-init` 保留（2026-10-01）**：`minio/minio:latest` 换成 `${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}`
+  （该版本是 2025-04-22 的社区版；2025-05-24 起官方把内置 Web 控制台标记为弃用并迁到单独的 object-browser 项目，
+  LDAP / OIDC 登录也移出社区版，继续用 latest 会让 9001 白发布），`minio/mc` 同样钉到 `RELEASE.2025-08-13T08-35-41Z`。
+  另按用户给的独立部署参考补了 `minioconfig:/root/.minio` 卷（证书 / 配置，数据仍在 `miniodata`）。
+  `minio-init` 不是可有可无：它做的是建桶 + 开版本化（`mc mb --ignore-existing` + `mc version enable`），而适配器
+  只读写对象、不建桶（`adapters/s3.py`），删掉它首次上传就是 `NoSuchBucket`；版本化是「原件被误覆盖 / 误删还能找回」
+  的兜底（对象键是内容哈希，正常不会覆盖）。它幂等、跑完即退，换成外部对象存储时用不到——在对方那边手工执行这两条
+  命令即可（`.env.example` 的 MinIO 段已给出）。当时本机仍没有 Docker，镜像切换只做了静态检查，未实跑。

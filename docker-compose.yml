@@ -1,0 +1,324 @@
+# AI-Tender 编排（Compose Spec；不写 version 字段，Compose v2 已弃用）
+#
+# 一份文件覆盖两种跑法，差别只在要不要 --profile app：
+#
+#   A) 只起依赖（默认，应用在宿主机直接跑 uvicorn / celery）：
+#        cp .env.example .env                                  # 按注释改；生产必须换掉默认口令
+#        docker compose up -d
+#        Set-Location apps/api; uv run alembic upgrade head     # 建表：migrate 在 app profile 里
+#      宿主机应用的连接参数写 apps/api/.env：口令类变量（POSTGRES_*、MINIO_ROOT_*）两边要同值，
+#      MINERU_URL 用 http://localhost:8100（下面 MinerU 发布在 8100，避开宿主机 uvicorn 的 8000）。
+#
+#   B) 全栈：api / worker / beat / migrate / web 也进容器：
+#        docker compose --profile app up -d --build
+#
+#   没有 NVIDIA GPU 的机器：docker compose up -d --scale mineru=0（跳过 MinerU，其余依赖照常）
+#
+# Gotenberg 不在这份文件里：它单独一条编排（docker/gotenberg/docker-compose.yml，自带自建镜像与副本入口
+#   gotenberg-lb），交付时把 docker/gotenberg 与 docker/gotenberg-lb 两个目录一起拷过去。
+#   分开的原因是转换是重资源服务，和 api / 数据库分机部署很常见（见 docs/调研/02 第 5 节）。
+#   本文件里的 api / worker 用 GOTENBERG_URL 指过去：同机部署走 http://host.docker.internal:3000
+#   （下面各服务已加 host-gateway 映射），异地部署覆盖成 http://<主机>:3000。
+#   扩缩仍在 Gotenberg 那一侧跑：docker compose up -d --scale gotenberg=N，客户端 URL 不用改。
+#   加副本后配套三件事：1) 配置中心 convert.max_inflight 调到副本数——Gotenberg 里 LibreOffice 的并发度
+#   写死为 1，副本数就是并行度；2) 内存按 副本数 × GOTENBERG_MEMORY 估；3) 升级镜像后重启 api / worker，
+#   因为适配器把 /version 缓存在进程内，新旧副本混跑会把 converter_version 记错。
+#
+# 与 apps/api/.env 的关系：那个文件只服务「在宿主机直接跑」的场景；容器里的部署参数由本文件从
+# 仓库根目录 .env 注入，两边同名同义、互不覆盖。
+#
+# 端口：除 web 外都只绑 127.0.0.1，由反向代理 / 网关转发；web 对外用 4321 —— Windows 宿主机把 3000
+#   落在保留端口段（见 docs/工程/07 第 2 节）。
+
+name: ai-tender
+
+# api / migrate / worker / beat 共用同一份部署参数（同名变量见 apps/api/.env.example）
+x-api-env: &api-env
+  DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://tender:tender@postgres:5432/tender}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  S3_BUCKET: ${S3_BUCKET:-ai-tender}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  # 指向单独部署的 Gotenberg 副本入口（那侧的 gotenberg-lb）：同机部署用 host.docker.internal 回到宿主
+  # 已发布的端口，异地部署改成 http://<主机>:3000。URL 后面始终是 LB，加副本时这里不用动。
+  GOTENBERG_URL: ${GOTENBERG_URL:-http://host.docker.internal:3000}
+  GOTENBERG_USER: ${GOTENBERG_USER:-}
+  GOTENBERG_PASS: ${GOTENBERG_PASS:-}
+  # 客户端预算必须 ≥ Gotenberg 那侧容器里的 API_TIMEOUT（默认 1800s，服务端硬超时还会多 5s）：
+  # 短了就是「服务端还在转、客户端已断开」，worker 槽白占着却拿不到结果
+  GOTENBERG_TIMEOUT_SECONDS: ${GOTENBERG_TIMEOUT_SECONDS:-1800}
+  MINERU_URL: ${MINERU_URL:-http://mineru:8000}
+  MINERU_API_KEY: ${MINERU_API_KEY:-}
+  # bbox 原点与旋转语义必须先实测再填（scripts/verify_coords.py）；unknown 时不写坐标
+  MINERU_BBOX_ORIGIN: ${MINERU_BBOX_ORIGIN:-unknown}
+  MINERU_BBOX_ROTATION: ${MINERU_BBOX_ROTATION:-unknown}
+  COMPANY_ID: ${COMPANY_ID:-1}
+  LLM_BASE_URL: ${LLM_BASE_URL:-}
+  LLM_MODEL: ${LLM_MODEL:-}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-90}
+  LLM_SECRET_KEYS: ${LLM_SECRET_KEYS:-}
+
+# 四个服务跑同一个后端镜像：写同一个 build 块，`up --build` 会构建一次、其余命中缓存。
+# 单独跑 api 时不必先手动 build；接了内部 registry 就换成 image 指向已发布镜像。
+# extra_hosts：Gotenberg 移出本文件后，容器要用 host.docker.internal 指回宿主端口；Linux 上这个域名
+# 不会自动解析，必须显式映射到宿主网关（Docker Desktop 自带，再写一条也无副作用）。
+x-api-base: &api-base
+  build:
+    context: ./apps/api
+  image: ai-tender-api:${IMAGE_TAG:-dev}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tender}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tender}
+      POSTGRES_DB: ${POSTGRES_DB:-tender}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 只给宿主机调试用（psql / 迁移排查）
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # 迁移会执行 CREATE EXTENSION pg_trgm（element.text 的三元组索引依赖它），
+    # 因此这里的账号必须是库 owner 或超级用户；外部托管库请预先建好扩展。
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF：配置缓存与 broker 状态在重启后不必重建（缓存本身有 60 秒 TTL 兜底）
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    # 钉版本、不用 latest：这是浮动标签，镜像一漂移连控制台都会跟着换——2025-05-24 的社区版把内置 Web
+    # 控制台标记为弃用并迁到单独的 object-browser 项目（LDAP / OIDC 登录也一并移出社区版），9001 会白发布。
+    # 默认值取那之前最后一个版本；不需要控制台就换更新的版本，并删掉下面 9001 那行端口。
+    # 对象存储是溯源数据的源头，升级版本要和转换器 / 解析器一起评审（见 docs/工程/07 第 1 节）。
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - miniodata:/data
+      # 证书 / 配置目录：重建容器不丢自定义 CA 与 TLS 证书（对象数据在 miniodata 里）
+      - minioconfig:/root/.minio
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # 建桶 + 开版本化：适配器只读写对象、不负责建桶（见 adapters/s3.py），少了这一步首次上传就是
+  # NoSuchBucket；版本化是「原件被误覆盖 / 误删还能找回」的兜底（对象键是内容哈希，正常不会覆盖）。
+  # 幂等（--ignore-existing）且跑完即退，每次 up 重跑一次没有副作用；换成外部对象存储时它用不上，
+  # 在对方那边建好桶并开版本化即可（两条命令见 .env.example 的 MinIO 段）。
+  # mc 不必与 server 同版本，这里只用到 mb / version 两个标准 S3 接口，但仍钉住避免漂移。
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-minio/mc:RELEASE.2025-08-13T08-35-41Z}
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-ai-tender}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" &&
+        mc mb --ignore-existing "local/$$S3_BUCKET" &&
+        mc version enable "local/$$S3_BUCKET"
+    restart: "no"
+
+  # 版式归一化之后才进 MinerU；它只吃 PDF。
+  # 它默认随 up 一起起（没有 GPU 的机器用 --scale mineru=0 跳过）；已有独立部署时把
+  # MINERU_URL / MINERU_API_KEY 指过去即可，不需要这个服务。
+  mineru:
+    image: ${MINERU_IMAGE:-mineru:4.0.7-cu121}
+    restart: unless-stopped
+    command:
+      - mineru-kit
+      - api-server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tier
+      - ${MINERU_TIER:-standard}
+      - --api-key
+      - ${MINERU_API_KEY:-local-dev-key}
+    environment:
+      MINERU_TABLE_DEVICE: ${MINERU_TABLE_DEVICE:-auto}
+      MINERU_HOME: /data/mineru
+      # 运行时禁止联网：模型必须预置进镜像，避免下载失败与隐私外泄
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - minerudata:/data
+    ports:
+      # 发布在 8100 而不是 8000：宿主机 uvicorn 默认也占 8000，两边同时发布会撞车。
+      # 宿主机跑 api / worker 时，apps/api/.env 的 MINERU_URL 要写成 http://localhost:8100。
+      - "127.0.0.1:${MINERU_PORT:-8100}:8000"
+    healthcheck:
+      # 基础镜像里没有 curl 时把这条删掉即可：api 只按 MINERU_URL 调用，不依赖它的健康状态
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # 一次性迁移；失败即中断启动，避免 api / worker 跑在半旧半新的表结构上
+  # 下面 5 个服务（migrate / api / worker / beat / web）只在 --profile app 时启动：
+  # 默认的「只起依赖」跑法用不到它们（应用在宿主机直接跑）。
+  migrate:
+    profiles: ["app"]
+    <<: *api-base
+    restart: "no"
+    command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+    environment: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: ["app"]
+    <<: *api-base
+    restart: unless-stopped
+    command:
+      - uvicorn
+      - tender.api.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      # 反代后面要拿到真实协议与客户端地址（下载审计与签名 URL 依赖它）
+      - --proxy-headers
+    environment: *api-env
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # 转换 / 解析 / 抽取 / 回归回放都在这里跑。
+  # tender 队列跑 beat 派发的调度任务，漏了它任务会永远停在 pending；
+  # regression 是低优先级回放队列，漏了回放会一直排队（见 docs/工程/07 第 1 节）。
+  worker:
+    profiles: ["app"]
+    <<: *api-base
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - tender.worker.celery_app
+      - worker
+      - -Q
+      - tender,convert,parse,extract,regression
+      - -c
+      - ${WORKER_CONCURRENCY:-4}
+      - -l
+      - info
+    environment: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  # 派发闸门：每 5 秒读 L1 配置、数在途、只提交差额（worker/dispatch.py）。
+  # 只能有一个实例：多实例会各算一份差额，虽然靠 job.dispatched_at 兜底，但不提高吞吐。
+  beat:
+    profiles: ["app"]
+    <<: *api-base
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - tender.worker.celery_app
+      - beat
+      - -l
+      - info
+      - --schedule
+      - /tmp/celerybeat-schedule
+    environment: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Next 的 rewrites 在构建期求值：容器里必须指向 compose 网络中的服务名
+        API_PROXY_TARGET: ${API_PROXY_TARGET:-http://api:8000}
+    image: ai-tender-web:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+    ports:
+      - "${WEB_PORT:-4321}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  # 与用户提供的独立 MinIO 部署参考一致：把 /root/.minio 也持久化（证书 / 配置）
+  minioconfig:
+  minerudata:

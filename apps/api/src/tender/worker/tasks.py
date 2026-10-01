@@ -205,10 +205,17 @@ def _converter() -> GotenbergConverter:
         credentials = settings.gotenberg_credentials()
     except ValueError as exc:
         raise ConversionFailed("Gotenberg 凭据配置无效") from exc
+    try:
+        timeout_seconds = settings.gotenberg_timeout_seconds()
+    except ValueError as exc:
+        raise ConversionFailed("Gotenberg 超时配置无效") from exc
+    # 客户端预算由部署参数给，不从构造函数默认值走：它必须跟着服务端的
+    # API_TIMEOUT 变，否则大文档的失败形态变成「服务端还在转、这边已放弃」
     return GotenbergConverter(
         settings.gotenberg_url(),
         username=credentials[0] if credentials else None,
         password=credentials[1] if credentials else None,
+        timeout_seconds=timeout_seconds,
     )
 
 
