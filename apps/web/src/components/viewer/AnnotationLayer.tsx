@@ -58,11 +58,11 @@ export function AnnotationLayer({ pageNo, items, activeEvidence, viewport, onLoc
             style={{ left, top }}
             className={
               "pointer-events-auto absolute flex h-5 min-w-5 items-center justify-center " +
-              "rounded-[2px] border px-0.5 font-mono text-[11px] leading-none tabular-nums " +
+              "rounded-lg border px-0.5 font-mono text-[11px] leading-none tabular-nums " +
               "shadow-[0_1px_0_rgba(18,22,29,0.12)] transition-colors " +
               (isActive
-                ? "border-amber-600 bg-amber-400 text-slate-900"
-                : "border-slate-300 bg-white text-slate-600 hover:border-amber-500 hover:bg-amber-50 hover:text-slate-900")
+                ? "border-sky-600 bg-sky-600 text-white"
+                : "border-slate-300 bg-white text-slate-600 hover:border-sky-500 hover:bg-sky-50 hover:text-slate-900")
             }
           >
             {item.badge}

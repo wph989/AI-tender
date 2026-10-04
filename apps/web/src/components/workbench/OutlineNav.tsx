@@ -55,7 +55,7 @@ function flatten(
 }
 
 const CHEVRON_CLASS =
-  "flex h-5 w-5 shrink-0 items-center justify-center rounded-[2px] text-[11px] leading-none " +
+  "flex h-5 w-5 shrink-0 items-center justify-center rounded-lg text-[11px] leading-none " +
   "text-slate-400 hover:bg-slate-100 hover:text-slate-700";
 
 export function OutlineNav({ items, currentPage, collapsed, onToggle, onSelect }: Props) {
@@ -86,13 +86,13 @@ export function OutlineNav({ items, currentPage, collapsed, onToggle, onSelect }
 
   if (collapsed) {
     return (
-      <div className="flex w-9 shrink-0 flex-col items-center gap-2 border-r border-slate-200 bg-white py-2">
+      <div className="outline-toggle flex w-9 shrink-0 flex-col items-center gap-2 border-r border-slate-200 bg-white py-2">
         <button
           type="button"
           onClick={onToggle}
           aria-label="展开章节树"
           title="展开章节树"
-          className="flex h-6 w-6 items-center justify-center rounded-[2px] border border-slate-300 bg-white text-[13px] leading-none text-slate-600 hover:border-slate-500 hover:bg-slate-50"
+          className="flex h-6 w-6 items-center justify-center rounded-lg border border-slate-300 bg-white text-[13px] leading-none text-slate-600 hover:border-slate-500 hover:bg-slate-50"
         >
           ›
         </button>
@@ -106,7 +106,7 @@ export function OutlineNav({ items, currentPage, collapsed, onToggle, onSelect }
   return (
     <nav
       aria-label="章节树"
-      className="flex w-[236px] shrink-0 flex-col border-r border-slate-200 bg-white"
+      className="outline-nav flex shrink-0 flex-col border-r border-slate-200 bg-white"
     >
       <div className="flex items-center gap-2 border-b border-slate-100 px-3.5 pt-3 pb-2">
         <p className={EYEBROW_CLASS}>章节</p>
@@ -116,7 +116,7 @@ export function OutlineNav({ items, currentPage, collapsed, onToggle, onSelect }
           onClick={onToggle}
           aria-label="收起章节树"
           title="收起章节树"
-          className="ml-auto flex h-5 w-5 items-center justify-center rounded-[2px] text-[13px] leading-none text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+          className="ml-auto flex h-5 w-5 items-center justify-center rounded-lg text-[13px] leading-none text-slate-400 hover:bg-slate-100 hover:text-slate-700"
         >
           ‹
         </button>
@@ -129,8 +129,8 @@ export function OutlineNav({ items, currentPage, collapsed, onToggle, onSelect }
           const isCurrent = node.key === currentKey;
           return (
             <li key={node.key} className="relative flex items-center">
-              {/* 当前章左侧那道琥珀色条：与结果卡/文件行的卷宗脊同一套「颜色即状态」语法 */}
-              {isCurrent && <span aria-hidden className="absolute inset-y-0 left-0 w-[4px] bg-amber-400" />}
+              {/* 当前章节使用操作色，与点击原文后的定位框保持一致 */}
+              {isCurrent && <span aria-hidden className="absolute inset-y-0 left-0 w-[4px] bg-sky-400" />}
               {hasChildren ? (
                 <button
                   type="button"

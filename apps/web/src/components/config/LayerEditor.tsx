@@ -53,7 +53,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
       await onSaved(
         result.status === "active"
           ? "已保存并立即生效（L1 不需要回归门禁）"
-          : "已生成草稿 v" + result.version_no + "，请在右侧逐条确认影响后激活",
+          : "已生成草稿 v" + result.version_no + "，请到「版本与发布」逐条确认影响后激活",
       );
     } catch (caught) {
       setError(message(caught, "保存配置失败"));
@@ -63,10 +63,10 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
   };
 
   return (
-    <section className="border border-slate-200 bg-white px-5 py-4">
+    <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">{LAYER_LABELS[layer]}</h2>
+          <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">{LAYER_LABELS[layer]}</h2>
           <p className="mt-1 text-[13px] leading-5 text-slate-500">{LAYER_HINTS[layer]}</p>
         </div>
         <span className="text-[13px] text-slate-400">{items.length} 项</span>
@@ -83,17 +83,17 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
           const value = drafts[item.key] ?? formatValue(item.value);
           const changed = value !== formatValue(item.value);
           return (
-            <div key={item.key} className="flex flex-wrap items-center gap-2 py-2">
-              <div className="min-w-0 flex-1">
+            <div key={item.key} className="config-field">
+              <div className="config-field-label">
                 <div className="flex items-center gap-2">
                   <code className="text-[13px] text-slate-700">{item.key}</code>
                   {item.overridden && (
-                    <span className="rounded-[2px] bg-sky-50 px-1 text-[11px] text-sky-700">
+                    <span className="rounded-lg bg-sky-50 px-1 text-[11px] text-sky-700">
                       已覆盖默认值
                     </span>
                   )}
                   {changed && (
-                    <span className="rounded-[2px] bg-amber-50 px-1 text-[11px] text-amber-700">
+                    <span className="rounded-lg bg-amber-50 px-1 text-[11px] text-amber-700">
                       未保存
                     </span>
                   )}
@@ -102,7 +102,8 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
               </div>
               {item.value_type === "bool" ? (
                 <select
-                  className={SELECT_CLASS + " w-24"}
+                  aria-label={item.description || item.key}
+                  className={SELECT_CLASS + " w-full"}
                   value={value}
                   disabled={!writable}
                   onChange={(event) =>
@@ -115,8 +116,9 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
               ) : (
                 <input
                   className={
-                    INPUT_CLASS + " w-56" + (item.value_type === "secret" ? " font-mono" : "")
+                    INPUT_CLASS + " w-full" + (item.value_type === "secret" ? " font-mono" : "")
                   }
+                  aria-label={item.description || item.key}
                   type={
                     item.value_type === "int" || item.value_type === "number" ? "number" : "text"
                   }
@@ -127,7 +129,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                   }
                 />
               )}
-              <span className="w-28 text-right text-[11px] text-slate-400">
+              <span className="config-field-default text-[11px] text-slate-400">
                 默认 {formatValue(item.default)}
               </span>
             </div>
@@ -136,14 +138,15 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
       </div>
 
       {error !== null && (
-        <p className="mt-3 rounded-[2px] border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">
+        <p className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">
           {error}
         </p>
       )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <input
-          className={INPUT_CLASS + " min-w-64 flex-1"}
+          aria-label="配置变更说明"
+          className={INPUT_CLASS + " min-w-0 flex-1"}
           placeholder="变更说明（会写进审计，例如：调整保证金字段提示词）"
           value={note}
           onChange={(event) => setNote(event.target.value)}

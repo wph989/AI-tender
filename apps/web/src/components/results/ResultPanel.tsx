@@ -74,10 +74,10 @@ function ModeButton({
       aria-selected={active}
       onClick={onClick}
       className={
-        "rounded-[2px] border px-2 py-1 text-[13px] transition-colors " +
+        "rounded-lg border px-2 py-1 text-[13px] transition-colors " +
         (active
-          ? "border-slate-900 bg-slate-900 font-medium text-white"
-          : "border-slate-300 bg-white text-slate-600 hover:border-slate-500 hover:bg-slate-50")
+          ? "border-sky-200 bg-sky-50 font-medium text-sky-700"
+          : "border-transparent bg-white text-slate-500 hover:bg-slate-50")
       }
     >
       {label}
@@ -216,7 +216,7 @@ export function ResultPanel({
       onKeyDown={handleKeyDown}
       className={RESULT_PANEL_WIDTH + " flex shrink-0 flex-col border-l border-slate-200 focus:outline-none"}
     >
-      <div className="border-b border-slate-200 bg-white px-4 pt-3.5 pb-3">
+      <div className="result-panel-heading border-b border-slate-200 bg-white px-4 pt-3.5 pb-3">
         <div className="flex items-baseline justify-between gap-3">
           <p className={EYEBROW_CLASS}>{reviewOnly ? "复核队列" : "解析结果"}</p>
           <span className={DATA_CLASS + " text-[13px] text-slate-400"}>
@@ -262,7 +262,7 @@ export function ResultPanel({
               {notFound}
             </span>
           </span>
-          <span className="ml-auto text-[11px] text-slate-400">
+          <span className="result-shortcuts ml-auto text-[11px] text-slate-400">
             j/k 移动 · Enter 确认 · Shift+Enter 带提示重跑
           </span>
         </p>

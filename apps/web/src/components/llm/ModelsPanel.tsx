@@ -99,12 +99,12 @@ export function ModelsPanel({ providers, models, onChanged }: Props) {
   );
 
   return (
-    <section className="border border-slate-200 bg-white px-5 py-4">
+    <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">模型</h2>
+          <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">模型</h2>
           <p className="mt-1 text-[13px] leading-5 text-slate-500">
-            超时、温度、max tokens 是调用参数，和优先级无关；测试会真实发一次要求 JSON 的请求。
+            管理可用模型及其调用参数，测试模型是否能正常返回抽取结果。
           </p>
         </div>
         <button
@@ -132,7 +132,7 @@ export function ModelsPanel({ providers, models, onChanged }: Props) {
       )}
 
       {models.length > 0 && (
-        <table className="mt-3 w-full border-collapse text-[14px]">
+        <div className="settings-table-scroll" role="region" aria-label="配置列表" tabIndex={0}><table className="w-full border-collapse text-[13px]">
           <thead>
             <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
               <th className="border-b border-slate-200 py-2 pr-3 font-normal">模型</th>
@@ -238,7 +238,7 @@ export function ModelsPanel({ providers, models, onChanged }: Props) {
               );
             })}
           </tbody>
-        </table>
+        </table></div>
       )}
 
       {newForm}

@@ -86,6 +86,15 @@ export interface WireProjectFile {
   confirmed_count: number;
   /** 最近一次抽取任务的状态（pending/running/completed/partial/failed）；null = 还没排过队。 */
   extraction_status: string | null;
+  /** 转换、解析排队等阶段还没有结果行，页面必须依据任务状态继续刷新。 */
+  latest_job: {
+    id: string;
+    status: string;
+    stage: string | null;
+    progress: Record<string, unknown> | null;
+    error_code: string | null;
+    error_message: string | null;
+  } | null;
 }
 
 export interface WireProjectDetail extends WireProject {

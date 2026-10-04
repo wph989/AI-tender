@@ -43,9 +43,9 @@ def _export_rows(
         clauses.append("effective.lot_id = :lot_id")
         params["lot_id"] = lot_id
     if include == "review":
-        clauses.append("effective.status IN ('need_review','conflict','not_found')")
+        clauses.append("effective.effective_status IN ('need_review','conflict','not_found')")
     elif include == "verified":
-        clauses.append("effective.status = 'verified'")
+        clauses.append("effective.effective_status = 'verified'")
     rows = (
         connection.execute(  # type: ignore[attr-defined]
             text(
@@ -63,7 +63,8 @@ def _export_rows(
                                WHEN ra.action = 'confirm' THEN 'verified'
                                WHEN ra.action = 'reject' THEN 'rejected'
                                ELSE e.status
-                           END AS status
+                           -- e.* 已含 status，派生复核状态必须另命名，避免查询列歧义。
+                           END AS effective_status
                     FROM extraction AS e
                     JOIN field_instance AS fi ON fi.id = e.instance_id
                     LEFT JOIN lot AS l ON l.id = fi.lot_id
@@ -74,7 +75,8 @@ def _export_rows(
                     ) AS ra ON true
                 )
                 SELECT effective.field_key, effective.group_key, effective.value_text,
-                       effective.lot_code, effective.confidence, effective.status,
+                       effective.lot_code, effective.confidence,
+                       effective.effective_status AS status,
                        effective.machine_attempt_no,
                        file.display_name, ev.page_no, ev.quote, review.comment
                 FROM effective

@@ -37,11 +37,13 @@ export function EvidenceList({ targets, activeAnchor, onLocate }: Props) {
       <h5 className="mb-1.5 flex items-baseline gap-1.5 text-[13px] text-slate-400">
         <span>证据 {targets.length} 处</span>
         <span aria-hidden>·</span>
-        <span>点哪条跳哪条</span>
+        <span>点击定位原文</span>
       </h5>
       <ul className="flex flex-col">
         {visible.map((target, index) => {
           const active = target.anchor === activeAnchor;
+          // 表格引文可能包含 HTML 排版标记；预览只展示文字，锚点和提交原文仍保持原值。
+          const preview = target.quote.replace(/<\/?(?:table|thead|tbody|tfoot|tr|th|td|p|div|span|br)\b[^>]*>/gi, " ").replace(/\s+/g, " ").trim();
           return (
             <li key={`${target.anchor}-${index}`}>
               <button
@@ -49,14 +51,14 @@ export function EvidenceList({ targets, activeAnchor, onLocate }: Props) {
                 data-evidence-row
                 data-evidence-anchor={target.anchor}
                 onClick={() => onLocate(target)}
-                title={target.quote === "" ? undefined : target.quote}
+                title={preview || undefined}
                 className={
-                  "relative flex w-full items-center gap-2 py-1.5 pr-1.5 pl-2 text-left text-[13px] " +
-                  (active ? "bg-amber-50" : "hover:bg-slate-50")
+                  "relative mb-1.5 flex w-full items-center gap-2 rounded-lg border border-sky-100 px-2.5 py-2 text-left text-[12px] " +
+                  (active ? "bg-sky-100" : "bg-sky-50/50 hover:bg-sky-50")
                 }
               >
                 {active && (
-                  <span aria-hidden className="absolute inset-y-0 left-0 w-[4px] bg-amber-400" />
+                  <span aria-hidden className="absolute inset-y-2 left-0 w-[3px] rounded-full bg-sky-400" />
                 )}
                 <span className={DATA_CLASS + " w-3 shrink-0 text-[13px] text-slate-400"}>
                   {index + 1}
@@ -64,7 +66,7 @@ export function EvidenceList({ targets, activeAnchor, onLocate }: Props) {
                 <span
                   className={
                     DATA_CLASS +
-                    " shrink-0 border border-slate-200 px-1 py-px text-[11px] text-slate-500"
+                    " shrink-0 rounded bg-white px-1.5 py-0.5 text-[11px] text-slate-500"
                   }
                 >
                   第 {target.pageNo} 页
@@ -73,7 +75,7 @@ export function EvidenceList({ targets, activeAnchor, onLocate }: Props) {
                   <span className="shrink-0 text-[11px] text-slate-400">页级</span>
                 )}
                 <span className="min-w-0 flex-1 truncate text-slate-600">
-                  {target.quote === "" ? "（无引文）" : target.quote}
+                  {preview || "（无引文）"}
                 </span>
               </button>
             </li>

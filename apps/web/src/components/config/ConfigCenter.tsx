@@ -30,6 +30,7 @@ import { ReleasePanel } from "./ReleasePanel";
 type LoadState = "loading" | "ready" | "error";
 
 export function ConfigCenter() {
+  const [section, setSection] = useState("L1");
   const [items, setItems] = useState<ConfigItem[]>([]);
   const [role, setRole] = useState("");
   const [active, setActive] = useState<{ release_id: number; version_no: number } | null>(null);
@@ -108,7 +109,7 @@ export function ConfigCenter() {
       breadcrumb={[<span>设置</span>, <span className="text-slate-600">配置中心</span>]}
       eyebrow="设置 · 配置"
       title="配置中心"
-      description="三层配置：L1 改完立即生效，L2/L3 先落成草稿，逐条确认影响清单过门禁后才激活。每次激活与回滚都会写进审计。"
+      description="管理运行、解析与抽取规则，查看每一次配置发布的影响。"
       actions={
         <>
           <span className="text-[13px] text-slate-500">
@@ -141,7 +142,7 @@ export function ConfigCenter() {
         <div className="border border-rose-200 bg-rose-50 px-4 py-3 text-[14px] text-rose-700">
           <p>{error ?? "加载失败"}</p>
           <p className="mt-1 text-[13px] text-rose-600">
-            配置数据来自后端 /api/v1/config，多半是服务没起来。确认后点下面的重试。
+            暂时无法获取配置，请确认服务可用后重试。
           </p>
           <button type="button" className={BUTTON_CLASS + " mt-2"} onClick={retry}>
             重试
@@ -162,24 +163,24 @@ export function ConfigCenter() {
       )}
 
       {state === "ready" && (
-        /*
-         * 两栏从 lg 起就成立（不像模型页要等到 2xl）：左边是配置项行，右边是版本与门禁，
-         * 右边那栏再宽也只是把一行说明拉长，反而是浪费；1600px 下 3:2 的分配刚好。
-         */
-        <div className="grid gap-6 lg:grid-cols-[3fr_2fr]">
-          <div className="flex flex-col gap-6">
-            {LAYERS.map((layer) => (
-              <LayerEditor
-                key={layer}
-                layer={layer}
-                items={itemsOfLayer(items, layer)}
-                onSaved={async (text) => {
-                  setInfo(text);
-                  await reload();
-                }}
-              />
-            ))}
-          </div>
+        <div className="settings-layout">
+          <nav className="settings-nav" aria-label="配置分类">
+            {[
+              { key: "L1", label: "运行参数", hint: "并发与超时 · 立即生效" },
+              { key: "L2", label: "解析配置", hint: "文档解析 · 发布后生效" },
+              { key: "L3", label: "抽取配置", hint: "信息抽取 · 发布后生效" },
+              { key: "releases", label: "版本与发布", hint: "变更确认、发布与回滚" },
+            ].map((item) => <button key={item.key} type="button" aria-pressed={section === item.key} onClick={() => setSection(item.key)}>
+              <span className="nav-step">{item.key === "releases" ? "↗" : item.key}</span>
+              <span><strong>{item.label}</strong><small>{item.hint}</small></span>
+            </button>)}
+            <p className="settings-help">解析与抽取配置先保存为草稿。确认影响并通过检查后，在「版本与发布」中生效。</p>
+          </nav>
+          <div className="settings-main">
+            {LAYERS.map((layer) => <div key={layer} hidden={section !== layer}>
+              <LayerEditor layer={layer} items={itemsOfLayer(items, layer)} onSaved={async (text) => { setInfo(text); await reload(); }} />
+            </div>)}
+            <div hidden={section !== "releases"}>
           <ReleasePanel
             releases={releases}
             detail={detail}
@@ -207,6 +208,8 @@ export function ConfigCenter() {
               })
             }
           />
+            </div>
+          </div>
         </div>
       )}
     </PageShell>

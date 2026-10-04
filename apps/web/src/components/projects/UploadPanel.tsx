@@ -1,33 +1,16 @@
 "use client";
 
-/**
- * 交件台：把文件放到台面上，而不是「点这里选择文件」。
- *
- * 为什么不做常见的虚线圆角框 + 云朵图标：那套外观把「上传」画成了一件抽象的事，
- * 而这里要同时说清三件事——拖进来、能选哪些格式、上传后会跑什么流水线。
- * 一条实底横带 + 左侧荧光黄竖线（和导航字标、列表行是同一道卷宗脊）把注意力
- * 引到「操作」上，右侧一栏专门写规格与角色推断规则：用户最常问的两个问题就是
- * 「能传多大」和「为什么这个 Excel 不算解析文件」。
- *
- * 为什么拖拽区给到 200px 以上：这块区域越矮，越像页面上一条不起眼的附件输入框；
- * 它是这一页的主操作，必须一眼看出「东西放这里」。
- *
- * ZIP 单独走 archive 字段：后端会解压后逐个入库（见 api/project_files.py 的
- * _read_archive），混在 files 里只会被当成一个不参与解析的文件。
- *
- * 为什么要有逐文件结果：一次请求只回一个汇总，而用户看的是自己挑的那几个文件。
- * 上传结束后每一行都标出「已入库 / 被拒（原因）/ 未入库」，不必去页面顶部对名字。
- */
+/** 先选择文件再确认上传，让批量回执与解析选项都能在提交前检查。 */
 
 import { useRef, useState } from "react";
 
 import {
   BUTTON_CLASS,
   DATA_CLASS,
-  EYEBROW_CLASS,
   PRIMARY_BUTTON_CLASS,
   SELECT_CLASS,
 } from "@/components/ui";
+import { Icon } from "@/components/Icon";
 import { UploadRejectedError } from "@/lib/api/client";
 import { formatBytes } from "@/lib/format";
 import { outcomeOf, type UploadOutcome } from "@/lib/projects/upload";
@@ -55,7 +38,7 @@ const LIMITS = [
 ];
 
 const ROLE_RULE =
-  "角色按扩展名推断：xls / xlsx / xlsm / ods → 清单，dwg / dxf / vsd / vsdx → 图纸，";
+  "电子表格自动归类为清单，CAD 与 Visio 文件归类为图纸，";
 
 const TIER_OPTIONS: { value: ParseTier; label: string }[] = [
   { value: "flash", label: "flash · 最快" },
@@ -114,7 +97,7 @@ export function UploadPanel({ busy, onUpload }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const stage = (incoming: FileList | null) => {
-    if (incoming === null) return;
+    if (incoming === null || busy) return;
     // 同名同大小视为同一个文件：拖两次同一份标书是常事，去重比报错友好。
     const next = [...staged];
     for (const file of Array.from(incoming)) {
@@ -158,151 +141,49 @@ export function UploadPanel({ busy, onUpload }: Props) {
   };
 
   return (
-    <section className="border border-slate-300 bg-white">
-      <div
-        onDragOver={(event) => {
-          event.preventDefault();
-          setDragging(true);
-        }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={(event) => {
-          event.preventDefault();
-          setDragging(false);
-          stage(event.dataTransfer.files);
-        }}
-        className={"flex min-h-[208px] items-stretch " + (dragging ? "bg-amber-50" : "bg-white")}
-      >
-        <div
-          aria-hidden
-          className={"w-[4px] shrink-0 " + (dragging ? "bg-amber-500" : "bg-amber-400")}
-        />
-        <div
-          className={
-            "flex flex-1 flex-col gap-y-5 px-6 py-6 lg:flex-row lg:gap-x-10 " +
-            (dragging ? "outline-2 -outline-offset-2 outline-dashed outline-amber-400" : "")
-          }
-        >
-          <div className="min-w-0 flex-1">
-            <p className={EYEBROW_CLASS}>01 · 交件台</p>
-            <p className="mt-2 font-serif text-[22px] leading-8 text-slate-900">
-              {dragging ? "松手即入库" : "把招标文件拖到这里"}
-            </p>
-            <p className="mt-2 max-w-xl text-[13px] leading-5 text-slate-500">
-              ZIP 会自动解开、按成员逐个入库。只有 PDF 与 Word / PPT 会进入「转换 → 解析 → 抽取」这条
-              流水线；清单与图纸入库备查，不参与文本解析。
-            </p>
-            <ul className="mt-3 flex flex-wrap items-center gap-1.5">
-              {FORMATS.map((format) => (
-                <li
-                  key={format}
-                  className={
-                    DATA_CLASS + " border border-slate-200 px-1.5 py-[1px] text-[11px] text-slate-500"
-                  }
-                >
-                  {format}
-                </li>
-              ))}
-            </ul>
-          </div>
-
-          {/*
-           * 右栏专门放「规则」：能传多大、ZIP 怎么算、角色怎么推断。
-           * 这些不是帮助文档——它们决定用户下一步怎么做，放在动作旁边才算说清楚。
-           */}
-          <div className="w-full shrink-0 lg:w-[23rem]">
-            <p className={EYEBROW_CLASS}>规格与角色</p>
-            <dl className="mt-2 flex flex-col gap-1.5 text-[13px] leading-5">
-              {LIMITS.map((line) => (
-                <dd key={line} className="flex gap-2 text-slate-500">
-                  <span aria-hidden className="mt-[7px] h-[4px] w-[4px] shrink-0 bg-slate-400" />
-                  <span>{line}</span>
-                </dd>
-              ))}
-            </dl>
-            <p className="mt-2 text-[13px] leading-5 text-slate-500">
-              {ROLE_RULE}其余 → 主文件。上传后可在文件清单里逐个改角色。
-            </p>
-            <div className="mt-4 flex flex-wrap items-center gap-2">
-              <input
-                ref={inputRef}
-                type="file"
-                multiple
-                accept={ACCEPT}
-                className="hidden"
-                onChange={(event) => stage(event.target.files)}
-              />
-              <button type="button" className={BUTTON_CLASS} onClick={() => inputRef.current?.click()}>
-                选择文件
-              </button>
-              <button
-                type="button"
-                className={PRIMARY_BUTTON_CLASS}
-                disabled={staged.length === 0 || busy}
-                onClick={() => void submit()}
-              >
-                {busy ? "正在上传…" : staged.length > 0 ? `上传 ${staged.length} 个文件` : "上传文件"}
-              </button>
-            </div>
-          </div>
+    <section className="upload-panel" aria-label="上传文件">
+      <div className={"upload-drop " + (dragging ? "is-dragging" : "")}
+        onDragOver={(event) => { event.preventDefault(); if (!busy) setDragging(true); }}
+        onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
+        onDrop={(event) => { event.preventDefault(); setDragging(false); stage(event.dataTransfer.files); }}>
+        <span className="upload-icon"><Icon name="upload" size={25} /></span>
+        <h2>{dragging ? "松开鼠标，添加到待上传列表" : "拖入文件，开始分析"}</h2>
+        <p>支持 PDF、Word、PPT 或 ZIP 招标包；清单与图纸可一同归档。</p>
+        <div className="mt-2 flex flex-wrap justify-center gap-2">
+          <input ref={inputRef} type="file" multiple accept={ACCEPT} className="hidden" disabled={busy} onChange={(event) => stage(event.target.files)} />
+          <button type="button" className={BUTTON_CLASS} disabled={busy} onClick={() => inputRef.current?.click()}><Icon name="plus" size={15} />选择文件</button>
+          {staged.length > 0 && <button type="button" className={PRIMARY_BUTTON_CLASS} disabled={busy} onClick={() => void submit()}>{busy ? "正在上传…" : "上传 " + staged.length + " 个文件"}<Icon name="arrow" size={15} /></button>}
+        </div>
+        <div className="mt-2 flex flex-wrap justify-center gap-2">
+          {FORMATS.map((format) => <span key={format} className="rounded border border-sky-200/60 px-1.5 text-[9px] text-sky-500">{format}</span>)}
         </div>
       </div>
-
-      {/* 参数行：这些值只在「入库」这一刻有效，所以跟在上传动作下面，而不是单独一页设置。 */}
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-3 border-t border-slate-200 bg-slate-50 px-5 py-2.5 text-[13px] text-slate-600">
-        <label className="flex items-center gap-2">
-          解析档位
-          <select
-            value={options.tier}
-            onChange={(event) => setOptions({ ...options, tier: event.target.value as ParseTier })}
-            className={SELECT_CLASS + " py-1"}
-          >
-            {TIER_OPTIONS.map((item) => (
-              <option key={item.value} value={item.value}>
-                {item.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="flex items-center gap-2">
-          OCR
-          <select
-            value={options.ocrMode}
-            onChange={(event) =>
-              setOptions({ ...options, ocrMode: event.target.value as "auto" | "txt" | "ocr" })
-            }
-            className={SELECT_CLASS + " py-1"}
-          >
-            <option value="auto">auto · 自动判断</option>
-            <option value="txt">txt · 强制文本层</option>
-            <option value="ocr">ocr · 强制 OCR</option>
-          </select>
-        </label>
-        <label className="flex items-center gap-2">
-          角色
-          <select
-            value={options.role}
-            onChange={(event) =>
-              setOptions({ ...options, role: event.target.value as FileRole | "" })
-            }
-            className={SELECT_CLASS + " py-1"}
-          >
-            <option value="">按扩展名自动判断</option>
-            {(Object.keys(FILE_ROLE_LABELS) as FileRole[]).map((role) => (
-              <option key={role} value={role}>
-                {FILE_ROLE_LABELS[role]}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={options.autoParse}
-            onChange={(event) => setOptions({ ...options, autoParse: event.target.checked })}
-          />
-          上传后自动解析
-        </label>
-      </div>
+      <details className="upload-settings">
+        <summary>解析选项与上传限制 <span className="ml-2 text-slate-400">默认自动识别，上传后开始解析</span></summary>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <label className="flex flex-col gap-2 text-[12px] text-slate-500">解析档位
+            <select disabled={busy} value={options.tier} onChange={(event) => setOptions({ ...options, tier: event.target.value as ParseTier })} className={SELECT_CLASS}>
+              {TIER_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label className="flex flex-col gap-2 text-[12px] text-slate-500">文字识别
+            <select disabled={busy} value={options.ocrMode} onChange={(event) => setOptions({ ...options, ocrMode: event.target.value as "auto" | "txt" | "ocr" })} className={SELECT_CLASS}>
+              <option value="auto">自动判断</option><option value="txt">使用文本层</option><option value="ocr">强制 OCR 识别</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-2 text-[12px] text-slate-500">文件角色
+            <select disabled={busy} value={options.role} onChange={(event) => setOptions({ ...options, role: event.target.value as FileRole | "" })} className={SELECT_CLASS}>
+              <option value="">自动判断</option>
+              {(Object.keys(FILE_ROLE_LABELS) as FileRole[]).map((role) => <option key={role} value={role}>{FILE_ROLE_LABELS[role]}</option>)}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-[12px] text-slate-600">
+            <input type="checkbox" disabled={busy} checked={options.autoParse} onChange={(event) => setOptions({ ...options, autoParse: event.target.checked })} />上传后自动解析
+          </label>
+        </div>
+        <ul className="mt-4 flex flex-col gap-1 text-[11px] text-slate-400">{LIMITS.map((line) => <li key={line}>{line}</li>)}</ul>
+        <p className="mt-2 text-[11px] text-slate-400">{ROLE_RULE}其他文件归为主文件。上传后可调整。</p>
+      </details>
 
       {staged.length > 0 && (
         <div className="border-t border-slate-200">
@@ -334,6 +215,7 @@ export function UploadPanel({ busy, onUpload }: Props) {
                 <button
                   type="button"
                   className="text-slate-400 hover:text-rose-600"
+                  disabled={busy}
                   aria-label={"移除 " + file.name}
                   onClick={() => setStaged(staged.filter((item) => item !== file))}
                 >

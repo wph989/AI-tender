@@ -60,7 +60,7 @@ export function ReviewStatsBar({ projectId, reviewOnly, onReviewModeChange, refr
   }, [projectId, refreshToken]);
 
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-slate-200 bg-white px-4 py-2">
+    <div className="review-stats">
       <span className={EYEBROW_CLASS}>复核进度</span>
 
       {stats === null ? (
@@ -78,7 +78,7 @@ export function ReviewStatsBar({ projectId, reviewOnly, onReviewModeChange, refr
               className={
                 DATA_CLASS +
                 " text-[17px] " +
-                (stats.corrected > 0 ? "text-indigo-700" : "text-slate-400")
+                (stats.corrected > 0 ? "text-sky-700" : "text-slate-400")
               }
             >
               {stats.corrected}
@@ -90,7 +90,7 @@ export function ReviewStatsBar({ projectId, reviewOnly, onReviewModeChange, refr
               type="button"
               onClick={() => onReviewModeChange(true)}
               title="切到结果面板的复核队列，先处理这些"
-              className="rounded-[2px] px-1 text-slate-600 hover:bg-amber-50 hover:text-slate-900"
+              className="rounded-lg px-1 text-slate-600 hover:bg-amber-50 hover:text-slate-900"
             >
               待复核{" "}
               <span className={DATA_CLASS + " mark-ink px-1 text-[17px] text-slate-900"}>
@@ -109,7 +109,7 @@ export function ReviewStatsBar({ projectId, reviewOnly, onReviewModeChange, refr
       )}
 
       {reviewOnly && (
-        <span className="ml-auto shrink-0 text-[13px] text-slate-400">
+        <span className="review-mode-note ml-auto shrink-0 text-[13px] text-slate-400">
           结果面板正按复核队列排序
         </span>
       )}

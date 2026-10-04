@@ -25,6 +25,8 @@ export interface FilePipelineView {
 
 /** 只取推导需要的字段，测试与调用方都不用造完整的接口对象。 */
 export interface PipelineInput {
+  is_parseable?: boolean;
+  latest_job?: { status: string; stage: string | null } | null;
   version_id: number | null;
   parse_status: string | null;
   extraction_status: string | null;
@@ -45,16 +47,23 @@ function runState(status: string | null): StageState {
 export function derivePipeline(file: PipelineInput): FilePipelineView {
   // 转换完成的标志是版本行被建出来，而不是 mime/后缀——PDF 与 Office 走的是两条实现，
   // 只有在 _finish_file_version 之后 version_id 才存在（见 worker/tasks.py）。
-  const convertState: StageState = file.version_id === null ? "idle" : "done";
+  const job = file.latest_job;
+  const jobState = runState(job?.status ?? null);
+  const convertState: StageState = file.version_id !== null ? "done"
+    : file.is_parseable === false ? "idle" : jobState;
 
-  const parseState: StageState = file.version_id === null ? "idle" : runState(file.parse_status);
+  // 提交解析后 parse_run 可能尚未创建；重解析时还可能残留上一次成功状态。
+  const parseQueued = job != null && ["submitting", "parsing"].includes(job.stage ?? "");
+  const parseState: StageState = file.version_id === null ? "idle"
+    : parseQueued ? jobState : runState(file.parse_status);
 
   // 解析没完成时抽取不可能开始：把抽取显式压回 idle，
   // 否则并发的两个 job 状态会拼出「解析进行中、抽取已完成」这种不存在的画面。
-  let extractState: StageState =
-    file.extraction_count > 0 ? "done" : runState(file.extraction_status);
-  if (parseState !== "done" && extractState === "done") extractState = "idle";
-  if (parseState !== "done" && extractState === "failed") extractState = "idle";
+  const extractionStatus = job?.stage === "extracting" ? job.status : file.extraction_status;
+  // 逐字段写入和重跑都会保留已有结果，结果条数不能盖过正在运行或失败的任务。
+  let extractState = runState(extractionStatus);
+  if (extractionStatus === null && file.extraction_count > 0) extractState = "done";
+  if (parseState !== "done") extractState = "idle";
 
   const stages: PipelineStage[] = [
     { key: "convert", label: "转换", state: convertState },
@@ -84,6 +93,9 @@ function describe(
   parseState: StageState,
   extractState: StageState,
 ): string {
+  if (file.is_parseable === false && file.version_id === null) return "仅归档";
+  if (convertState === "active") return file.latest_job?.status === "pending" ? "排队转换" : "转换中";
+  if (convertState === "failed") return file.latest_job?.status === "canceled" ? "转换已取消" : "转换失败";
   if (convertState === "idle") return "等待转换";
   if (parseState === "idle") return "等待解析";
   if (parseState === "failed") return "解析失败";

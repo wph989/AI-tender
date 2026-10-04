@@ -12,7 +12,7 @@
 
 "use client";
 
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 import type { MountedPage, PageRegistry } from "@/hooks/usePageRenderer";
 import type { ActiveEvidence } from "@/lib/store/viewerStore";
@@ -26,9 +26,15 @@ function nextFrame(): Promise<void> {
   });
 }
 
-/** 占位容器对每一页始终存在（虚拟列表负责），所以这一步不依赖该页是否已挂载 */
-function scrollPlaceholderIntoView(pageNo: number): void {
-  document.querySelector(`[data-page-no="${pageNo}"]`)?.scrollIntoView({ block: "center" });
+/** 小屏切回原文时，ResizeObserver 重新测宽后才会恢复虚拟页占位，不能提前滚动。 */
+async function waitForPageSlot(pageNo: number, isCurrent: () => boolean): Promise<HTMLElement | null> {
+  const deadline = performance.now() + 4000;
+  while (isCurrent() && performance.now() < deadline) {
+    const slot = document.querySelector<HTMLElement>(`[data-page-no="${pageNo}"]`);
+    if (slot && slot.getBoundingClientRect().height > 0) return slot;
+    await nextFrame();
+  }
+  return null;
 }
 
 /** ⑤ 页内精确滚动：把高亮块垂直居中到滚动容器 */
@@ -56,6 +62,8 @@ function scrollBboxToCenter(page: MountedPage, bbox: Bbox): void {
 export function useLocate(registry: PageRegistry) {
   // 请求序号：快速连点不同结果时丢弃过期请求，避免最后停在中间某一页
   const sequence = useRef(0);
+  // 切换文件时终止旧文档的等待，防止稍后完成的定位覆盖新文件状态。
+  useEffect(() => () => { sequence.current += 1; }, []);
 
   const setActiveEvidence = useViewerStore((state) => state.setActiveEvidence);
   const setNotice = useViewerStore((state) => state.setNotice);
@@ -68,9 +76,15 @@ export function useLocate(registry: PageRegistry) {
       try {
         // ① 目标页没渲染就先把它滚进视口（虚拟滚动靠 IntersectionObserver 触发挂载），再等它画完
         let page = registry.rendered(target.pageNo);
-        if (!page) {
-          scrollPlaceholderIntoView(target.pageNo);
-          page = await registry.waitFor(target.pageNo);
+        if (!page || page.root.getBoundingClientRect().height === 0) {
+          const slot = await waitForPageSlot(target.pageNo, () => token === sequence.current);
+          if (token !== sequence.current) return;
+          if (slot) {
+            slot.scrollIntoView({ block: "center" });
+            page = registry.rendered(target.pageNo) ?? await registry.waitFor(target.pageNo);
+          } else {
+            page = null;
+          }
         }
         if (token !== sequence.current) return;
 

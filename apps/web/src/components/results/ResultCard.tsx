@@ -4,9 +4,7 @@
  * 单条字段结果卡：值、证据定位和复核操作。
  *
  * 版式按「读的顺序」排：字段名 → 值 → 出处 → 动作。
- * 值用等宽大字（22px，与 components/ui.ts 的尺度表同源）：用户在这一屏上真正要读的
- * 就是这些数字与条款号，它们必须比周围的说明文字更响；字段名用宋体，
- * 和标书里的章节标题同一种字体，提醒用户「这一条来自纸面上的哪一节」。
+ * 结果用无衬线正文保证长条款可读，原文入口使用同色连接框，便于识别溯源动作。
  *
  * 人工修正必须把锚点一起提交：编辑器会预填当前证据，也允许在反向标注模式下
  * 手动输入当前 run 的锚点，后端仍会再次校验锚点属于该版本。
@@ -26,7 +24,6 @@ import type { ReviewEvidenceInput, ReviewInput } from "@/lib/api/client";
 import {
   statusDotClass,
   statusLabel,
-  statusSpineClass,
   statusTextClass,
 } from "@/lib/results/labels";
 import type { RerunButtonMode } from "@/lib/results/rerun";
@@ -47,7 +44,7 @@ interface Props {
   onReview: (input: ReviewInput) => Promise<boolean>;
   onRerun: (hint: string | null) => Promise<boolean>;
   onLoadAttempts: (extractionId: number) => Promise<WireAttempt[]>;
-  /** 键盘 j/k 或原文角标选中的那一张：加一圈琥珀色描边并滚进视野。 */
+  /** 键盘 j/k 或原文角标选中的那一张：加一圈紫色描边并滚进视野。 */
   highlighted?: boolean;
   /** 复核模式下强制展开证据：排队处理时不该还要逐条点开才看得到出处。 */
   forceOpen?: boolean;
@@ -199,23 +196,17 @@ export function ResultCard({
       ref={rootRef}
       data-extraction-id={extraction.id}
       className={
-        "relative border bg-white transition-colors " +
+        "result-card " +
         (highlighted
-          ? "border-amber-400 ring-2 ring-amber-400"
+          ? "is-highlighted"
           : activeAnchor !== null
-            ? "border-amber-300"
+            ? "is-located"
             : "border-slate-200")
       }
     >
-      {/* 卷宗脊：颜色即这条结果的处置状态，扫一列颜色就知道哪几条还没人管 */}
-      <span
-        aria-hidden
-        className={"absolute inset-y-0 left-0 w-[4px] " + statusSpineClass(extraction.status)}
-      />
-
       <div className="px-3.5 pt-2.5 pb-2">
         <header className="flex items-start justify-between gap-2">
-          <h4 className="font-serif text-[15px] leading-[22px] text-slate-900">
+          <h4 className="font-display font-semibold text-[15px] leading-[22px] text-slate-900">
             {extraction.field_label ?? extraction.field_key}
           </h4>
           <span className="flex shrink-0 items-center gap-1.5 text-[13px]">
@@ -233,7 +224,7 @@ export function ResultCard({
           <p
             className={
               DATA_CLASS +
-              " mt-2 text-[22px] leading-[30px] break-words whitespace-pre-wrap text-slate-900"
+              " mt-2 result-value break-words whitespace-pre-wrap text-slate-900"
             }
           >
             {extraction.value_text}
@@ -266,8 +257,8 @@ export function ResultCard({
             onClick={() => onLocate(onlyTarget)}
             disabled={busy}
             className={
-              "mt-2 flex items-center gap-2 border border-amber-300 bg-amber-50 px-2 py-1 " +
-              "text-[13px] text-amber-900 hover:border-amber-400 hover:bg-amber-100 disabled:opacity-40"
+              "mt-3 flex w-full items-center justify-between gap-2 rounded-lg border border-sky-100 bg-sky-50 px-3 py-2 " +
+              "text-[12px] text-sky-700 hover:border-sky-300 hover:bg-sky-100 disabled:opacity-40"
             }
           >
             <span className={DATA_CLASS}>第 {onlyTarget.pageNo} 页</span>

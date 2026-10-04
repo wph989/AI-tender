@@ -90,6 +90,7 @@ def list_projects(
                           count(DISTINCT pf.id) FILTER (
                               WHERE latest_parse.status = 'failed'
                                     OR latest_extract.status IN ('failed', 'canceled')
+                                    OR latest_job.status IN ('failed', 'canceled')
                           ) AS failed_count
                    FROM project_file AS pf
                    JOIN project AS agg_owner ON agg_owner.id = pf.project_id
@@ -107,6 +108,11 @@ def list_projects(
                        WHERE j.project_file_id = pf.id AND j.stage = 'extracting'
                        ORDER BY j.created_at DESC, j.id DESC LIMIT 1
                    ) AS latest_extract ON true
+                   LEFT JOIN LATERAL (
+                       SELECT j.status FROM job AS j
+                       WHERE j.project_file_id = pf.id
+                       ORDER BY j.created_at DESC, j.id DESC LIMIT 1
+                   ) AS latest_job ON true
                    WHERE pf.deleted_at IS NULL
                          AND agg_owner.company_id = :company_id
                          AND agg_owner.deleted_at IS NULL
@@ -160,7 +166,15 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
                           -- 已确认条数：重新解析的二次确认要列出「将失效的已确认结果数量」
                           -- （见 docs/质量/09 第 5.2 节），列表页因此必须拿到它。
                           COALESCE(result.confirmed_count, 0) AS confirmed_count,
-                          extraction_job.status AS extraction_status
+                          extraction_job.status AS extraction_status,
+                          -- 转换和解析排队时尚无 parse_run，必须返回任务才能驱动前端轮询。
+                          CASE WHEN latest_job.id IS NULL THEN NULL ELSE
+                              jsonb_build_object(
+                                  'id', latest_job.id, 'status', latest_job.status,
+                                  'stage', latest_job.stage, 'progress', latest_job.progress,
+                                  'error_code', latest_job.error_code,
+                                  'error_message', latest_job.error_message
+                              ) END AS latest_job
                    FROM project_file AS pf
                    JOIN project AS p ON p.id = pf.project_id
                    LEFT JOIN document_version AS v ON v.id = pf.version_id
@@ -195,6 +209,12 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
                        WHERE j.project_file_id = pf.id AND j.stage = 'extracting'
                        ORDER BY j.created_at DESC, j.id DESC LIMIT 1
                    ) AS extraction_job ON true
+                   LEFT JOIN LATERAL (
+                       SELECT j.id, j.status, j.stage, j.progress, j.error_code, j.error_message
+                       FROM job AS j
+                       WHERE j.project_file_id = pf.id
+                       ORDER BY j.created_at DESC, j.id DESC LIMIT 1
+                   ) AS latest_job ON true
                    WHERE pf.project_id = :project_id AND pf.deleted_at IS NULL
                      AND p.company_id = :company_id AND p.deleted_at IS NULL
                    ORDER BY pf.sort_no, pf.id"""

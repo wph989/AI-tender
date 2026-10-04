@@ -2,7 +2,8 @@ import path from "node:path";
 
 import type { NextConfig } from "next";
 
-const apiTarget = (process.env.API_PROXY_TARGET ?? "http://localhost:8000").replace(/\/$/, "");
+// 本地 API 固定使用 8300；容器构建仍通过 API_PROXY_TARGET 指向 api:8000。
+const apiTarget = (process.env.API_PROXY_TARGET ?? "http://127.0.0.1:8300").replace(/\/$/, "");
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,

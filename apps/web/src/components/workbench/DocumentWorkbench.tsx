@@ -83,6 +83,8 @@ function buildConflictMap(items: readonly WireConflict[]): ReadonlyMap<string, W
 
 interface Props {
   versionId: number;
+  /** 新任务尚未产生 parse_run 时由项目轮询通知，避免工作台停留在旧的空结果状态。 */
+  refreshToken?: string;
   /**
    * 复核 / 重跑落定后通知外层：项目文件栏的流水线与待复核数由外层取数，
    * 工作台自己刷不到它（见 ProjectWorkspace）。
@@ -90,7 +92,7 @@ interface Props {
   onSettled?: () => void;
 }
 
-export function DocumentWorkbench({ versionId, onSettled }: Props) {
+export function DocumentWorkbench({ versionId, refreshToken, onSettled }: Props) {
   const [data, setData] = useState<WorkbenchData | null>(null);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -100,7 +102,8 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
   // 所以额外挂一个自增的尝试次数，让加载 PDF 的 effect 重跑。
   const [pdfAttempt, setPdfAttempt] = useState(0);
   const [outline, setOutline] = useState<readonly WireOutlineItem[]>([]);
-  const [outlineCollapsed, setOutlineCollapsed] = useState(false);
+  const [outlineCollapsed, setOutlineCollapsed] = useState(true);
+  const [mobileView, setMobileView] = useState<"document" | "results">("document");
   const [reviewOnly, setReviewOnly] = useState(false);
   const [conflictsByField, setConflictsByField] = useState<ReadonlyMap<string, WireConflict>>(
     () => new Map<string, WireConflict>(),
@@ -111,6 +114,11 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
   const [reparsePending, setReparsePending] = useState(false);
   // 复核与重跑都会改变统计；自增这个令牌让统计条重新取数
   const [statsToken, setStatsToken] = useState(0);
+
+  // 每次切换版本清除上一份文件的定位，锚点只在各自版本内唯一。
+  useEffect(() => {
+    useViewerStore.setState({ activeEvidence: null, currentPage: 1, jumpRequest: null, notice: null });
+  }, [versionId]);
 
   const registry = usePageRegistry();
   const { locate } = useLocate(registry);
@@ -173,7 +181,7 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
     return () => {
       alive = false;
     };
-  }, [refreshWorkbench]);
+  }, [refreshWorkbench, refreshToken]);
 
   // PDF 基座单独加载：原文区失败时，结果面板仍能呈现可读的接口错误。
   const pdfUrl = data?.pdfUrl;
@@ -218,10 +226,17 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
 
   const handleLocate = useCallback(
     (target: EvidenceTarget) => {
+      setMobileView("document");
       void locate(toActiveEvidence(target));
     },
     [locate],
   );
+
+  // 原文角标是反向核对入口，窄屏应切到结果；结果中的证据入口则切回原文。
+  const handleAnnotationLocate = useCallback((target: EvidenceTarget) => {
+    void locate(toActiveEvidence(target));
+    setMobileView("results");
+  }, [locate]);
 
   const handleViewerError = useCallback(
     (message: string) => {
@@ -420,7 +435,7 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
   const filesHref = data?.projectId != null ? "/projects/" + data.projectId + "/files" : "/projects";
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-slate-100">
+    <div className="workbench">
       <Toolbar
         pageCount={data?.pages.length ?? 0}
         projectId={data?.projectId ?? null}
@@ -434,7 +449,7 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
           <button
             type="button"
             onClick={() => setNotice(null)}
-            className="rounded-[2px] px-1.5 py-0.5 text-[13px] text-amber-700 hover:bg-amber-100"
+            className="rounded-lg px-1.5 py-0.5 text-[13px] text-amber-700 hover:bg-amber-100"
           >
             关闭
           </button>
@@ -447,7 +462,7 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
             <h2 className={SECTION_TITLE_CLASS}>加载失败</h2>
             <p className="mt-2 text-[13px] leading-5 text-rose-700">{loadError}</p>
             <p className="mt-2 text-[13px] leading-5 text-slate-500">
-              原文与结果分别取自两个接口，其中一个失败不影响另一个；重试会一起再取一次。
+              暂时无法加载此文件，请检查连接后重试。
             </p>
             <button type="button" className={PRIMARY_BUTTON_CLASS + " mt-3"} onClick={reloadAll}>
               重新加载
@@ -497,7 +512,11 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
             </div>
           )}
 
-          <div className="flex min-h-0 flex-1">
+          <div className="mobile-view-switch" aria-label="工作台视图">
+            <button type="button" aria-pressed={mobileView === "document"} onClick={() => setMobileView("document")}>文档原文</button>
+            <button type="button" aria-pressed={mobileView === "results"} onClick={() => setMobileView("results")}>解析结果 · {data.extractions.length}</button>
+          </div>
+          <div className="document-split" data-mobile-view={mobileView}>
             <OutlineNav
               items={outline}
               currentPage={currentPage}
@@ -506,14 +525,14 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
               onSelect={handleOutlineSelect}
             />
 
-            <div className="min-w-0 flex-1">
+            <div className="document-area">
               <DocumentViewer
                 pdf={pdf}
                 pages={data.pages}
                 index={index}
                 registry={registry}
                 onError={handleViewerError}
-                onLocate={handleLocate}
+                onLocate={handleAnnotationLocate}
               />
             </div>
 
@@ -546,7 +565,7 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
                 }
               >
                 <p className={EYEBROW_CLASS}>解析结果</p>
-                <h2 className="mt-1.5 font-serif text-[19px] leading-[28px] text-rose-700">
+                <h2 className="mt-1.5 font-display font-semibold text-[19px] leading-[28px] text-rose-700">
                   解析失败
                 </h2>
                 <div className="mt-3 border border-rose-200 bg-rose-50 px-3 py-2">
@@ -580,7 +599,7 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
                 }
               >
                 <p className={EYEBROW_CLASS}>解析结果</p>
-                <h2 className="mt-1.5 font-serif text-[19px] leading-[28px] text-slate-900">
+                <h2 className="mt-1.5 font-display font-semibold text-[19px] leading-[28px] text-slate-900">
                   {parseRunning ? "正在解析原文…" : "这份文件还没有解析"}
                 </h2>
                 <p className="mt-3 text-[14px] leading-[22px] text-slate-600">
@@ -602,7 +621,7 @@ export function DocumentWorkbench({ versionId, onSettled }: Props) {
                 }
               >
                 <p className={EYEBROW_CLASS}>解析结果</p>
-                <h2 className="mt-1.5 font-serif text-[19px] leading-[28px] text-slate-900">
+                <h2 className="mt-1.5 font-display font-semibold text-[19px] leading-[28px] text-slate-900">
                   {extractRunning ? "正在抽取…" : extractFailed ? "抽取失败" : "还没有抽取结果"}
                 </h2>
                 {data.extractionError !== null && (

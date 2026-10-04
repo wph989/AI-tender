@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { PageShell } from "@/components/PageShell";
-import { BUTTON_CLASS, SETTINGS_GRID_CLASS } from "@/components/ui";
+import { BUTTON_CLASS } from "@/components/ui";
 import { listFeatures, listModels, listProviders } from "@/lib/api/llm";
 import { message } from "@/lib/llm/format";
 import type { LlmFeature, LlmModel, LlmProvider } from "@/types/llm";
@@ -25,6 +25,7 @@ import { ProvidersPanel } from "./ProvidersPanel";
 type LoadState = "loading" | "ready" | "error";
 
 export function ModelSettings() {
+  const [section, setSection] = useState("providers");
   const [providers, setProviders] = useState<LlmProvider[]>([]);
   const [models, setModels] = useState<LlmModel[]>([]);
   const [features, setFeatures] = useState<LlmFeature[]>([]);
@@ -83,7 +84,7 @@ export function ModelSettings() {
       breadcrumb={[<span>设置</span>, <span className="text-slate-600">模型管理</span>]}
       eyebrow="设置 · 模型"
       title="模型管理"
-      description="供应商、模型、功能绑定三者互相引用：模型属于供应商，功能绑定又指向模型。测试会真实发一次请求，用来判断这条链路到底通不通。"
+      description="连接模型服务，为标书解析与信息抽取选择合适的模型。"
       actions={
         <button type="button" className={BUTTON_CLASS} onClick={refresh}>
           刷新
@@ -98,7 +99,7 @@ export function ModelSettings() {
         <div className="border border-rose-200 bg-rose-50 px-4 py-3 text-[14px] text-rose-700">
           <p>{error ?? "加载失败"}</p>
           <p className="mt-1 text-[13px] text-rose-600">
-            数据来自后端 /api/v1/llm，多半是服务没起来。确认后点下面的重试。
+            暂时无法获取模型配置，请确认服务可用后重试。
           </p>
           <button type="button" className={BUTTON_CLASS + " mt-2"} onClick={retry}>
             重试
@@ -113,17 +114,24 @@ export function ModelSettings() {
       )}
 
       {state === "ready" && (
-        /*
-         * 超宽屏（≥1536px）分两栏：供应商的表格要横跨一整行（Base URL 与四个行内动作），
-         * 模型表与功能绑定表并排——它们被压到 ~680px 时只会让「参数」「最近测试」两列折行，
-         * 仍然读得下去；而供应商表这样并排会连操作按钮都换行。
-         */
-        <div className={SETTINGS_GRID_CLASS}>
-          <div className="2xl:col-span-2">
-            <ProvidersPanel providers={providers} onChanged={reload} />
+        <div className="settings-layout">
+          <nav className="settings-nav" aria-label="模型设置分类">
+            {[
+              { key: "providers", step: "1", label: "连接供应商", hint: "服务地址与访问密钥", count: providers.length },
+              { key: "models", step: "2", label: "管理模型", hint: "模型能力与调用参数", count: models.length },
+              { key: "bindings", step: "3", label: "分配功能", hint: "为抽取任务选择模型", count: features.length },
+            ].map((item) => <button type="button" key={item.key} aria-pressed={section === item.key} onClick={() => setSection(item.key)}>
+              <span className="nav-step">{item.step}</span>
+              <span><strong>{item.label} <span className="ml-1 text-[11px] text-slate-400">{item.count}</span></strong><small>{item.hint}</small></span>
+            </button>)}
+            <p className="settings-help">按顺序完成连接、添加模型与功能分配。修改后可使用测试按钮检查连接。</p>
+          </nav>
+          {/* 保留面板挂载，切换分类时不丢失未保存的表单。 */}
+          <div className="settings-main">
+            <div hidden={section !== "providers"}><ProvidersPanel providers={providers} onChanged={reload} /></div>
+            <div hidden={section !== "models"}><ModelsPanel providers={providers} models={models} onChanged={reload} /></div>
+            <div hidden={section !== "bindings"}><FeatureBindingsPanel features={features} models={models} onChanged={reload} /></div>
           </div>
-          <ModelsPanel providers={providers} models={models} onChanged={reload} />
-          <FeatureBindingsPanel features={features} models={models} onChanged={reload} />
         </div>
       )}
     </PageShell>

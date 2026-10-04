@@ -38,8 +38,8 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
   const active = features.find((feature) => feature.key === activeKey) ?? features[0];
   if (active === undefined) {
     return (
-      <section className="border border-slate-200 bg-white px-5 py-4">
-        <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">功能绑定</h2>
+      <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
+        <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">功能绑定</h2>
         <p className="mt-3 text-[14px] leading-6 text-slate-500">后端没有返回功能列表。</p>
       </section>
     );
@@ -99,10 +99,10 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
   };
 
   return (
-    <section className="border border-slate-200 bg-white px-5 py-4">
+    <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">功能绑定</h2>
+          <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">功能绑定</h2>
           <p className="mt-1 text-[13px] leading-5 text-slate-500">
             1 级为首选模型，失败后按 2、3… 降级；同一模型不会原地重试。
           </p>
@@ -110,6 +110,7 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
         <div className="flex items-center gap-2 text-[13px] text-slate-600">
           转移深度
           <input
+            aria-label="模型转移深度"
             type="number"
             min={1}
             max={10}
@@ -121,7 +122,7 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
         </div>
       </div>
 
-      <div className="mt-3 flex gap-1">
+      <div className="mt-4 flex flex-wrap gap-2">
         {features.map((feature) => (
           <button
             key={feature.key}
@@ -133,8 +134,8 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
             }}
             className={
               feature.key === active.key
-                ? "rounded-[2px] bg-slate-900 px-3 py-1 text-[13px] text-white"
-                : "rounded-[2px] border border-slate-300 px-3 py-1 text-[13px] text-slate-600 hover:bg-slate-50"
+                ? "rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-[13px] text-sky-700"
+                : "rounded-lg border border-slate-200 px-3 py-2 text-[13px] text-slate-600 hover:bg-slate-50"
             }
           >
             {feature.name}
@@ -153,10 +154,10 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
 
       {ids.length === 0 ? (
         <p className="mt-2 text-[14px] leading-6 text-slate-500">
-          这个功能还没有绑定模型，抽取会整体回退到 .env 的单模型配置。
+          还未分配模型，当前使用部署时配置的默认模型。
         </p>
       ) : (
-        <table className="mt-2 w-full border-collapse text-[14px]">
+        <div className="settings-table-scroll" role="region" aria-label="功能模型列表" tabIndex={0}><table className="w-full border-collapse text-[13px]">
           <thead>
             <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
               <th className="border-b border-slate-200 py-2 pr-3 font-normal w-16">级别</th>
@@ -234,7 +235,7 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
               );
             })}
           </tbody>
-        </table>
+        </table></div>
       )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">

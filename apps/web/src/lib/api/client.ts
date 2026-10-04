@@ -352,9 +352,16 @@ export function saveBlob(blob: Blob, filename: string): void {
  * ------------------------------------------------------------------------- */
 
 export async function listProjects(keyword?: string): Promise<WireProject[]> {
-  const query = keyword?.trim() ? "?keyword=" + encodeURIComponent(keyword.trim()) : "";
-  const data = await getJson<{ items: WireProject[] }>("/api/v1/projects" + query);
-  return data.items;
+  // 页面在本地做筛选和概览统计，不能把后端默认的前 50 条当成全部项目。
+  const query = new URLSearchParams({ limit: "100" });
+  if (keyword?.trim()) query.set("keyword", keyword.trim());
+  const items: WireProject[] = [];
+  for (;;) {
+    query.set("offset", String(items.length));
+    const page = await getJson<{ items: WireProject[]; limit: number }>("/api/v1/projects?" + query);
+    items.push(...page.items);
+    if (page.items.length === 0 || page.items.length < page.limit) return items;
+  }
 }
 
 export async function createProject(input: {

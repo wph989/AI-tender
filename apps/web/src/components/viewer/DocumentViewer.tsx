@@ -78,7 +78,7 @@ export function DocumentViewer({ pdf, pages, index, registry, onError, onLocate 
     <div
       ref={scrollRef}
       data-scroll-root
-      className="relative h-full overflow-auto bg-slate-200/70 px-6 py-6"
+      className="viewer-surface relative h-full overflow-auto px-4 py-5 md:px-7"
     >
       <div ref={measureRef} className="mx-auto w-full max-w-[1240px]">
         {fitScale > 0 ? (

@@ -80,7 +80,7 @@ export function ResultGroupTabs({ tabs, activeKey, onSelect }: Props) {
               "flex shrink-0 items-center gap-1.5 border-b-2 px-2.5 py-2 text-[13px] whitespace-nowrap " +
               "transition-colors " +
               (active
-                ? "border-slate-900 font-medium text-slate-900"
+                ? "border-sky-500 font-medium text-sky-700"
                 : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-800")
             }
           >

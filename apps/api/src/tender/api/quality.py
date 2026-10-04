@@ -420,7 +420,12 @@ def field_stats(
         by_attempt[str(row["action"])] = int(row["n"])
     instances: dict[str, dict[str, dict[str, int]]] = {}
     for row in instance_rows:
-        data = {str(key): int(value) for key, value in dict(row).items() if key != "field_key"}
+        # 字段与复核方式是分组维度，不是计数；有复核记录后不能把 item 等文本转成整数。
+        data = {
+            str(key): int(value)
+            for key, value in dict(row).items()
+            if key not in {"field_key", "review_mode"}
+        }
         instances.setdefault(str(row["field_key"]), {})[str(row["review_mode"])] = data
     manual: dict[str, tuple[int, int]] = {
         str(row["field_key"]): (int(row["reviewed"]), int(row["manual"])) for row in manual_rows

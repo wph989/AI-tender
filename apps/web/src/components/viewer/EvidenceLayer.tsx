@@ -55,8 +55,8 @@ export function EvidenceLayer({ pageNo, items, activeEvidence, pulseKey, viewpor
             data-evidence-anchor={item.anchor}
             className={
               isActive
-                ? "absolute rounded-[2px] border-2 border-amber-500 bg-amber-300/40"
-                : "absolute rounded-[2px] border border-amber-400/60 bg-amber-200/25"
+                ? "absolute rounded-sm border-2 border-sky-500 bg-sky-300/40"
+                : "absolute rounded-sm border border-sky-400/60 bg-sky-200/25"
             }
             style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
           />
@@ -69,7 +69,7 @@ export function EvidenceLayer({ pageNo, items, activeEvidence, pulseKey, viewpor
           key={`pulse-${pulseKey}-${activeEvidence.anchor}`}
           data-active-evidence
           data-active-anchor={activeEvidence.anchor}
-          className="evidence-pulse absolute rounded-[2px] border-2 border-amber-600 bg-amber-300/50 shadow-[0_0_0_3px_rgba(251,191,36,0.25)]"
+          className="evidence-pulse absolute rounded-sm border-2 border-sky-600 bg-sky-300/50 shadow-[0_0_0_3px_rgba(113,86,206,0.16)]"
           style={(() => {
             const rect = bboxToRect(activeBbox, viewport);
             return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
@@ -82,7 +82,7 @@ export function EvidenceLayer({ pageNo, items, activeEvidence, pulseKey, viewpor
           key={`page-${pulseKey}-${activeEvidence?.anchor ?? ""}`}
           data-active-evidence
           data-active-anchor={activeEvidence?.anchor ?? ""}
-          className="evidence-pulse absolute inset-0 rounded-[2px] border-2 border-dashed border-amber-500"
+          className="evidence-pulse absolute inset-0 rounded-sm border-2 border-dashed border-sky-500"
         />
       )}
     </div>

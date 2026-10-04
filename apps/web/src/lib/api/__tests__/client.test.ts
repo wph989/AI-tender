@@ -4,9 +4,22 @@
  * 后端对中文名走 RFC 5987 的 filename*（见 api/storage.py 的 content_disposition），
  * 只读 filename= 会拿到被下划线替换过的名字——用户看到的文件名会变成 "______-____.xlsx"。
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { filenameFromDisposition } from "@/lib/api/client";
+import { filenameFromDisposition, listProjects } from "@/lib/api/client";
+
+afterEach(() => vi.unstubAllGlobals());
+
+it("项目筛选覆盖后端所有分页，后续分页保留搜索条件", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{ id: 1 }, { id: 2 }], limit: 2 })))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{ id: 3 }], limit: 2 })));
+  vi.stubGlobal("fetch", fetchMock);
+  expect((await listProjects("工程 A")).map((item) => item.id)).toEqual([1, 2, 3]);
+  const query = new URL(String(fetchMock.mock.calls[1]?.[0]), "http://localhost").searchParams;
+  expect(query.get("offset")).toBe("2");
+  expect(query.get("keyword")).toBe("工程 A");
+});
 
 describe("Content-Disposition 文件名解析", () => {
   it("优先取 filename*（中文名走这条）", () => {

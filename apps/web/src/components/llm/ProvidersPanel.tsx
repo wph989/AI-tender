@@ -105,12 +105,12 @@ export function ProvidersPanel({ providers, onChanged }: Props) {
     });
 
   return (
-    <section className="border border-slate-200 bg-white px-5 py-4">
+    <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">供应商</h2>
+          <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">供应商</h2>
           <p className="mt-1 text-[13px] leading-5 text-slate-500">
-            一次连接所需的全部信息：Base URL、加密密钥、启用状态。测试走远端 GET /v1/models。
+            连接你的模型服务。添加服务地址与密钥后，可测试连接并获取可用模型。
           </p>
         </div>
         <button
@@ -129,12 +129,12 @@ export function ProvidersPanel({ providers, onChanged }: Props) {
 
       {providers.length === 0 && editing !== "new" && (
         <p className="mt-3 text-[14px] leading-6 text-slate-500">
-          还没有供应商。注册表为空时抽取会整体回退到 .env 里的单模型配置。
+          添加一个供应商以管理模型连接。未添加时将使用部署时配置的默认模型。
         </p>
       )}
 
       {providers.length > 0 && (
-        <table className="mt-3 w-full border-collapse text-[14px]">
+        <div className="settings-table-scroll" role="region" aria-label="配置列表" tabIndex={0}><table className="w-full border-collapse text-[13px]">
           <thead>
             <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
               <th className="border-b border-slate-200 py-2 pr-3 font-normal">名称</th>
@@ -297,7 +297,7 @@ export function ProvidersPanel({ providers, onChanged }: Props) {
               );
             })}
           </tbody>
-        </table>
+        </table></div>
       )}
 
       {editing === "new" && (

@@ -14,6 +14,31 @@ function input(overrides: Partial<PipelineInput> = {}): PipelineInput {
 }
 
 describe("derivePipeline", () => {
+  it("上传已排队但没有 PDF 版本时持续轮询，转换失败后停止", () => {
+    const file = input({ version_id: null, parse_status: null, extraction_status: null,
+      extraction_count: 0, latest_job: { status: "pending", stage: "converting" } });
+    expect(derivePipeline(file)).toMatchObject({ inFlight: true, headline: "排队转换" });
+    expect(derivePipeline({ ...file, latest_job: { status: "failed", stage: "converting" } }))
+      .toMatchObject({ inFlight: false, tone: "failed", headline: "转换失败" });
+  });
+
+  it("仅归档文件没有转换任务，不会永久等待或轮询", () => {
+    expect(derivePipeline(input({ is_parseable: false, version_id: null })))
+      .toMatchObject({ inFlight: false, headline: "仅归档" });
+  });
+
+  it("重解析已排队但旧 parse_run 仍成功时，以新任务状态为准", () => {
+    const view = derivePipeline(input({ latest_job: { status: "pending", stage: "submitting" } }));
+    expect(view.inFlight).toBe(true);
+    expect(view.stages.map((stage) => stage.state)).toEqual(["done", "active", "idle"]);
+  });
+
+  it("已有部分结果不能掩盖抽取中的任务或失败状态", () => {
+    expect(derivePipeline(input({ extraction_status: "running", extraction_count: 3 })))
+      .toMatchObject({ inFlight: true, headline: "抽取中" });
+    expect(derivePipeline(input({ extraction_status: "failed", extraction_count: 3 })))
+      .toMatchObject({ inFlight: false, tone: "failed", headline: "抽取失败" });
+  });
   it("没有版本时停在转换，后面的阶段一律不亮", () => {
     const view = derivePipeline(
       input({ version_id: null, parse_status: null, extraction_status: null, extraction_count: 0 }),

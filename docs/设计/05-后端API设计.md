@@ -104,6 +104,11 @@ fields:
 因此响应中的 `version_id` 固定为 `null`，也不承诺 `deduplicated`；版本 ID 与最终状态通过 `GET /api/v1/jobs/{job_id}` 查询。
 不可解析附件会返回 `job_id: null`，仍保留在项目文件清单中。
 
+`GET /api/v1/projects/{id}` 的 `files[]` 同时返回 `latest_job`，包含最近任务的
+`id / status / stage / progress / error_code / error_message`；没有任务时为 `null`。
+前端在 `version_id` 仍为空、解析尚未生成 `parse_run` 时也依据该状态轮询；转换失败展示
+后端错误原因，仅归档文件不等待转换。抽取已写入部分结果时，仍以任务状态决定是否继续刷新。
+
 ### 3.2 页面清单
 
 ```

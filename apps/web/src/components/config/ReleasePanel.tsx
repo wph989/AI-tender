@@ -65,8 +65,8 @@ export function ReleasePanel({
 
   return (
     <div className="flex flex-col gap-4">
-      <section className="border border-slate-200 bg-white px-5 py-4">
-        <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">配置版本</h2>
+      <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
+        <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">配置版本</h2>
         <p className="mt-1 text-[13px] leading-5 text-slate-500">
           回滚是把历史版本直接置回生效，不重建配置（避免遗漏）。
         </p>
@@ -111,9 +111,9 @@ export function ReleasePanel({
       </section>
 
       {detail !== null && (
-        <section className="border border-slate-200 bg-white px-5 py-4">
+        <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="font-serif text-[19px] leading-[28px] text-slate-900">v{detail.version_no} 详情</h2>
+            <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">v{detail.version_no} 详情</h2>
             <span
               className={
                 "inline-flex items-center gap-1.5 text-[13px] " +
@@ -136,7 +136,7 @@ export function ReleasePanel({
             )}
           </div>
 
-          <h3 className="mt-3 font-serif text-[14px] text-slate-800">与当前生效版本的差异</h3>
+          <h3 className="mt-3 font-display font-semibold text-[14px] text-slate-800">与当前生效版本的差异</h3>
           {rows.length === 0 ? (
             <p className="mt-1 text-[13px] leading-5 text-slate-500">没有差异。</p>
           ) : (
@@ -162,7 +162,7 @@ export function ReleasePanel({
             </table>
           )}
 
-          <h3 className="mt-4 font-serif text-[14px] text-slate-800">变更影响清单</h3>
+          <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">变更影响清单</h3>
           <p className="mt-1 text-[13px] leading-5 text-slate-500">
             必须逐条确认"已知悉"，每条单独落一行确认记录（谁、何时、确认了哪一条）。
           </p>
@@ -203,7 +203,7 @@ export function ReleasePanel({
             />
           )}
 
-          <h3 className="mt-4 font-serif text-[14px] text-slate-800">门禁</h3>
+          <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">门禁</h3>
           {detail.gate.passed ? (
             <p className="mt-1 text-[13px] text-emerald-700">当前满足激活条件。</p>
           ) : (
@@ -265,7 +265,7 @@ export function ReleasePanel({
             </div>
           )}
 
-          <h3 className="mt-4 font-serif text-[14px] text-slate-800">审计</h3>
+          <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">审计</h3>
           <ul className="mt-1 flex flex-col gap-0.5 text-[13px] text-slate-600">
             {detail.audit.map((entry) => (
               <li key={entry.id}>
