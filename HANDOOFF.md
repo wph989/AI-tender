@@ -1,4 +1,4 @@
-﻿# 前端界面重构交接
+# 前端界面重构交接
 
 更新日期：2026-10-04
 
@@ -412,3 +412,73 @@ node .tmp/redesign-compact-check.mjs
 - 用户在审查修复完成后明确要求“提交代码”，本次提交包括前端重构、接口对接、两处审查修复、启动脚本与测试、设计文档和交接规则。
 - 使用中文提交信息，不添加作者说明或协作者尾注。不包含 `.env`、`.tmp`、日志或构建产物，不执行推送。
 - 第 1—13 节中的“未提交”描述保留为当时的历史状态。RAG/GraphRAG 相关提交仅为设计文档，不代表已实现相关功能。
+
+## 15. 知识库与 Skill 综合分析实施中（2026-10-04）
+
+- 用户通过 grill-me / grilling 访谈确认：通用多库管理；类别用途区分；Skill 可自行改造但定位沿用现有方式；项目全部当前有效文件共同分析；手动开始；资料新增/替换提示更新；默认等齐，显式允许部分分析。用户回复“按建议来”后已开始实施。
+- 已找到 `投标skill/parse_skills`，被 Git 忽略，含 12 标准解析模块、通用兜底、4 历史分类模块。之前“未找到 Skill”是历史错误状态。普通模板缺稳定引用，格式模块原依赖唯一 DOCX；已按授权改为统一带 PDF 锚点的模块协议。
+- 已新增迁移 0005 和知识库/来源/索引/报告/模块/关系/问答表，并在开发数据库执行。现场 PG 18.6 无 pgvector；暂用数组存向量、范围内精确余弦检索。用户明确向量服务稍后填写，当前先实现代码接口。
+- 新代码：`api/knowledge.py`、`application/knowledge.py`、`knowledge_store.py`、`analysis_skills.py`、`worker/knowledge.py`、`adapters/openai_embedding.py`、`ports/embedding.py`；原 Skill Markdown 81 文件打包至 `resources/parse_skills`。新增前端知识库列表/详情及 ProjectAnalysis、CitationViewer、ReportItems、QuestionPanel；项目首页默认综合报告，`?file=` 或 `?view=fields` 保留旧字段工作台。
+- 最新测试：新增专项 15 passed（含真实 PostgreSQL 临时表，全部回滚）；旧后端 263 passed、5 skipped；前端 typecheck 通过。全部未提交。
+- 当前运行中的 API/worker/beat 尚未重启加载新代码，前端开发进程可能已自动更新。不要把现有运行状态当作新功能已经可访问。
+- 待做：复核新任务的恢复/权限/引用过滤；为报告固定 Skill 快照；确保旧归档文件可重新处理；修复 Ruff 残留长行；同步 DDL/API 契约测试和文档；跑全部数据库测试/前端测试/build；使用测试资料做浏览器跨文件与移动端定位。详见 `docs/设计/14-知识库与综合分析实现.md`。
+- `.tmp` 中可创建独立验收脚本与截图。不要重放旧 UI 批量修改脚本。禁止自动提交。
+
+
+## 16. AI 模型管理增量完成（2026-10-05）
+
+- 用户要求参考根目录 `11-AI模型管理详细设计.md` 继续完善模型管理。本轮接续已有未提交的模型能力代码，保留知识库等其它改动，没有自动提交或推送。
+- 修复 ModelSettings 缺失 profiles/secretReady 导致的 TypeScript 编译失败。管理页现有供应商、模型、功能绑定、调用记录四类；导入显示 created/skipped 且默认停用，失败不再无限显示加载中，最多导入 100 项。
+- 功能草稿按功能分别保留，切换/刷新不丢排序；保存带旧 revision，预算和绑定原子保存。供应商/模型表单也固定打开时的 revision，避免刷新后无意覆盖并发修改。保存过程中冻结表单。
+- 模型协议能力与参数范围由服务端清单驱动；Responses 最小输出预算 16，temperature 留空不再强塞 0。原生 OpenAI/兼容、Anthropic、Gemini 协议有本地金样测试；不把这些测试当作真实供应商连通。
+- 测试持久记录并返回 test_id，可查询详情；7 天有效期、配置变化失效、同值保存/改名保留有效性；同时检查供应商版本与测试开始顺序，较早测试不能覆盖较新结果。专用重排目录明确 unsupported。测试日志包含向量/重排数量及名称快照。
+- 调用记录支持功能/模型/状态筛选、分页和 invocation_id 请求链。修复历史错误回显网关 HTML 的问题；参数校验错误不返回 Pydantic input/ctx，防止密钥进入响应。新增明确拒绝停止换源、Retry-After、默认 A/A/B/B/C/C、总请求上限及数据库登记失败不出站测试。
+- 0006 迁移先在独立 schema 的事务内验证完整 0001—0006，再成功应用到当前开发库；本轮没有变更 `.env`。开发库现在为 `0006_model_capabilities`。向量/语言混用旧绑定会阻止迁移，避免自动删除绑定。
+- 最终验证：后端 **340 passed、4 skipped**（TENDER_RUN_DB_TESTS=1），前端 **76 项测试**、typecheck、生产 build 通过；本模块 Python Ruff 和 **5 项依赖分层契约**通过。剩余一条 Starlette/httpx 弃用提醒未升级依赖。
+- 浏览器 **17 项检查通过**：真实 API 创建匿名供应商、拉取本机模拟目录并导入停用模型、测试、改名、有效性、调用记录历史名称与筛选、跨功能草稿保留，以及 390/320px 四面板无整页溢出。人工查看桌面/320px 截图后修复选择框在面板内被裁切。没有向用户真实供应商发送模型请求。
+- 浏览器只操作独立的 `接口联调供应商-*` 与 fixture 模型，结束通过 API 软删除供应商和模型；测试调用历史按设计保留，未改原有功能绑定。数据库集成测试创建独立 schema，事务结束全部回滚。
+- 脚本与产物：`.tmp/llm-management-browser.mjs`、`.tmp/llm-management-check/checks.json`、`models-desktop.png`、`calls-desktop.png`、`calls-mobile.png`。脚本自己启动 9486 模拟协议服务和 9484 Headless Edge，退出会关闭两者。
+- 本轮启动的 API 当前 PID **28004**，`http://127.0.0.1:8300`；前端开发服务器在 `http://localhost:4400/settings/models`。下轮检查实时进程，不凭历史 PID 直接终止。没有启动 Worker/beat，也没有重跑真实抽取。
+- 根目录设计包含 PPT、多工作区等跨项目约定。适用范围、真实交付及后续项已写入 `docs/设计/12-LLM管理与模型路由.md` 第 10 节并同步 API/DDL 契约；不要将视觉/多模态/生图、平台共享、完整网络策略、动态测试策略、持久预算恢复、unknown 对账或金额预算描述为已实现。嵌入/重排当前仍是单模型单次请求，完整业务账本待补。
+
+
+## 17. 修复回环 IP 访问不取数（2026-10-05）
+
+- 用户使用 `http://127.0.0.1:4400/settings/models`，控制台 HMR WebSocket 握手失败；浏览器复现页面仅保留 SSR 的“正在加载模型配置”，没有任何模型 API 请求。同一服务用 localhost 可正常取数，后端及两种地址的 API 代理均返回 200。
+- 根因：Next.js 16.3.6 默认开发来源允许 localhost，但未自动允许 127.0.0.1；`/_next/hmr` 被开发来源检查拒绝，客户端启动未完成。上一轮只用 localhost 验收，遗漏了启动指南中的回环 IP 地址。
+- `apps/web/next.config.ts` 增加 `allowedDevOrigins: ["127.0.0.1"]`，仅补允许本机地址。开发服务已自动重新加载；启动指南同步说明 localhost/IP 均可使用，健康接口成功不能替代页面取数检查。第 8.1 节仅换 localhost 的旧规避方式已被本节修复替代。
+- 修复后浏览器在两种地址均加载真实供应商/模型/功能/设置，API 全部 200，原 WebSocket 握手错误消失；typecheck、diff check 通过。诊断脚本 `.tmp/frontend-origin-browser.mjs` 只读，不写业务数据，报告 `.tmp/frontend-origin-check/checks.json`。
+- 本轮没有重新启动后端、修改接口或提交代码。当前用户自行启动的服务 PID 已与第 16 节不同，仍须实时核验身份。
+
+
+## 18. Ollama 嵌入真实验证与测试反馈（2026-10-05）
+
+- 用户反馈 Ollama 嵌入不可用，要求核实是否真正适配。现有实现调用 OpenAI 兼容 `POST /v1/embeddings`，不是模拟返回；尚未单独实现 Ollama 原生 `/api/embed`。
+- 当前供应商 ollama（ID 4）为 `http://127.0.0.1:11434/v1`、匿名，模型 qwen3-embedding:0.6b（ID 4）登记为 embedding/embeddings。服务返回版本 0.35.1。
+- 先用现有适配器发送三条合成短文本，真实返回 3×1024 维有限、非零向量，约 10.8 秒；随后通过真实管理页点击该模型测试，返回 1×1024 维向量、3.1 秒，4 项浏览器检查通过。没有调用其它供应商或提交用户私有文档。
+- 查到用户最近一次嵌入测试已成功，耗时约 39 秒；此前页面只有禁用按钮，没有明确运行反馈。本轮补“测试中”、等待上限与可能的本地加载提示，成功后显示实际向量数量、维度、耗时。响应增加可选 vector_count/embedding_dimensions/document_count，不新增迁移，维度仅当次响应展示。
+- 同时修复 `GET /llm/tests` 不传 model_id 时 PostgreSQL 无法推断 NULL 参数类型导致 500；改成按筛选条件生成 SQL。专项覆盖无筛选、匹配/不匹配模型及嵌入测试实测形状，14 项后端专项通过；前端 typecheck/build、Ruff 和 diff 检查通过。
+- 当前 embedding 功能绑定为空，所以知识库不会自动使用模型；本轮没有擅自设置绑定或重建用户索引。已向用户询问是模型测试失败、知识库使用失败还是配置绑定问题，截至本轮收尾未收到选择，不能把空绑定断言为其全部问题根因。
+- 真实测试未复现失败。后续如用户明确是知识库问题，应在授权范围内完善绑定与索引构建/检索链路验证，不因模型探测成功就宣称整个知识库已验收。
+- API 在确认无近期 running 测试后核验父子进程身份，只重启 API 加载修复；当前 PID 33064，未重启 Worker/beat。诊断脚本 `.tmp/ollama-embedding-browser.mjs`、报告 `.tmp/ollama-embedding-check/checks.json`、截图同目录 models.png。下轮重新核验实时进程。
+
+
+## 19. 按用户纠正补齐模型分类与配置（2026-10-05）
+
+- 用户质疑“完全按需求实现了吗？模型分类没这么少吧？模型的配置也不全吧？”。已经承认第 16 节版本没有完整覆盖需求；不能继续把三种类型、固定能力、少量参数描述为完整交付，也不能用“跨项目设计”当作删减范围的授权。
+- 新增 `docs/设计/15-AI模型需求核对.md`，逐项记录 AI01—AI22 的已验证、部分及未完成状态。根设计顶部链接该核对表；设计12第11节与 API/DDL 契约同步。后续继续按原基线补齐，未完成项没有被用户取消。
+- 本轮补齐四基础 kind：language、embedding、rerank、image_generation；视觉为 image_input；嵌入派生 text/multimodal。模型种类、接口模式、能力独立；适配器限制之外的组合明确拒绝。
+- 新建、编辑、目录导入共用 `ModelConfigurationFields.tsx`。后端 profiles 有 required/default/allowed capabilities 与参数 schema；模型 supported_parameters 可收窄，parameters 持久化并参与实际请求。语言有 Top P/K、停止词、种子、惩罚、推理强度、显式输出预算字段等适用项，嵌入有 dimensions/task_type，重排有 top_n，生图有尺寸/质量/格式或宽高比/分辨率。字段按协议控制，不接受任意请求覆写。
+- 真实适配代码：OpenAI/兼容 Chat Completions/Responses、Anthropic Messages、Gemini generateContent 均发送原生图片内容；Gemini 原生 batchEmbedContents 支持真正图文嵌入；OpenAI/兼容 embeddings 仍只支持文本。生图新增 ProviderImageModel（OpenAI/兼容 images/generations、Gemini 图片 generateContent），解码校验 PNG/JPEG/WebP，只请求一张，不抓取供应商返回的任意 URL。Pillow 成为显式运行时依赖，uv.lock 已同步。
+- 模型能力测试分 text/vision/embedding/multimodal_embedding/rerank/image_generation，独立保存证明；总体有效性也取各能力的聚合。文本成功不证明视觉/图文。保留同步 `/test`，增加 `/tests` 202 受理后执行，刷新继续查询；发送前在同一事务登记测试和调用记录。测试超时或 API 崩溃后收敛为 unknown，不自动重发。
+- 新增测试图临时预览端点；图片字节只在 llm_test 保留，失效即时停止预览，失效满24小时清理。API 查询及既有知识任务派发会维护清理；未新增正式素材，也未启动生图业务。新增 image_generation 功能绑定；原生图调用端口与测试已连接。
+- 迁移 `0007_model_inputs` 已验证并应用开发库。新增模型参数/空间身份、测试结果/临时图/超时快照/调用关联、图片用量。0006没有再改。后续结构变更必须继续新增迁移，不再修改已应用0007。
+- JSON 是可选能力，当前抽取/分析功能必须有 JSON；绑定和修改都校验，worker 同时过滤。修复旧模型表单将默认参数清单显式保存时无谓失效的问题，改名/参数顺序变化保持原证明。
+- 最终后端 **363 passed、5 skipped**，Ruff、5项依赖分层检查、diff检查通过。前端 **76项测试**、typecheck/build通过。5个跳过包含迁移没有新增表的适用性跳过，不是新增模型场景未测。
+- 浏览器12项通过：4分类、视觉配置保存、图文实际带图、运行中刷新不重发、分别保留能力证明、可读生图预览、图文目录导入/参数/默认停用、390px四面板、无未捕获异常。脚本 `.tmp/model-inputs-browser.mjs` 与报告/截图 `.tmp/model-inputs-check/`。模拟供应商结束已软删除，调用历史保留。首次脚本在“分配功能”标签写错处失败，修正选择器后12项通过，不是产品故障。
+- Ollama 经新异步测试入口重测：现有模型ID4 `qwen3-embedding:0.6b` 返回1×1024维，3.89秒，test_id=15。未改原有模型配置/功能绑定或重建索引。云端模型没有发收费测试；其它协议是模拟载荷验收。
+- API 已在核实进程身份且无 running 测试后重启加载全部补丁，最后启动父进程31360；运行子进程须实时查询，不能凭该PID停止。日志 `.tmp/model-inputs-api-final.*.log`。前端仍4400、API8300；保留 allowedDevOrigins。未重启 Worker/beat。
+- 原设计仍有未完成项：工具/流式、远端分页、动态测试/执行策略、多工作区/共享、AES-GCM/AAD、完整网络策略/审计幂等、持久预算和unknown对账、嵌入/重排多候选与完整业务账本、跨实例空间证明/旧索引固定模型读取。不能称全文完成。详见逐项核对表，后续应真正落实代码，不能只更新“后续”列表。
+- 全部未提交，保留此前知识库等修改，没有启动子代理。
+
+- 最终只读复验：127.0.0.1 与 localhost 的模型页均实际请求后端，四组 API 全部200，HMR均101，无浏览器异常。API当前监听子进程2672（父进程31360），仍须实时核验。
