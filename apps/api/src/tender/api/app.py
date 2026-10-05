@@ -13,6 +13,7 @@ from tender.api import (
     exports,
     extractions,
     jobs,
+    knowledge,
     llm,
     parsing,
     project_files,
@@ -56,6 +57,7 @@ def create_app(components: ApiComponents | None = None) -> FastAPI:
     app.include_router(llm.router)
     app.include_router(config.router)
     app.include_router(quality.router)
+    app.include_router(knowledge.router)
     return app
 
 

@@ -1,0 +1,82 @@
+"""检索与问答共用同一混合召回，嵌入客户端由装配点注入。"""
+
+import asyncio
+from collections.abc import Callable
+
+from tender.application.knowledge import rank_chunks
+from tender.application.knowledge_store import KnowledgeStore, source_state
+from tender.ports.embedding import EmbeddingModel
+from tender.ports.rerank import RerankModel
+
+
+async def retrieve_chunks(
+    db: KnowledgeStore,
+    sources: list[dict],
+    question: str,
+    heartbeat: Callable[[], None],
+    gateway: Callable[[dict], EmbeddingModel],
+    rerank_gateway: Callable[[dict], RerankModel] | None = None,
+) -> tuple[list[dict], dict]:
+    rows = []
+    # 同步数据库访问移到线程池，避免大表查询阻塞进程内事件循环（模型页轮询等）。
+    config = await asyncio.to_thread(db.embedding_config)
+    vector = None
+    semantic_sources = set()
+    warning = None
+    if config:
+        client = None
+        try:
+            client = gateway(config)
+            vector = (await client.embed([question]))[0]
+        except Exception as exc:
+            warning = f"语义检索暂不可用，使用全文检索：{str(exc)[:200]}"
+        finally:
+            if client:
+                await client.aclose()
+    for source in sources:
+        heartbeat()
+        if source_state(source) not in {"ready", "partial"}:
+            continue
+        blocks = await asyncio.to_thread(db.readable_chunks, source)
+        if (
+            vector is not None
+            and source.get("index_id")
+            and source.get("embedding_signature") == config["signature"]
+        ):
+            vectors = await asyncio.to_thread(
+                db.rows,
+                """SELECT ordinal,embedding FROM knowledge_chunk WHERE index_id=:id""",
+                {"id": source["index_id"]},
+            )
+            by_ordinal = {r["ordinal"]: r["embedding"] for r in vectors}
+            for block in blocks:
+                candidate = by_ordinal.get(block["ordinal"])
+                if candidate is not None and len(candidate) == len(vector):
+                    block["embedding"] = candidate
+                    semantic_sources.add(source["source_id"])
+        rows.extend(blocks)
+    ranked = rank_chunks(rows, question, vector)
+    reranked = False
+    rerank_config = await asyncio.to_thread(db.rerank_config) if rerank_gateway else None
+    if ranked and rerank_config and rerank_gateway:
+        client = None
+        try:
+            client = rerank_gateway(rerank_config)
+            candidates = ranked[:30]
+            order = await client.rerank(
+                question, [r["content"] for r in candidates], len(candidates)
+            )
+            ranked = [candidates[index] for index, _ in order] + ranked[30:]
+            reranked = True
+        except Exception:
+            warning = (warning + "；" if warning else "") + "重排服务不可用，保留混合检索顺序"
+        finally:
+            if client:
+                await client.aclose()
+    return ranked, {
+        "reranked": reranked,
+        "mode": "hybrid" if semantic_sources else "keyword",
+        "semantic_source_ids": sorted(semantic_sources),
+        "warning": warning,
+        "embedding_configured": config is not None,
+    }

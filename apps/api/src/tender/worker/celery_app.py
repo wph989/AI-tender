@@ -14,5 +14,6 @@ celery_app.conf.update(
         "tender.worker.regression",
         # 派发任务也必须注册：beat 只负责发消息，执行它的仍是 worker。
         "tender.worker.dispatch",
+        "tender.worker.knowledge",
     )
 )

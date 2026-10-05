@@ -9,6 +9,10 @@ from celery import Celery
 from tender.core.settings import redis_url
 
 _TASK_ROUTES = {
+    "tender.worker.knowledge.dispatch_knowledge": {"queue": "tender"},
+    "tender.worker.knowledge.build_index": {"queue": "extract"},
+    "tender.worker.knowledge.analyze_project": {"queue": "extract"},
+    "tender.worker.knowledge.answer_question": {"queue": "extract"},
     "tender.worker.tasks.process_file": {"queue": "convert"},
     "tender.worker.tasks.submit_parse": {"queue": "parse"},
     "tender.worker.tasks.poll_parse": {"queue": "parse"},
@@ -26,6 +30,10 @@ _TASK_ROUTES = {
 # beat 自己不读配置，靠 tick 内部节流（worker/dispatch.py）。写成配置驱动会让
 # "改配置"依赖 beat 重启，恰好违背配置中心的初衷。
 _BEAT_SCHEDULE = {
+    "dispatch-knowledge": {
+        "task": "tender.worker.knowledge.dispatch_knowledge",
+        "schedule": 15.0,
+    },
     "dispatch-pending": {
         "task": "tender.worker.dispatch.dispatch_pending",
         "schedule": 5.0,

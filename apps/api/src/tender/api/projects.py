@@ -9,6 +9,7 @@ from starlette.responses import Response
 
 from tender.api.common import engine, project_row
 from tender.api.errors import ApiProblem
+from tender.application.knowledge_store import ensure_project_collection
 from tender.core import settings
 
 router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
@@ -53,6 +54,7 @@ def create_project(payload: ProjectCreate, request: Request) -> dict[str, object
             .mappings()
             .one()
         )
+        ensure_project_collection(connection, int(row["id"]))
     return dict(row)
 
 
@@ -128,7 +130,7 @@ def list_projects(
                          AND job_owner.deleted_at IS NULL
                    GROUP BY job.project_id
                ) AS act ON act.project_id = p.id
-               WHERE p.company_id = :company_id AND p.deleted_at IS NULL"""
+               WHERE p.company_id = :company_id AND p.deleted_at IS NULL AND p.kind = 'project'"""
     params: dict[str, object] = {
         "company_id": settings.company_id(),
         "limit": limit,

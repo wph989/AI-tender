@@ -54,6 +54,7 @@ class _MigrationSpec:
     sources: tuple[tuple[str, int], ...]
     # 有的迁移只 ALTER 既有表（没有 CREATE TABLE），对应的文档切片自然解析不出表名
     require_tables: bool = True
+    require_indexes: bool = True
 
 
 _MIGRATIONS: tuple[_MigrationSpec, ...] = (
@@ -61,6 +62,14 @@ _MIGRATIONS: tuple[_MigrationSpec, ...] = (
     _MigrationSpec("0002_storage_and_jobs.py", _SOURCES_0002),
     _MigrationSpec("0003_llm_management.py", _SOURCES_0003),
     _MigrationSpec("0004_config_center.py", _SOURCES_0004, require_tables=False),
+    _MigrationSpec("0005_knowledge_analysis.py", (("设计/14-知识库与综合分析实现.md", 0),)),
+    _MigrationSpec("0006_model_capabilities.py", (("设计/12-LLM管理与模型路由.md", 1),)),
+    _MigrationSpec(
+        "0007_model_inputs.py",
+        (("设计/12-LLM管理与模型路由.md", 2),),
+        require_tables=False,
+        require_indexes=False,
+    ),
 )
 
 # 两处外键在文档里写成列内 REFERENCES，而它们互相引用（field_instance ↔ extraction、
@@ -72,8 +81,8 @@ _DEFERRED_FKS: tuple[tuple[str, str, str], ...] = (
     ("config_release", "regression_run_id", "fk_config_release_regression_run"),
 )
 
-_CREATE_TABLE_RE = re.compile(r"^CREATE TABLE (\w+) \((.*?)^\);", re.S | re.M)
-_ADD_COLUMN_RE = re.compile(r"^ALTER TABLE (\w+)\s+ADD COLUMN (\w+)", re.M)
+_CREATE_TABLE_RE = re.compile(r"^CREATE TABLE (\w+) \((.*?)^\s*\);", re.S | re.M)
+_ADD_COLUMN_RE = re.compile(r"^ALTER TABLE (\w+)\s+(.*?);", re.M | re.S)
 _CREATE_INDEX_RE = re.compile(r"^CREATE (?:UNIQUE )?INDEX (\w+) ON (\w+)", re.M)
 _SQL_FENCE_RE = re.compile(r"```sql\n(.*?)```", re.S)
 
@@ -112,7 +121,9 @@ def _doc_ddl(sources: tuple[tuple[str, int], ...]) -> str:
     return "\n\n".join(blocks)
 
 
-def _parse(sql: str, label: str, *, require_tables: bool = True) -> _Schema:
+def _parse(
+    sql: str, label: str, *, require_tables: bool = True, require_indexes: bool = True
+) -> _Schema:
     tables: dict[str, set[str]] = {}
     for match in _CREATE_TABLE_RE.finditer(sql):
         columns: set[str] = set()
@@ -128,12 +139,14 @@ def _parse(sql: str, label: str, *, require_tables: bool = True) -> _Schema:
 
     added: dict[str, set[str]] = {}
     for match in _ADD_COLUMN_RE.finditer(sql):
-        added.setdefault(match.group(1), set()).add(match.group(2))
+        for column in re.findall(r"\bADD COLUMN\s+(\w+)", match.group(2)):
+            added.setdefault(match.group(1), set()).add(column)
 
     indexes = {match.group(1): match.group(2) for match in _CREATE_INDEX_RE.finditer(sql)}
 
     # 解析器静默失效（比如文档把 CREATE TABLE 改成小写）比比对失败更危险，这里直接拦掉
-    assert indexes, f"{label} 没解析出索引：DDL 的书写形态变了，解析器要跟进"
+    if require_indexes:
+        assert indexes, f"{label} 没解析出索引：DDL 的书写形态变了，解析器要跟进"
     if require_tables:
         assert tables, f"{label} 没解析出表：DDL 的书写形态变了，解析器要跟进"
 
@@ -170,11 +183,13 @@ def _build_cases() -> tuple[_Case, ...]:
                     doc_text,
                     f"{spec.file_name} 对应的设计文档",
                     require_tables=spec.require_tables,
+                    require_indexes=spec.require_indexes,
                 ),
                 migration_schema=_parse(
                     migration_sql,
                     f"迁移 {spec.file_name}",
                     require_tables=spec.require_tables,
+                    require_indexes=spec.require_indexes,
                 ),
             )
         )

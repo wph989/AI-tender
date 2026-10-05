@@ -18,6 +18,8 @@ from tender.api import (
     exports,
     extractions,
     jobs,
+    knowledge,
+    llm,
     parsing,
     project_files,
     projects,
@@ -67,6 +69,8 @@ def _implemented() -> set[str]:
         exports.router,
         jobs.router,
         quality.router,
+        knowledge.router,
+        llm.router,
     )
     found: set[str] = set()
     for router in routers:

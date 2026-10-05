@@ -20,6 +20,7 @@ from starlette.responses import Response
 from tender.api.common import blobs, engine, project_file_row
 from tender.api.errors import ApiProblem
 from tender.api.storage import stream_object
+from tender.application.knowledge_store import sync_sources
 from tender.core import settings
 from tender.domain.errors import TenderError
 from tender.ports.blob_store import BlobStoreError
@@ -34,9 +35,24 @@ _MAX_COMPRESSION_RATIO = 200
 _ALLOWED_ROLES = frozenset(
     {"main", "clarification", "addendum", "boq", "drawing", "format", "other"}
 )
-_PARSEABLE_ROLES = frozenset({"main", "clarification", "addendum", "format", "other"})
+_PARSEABLE_ROLES = _ALLOWED_ROLES
 _PARSEABLE_EXTENSIONS = frozenset(
-    {".pdf", ".doc", ".docx", ".odt", ".rtf", ".ppt", ".pptx", ".odp"}
+    {
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".odt",
+        ".rtf",
+        ".ppt",
+        ".pptx",
+        ".odp",
+        ".xls",
+        ".xlsx",
+        ".xlsm",
+        ".ods",
+        ".csv",
+        ".txt",
+    }
 )
 _BOQ_EXTENSIONS = frozenset({".xls", ".xlsx", ".xlsm", ".ods"})
 _DRAWING_EXTENSIONS = frozenset({".dwg", ".dxf", ".vsd", ".vsdx"})
@@ -350,6 +366,7 @@ async def _add_project_file(
                 },
             ).scalar_one()
         )
+        sync_sources(connection, project_id)
         if parseable:
             job_id = f"job_{uuid4().hex}"
             stage = "probing" if extension == ".pdf" else "converting"

@@ -640,3 +640,65 @@ data: {"status":"completed","version_id":2048}
 | `action` 枚举 | `confirm` / `correct` / `supplement` / `reject` |
 | `review_mode` 枚举 | `item` / `batch` / `spot_check` |
 | 统计字段名 | `first_pass_rate` / `rescue_rate` / `cumulative_pass` / `manual_fallback_rate` / `rerun_button` |
+
+## 知识库与综合分析接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/knowledge/collections` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/knowledge/collections` | 知识库与项目综合分析，见设计/14 |
+| `GET` | `/api/v1/knowledge/collections/{collection_id}` | 知识库与项目综合分析，见设计/14 |
+| `PATCH` | `/api/v1/knowledge/collections/{collection_id}` | 知识库与项目综合分析，见设计/14 |
+| `DELETE` | `/api/v1/knowledge/collections/{collection_id}` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/knowledge/collections/{collection_id}/reindex` | 知识库与项目综合分析，见设计/14 |
+| `GET` | `/api/v1/knowledge/collections/{collection_id}/search` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/knowledge/citations/resolve` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/knowledge/embedding/test` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/knowledge/sources/{source_id}/process` | 知识库与项目综合分析，见设计/14 |
+| `GET` | `/api/v1/projects/{project_id}/knowledge` | 知识库与项目综合分析，见设计/14 |
+| `PUT` | `/api/v1/projects/{project_id}/knowledge/collections` | 知识库与项目综合分析，见设计/14 |
+| `GET` | `/api/v1/projects/{project_id}/analysis` | 知识库与项目综合分析，见设计/14 |
+| `PUT` | `/api/v1/projects/{project_id}/analysis/settings` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/projects/{project_id}/analysis` | 知识库与项目综合分析，见设计/14 |
+| `GET` | `/api/v1/analysis/reports/{report_id}` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/analysis/reports/{report_id}/cancel` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/analysis/reports/{report_id}/retry` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/knowledge/collections/{collection_id}/ask` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/projects/{project_id}/knowledge/ask` | 知识库与项目综合分析，见设计/14 |
+| `GET` | `/api/v1/knowledge/answers/{answer_id}` | 知识库与项目综合分析，见设计/14 |
+
+独立知识库上传复用 `/projects/{upload_project_id}/files`，集合详情提供该标识。
+报告与问答返回逐项引用，定位前通过 `/knowledge/citations/resolve` 校验完整身份。
+
+
+## AI 模型管理接口
+
+参数与行为见 [12-LLM管理与模型路由](12-LLM管理与模型路由.md) 第 10 节。路径保留 `/llm`，不增加平行 `/ai` 入口。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/llm/settings` | 能力清单、参数范围与加密设施状态 |
+| `GET` | `/api/v1/llm/tests` | 最近测试记录 |
+| `GET` | `/api/v1/llm/tests/{test_id}` | 查询执行状态、能力证明有效性与当次用量 |
+| `GET` | `/api/v1/llm/tests/{test_id}/preview` | 有效生图测试的临时图片，失效返回 410 |
+| `GET` | `/api/v1/llm/providers` | 供应商列表 |
+| `POST` | `/api/v1/llm/providers` | 创建供应商 |
+| `PATCH` | `/api/v1/llm/providers/{provider_id}` | 修改供应商与密钥 |
+| `DELETE` | `/api/v1/llm/providers/{provider_id}` | 软删除供应商及未被引用的子模型 |
+| `POST` | `/api/v1/llm/providers/{provider_id}/test` | 目录连通测试 |
+| `GET` | `/api/v1/llm/providers/{provider_id}/remote-models` | 服务端代理远端目录 |
+| `POST` | `/api/v1/llm/providers/{provider_id}/models/import` | 勾选导入，返回新增及跳过数量 |
+| `GET` | `/api/v1/llm/models` | 模型列表 |
+| `POST` | `/api/v1/llm/models` | 手动创建模型 |
+| `PATCH` | `/api/v1/llm/models/{model_id}` | 修改能力与参数 |
+| `DELETE` | `/api/v1/llm/models/{model_id}` | 检查引用后软删除模型 |
+| `POST` | `/api/v1/llm/models/{model_id}/test` | 按 capability 测试一次，保留同步兼容入口 |
+| `POST` | `/api/v1/llm/models/{model_id}/tests` | 持久受理后 202 返回 test_id，页面轮询查询 |
+| `GET` | `/api/v1/llm/features` | 功能及完整有序绑定 |
+| `PATCH` | `/api/v1/llm/features/{feature_key}` | 修改调用预算 |
+| `PUT` | `/api/v1/llm/features/{feature_key}/models` | 原子保存绑定顺序与预算 |
+| `GET` | `/api/v1/llm/calls` | 分页调用日志或有序请求链 |
+
+`GET /llm/calls` 可使用 feature_key、model_id、status、invocation_id、limit、offset。测试响应包含 test_id、status、latency_ms、http_status、error；HTTP 200 仅表示操作完成，status 为 error/unsupported 时不能显示通过。
+
+模型测试成功时还返回适用的 vector_count、embedding_dimensions、document_count；不适用项为 null，供应商目录测试可省略。这些诊断字段不包含向量内容，维度信息当前仅在本次响应展示。
