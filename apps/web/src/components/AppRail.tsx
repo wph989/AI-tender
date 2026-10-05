@@ -5,6 +5,7 @@ import { Icon } from "@/components/Icon";
 
 const NAV = [
   { href: "/projects", label: "项目空间", icon: "folder" },
+  { href: "/knowledge", label: "知识库", icon: "book" },
   { href: "/settings/models", label: "模型管理", icon: "layers" },
   { href: "/settings/config", label: "配置中心", icon: "sliders" },
 ] as const;

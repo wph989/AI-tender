@@ -4,6 +4,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { AppRail } from "@/components/AppRail";
 import { Icon } from "@/components/Icon";
+import { ProjectAnalysis } from "@/components/knowledge/ProjectAnalysis";
 import { FilePipeline } from "@/components/projects/FilePipeline";
 import { DocumentWorkbench } from "@/components/workbench/DocumentWorkbench";
 import { BUTTON_CLASS, GHOST_BUTTON_CLASS, PRIMARY_BUTTON_CLASS } from "@/components/ui";
@@ -13,6 +14,12 @@ import type { WireProjectDetail } from "@/types/projects";
 
 /** 文件以横向标签切换，将横向空间优先留给原文与证据；URL 仍保留当前文件。 */
 export function ProjectWorkspace({ projectId }: { projectId: number }) {
+  const params = useSearchParams();
+  return params.get("view") === "fields" || params.has("file")
+    ? <FileWorkspace projectId={projectId} /> : <ProjectAnalysis key={projectId} projectId={projectId} />;
+}
+
+function FileWorkspace({ projectId }: { projectId: number }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const requested = Number(searchParams.get("file") ?? "");
@@ -47,6 +54,7 @@ export function ProjectWorkspace({ projectId }: { projectId: number }) {
         <Link href="/projects" className="back-button" aria-label="返回项目空间"><Icon name="back" size={16} /></Link>
         <div className="min-w-0"><p className="mb-0.5 text-[10px] text-slate-400">项目空间 / 核对工作台</p><h1>{project?.name ?? "正在加载项目…"}</h1></div>
         <div className="ml-auto flex shrink-0 items-center gap-2">
+          <Link href={"/projects/" + projectId} className={BUTTON_CLASS}>综合分析</Link>
           <button type="button" className={GHOST_BUTTON_CLASS} aria-label="刷新项目" onClick={() => void reload().catch(() => setError("刷新失败，请重试"))}><Icon name="refresh" size={16} /></button>
           <Link href={"/projects/" + projectId + "/files"} className={BUTTON_CLASS}><Icon name="upload" size={15} /><span>文件管理</span></Link>
         </div>

@@ -5,10 +5,10 @@ import { BUTTON_CLASS, DATA_CLASS, INPUT_CLASS, GHOST_BUTTON_CLASS } from "@/com
 import { useViewerStore } from "@/lib/store/viewerStore";
 import { ExportButton } from "./ExportButton";
 
-interface Props { pageCount: number; projectId: number | null; onNotice: (message: string | null) => void; }
+interface Props { pageCount: number; projectId: number | null; onNotice: (message: string | null) => void; showExport?: boolean; }
 
 /** 页码草稿独立于滚动位置，避免用户输入时被当前页同步覆盖。 */
-export function Toolbar({ pageCount, projectId, onNotice }: Props) {
+export function Toolbar({ pageCount, projectId, onNotice, showExport = true }: Props) {
   const [draft, setDraft] = useState("");
   const zoom = useViewerStore((state) => state.zoom);
   const setZoom = useViewerStore((state) => state.setZoom);
@@ -34,7 +34,7 @@ export function Toolbar({ pageCount, projectId, onNotice }: Props) {
         <button type="button" className={GHOST_BUTTON_CLASS} aria-label="放大" onClick={() => setZoom(zoom + .1)}>＋</button>
         <button type="button" className={BUTTON_CLASS + " toolbar-fit ml-2 py-1.5"} onClick={() => setZoom(1)}>适应宽度</button>
       </div>
-      <ExportButton projectId={projectId} onNotice={onNotice} />
+      {showExport && <ExportButton projectId={projectId} onNotice={onNotice} />}
     </div>
   );
 }

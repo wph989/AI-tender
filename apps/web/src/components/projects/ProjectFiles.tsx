@@ -262,7 +262,11 @@ export function ProjectFiles({ projectId }: Props) {
           >
             刷新
           </button>
-          <Link href={"/projects/" + projectId} className={PRIMARY_BUTTON_CLASS}>
+          {/* 默认页已改为综合分析，项目级入口需显式带 view=fields 才能进入字段工作台。 */}
+          <Link
+            href={"/projects/" + projectId + "?view=fields"}
+            className={PRIMARY_BUTTON_CLASS}
+          >
             打开工作台
           </Link>
         </>
