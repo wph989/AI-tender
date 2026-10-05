@@ -7,6 +7,8 @@ const apiTarget = (process.env.API_PROXY_TARGET ?? "http://127.0.0.1:8300").repl
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // 启动指南使用回环 IP；Next 默认只信任 localhost，拦截 HMR 后客户端无法启动取数。
+  allowedDevOrigins: ["127.0.0.1"],
   // 关掉 Next 16 自动生成的 AGENTS.md / CLAUDE.md：
   // 仓库根已经有自己的 AGENTS.md（编码规范、提交口径都在那儿），
   // 这里再生成一份只会在子目录里多出一份可能冲突的说明，且每次 dev 都重写。
