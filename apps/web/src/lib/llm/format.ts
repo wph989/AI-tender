@@ -25,3 +25,37 @@ export function testLabel(status: string | null): string {
   if (status === null || status === "") return "未测";
   return status;
 }
+export function validityLabel(state: string): string {
+  return (
+    (
+      {
+        valid: "通过 · 有效",
+        failed: "失败",
+        unknown: "结果未知，请核实供应商状态",
+        running: "测试进行中",
+        unsupported: "不支持目录，请单独测试模型",
+        expired: "已过期，需重测",
+        config_changed: "配置已变更，需重测",
+        untested: "未测试",
+      } as Record<string, string>
+    )[state] ?? state
+  );
+}
+export const kindLabel = {
+  language: "Language · 语言",
+  embedding: "Embedding · 嵌入",
+  rerank: "Rerank · 重排",
+  image_generation: "Image · 生图",
+};
+
+export const capabilityLabel: Record<string, string> = {
+  text_input: "文本输入",
+  image_input: "图片输入",
+  json_output: "JSON 输出",
+  embedding: "文本嵌入",
+  rerank: "专用重排",
+  image_generation: "图片生成",
+  text: "文本",
+  vision: "视觉",
+  multimodal_embedding: "图文嵌入",
+};

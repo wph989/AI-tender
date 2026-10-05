@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * 功能绑定面板：给功能选模型、排优先级、改转移深度（设计文档 12 第 3、4、8 节）。
+ * 功能绑定面板：给功能选模型、排优先级、改不同候选上限（设计文档 12 第 3、4、8 节）。
  *
  * 优先级是"整表"的：草稿就是一份有序的模型行 id 数组，任何排序动作都只改这份数组，
  * 保存时整表 PUT（服务端按位置写 1..N）。单行改数字会造出空洞与同级，接口也不接受。
@@ -9,12 +9,18 @@
 
 import { useState } from "react";
 
-import { replaceBindings, updateFeature } from "@/lib/api/llm";
+import { replaceBindings } from "@/lib/api/llm";
 import { message } from "@/lib/llm/format";
 import { MAX_BINDINGS, moveToPriority } from "@/lib/llm/priority";
 import type { LlmFeature, LlmModel } from "@/types/llm";
 
-import { BUTTON_CLASS, DANGER_BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS, SELECT_CLASS } from "./ui";
+import {
+  BUTTON_CLASS,
+  DANGER_BUTTON_CLASS,
+  INPUT_CLASS,
+  PRIMARY_BUTTON_CLASS,
+  SELECT_CLASS,
+} from "./ui";
 
 interface Props {
   features: LlmFeature[];
@@ -26,34 +32,74 @@ interface Draft {
   key: string;
   ids: number[];
   limit: number;
+  total: number;
+  deadline: number;
+  revision: number;
 }
 
 export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [draft, setDraft] = useState<Draft | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [pendingAdd, setPendingAdd] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const active = features.find((feature) => feature.key === activeKey) ?? features[0];
+  const active =
+    features.find((feature) => feature.key === activeKey) ?? features[0];
+  const draft = active ? (drafts[active.key] ?? null) : null;
   if (active === undefined) {
     return (
       <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
-        <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">功能绑定</h2>
-        <p className="mt-3 text-[14px] leading-6 text-slate-500">后端没有返回功能列表。</p>
+        <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">
+          功能绑定
+        </h2>
+        <p className="mt-3 text-[14px] leading-6 text-slate-500">
+          后端没有返回功能列表。
+        </p>
       </section>
     );
   }
 
   const serverIds = active.bindings.map((binding) => binding.model_row_id);
-  // 草稿只对当前功能有效：切功能就丢掉，避免把 A 的排序带到 B 上
-  const ids = draft !== null && draft.key === active.key ? draft.ids : serverIds;
+  // 每个功能保留独立草稿，切换功能和刷新服务端快照都不能清除未保存的排序。
+  const setDraft = (value: Draft | null) =>
+    setDrafts((previous) => {
+      const next = { ...previous };
+      if (value) next[active.key] = value;
+      else delete next[active.key];
+      return next;
+    });
+  const ids =
+    draft !== null && draft.key === active.key ? draft.ids : serverIds;
   const limit =
-    draft !== null && draft.key === active.key ? draft.limit : active.failover_limit;
-  const dirty = ids.join(",") !== serverIds.join(",") || limit !== active.failover_limit;
+    draft !== null && draft.key === active.key
+      ? draft.limit
+      : active.failover_limit;
+  const total =
+    draft?.key === active.key ? draft.total : active.max_total_requests;
+  const deadline =
+    draft?.key === active.key ? draft.deadline : active.deadline_seconds;
+  const revision = draft?.key === active.key ? draft.revision : active.revision;
+  const dirty =
+    total !== active.max_total_requests ||
+    deadline !== active.deadline_seconds ||
+    ids.join(",") !== serverIds.join(",") ||
+    limit !== active.failover_limit;
 
-  const update = (nextIds: number[], nextLimit: number = limit) =>
-    setDraft({ key: active.key, ids: nextIds, limit: Math.min(Math.max(nextLimit, 1), 10) });
+  const update = (
+    nextIds: number[],
+    nextLimit: number = limit,
+    nextTotal: number = total,
+    nextDeadline: number = deadline,
+  ) =>
+    setDraft({
+      key: active.key,
+      ids: nextIds,
+      limit: nextLimit,
+      total: nextTotal,
+      deadline: nextDeadline,
+      revision,
+    });
 
   const run = async (fallback: string, task: () => Promise<void>) => {
     setBusy(true);
@@ -62,6 +108,8 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
       await task();
     } catch (caught) {
       setError(message(caught, fallback));
+      // 刷新只更新服务端基线，草稿继续保留，用户可比较冲突的最新版本。
+      await onChanged().catch(() => undefined);
     } finally {
       setBusy(false);
     }
@@ -69,16 +117,29 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
 
   const save = () =>
     void run("保存绑定失败", async () => {
-      // 先写绑定再写深度：绑定失败时不要留下一个只改了深度的半成品配置
-      await replaceBindings(active.key, ids);
-      await updateFeature(active.key, limit);
+      // 排序和预算一次原子提交；旧版本失败时保留当前草稿供比较。
+      await replaceBindings(active.key, ids, {
+        revision,
+        failover_limit: limit,
+        max_total_requests: total,
+        deadline_seconds: deadline,
+      });
       setDraft(null);
       await onChanged();
     });
 
   const modelById = new Map(models.map((model) => [model.id, model]));
-  const unbound = models.filter((model) => !ids.includes(model.id));
-  const effective = ids.length === 0 ? 0 : Math.max(1, Math.min(limit, ids.length));
+  const unbound = models.filter(
+    (model) =>
+      !ids.includes(model.id) &&
+      model.kind === active.required_kind &&
+      (active.required_kind !== "language" ||
+        model.capabilities.includes("json_output")),
+  );
+  const singleModel = ["embedding", "rerank"].includes(active.required_kind);
+  const maxBindings = singleModel ? 1 : MAX_BINDINGS;
+  const effective =
+    ids.length === 0 ? 0 : Math.max(1, Math.min(limit, ids.length));
 
   const setPriority = (modelRowId: number, target: number) => {
     update(moveToPriority(ids, modelRowId, target));
@@ -93,194 +154,286 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
   const add = () => {
     const modelRowId = Number(pendingAdd);
     if (!Number.isSafeInteger(modelRowId) || modelRowId <= 0) return;
-    if (ids.includes(modelRowId) || ids.length >= MAX_BINDINGS) return;
+    if (ids.includes(modelRowId) || ids.length >= maxBindings) return;
     update([...ids, modelRowId]);
     setPendingAdd("");
   };
 
   return (
     <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">功能绑定</h2>
-          <p className="mt-1 text-[13px] leading-5 text-slate-500">
-            1 级为首选模型，失败后按 2、3… 降级；同一模型不会原地重试。
+      <fieldset disabled={busy} className="min-w-0">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">
+              功能绑定
+            </h2>
+            <p className="mt-1 text-[13px] leading-5 text-slate-500">
+              暂时故障按模型的额外次数重试，再尝试后续候选；请求总量与时间预算始终优先。
+            </p>
+          </div>
+          <div className="flex items-center gap-2 text-[13px] text-slate-600">
+            不同候选上限
+            <input
+              aria-label="不同候选上限"
+              type="number"
+              min={1}
+              max={10}
+              className={INPUT_CLASS + " w-20"}
+              value={limit}
+              onChange={(event) => update(ids, Number(event.target.value))}
+            />
+            级
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-3 text-sm">
+          <label>
+            总请求上限{" "}
+            <input
+              aria-label="总请求上限"
+              type="number"
+              min={1}
+              max={20}
+              className={INPUT_CLASS + " w-20"}
+              value={total}
+              onChange={(e) => update(ids, limit, Number(e.target.value))}
+            />
+          </label>
+          <label>
+            总时间（秒）{" "}
+            <input
+              aria-label="调用总时间"
+              type="number"
+              min={1}
+              max={86400}
+              className={INPUT_CLASS + " w-24"}
+              value={deadline}
+              onChange={(e) =>
+                update(ids, limit, total, Number(e.target.value))
+              }
+            />
+          </label>
+        </div>
+        {singleModel && (
+          <p className="mt-2 text-xs text-slate-500">
+            嵌入与重排当前固定一个模型、单次请求。上述重试预算用于语言模型调用。
           </p>
-        </div>
-        <div className="flex items-center gap-2 text-[13px] text-slate-600">
-          转移深度
-          <input
-            aria-label="模型转移深度"
-            type="number"
-            min={1}
-            max={10}
-            className={INPUT_CLASS + " w-20"}
-            value={limit}
-            onChange={(event) => update(ids, Number(event.target.value))}
-          />
-          级
-        </div>
-      </div>
-
-      <div className="mt-4 flex flex-wrap gap-2">
-        {features.map((feature) => (
-          <button
-            key={feature.key}
-            type="button"
-            onClick={() => {
-              setActiveKey(feature.key);
-              setDraft(null);
-              setError(null);
-            }}
-            className={
-              feature.key === active.key
-                ? "rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-[13px] text-sky-700"
-                : "rounded-lg border border-slate-200 px-3 py-2 text-[13px] text-slate-600 hover:bg-slate-50"
-            }
-          >
-            {feature.name}
-            <span className="ml-1 text-slate-400">{feature.bindings.length}</span>
-          </button>
-        ))}
-      </div>
-
-      {error !== null && (
-        <p className="mt-3 border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">{error}</p>
-      )}
-
-      <p className="mt-3 text-[13px] text-slate-500">
-        共 {ids.length} 个候选，实际前 {effective} 级生效（深度会夹到候选数量以内）。
-      </p>
-
-      {ids.length === 0 ? (
-        <p className="mt-2 text-[14px] leading-6 text-slate-500">
-          还未分配模型，当前使用部署时配置的默认模型。
-        </p>
-      ) : (
-        <div className="settings-table-scroll" role="region" aria-label="功能模型列表" tabIndex={0}><table className="w-full border-collapse text-[13px]">
-          <thead>
-            <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
-              <th className="border-b border-slate-200 py-2 pr-3 font-normal w-16">级别</th>
-              <th className="border-b border-slate-200 py-2 pr-3 font-normal">模型</th>
-              <th className="border-b border-slate-200 py-2 pr-3 font-normal">供应商</th>
-              <th className="border-b border-slate-200 py-2 pr-3 font-normal">状态</th>
-              <th className="border-b border-slate-200 py-2 text-right font-normal">调整</th>
-            </tr>
-          </thead>
-          <tbody>
-            {ids.map((modelRowId, index) => {
-              const model = modelById.get(modelRowId);
-              return (
-                <tr key={modelRowId} className="border-t border-slate-100">
-                  <td className="py-2 pr-3">
-                    <input
-                      type="number"
-                      min={1}
-                      max={ids.length}
-                      className={INPUT_CLASS + " w-16"}
-                      value={index + 1}
-                      onChange={(event) => setPriority(modelRowId, Number(event.target.value))}
-                    />
-                  </td>
-                  <td className="py-2 pr-3">
-                    <div className="font-medium text-slate-800">
-                      {model?.display_name ?? "模型 #" + modelRowId}
-                    </div>
-                    <div className="text-[13px] text-slate-500">{model?.model_id ?? "已不在模型列表中"}</div>
-                  </td>
-                  <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
-                    {model?.provider_name ?? "—"}
-                  </td>
-                  <td className="border-b border-slate-100 py-2 pr-3 text-[13px]">
-                    {model === undefined ? (
-                      "—"
-                    ) : model.enabled ? (
-                      <span className="inline-flex items-center gap-1.5 text-emerald-700">
-                        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                        启用
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1.5 text-slate-500">
-                        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-slate-400" />
-                        停用
-                      </span>
-                    )}
-                  </td>
-                  <td className="border-b border-slate-100 py-2 text-right whitespace-nowrap">
-                    <button
-                      type="button"
-                      className={BUTTON_CLASS + " mr-1"}
-                      disabled={index === 0}
-                      onClick={() => shift(index, -1)}
-                    >
-                      ↑
-                    </button>
-                    <button
-                      type="button"
-                      className={BUTTON_CLASS + " mr-1"}
-                      disabled={index === ids.length - 1}
-                      onClick={() => shift(index, 1)}
-                    >
-                      ↓
-                    </button>
-                    <button
-                      type="button"
-                      className={DANGER_BUTTON_CLASS}
-                      onClick={() => update(ids.filter((id) => id !== modelRowId))}
-                    >
-                      移除
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table></div>
-      )}
-
-      <div className="mt-3 flex flex-wrap items-center gap-2">
-        <select
-          className={SELECT_CLASS}
-          value={pendingAdd}
-          onChange={(event) => setPendingAdd(event.target.value)}
-        >
-          <option value="">选择要加入的模型…</option>
-          {unbound.map((model) => (
-            <option key={model.id} value={model.id}>
-              {model.display_name}
-              {model.enabled ? "" : "（停用）"} · {model.provider_name ?? "—"}
-            </option>
+        )}
+        {draft && revision !== active.revision && (
+          <p className="mt-3 text-sm text-amber-700">
+            服务端配置已变化。当前草稿保留，请比较最新配置后放弃草稿并重新编辑。
+          </p>
+        )}
+        <div className="mt-4 flex flex-wrap gap-2">
+          {features.map((feature) => (
+            <button
+              key={feature.key}
+              type="button"
+              onClick={() => {
+                setActiveKey(feature.key);
+                setPendingAdd("");
+                setError(null);
+              }}
+              className={
+                feature.key === active.key
+                  ? "rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-[13px] text-sky-700"
+                  : "rounded-lg border border-slate-200 px-3 py-2 text-[13px] text-slate-600 hover:bg-slate-50"
+              }
+            >
+              {feature.name}
+              <span className="ml-1 text-slate-400">
+                {feature.bindings.length}
+              </span>
+            </button>
           ))}
-        </select>
-        <button
-          type="button"
-          className={BUTTON_CLASS}
-          disabled={pendingAdd === "" || ids.length >= MAX_BINDINGS}
-          onClick={add}
-        >
-          加到最低级
-        </button>
-        <span className="text-[13px] text-slate-400">最多 {MAX_BINDINGS} 个</span>
+        </div>
 
-        <div className="ml-auto flex gap-2">
-          <button
-            type="button"
-            className={PRIMARY_BUTTON_CLASS}
-            disabled={busy || !dirty}
-            onClick={save}
+        {error !== null && (
+          <p className="mt-3 border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">
+            {error}
+          </p>
+        )}
+
+        <p className="mt-3 text-[13px] text-slate-500" hidden={singleModel}>
+          共 {ids.length} 个候选，最多实际尝试 {effective} 个可用模型、{total}{" "}
+          次请求。前面的模型可能耗尽预算，后续模型不保证执行。
+        </p>
+
+        {ids.length === 0 ? (
+          <p className="mt-2 text-[14px] leading-6 text-slate-500">
+            还未分配模型。语言功能暂停调用；向量或重排留空时使用基础检索。
+          </p>
+        ) : (
+          <div
+            className="settings-table-scroll"
+            role="region"
+            aria-label="功能模型列表"
+            tabIndex={0}
           >
-            保存
-          </button>
+            <table className="w-full border-collapse text-[13px]">
+              <thead>
+                <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
+                  <th className="border-b border-slate-200 py-2 pr-3 font-normal w-16">
+                    级别
+                  </th>
+                  <th className="border-b border-slate-200 py-2 pr-3 font-normal">
+                    模型
+                  </th>
+                  <th className="border-b border-slate-200 py-2 pr-3 font-normal">
+                    供应商
+                  </th>
+                  <th className="border-b border-slate-200 py-2 pr-3 font-normal">
+                    状态
+                  </th>
+                  <th className="border-b border-slate-200 py-2 text-right font-normal">
+                    调整
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {ids.map((modelRowId, index) => {
+                  const model = modelById.get(modelRowId);
+                  return (
+                    <tr key={modelRowId} className="border-t border-slate-100">
+                      <td className="py-2 pr-3">
+                        <input
+                          type="number"
+                          min={1}
+                          max={ids.length}
+                          className={INPUT_CLASS + " w-16"}
+                          value={index + 1}
+                          onChange={(event) =>
+                            setPriority(modelRowId, Number(event.target.value))
+                          }
+                        />
+                      </td>
+                      <td className="py-2 pr-3">
+                        <div className="font-medium text-slate-800">
+                          {model?.display_name ?? "模型 #" + modelRowId}
+                        </div>
+                        <div className="text-[13px] text-slate-500">
+                          {model?.model_id ?? "已不在模型列表中"} · 理论最多{" "}
+                          {!singleModel ? (model?.extra_retries ?? 0) + 1 : 1}{" "}
+                          次
+                        </div>
+                      </td>
+                      <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
+                        {model?.provider_name ?? "—"}
+                      </td>
+                      <td className="border-b border-slate-100 py-2 pr-3 text-[13px]">
+                        {model === undefined ? (
+                          "—"
+                        ) : model.enabled && model.provider_enabled ? (
+                          <span className="inline-flex items-center gap-1.5 text-emerald-700">
+                            <span
+                              aria-hidden
+                              className="h-1.5 w-1.5 rounded-full bg-emerald-500"
+                            />
+                            启用
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 text-slate-500">
+                            <span
+                              aria-hidden
+                              className="h-1.5 w-1.5 rounded-full bg-slate-400"
+                            />
+                            停用
+                          </span>
+                        )}
+                      </td>
+                      <td className="border-b border-slate-100 py-2 text-right whitespace-nowrap">
+                        <button
+                          type="button"
+                          className={BUTTON_CLASS + " mr-1"}
+                          disabled={index === 0}
+                          onClick={() => shift(index, -1)}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          className={BUTTON_CLASS + " mr-1"}
+                          disabled={index === ids.length - 1}
+                          onClick={() => shift(index, 1)}
+                        >
+                          ↓
+                        </button>
+                        <button
+                          type="button"
+                          className={DANGER_BUTTON_CLASS}
+                          onClick={() =>
+                            update(ids.filter((id) => id !== modelRowId))
+                          }
+                        >
+                          移除
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <select
+            className={SELECT_CLASS}
+            value={pendingAdd}
+            onChange={(event) => setPendingAdd(event.target.value)}
+          >
+            <option value="">选择要加入的模型…</option>
+            {unbound.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.display_name}
+                {model.enabled ? "" : "（停用）"} · {model.provider_name ?? "—"}
+              </option>
+            ))}
+          </select>
           <button
             type="button"
             className={BUTTON_CLASS}
-            disabled={busy || !dirty}
-            onClick={() => setDraft(null)}
+            disabled={pendingAdd === "" || ids.length >= maxBindings}
+            onClick={add}
           >
-            放弃改动
+            加到最低级
           </button>
+          <span className="text-[13px] text-slate-400">
+            最多 {maxBindings} 个
+          </span>
+
+          <div className="ml-auto flex gap-2">
+            <button
+              type="button"
+              className={PRIMARY_BUTTON_CLASS}
+              disabled={
+                busy ||
+                !dirty ||
+                !Number.isInteger(limit) ||
+                limit < 1 ||
+                limit > 10 ||
+                !Number.isInteger(total) ||
+                total < 1 ||
+                total > 20 ||
+                !Number.isInteger(deadline) ||
+                deadline < 1 ||
+                deadline > 86400
+              }
+              onClick={save}
+            >
+              保存
+            </button>
+            <button
+              type="button"
+              className={BUTTON_CLASS}
+              disabled={busy || !dirty}
+              onClick={() => setDraft(null)}
+            >
+              放弃改动
+            </button>
+          </div>
         </div>
-      </div>
+      </fieldset>
     </section>
   );
 }
