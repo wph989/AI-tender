@@ -73,4 +73,13 @@ def decrypt_secret(ciphertext: str) -> str:
 
 def secret_hint(plaintext: str) -> str:
     """只保留末 4 位供页面辨认；短于 4 位时全部隐藏。"""
-    return f"****{plaintext[-4:]}" if len(plaintext) >= 4 else "****"
+    return f"****{plaintext[-4:]}" if len(plaintext) > 4 else "已配置"
+
+
+def secret_key_ready() -> bool:
+    """只报告能否加密，避免把部署主密钥或错误详情送到浏览器。"""
+    try:
+        _cipher()
+        return True
+    except SecretKeyUnavailable:
+        return False

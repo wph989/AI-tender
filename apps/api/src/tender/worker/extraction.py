@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -16,7 +17,6 @@ from tender.adapters.redis_cache import RedisConfigCache
 from tender.application.agent import extract_field
 from tender.application.extraction import build_anchor_document, identify_lots
 from tender.application.fields import FIELD_BY_KEY, FIELDS
-from tender.application.llm_registry import effective_limit
 from tender.application.llm_routing import CallRecord, ModelCandidate, RoutingModel
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
@@ -155,49 +155,19 @@ def _field_keys(snapshot: Mapping[str, Any]) -> list[str]:
 
 
 def _log_call(record: CallRecord) -> None:
-    """调用记录单独一个小事务写：抽取事务回滚时也要留下失败痕迹。"""
-    with _engine.begin() as connection:
-        connection.execute(
-            text(
-                """INSERT INTO llm_call_log
-                       (provider_id, model_id, feature_key, purpose, status, http_status,
-                        latency_ms, prompt_tokens, completion_tokens, error_message)
-                   VALUES
-                       (:provider_id, :model_id, :feature_key, :purpose, :status, :http_status,
-                        :latency_ms, :prompt_tokens, :completion_tokens, :error_message)"""
-            ),
-            {
-                "provider_id": record.provider_id,
-                "model_id": record.model_id,
-                "feature_key": record.feature_key,
-                "purpose": record.purpose,
-                "status": record.status,
-                "http_status": record.http_status,
-                "latency_ms": record.latency_ms,
-                "prompt_tokens": record.prompt_tokens,
-                "completion_tokens": record.completion_tokens,
-                "error_message": record.error_message,
-            },
+    data = asdict(record)
+    columns = ",".join(data)
+    values = ",".join(":" + key for key in data)
+    # 首次先插入 running；返回后只补写同一请求，不新增第二条调用账。
+    with _engine.begin() as c:
+        c.execute(
+            text(f"""INSERT INTO llm_call_log({columns}) VALUES ({values})
+            ON CONFLICT (invocation_id,request_ordinal) DO UPDATE SET
+            status=EXCLUDED.status,http_status=EXCLUDED.http_status,latency_ms=EXCLUDED.latency_ms,
+            prompt_tokens=EXCLUDED.prompt_tokens,completion_tokens=EXCLUDED.completion_tokens,
+            error_message=EXCLUDED.error_message"""),
+            data,
         )
-
-
-def _env_candidate() -> ModelCandidate | None:
-    """注册表为空时回退到 .env 单模型；这是已部署环境不因本模块失效的保险。"""
-    base_url = settings.llm_base_url()
-    model = settings.llm_model()
-    if not base_url or not model:
-        return None
-    return ModelCandidate(
-        registry_model_id=None,
-        provider_id=None,
-        display_name=model,
-        model=model,
-        base_url=base_url,
-        api_key=settings.llm_api_key(),
-        timeout=settings.llm_timeout_seconds(),
-        temperature=None,
-        max_tokens=None,
-    )
 
 
 def _key_error_record(
@@ -223,13 +193,16 @@ def _load_candidates(feature_key: str, purpose: str) -> list[ModelCandidate]:
             connection.execute(
                 text(
                     """SELECT m.id AS model_row_id, m.model_id, m.display_name, m.timeout_seconds,
-                              m.temperature, m.max_tokens, p.api_key_ciphertext,
+                              m.temperature, m.max_tokens, m.extra_retries,m.api_mode,p.protocol,
+                              m.parameters,m.capabilities,
+                              p.name AS provider_name,p.auth_mode,p.api_key_ciphertext,
                               p.id AS provider_id, p.base_url
                        FROM llm_feature_model AS fm
                        JOIN llm_model AS m ON m.id = fm.model_id
                        JOIN llm_provider AS p ON p.id = m.provider_id
                        WHERE fm.feature_key = :feature_key
-                         AND m.enabled AND m.deleted_at IS NULL
+                         AND m.enabled AND m.deleted_at IS NULL AND m.kind='language'
+                         AND m.capabilities @> '["json_output"]'::jsonb
                          AND p.enabled AND p.deleted_at IS NULL
                        ORDER BY fm.priority"""
                 ),
@@ -241,10 +214,12 @@ def _load_candidates(feature_key: str, purpose: str) -> list[ModelCandidate]:
     candidates: list[ModelCandidate] = []
     for row in rows:
         try:
+            if row["auth_mode"] == "api_key" and not row["api_key_ciphertext"]:
+                raise SecretKeyUnavailable("供应商未配置 API Key")
             api_key = (
                 decrypt_secret(str(row["api_key_ciphertext"]))
-                if row["api_key_ciphertext"]
-                else settings.llm_api_key()
+                if row["api_key_ciphertext"] and row["auth_mode"] == "api_key"
+                else None
             )
         except SecretKeyUnavailable as exc:
             # 解不开的密钥不能被静默跳过：先落一条失败记录，页面才看得到真正原因。
@@ -252,6 +227,12 @@ def _load_candidates(feature_key: str, purpose: str) -> list[ModelCandidate]:
             continue
         candidates.append(
             ModelCandidate(
+                parameters_json=json.dumps(row["parameters"], sort_keys=True),
+                capabilities=tuple(row["capabilities"]),
+                extra_retries=int(row["extra_retries"]),
+                protocol=row["protocol"],
+                api_mode=row["api_mode"],
+                provider_name=row["provider_name"],
                 registry_model_id=int(row["model_row_id"]),
                 provider_id=int(row["provider_id"]),
                 display_name=str(row["display_name"]),
@@ -268,17 +249,42 @@ def _load_candidates(feature_key: str, purpose: str) -> list[ModelCandidate]:
 
 def _routing_model(feature_key: str, purpose: str) -> RoutingModel:
     candidates = _load_candidates(feature_key, purpose)
-    if not candidates:
-        fallback = _env_candidate()
-        candidates = [fallback] if fallback is not None else []
-        return RoutingModel(feature_key, purpose, candidates, create_model_gateway, _log_call)
-    with _engine.connect() as connection:
-        configured = connection.execute(
-            text("SELECT failover_limit FROM llm_feature WHERE key = :key"),
-            {"key": feature_key},
-        ).scalar_one_or_none()
-    limit = effective_limit(int(configured) if configured is not None else None, len(candidates))
-    return RoutingModel(feature_key, purpose, candidates[:limit], create_model_gateway, _log_call)
+    with _engine.connect() as c:
+        policy = (
+            c.execute(text("SELECT * FROM llm_feature WHERE key=:key"), {"key": feature_key})
+            .mappings()
+            .first()
+        )
+
+    def recheck(snapshot: ModelCandidate) -> ModelCandidate | None:
+        current = next(
+            (
+                c
+                for c in _load_candidates(feature_key, purpose)
+                if c.registry_model_id == snapshot.registry_model_id
+            ),
+            None,
+        )
+        if current is None or (current.protocol, current.api_mode) != (
+            snapshot.protocol,
+            snapshot.api_mode,
+        ):
+            return None
+        # 参数与次数固定于调用创建时；端点和密钥必须取同一最新供应商行。
+        return replace(snapshot, base_url=current.base_url, api_key=current.api_key)
+
+    return RoutingModel(
+        feature_key,
+        purpose,
+        candidates,
+        create_model_gateway,
+        _log_call,
+        failover_limit=policy["failover_limit"] if policy else 3,
+        max_total_requests=policy["max_total_requests"] if policy else 6,
+        deadline_seconds=policy["deadline_seconds"] if policy else 600,
+        recheck=recheck,
+        reserve=_log_call,
+    )
 
 
 def _refresh_conflict(
@@ -781,7 +787,6 @@ def create_extraction_job(
         "actor": actor,
         "hint": hint,
         "field_keys": keys,
-        "model": settings.llm_model(),
     }
     # 先读活动配置（可能走 Redis 缓存）再开事务：不在事务里等网络。
     active_config = _config_registry().active(settings.company_id())

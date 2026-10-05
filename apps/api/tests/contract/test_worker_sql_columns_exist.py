@@ -26,7 +26,7 @@ ALEMBIC_DIR = API_ROOT / "alembic" / "versions"
 _CREATE_TABLE = re.compile(r"CREATE TABLE\s+(\w+)\s*\((?P<body>.*?)\);", re.S)
 # 不少列是后加的（0001 的 document.company_id、0002 的 project_file.sha256…），
 # 漏掉 ALTER 会把它们误判成「不存在的列」——这个测试必须先真的承认 DDL 的现状。
-_ALTER_ADD = re.compile(r"ALTER TABLE\s+(\w+)\s+ADD COLUMN\s+(\w+)", re.I)
+_ALTER_ADD = re.compile(r"ALTER TABLE\s+(\w+)\s+(.*?);", re.I | re.S)
 _ALIAS = re.compile(r"\b(\w+)\s+AS\s+(\w+)\b")
 _QUALIFIED = re.compile(r"\b(\w+)\.(\w+)\b")
 # DDL 的列定义行：第一段是列名；约束行不是列。
@@ -46,8 +46,10 @@ def _ddl_columns() -> dict[str, set[str]]:
                 if not head or head.upper() in _NOT_A_COLUMN:
                     continue
                 columns.add(head)
-        for table, column in _ALTER_ADD.findall(text):
-            tables.setdefault(table, set()).add(column)
+        for table, operations in _ALTER_ADD.findall(text):
+            # 同一 ALTER 可以连续 ADD 多列，不能只识别第一列而误报合法 SQL。
+            for column in re.findall(r"\bADD COLUMN\s+(\w+)", operations, re.I):
+                tables.setdefault(table, set()).add(column)
     return tables
 
 

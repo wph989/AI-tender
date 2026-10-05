@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from tender.ports.model_media import ModelImage
+
 
 @dataclass(frozen=True, slots=True)
 class Completion:
@@ -36,6 +38,10 @@ class StructuredTextModel(Protocol):
 class ChatGateway(StructuredTextModel, Protocol):
     """管理页与抽取共用的完整能力：补全 + 远端模型列表。"""
 
+    async def complete(
+        self, prompt: str, *, images: tuple[ModelImage, ...] = (), json_mode: bool = True
+    ) -> Completion: ...
+
     async def list_models(self) -> list[str]:
         """读取供应商侧的模型 id 列表，仅用于页面勾选导入。"""
         ...
@@ -57,4 +63,8 @@ class ModelGateway(Protocol):
         timeout: float = 90,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        protocol: str = "openai_compatible",
+        api_mode: str = "chat_completions",
+        parameters: dict | None = None,
+        capabilities: list[str] | None = None,
     ) -> ChatGateway: ...

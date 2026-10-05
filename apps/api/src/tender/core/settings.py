@@ -167,30 +167,6 @@ def s3_region() -> str:
     return _setting("S3_REGION") or DEFAULT_S3_REGION
 
 
-def llm_base_url() -> str | None:
-    """内网结构化模型网关；留空时不构造模型客户端。"""
-    return _setting("LLM_BASE_URL").rstrip("/") or None
-
-
-def llm_model() -> str | None:
-    return _setting("LLM_MODEL") or None
-
-
-def llm_api_key() -> str | None:
-    return _setting("LLM_API_KEY") or None
-
-
-def llm_timeout_seconds() -> float:
-    raw = _setting("LLM_TIMEOUT_SECONDS") or "90"
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError("LLM_TIMEOUT_SECONDS 必须是正数") from exc
-    if value <= 0:
-        raise ValueError("LLM_TIMEOUT_SECONDS 必须是正数")
-    return value
-
-
 def llm_secret_keys() -> tuple[str, ...]:
     """供应商密钥的加密主密钥：逗号分隔，第一个用于加密，其余用于解密（轮换）。
 

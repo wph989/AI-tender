@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
 from tender.application.llm_routing import CallRecord, ModelCandidate, RoutingModel
-from tender.domain.errors import ExtractionFailed, ExtractionUnavailable
+from tender.domain.errors import ExtractionFailed, ExtractionUnavailable, ModelRefused, TenderError
 from tender.ports.llm import ChatGateway, Completion
 
 
@@ -71,6 +72,7 @@ def _candidate(model: str, registry_id: int) -> ModelCandidate:
         timeout=1,
         temperature=None,
         max_tokens=None,
+        extra_retries=0,
     )
 
 
@@ -145,3 +147,96 @@ def test_client_is_created_once_and_reused_across_calls() -> None:
 
     assert gateway.created == ["m"]
     assert len(records) == 2
+
+
+def test_default_retries_try_a_a_b_b_c_c():
+    records = []
+    candidates = [replace(_candidate(name, i), extra_retries=1) for i, name in enumerate("abc", 1)]
+    gateway = _ScriptedGateway(
+        {name: [ExtractionUnavailable("忙", http_status=503)] * 2 for name in "abc"}
+    )
+    router = RoutingModel(
+        "extract", "extract", candidates, gateway, records.append, retry_base_seconds=0
+    )
+    with pytest.raises(ExtractionUnavailable):
+        asyncio.run(router.complete("测试"))
+    assert [r.model_key_snapshot for r in records] == list("aabbcc")
+    assert [r.request_ordinal for r in records] == list(range(1, 7))
+    assert [r.retry_ordinal for r in records] == [0, 1, 0, 1, 0, 1]
+    assert len({r.invocation_id for r in records}) == 1
+
+
+def test_total_budget_prevents_starting_next_candidate():
+    records = []
+    gateway = _ScriptedGateway(
+        {"a": [ExtractionUnavailable("忙", http_status=429)] * 11, "b": [None]}
+    )
+    router = RoutingModel(
+        "extract",
+        "extract",
+        [replace(_candidate("a", 1), extra_retries=10), _candidate("b", 2)],
+        gateway,
+        records.append,
+        retry_base_seconds=0,
+    )
+    with pytest.raises(ExtractionFailed, match="上限"):
+        asyncio.run(router.complete("测试"))
+    assert len(records) == 6
+    assert gateway.created == ["a"]
+
+
+def test_skipped_candidate_does_not_consume_failover_limit():
+    records = []
+    router = RoutingModel(
+        "extract",
+        "extract",
+        [_candidate("a", 1), _candidate("b", 2)],
+        _ScriptedGateway({"b": [None]}),
+        records.append,
+        failover_limit=1,
+        recheck=lambda c: c if c.model == "b" else None,
+    )
+    assert asyncio.run(router.complete("测试")).model == "b"
+    assert records[0].candidate_ordinal == 1
+
+
+@pytest.mark.parametrize("error", [ModelRefused("拒绝"), TenderError("权限失效")])
+def test_refusal_and_local_errors_do_not_failover(error):
+    gateway = _ScriptedGateway({"a": [error], "b": [None]})
+    router = RoutingModel(
+        "extract", "extract", [_candidate("a", 1), _candidate("b", 2)], gateway, lambda _: None
+    )
+    with pytest.raises(type(error)):
+        asyncio.run(router.complete("测试"))
+    assert gateway.created == ["a"]
+
+
+def test_database_reservation_failure_sends_no_request():
+    gateway = _ScriptedGateway({"a": [None]})
+
+    def reserve(_):
+        raise RuntimeError("数据库断开")
+
+    router = RoutingModel(
+        "extract", "extract", [_candidate("a", 1)], gateway, lambda _: None, reserve=reserve
+    )
+    with pytest.raises(RuntimeError):
+        asyncio.run(router.complete("测试"))
+    assert gateway.created == []
+
+
+def test_retry_after_larger_than_deadline_stops_without_retry():
+    error = ExtractionUnavailable("限流", http_status=429)
+    error.retry_after = 60
+    records = []
+    router = RoutingModel(
+        "extract",
+        "extract",
+        [replace(_candidate("a", 1), extra_retries=1)],
+        _ScriptedGateway({"a": [error, None]}),
+        records.append,
+        deadline_seconds=1,
+    )
+    with pytest.raises(ExtractionFailed, match="时间预算"):
+        asyncio.run(router.complete("测试"))
+    assert len(records) == 1

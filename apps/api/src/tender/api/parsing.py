@@ -271,7 +271,6 @@ def extract_version(
             "actor": request.headers.get("x-actor", "local-user")[:200],
             "hint": hint,
             "field_keys": keys,
-            "model": settings.llm_model(),
         }
         snapshot_id = configs(request).snapshot_for_job(connection, active_config)
         connection.execute(

@@ -107,3 +107,9 @@ class ExtractionUnavailable(TenderError):
 
     code: ClassVar[str] = "extraction_unavailable"
     retryable: ClassVar[bool] = True
+
+
+class ModelRefused(ExtractionFailed):
+    """模型明确拒绝时停止调用，不能把拒绝当成更换供应商的理由。"""
+
+    code: ClassVar[str] = "model_refused"

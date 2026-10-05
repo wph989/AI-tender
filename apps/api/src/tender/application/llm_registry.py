@@ -18,6 +18,11 @@ DEFAULT_FAILOVER_LIMIT = 3
 FEATURES: tuple[tuple[str, str], ...] = (
     ("extract", "字段抽取"),
     ("retry", "重跑与带提示重跑"),
+    ("analysis", "智能分析"),
+    ("knowledge_ask", "知识问答"),
+    ("embedding", "语义检索向量（只绑定一个向量模型）"),
+    ("rerank", "检索重排"),
+    ("image_generation", "图片生成"),
 )
 
 

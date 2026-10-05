@@ -78,7 +78,13 @@ def install_error_handlers(app: FastAPI) -> None:
             400,
             "invalid_argument",
             "请求参数格式错误",
-            detail={"errors": exc.errors()},
+            # Pydantic 的 input/ctx 可能包含整份供应商请求和密钥，错误回包只保留定位信息。
+            detail={
+                "errors": [
+                    {"loc": error["loc"], "type": error["type"], "msg": error["msg"]}
+                    for error in exc.errors()
+                ]
+            },
         )
 
     @app.exception_handler(StarletteHTTPException)

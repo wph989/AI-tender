@@ -231,7 +231,6 @@ def start_rerun(
             "hint": hint,
             "field_keys": [row["field_key"]],
             "instance_id": int(row["instance_id"]),
-            "model": settings.llm_model(),
         }
         snapshot_id = configs.snapshot_for_job(connection, active_config)
         connection.execute(

@@ -76,4 +76,4 @@ def test_invalid_master_key_is_reported(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_hint_keeps_only_last_four() -> None:
     assert secret_hint("sk-abcdef") == "****cdef"
-    assert secret_hint("abc") == "****"
+    assert secret_hint("abc") == "已配置"
