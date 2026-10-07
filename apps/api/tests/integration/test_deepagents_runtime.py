@@ -339,7 +339,7 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     )[0]["module_key"]
     result = knowledge.retry_report(
         runtime.report["id"],
-        knowledge.RetryInput(module_keys=[key], max_output_tokens=8192),
+        knowledge.RetryInput(module_keys=[key], max_output_tokens=8192, timeout_seconds=1800),
         env.request,
     )
     assert result["status"] == "pending"
@@ -351,6 +351,8 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     assert [r["attempt"] for r in rows] == [1, 2]
     assert rows[0]["limits"]["max_output_tokens"] == 4096
     assert rows[1]["limits"]["max_output_tokens"] == 8192
+    assert rows[0]["limits"]["timeout_seconds"] == 900
+    assert rows[1]["limits"]["timeout_seconds"] == 1800
     assert rows[0]["thread_id"] != rows[1]["thread_id"]
     carried_key = "staged_items" if staged else "draft"
     assert rows[1]["state"][carried_key] == rows[0]["state"][carried_key]

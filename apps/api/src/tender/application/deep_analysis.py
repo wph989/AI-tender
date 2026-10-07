@@ -139,32 +139,54 @@ def context_size(messages: Sequence[BaseMessage]) -> int:
     return sum(len(json.dumps(message_to_dict(m), ensure_ascii=False)) + 8 for m in messages)
 
 
+ABSENCE_TERMS = (
+    "未约定",
+    "未见",
+    "未检索到",
+    "未找到",
+    "无法认定",
+    "条款缺失",
+    "未明示",
+    "未列示",
+    "未单独列示",
+    "未给出",
+    "未规定",
+    "未明确",
+    "未划分",
+    "缺失细节",
+)
+
+
+def is_absence_claim(item: dict) -> bool:
+    """识别无法由单段引文证明的“文件未约定”类断言。"""
+    body = item["title"] + item["text"] + json.dumps(item.get("cells", {}), ensure_ascii=False)
+    quotes = "\n".join(ref["quote"] for ref in item["citations"])
+    return any(term in body and term not in quotes for term in ABSENCE_TERMS)
+
+
+def split_absence_claims(items: list[dict], project_id: int) -> tuple[list[dict], list[dict]]:
+    """把检索缺口条目从结论中拆出，交由运行时写入 research_summary。
+
+    弱模型会反复把缺口断言当结论提交；契约已规定缺口属于检索总结，
+    这里由运行时确定性执行，不再依赖模型自纠。缺项目引用的条目仍走严格校验。
+    """
+    kept: list[dict] = []
+    gaps: list[dict] = []
+    for item in items:
+        own = any(ref["project_id"] == project_id for ref in item["citations"])
+        (gaps if own and is_absence_claim(item) else kept).append(item)
+    return kept, gaps
+
+
 def validate_project_claims(items: list[dict], project_id: int) -> None:
     """拒绝可确定的证据范围错误，不能把模型的 supported 当成权限或缺失证明。"""
-    absence = (
-        "未约定",
-        "未见",
-        "未检索到",
-        "未找到",
-        "无法认定",
-        "条款缺失",
-        "未明示",
-        "未列示",
-        "未单独列示",
-        "未给出",
-        "未规定",
-        "未明确",
-        "未划分",
-        "缺失细节",
-    )
     for item in items:
         refs = item["citations"]
         own = {ref["source_id"] for ref in refs if ref["project_id"] == project_id}
         if not own:
             raise ValueError("项目结论及参考建议都须引用本项目相关要求；参考建议还须保留参考来源")
         body = item["title"] + item["text"] + json.dumps(item.get("cells", {}), ensure_ascii=False)
-        quotes = "\n".join(ref["quote"] for ref in refs)
-        if any(term in body and term not in quotes for term in absence):
+        if is_absence_claim(item):
             raise ValueError("检索缺口只能写入 research_summary，单段引文不能证明整份文件未约定")
         if "补充" in body and re.search("调整|更正|修订|修改", body) and len(own) < 2:
             raise ValueError("跨文件修订结论须在同一条目同时引用原条款与补充文件")
@@ -196,7 +218,8 @@ class ResearchMiddleware(AgentMiddleware):
             + json.dumps(status, ensure_ascii=False)
             + "。已有依据足以覆盖本专题时请提交，不必反复读取相同 Skill 或相同原文。"
             + "只输出原文明示的有效要求，正文可直接沿用原文，不写长篇推演或缺失检查表；"
-            "检索缺口写 research_summary。cells只填有依据的字段，没有依据的可选字段直接省略。"
+            "检索缺口写 research_summary，提交缺口条目时运行时会自动转入检索总结。"
+            "cells只填有依据的字段，没有依据的可选字段直接省略。"
             "每条引用须覆盖该条全部金额、数量、条件和范围，不能借用其它条目的引用。"
             "结果较多时每次提交2至3条，使用submit_analysis(final=false)暂存，"
             "最后一次final=true结束；检索总结简短说明即可，不复述全部原文。"
@@ -324,6 +347,9 @@ def build_module_agent(
                 if key == "bid_format_outline_parsing"
                 else _module_result(draft, research.seen)
             )
+            gaps: list[dict] = []
+            if key != "bid_format_outline_parsing":
+                checked, gaps = split_absence_claims(checked, research.project_id)
             validate_project_claims(checked, research.project_id)
             if validate_support:
                 await validate_support(checked)
@@ -335,17 +361,31 @@ def build_module_agent(
                 link for link in links if link not in state.get("staged_relations", [])
             ]
             validate_project_claims(checked, research.project_id)
+            state.setdefault("gap_notes", []).extend(
+                f"- {item['title']}：{item['text']}" for item in gaps
+            )
             if not final:
                 state["staged_items"], state["staged_relations"] = checked, links
-                return {"accepted": True, "final": False, "staged_items": len(checked)}
+                return {
+                    "accepted": True,
+                    "final": False,
+                    "staged_items": len(checked),
+                    "gap_items_moved": len(gaps),
+                }
             if validate_support:
                 state["items_verified"] = True
+            summary = research_summary.strip()
+            gap_notes = state.get("gap_notes", [])
+            if gap_notes:
+                # 缺口只进检索总结，不作为结论条目；截断到接口上限避免超长摘要。
+                notes = "\n".join(gap_notes)
+                summary = (summary + "\n\n检索缺口（不作为结论条目）：\n" + notes)[:4000]
             state["draft"] = {
                 "items": checked,
                 "relations": links,
-                "research_summary": research_summary,
+                "research_summary": summary,
             }
-            return {"accepted": True, "items": len(checked)}
+            return {"accepted": True, "items": len(checked), "gap_items_moved": len(gaps)}
         except ValueError as exc:
             state["invalid_submissions"] = state.get("invalid_submissions", 0) + 1
             if state["invalid_submissions"] > 2:

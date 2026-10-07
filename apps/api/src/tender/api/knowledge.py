@@ -66,6 +66,7 @@ class AnalysisInput(StrictModel):
 class RetryInput(StrictModel):
     module_keys: list[str] = Field(default_factory=list, max_length=13)
     max_output_tokens: int | None = Field(default=None, ge=512, le=16384)
+    timeout_seconds: int | None = Field(default=None, ge=300, le=3600)
 
 
 class AskInput(StrictModel):
@@ -656,7 +657,9 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             limits = dict(report["runtime_settings"])
             if payload.max_output_tokens is not None:
                 limits["max_output_tokens"] = payload.max_output_tokens
-            # 新attempt可以显式调整输出上限，旧报告快照及运行账不回写。
+            if payload.timeout_seconds is not None:
+                limits["timeout_seconds"] = payload.timeout_seconds
+            # 新attempt可以显式调整输出与时限上限，旧报告快照及运行账不回写。
             for module_id in sorted(retried):
                 attempt = connection.execute(
                     text(

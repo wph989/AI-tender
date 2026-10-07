@@ -15,6 +15,7 @@ from tender.application.deep_analysis import (
     RoutedAgentModel,
     build_module_agent,
     invoke_module,
+    split_absence_claims,
     validate_project_claims,
 )
 from tender.ports.llm import Completion
@@ -324,6 +325,88 @@ def test_explicit_negative_requirement_and_two_sided_revision_are_accepted():
         ],
         10,
     )
+
+
+def test_split_absence_claims_routes_gaps_and_keeps_scope_errors_strict():
+    gap = {
+        "title": "条款未约定",
+        "text": "文件未约定违约金",
+        "citations": [{"project_id": 10, "source_id": 1, "quote": "质保三年"}],
+    }
+    valid = {
+        "title": "质保",
+        "text": "质保三年",
+        "citations": [{"project_id": 10, "source_id": 1, "quote": "质保三年"}],
+    }
+    reference_only = {
+        "title": "历史",
+        "text": "历史五年",
+        "citations": [{"project_id": 20, "source_id": 2, "quote": "历史五年"}],
+    }
+    kept, gaps = split_absence_claims([gap, valid, reference_only], 10)
+    assert gaps == [gap] and kept == [valid, reference_only]
+    # 缺项目引用的条目不能借“缺口”之名绕开严格校验
+    with pytest.raises(ValueError):
+        validate_project_claims(kept, 10)
+
+
+def test_absence_gap_item_is_moved_into_summary_without_rejecting():
+    async def run():
+        research = session([block()])
+        router = ScriptedRouter(
+            [
+                call("search_document", {"query": "质保要求"}, 1),
+                call(
+                    "submit_analysis",
+                    {
+                        "items": [
+                            {
+                                "kind": "fact",
+                                "title": "质保",
+                                "text": "质保三年",
+                                "presentation": "paragraph",
+                                "cells": {},
+                                "citations": [{"block_id": "s1r1c0", "quote": "质保三年"}],
+                            },
+                            {
+                                "kind": "insufficient",
+                                "title": "质保金",
+                                "text": "文件未约定质保金比例",
+                                "presentation": "paragraph",
+                                "cells": {},
+                                "citations": [{"block_id": "s1r1c0", "quote": "质保三年"}],
+                            },
+                        ],
+                        "relations": [],
+                        "research_summary": "已检索质保条款",
+                    },
+                    2,
+                ),
+            ]
+        )
+        state = {}
+
+        async def noop(*_):
+            pass
+
+        graph, files = build_module_agent(
+            key=KEY,
+            model=RoutedAgentModel(router=router),
+            research=research,
+            state=state,
+            snapshot=SKILL,
+            checkpointer=InMemorySaver(),
+            reserve_tool=noop,
+            save=noop,
+        )
+        await invoke_module(graph, files, thread_id="gap-routing", task="分析")
+        # 缺口条目不能作为结论，由运行时确定性转入检索总结，避免整批被拒
+        assert [item["text"] for item in state["draft"]["items"]] == ["质保三年"]
+        assert "文件未约定质保金比例" in state["draft"]["research_summary"]
+        assert state["draft"]["research_summary"].startswith("已检索质保条款")
+        assert "invalid_submissions" not in state
+
+    asyncio.run(run())
 
 
 def test_scope_and_schema_errors_are_bounded_feedback_without_leaking_bad_draft():
