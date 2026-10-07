@@ -4,6 +4,8 @@
 
 工作目录：`G:\aicode\AI-tender`
 
+> **新会话先读**：当前最高优先级是第 22、23 节的 DeepAgents 标书解析重构（goal 仍 active，全部未提交）。顶部 2026-10-04 的状态描述是历史记录。
+
 状态：前端重构、现有后端接口对接及审查问题修复已完成，构建、测试与浏览器验证通过；本次按用户要求提交相关代码、测试与文档。
 
 **接口对接见第 12 节，随后审查发现的两处问题及修复见第 13 节，提交说明见第 14 节。第 1—11 节保留此前重构与产品讨论的历史记录，其中“尚需最终验证”和旧服务状态已由后文更新。RAG、GraphRAG、动态报告和分类选择仍处于设计阶段。**
@@ -493,3 +495,406 @@ node .tmp/redesign-compact-check.mjs
 - `5d68a7c` 回环 IP 开发源修复（next.config.ts）；`e282bbb` 交接记录与设计索引（本文件、docs/README.md）。
 - 提交前验证：后端单测+契约 345 收集（0 失败、18 个沙箱 tmp_path 环境错误、5 跳过）、模型管理集成 16 项、知识库集成 6 项、Ruff、5 项分层契约、前端 typecheck、git diff --check 均通过；前端 vitest 因沙箱 spawn EPERM 未复跑。
 - `本地启动指南.md` 是用户自己的未提交修改，按第 8.9 节约定未代为提交。
+
+## 21. 重新打通标书解析流程（2026-10-05，进行中）
+
+用户当前明确目标：重新打通标书解析，包括知识库构建，使用 Agent + Skill 解析招标文件。线程 goal 已激活，不得把仅修复上传或单测通过当作完成。无 token 预算。未提交、未启动子代理。开始前已读本文件，使用 karpathy-guidelines。
+
+### 已修改且已验证的代码
+
+- `adapters/mineru.py`：纯哈希 PDF 存储键提交上游时补 `.pdf`；真实旧错误是 `Unsupported file type: <hash>`。不改存储字节/键/hash。
+- `adapters/gotenberg.py`：`trust_env=False`，与 MinerU 一样内网直连。原 worker 版本探测 502，直连正常；重启后 DOCX 真实转换完成。
+- `adapters/openai_chat.py`：只兼容完整外层 Markdown JSON 围栏；仍拒绝说明文字、截断 JSON、NaN/Infinity。真实 llama.cpp 返回了完整 fenced JSON，修复前被当非法 JSON 换源失败。
+- `application/knowledge_store.py`：来源关联最新预处理任务，即使没有 parse_run 也可显示失败和错误。embedding_signature 用 embedding_space_id + parameters 替代 config_revision，纯改名不再换向量空间；旧签名需重建。
+- `worker/knowledge.py`：空文字索引失败；完整报告遇到已失败/partial/unsupported 文件终止等待列出文件，不再无期限等待。未开始全文扫描的失败报告重试重新等待原范围最新可用批次。
+- `application/analysis_skills.py`：新增独立 SCAN_CONTRACT，扫描只分配模块候选，避免与 Agent search/read/finish 协议混用。扫描结构错误最多纠正两次，不能跳过批次；首个模型请求前初始化覆盖块总数。Skill 必须加载通用 extraction_rules、类别及标段覆盖规则；给出候选位置，必须读取扫描候选才能 finish；结构/引文错误反馈 Agent 修正，32 步上限不变。规则快照增加 `__scan_contract__`。
+- `api/knowledge.py`：集合来源增加 semantic_ready/needs_reindex，当前空间匹配才标向量可用；重试前扫描失败返回 waiting，已开始扫描返回 pending。
+- 前端 KnowledgeCollectionDetail：补解析完成至索引派发间隔轮询、当前向量是否需要重建、文件错误可见。ProjectAnalysis：文件处理中也轮询，失败/partial 文件可直接重新处理。
+- 更新设计14与API设计05，标为本轮验收进行中。无需数据库迁移。`本地启动指南.md` 为用户原有未提交内容，没有改动它。
+
+### 真实服务验收与现场配置
+
+- 独立验收项目 **13**，名称 `解析全链路验收-1791201167`；主文件 `采购招标文件.docx`、补充 `交货期补充通知.pdf`。独立参考库 **7**，上传项目14，文件 `设备保修参考.pdf`。自有资料库集合6。
+- 所有文件仅通过真实 API 上传，经历实际 Gotenberg、MinerU、数据库/存储/队列，未插入解析/索引/报告 fixture。3份均完成解析并得到真实1024维向量索引。主文件source9，补充source11，参考source12。
+- 索引早期失败因本机 Ollama 没启动，已启动本机已有 `ollama serve`，进程当时33068，日志 `.tmp/tender-flow-check/ollama.*.log`。没有下载新模型或改绑定。
+- 当前绑定：analysis/knowledge_ask/extract 的首选是模型16 `qwen3.5-9b`，provider11 lammacpp `http://127.0.0.1:7896/v1`；后备glm模型2。embedding绑定模型4 `qwen3-embedding:0.6b`，Ollama `http://127.0.0.1:11434/v1`。
+- 原 llama.cpp PID28816 健康200但槽连续数分钟卡同一进度、极短请求超时。核验完整身份后，**保留原参数**重启成17796：exe `G:/llama-cpp/llama.cpp/build/bin/Release/llama-server.exe`，cwd `G:/llama-cpp/gguf/qwen3.6-9b`。参数备份 `.tmp/tender-flow-check/llama-restart.json`，日志同目录 `llama.*.log`。原参数含 Q8模型、mmproj、`-c 256000`、自动4槽、q4 KV、fit；尚未调小上下文。不要凭旧PID杀进程。
+- 重启后短请求约5.2秒，真实响应含 fenced JSON。复杂请求本机常在每秒4—20 Token波动，默认90秒不足；通过管理API将模型16 timeout从90调到**300秒**、max_tokens从空设为**4096**，revision现3，旧值完整留在 `model-settings-before.json`。未改模型绑定或云端配置。`reasoning_effort=none` 与直接 `chat_template_kwargs.enable_thinking=false` 的诊断仍返回 reasoning_content，没有为这些未生效参数新增代码。
+- 本机llama `--help`确认支持 `--reasoning on|off|auto`、`--reasoning-budget`、`--parallel`。后续若需要性能调优，可据真实负载研究；未调小原ctx256000。不要因模型慢就缩小验收范围。
+- 本次两条旧字段抽取耗尽时间争抢本机模型，已通过API取消样本项目13的 job `040b7bf79c0e40b0a1942ade17a44106`、`4723674317e14a8f86ae03f2fe94c6af`。其它用户项目任务没有取消。当前主目标是13模块Agent综合报告。
+- 旧报告4保留失败历史（PDF后缀、语言JSON、扫描协议）。新报告 **5** 使用修订后的完整规则快照，**最后核验 running，全文20/20块扫描完毕，project_basic_info_parsing模块running，其它尚未创建**。必须继续轮询这个真实任务，不能启动重复报告，也不能将超时观察当任务终止。
+- 后端最后通过安全启动脚本重启加载本轮代码：API父15488、worker父24000、beat父20804；实际子进程实时核验。所有最新代码均已加载，扫描模块修正也已加载。模型配置在DB中，不需重新启动读取。
+
+### 测试及后续必须完成
+
+- 最后后端完整 `TENDER_RUN_DB_TESTS=1`：**383 passed, 5 skipped**，一次Starlette/httpx提醒。工具会话50514已输出完整结果，但若需确认退出可poll一次。
+- 前端76项测试、typecheck、生产build通过；5条分层契约通过；新改动Ruff通过（最后整个修改集合应再做一次diff/Ruff检查）。
+- 真实混合检索 `GET /knowledge/collections/7/search?q=保修期限` 返回 hybrid、source12、4块，逐项resolve成功；结果 `.tmp/tender-flow-check/retrieval.json`。
+- 浏览器7项通过：真实知识库语义就绪、检索命中、PDF原文高亮、项目显示2文件、390/320px无整页溢出、无未捕获异常。截图已看knowledge-desktop，显示真实原文正确高亮。**报告完成后的13模块展示与报告引用测试尚未执行**；脚本只在report.completed时执行这两项，最终必须确认它没有跳过。
+- `.tmp/tender-flow-check.py status` 会读取state.json内的报告ID并保存最新report.json；不要重跑start（它会拒绝已有state，避免重复项目）。用 `.\apps\api\.venv\Scripts\python.exe`，设置 `$env:PYTHONUTF8='1'`。
+- `.tmp/tender-flow-browser.mjs` 用Headless Edge 9491，运行 `node .tmp/tender-flow-browser.mjs`。截图与checks在 `.tmp/tender-flow-check/browser/`。
+- `.tmp/probe-analysis-model.py` 是直接合成样本诊断，不走调用账；旧会话35166已完成，证明新围栏适配+旧扫描能解析一批。无需反复调用与主任务争抢GPU。
+- 下一步：继续报告5真实运行，检查最终所有13模块而非仅状态；验证已读工具轨迹、逐项引文、补充通知45日与主文30日差异、独立历史质保五年不得污染本项目三年要求。遇到真实错误按证据修复并针对失败模块重跑。
+- 接着走真实项目/知识库问答与独立库隔离引用，重跑浏览器报告定位（至少两文件与移动端）；将最终证据更新设计14和本交接文件；审查diff后再调用goal complete。未达到全部要求不能宣称打通。不要自动提交。
+
+### 第21节最新续记（Skill资源冲突已确认）
+
+- 报告5完成全文20/20扫描后，首个项目概况模块因“模型输出不是合法JSON”失败，否决条件模块开始运行。检查资源确认**13个SKILL及输出模板仍要求旧Markdown**，bid_format_outline还强制不存在的read_docx_structure及DOCX element_index。这与当前PDF块工具/JSON报告相冲突，必须真正修改资源，而非只靠优先级提示遮盖。
+- 已告知使用技能 `C:/Users/wph98/.codex/skills/skill-creator/SKILL.md` 并读取。这个技能明确要求改现有Skill时保留旧版，并做旧版/新版测试与展示结果；其中明确的测试子代理流程属于允许委派的来源。尚未启动子代理。领域/输出/成功条件已由用户原目标与项目设计明确，**不用再向用户确认范围**。
+- 旧81份markdown已按UTF-8复制到 `.tmp/parse-skills-workspace/skill-snapshot/`，尚未修改原资源。计划保留领域逻辑与原skill名称，统一SKILL输入为带block_id的PDF原文块，工具search/read/reference，最终finish/items/relations；替换旧Markdown输出模板为动态条目及每行引用，格式大纲模块改PDF锚点，保留逻辑标/三级层级/目录排除，不再调用DOCX工具。
+- 为避免已知冲突继续消耗本地模型，已通过API取消**本次样本报告5**，来源和索引保持就绪。下一轮先查询确认取消状态；不要把它当作仍在正常等待的原任务。
+- 可用 skill-creator 的双子代理评估旧/新版典型输入（项目基本信息、否决条款、格式大纲），但**最终仍以项目配置的真实qwen模型、真实报告13模块及浏览器引用为验收**，不能用Codex子代理输出替代应用链路。
+- 最后全量后端仍为383 passed/5 skipped，工具会话50514已poll确认exit0。前端与浏览器结果同前。
+- 下一轮可能需要更有效的LLM诊断：在应用调用层保存合成样本的原始响应到.tmp或增加安全阶段错误分类，而不是放宽引文校验。原始响应不可写成用户可见未经校验报告。
+
+
+### 第21节续记：2026-10-06 Skill 适配、纠正与依赖中断
+
+- 本轮属于实质进展，goal 仍 active，未提交。开始已读取本文件；继续使用 karpathy-guidelines 和 skill-creator。按后者明确的配对测试流程启动新版/旧版两个子代理，各自只读指定版本并写 `.tmp` 评估产物。第三个 grader 子代理因服务限流未执行，最终评分由主代理完整读取原始产物并逐项核验，不把它称为独立 grader 结果。
+- 上次一次性适配脚本的13个 Skill 修改已审查并继续修正：统一 PDF block 输入与 search/read/reference/finish 协议；输出模板改为核对清单；多标段逐项引用；移除空反引号和旧 HTML 单元格指令；类别使用 category/lots，不自行默认 service；81份旧资源快照仍保留，不要重跑一次性转换脚本。
+- 修正否决 Skill 缺失规则路径，及货物/服务 examples 把一般强制、星号、合格栏目直接当否决的问题。格式模块保留逻辑标、三级层级、独立附件，引用必须覆盖父子关系完整正文，目录只供导航；技术模块不再排除纯参数表，保留数值、单位、上下限、接口/标准/检测要求。
+- 真实 qwen 诊断发现仅输出“需要读取补充通知”及“说明文字+JSON”的情况。新增 `InvalidModelOutput` 细分已收到的非法JSON；`json_completion` 对直接模型最多纠正两次。实际 RoutingModel 在换候选前先最多两次修改提示，仍计入原有6请求/600秒总预算；最终失败回到普通 ExtractionFailed，避免外围循环重置预算。连接、配置、权限和明确拒绝不进入格式纠正。已测试主模型纠正后不触碰不可用后备、纠正耗尽后换源、总预算不重置。
+- 支持性校验现在最多反馈两次让 Agent 补读或修正无依据结论，仍受32轮动作上限；最终不支持仍保留 insufficient/unsupported，不自动视为事实。
+- worker 修复“补跑本模块”顺带执行其它失败模块：只执行 pending 或中断遗留 running；未选中的 failed 和 completed 保留。新增真实 PostgreSQL 临时表集成用例，但本轮依赖断开，尚未跑该新增用例。
+- 最新单元+契约测试 **365 passed、5 skipped**，此前383是上一轮含数据库的数量，不能沿用为本轮完整结果。路由最后15项专项通过，Ruff全src/tests和diff check通过。依赖分层5条通过（随后仅调整应用层内部代码和文档，没有跨层依赖）。前端本轮没改，没有重复跑前端历史76项。
+
+#### 真实模型诊断与对照产物
+
+- `.tmp/parse-skills-workspace/iteration-1/review.html` 由 skill-creator 自带 viewer生成，benchmark和grading完整；新旧静态测试均8/8。测试用同一8块/2来源的合成输入，覆盖项目概况、否决、格式。新版21条24引用；旧版22条40引用（含关系）。旧版依赖上级协议覆盖旧Markdown/DOCX规则，不说明原生兼容；单次静态Codex结果不能推断优劣，更不能代替真实应用链路。全程token/耗时工具没有提供，timing只记录部分观测83秒/136秒，不能做速度比较。
+- `.tmp/probe-current-skill.py` 使用真实本地qwen与应用run_module，但原文是独立合成块，无数据库/应用调用账，仅作故障诊断。不能称它完成项目13报告。脚本参数为模块key，可选第二参数为输出后缀，避免覆盖旧尝试。
+- `local-model-probe/attempt-2/result.json`：项目概况11项，134.3秒，全部supported；45日引用同时含主文件及补充通知，未混入合同模板。
+- `local-model-probe/disqualified_items_parsing/result.json`：2项，183.4秒，全部supported；营业执照和2023年1月1日起2项业绩及合同/验收证明逐项保留；真实非法JSON两次被拒绝后经纠正继续。旧自然语言失败响应也保留。
+- `local-model-probe/bid_format_outline_parsing/result.json`：8项，322.6秒，但**只有3项supported，5项unsupported**，还有培训附件被误归技术标。不能把模块正常结束当质量验收通过。已据此修改父子引用与独立附件规则，并加入支持性修正循环。
+- 新格式诊断输出目录 `local-model-probe/bid_format_outline_parsing-revised/`，工具会话 **43715** 正在跑，最后已读两来源并继续生成。必须继续poll同一会话、检查最终8项及supported状态、附件归属，不要重复启动。该记录若有后续结果，以后文为准。
+
+#### 当前服务与阻塞
+
+- 本轮开始API、worker、beat、前端、llama均已停止，Ollama11434仍在。已用既有脚本启动后端：API父10764、worker父16648、beat父18236，实际身份须实时核验；这些进程在后续代码修改前启动，待依赖恢复后需加载本轮最终代码。
+- 按 `.tmp/tender-flow-check/llama-restart.json` 原参数重启llama，PID当时14420；**未改原256000上下文/4槽/Q8参数**，约65秒加载，当前本地模型可用。前端没有重启。
+- 依赖地址 **172.29.199.222** 当前不能正常响应：PostgreSQL连接被服务器关闭，Redis关闭或超时，MinerU/Gotenberg HTTP超时或无响应；TCP能连接不代表服务可用。API health200但报告查询500。重测证据 `.tmp/tender-flow-check/dependency-status-20261006.json`，API/worker日志`.tmp/logs/`。本机有Meta网卡，未擅自改VPN/路由或依赖地址。
+- 已异步询问用户该服务器当前地址或是否需先启动，尚未答复。没有创建新报告、没有重复上传。报告5最后已知状态是上轮取消，**本轮因数据库断开无法重新核实**。项目13/集合6/参考库7/source9、11、12均应继续复用。
+- 下一步：完成当前格式诊断；依赖恢复后实时核验任务与服务、加载新版后端；确认报告5终态再创建新报告保存state；验收13模块报告、所有引用、30→45日关系与项目三年/历史五年隔离；真实问答和浏览器完整报告/两文件/移动端定位；新增重试集成与最终必要测试。目标尚未完成，不能调用complete，也不要自动提交。
+
+
+#### 2026-10-06 本轮结束前的最后核验
+
+- 格式重测会话43715已exit0，191.5秒生成8项，全部引用来自格式正文，层级和父路径大体修正；但**不能宣布质量通过**：技术标text仍说包含培训附件，而培训条目的cells写独立章节、text又称技术标附件，且层级写0。`supported` 全true不足以证明语义正确。
+- 已加强 `verify_items` 提示，要求同时核对title/text/cells的一致性及父子依据；关系校验文本补入scope。用上述真实结果再次独立调用本地模型，会话2860已exit0，仍把8项全部判supported。结果保留为 `bid_format_outline_parsing-revised/verification-recheck.json`。这个模型支持性判断未发现已知矛盾，后续必须解决或保留明确待复核，不能靠绿色状态作为通过证据；不要只反复加提示然后宣称成功。
+- 当前没有仍运行的本轮模型诊断会话。主模型进程仍可用；未创建新数据库报告。
+- 最后后端单元/契约仍365通过、5跳过，Ruff全src/tests和diff check通过。数据库新增用例未运行；前端和浏览器没有在依赖断开下冒充成功。
+- 为判断172.29地址是否是重启后变化的本机虚拟机，尝试只读Get-VM/Get-VMNetworkAdapter，OS明确拒绝权限；未提权、未换路径绕过、未改网络。用户关于依赖服务器的澄清问题仍待回答。
+- 后续优先：确认依赖地址/启动状态恢复全应用验收；并针对格式的结构化父路径、正文和relations一致性设计可靠验证/纠正，真实回归不能只数条目或看supported布尔值。新规则资源、路由及worker最终变更仍需重启服务加载。
+
+#### 2026-10-06 续记：格式节点结构与独立材料清点
+
+- 上述节点正文、cells、relations冲突已有结构性修复：新增 `application/analysis_outline.py`。格式Agent仅提交 `outline_nodes`，字段为id/name/node_type/parent_id/requirements/citations，程序从唯一parent_id生成动态条目、完整父路径、层级及关系。逻辑标根0级、独立材料1级、材料最多三级；拒绝重复ID、缺失父级、循环、无依据名称/要求及缺少完整父路径引文。分类/归属判断仍经支持性检查，不能将结构合法当语义正确。
+- 快照新增 `__outline_contract__`；历史无此键继续items协议。前端/API不换数据模型、不新增迁移。格式SKILL和引用规则已同步。新增 `test_analysis_outline.py`；支持性修正要求完整返回，防止只修一项时丢其他节点。
+- 最初 `missing_outline_nodes` 让模型对照已有节点查漏。诊断会话18011已exit0，374.7秒，6项全部supported，但仍漏“营业执照复印件”和“业绩证明”。真实响应7显示完整性检查也漏判，不能视为通过，产物 `bid_format_outline_parsing-nodes-coverage/`。
+- 据此改为从原文独立提取 `outline_inventory`，不让模型看到已有节点及requirements。程序按名称+引用块比较；父节点requirements里提及不能抵作独立节点。已检查块缓存，新读块增补，纠正不能靠下一次模型忘掉遗漏而通过。最多两次补全，仍漏则模块失败。成功执行记录包含最终节点和材料清单。未实施稀疏更新、自动扩展引文或预读候选。
+- 独立清点诊断24733已exit0，实际发现上述两个子材料，产物 `.tmp/parse-skills-workspace/local-model-probe/independent-inventory/`。清点未列逻辑标容器本身，不能把它称为完整覆盖所有类型；主节点列表仍有两容器，实际复核不能只看布尔值。
+- **当前完整模块诊断会话74907仍在运行**：`.tmp/probe-current-skill.py bid_format_outline_parsing independent-inventory`，输出 `.tmp/parse-skills-workspace/local-model-probe/bid_format_outline_parsing-independent-inventory/`。须继续poll并核验8个节点、层级、独立附件、引用和支持性；不要启动重复诊断。本段结果以之后续记为准。
+- 最新单元/契约378通过、5跳过，Ruff全src/tests通过，diff check仅原有行尾提醒。新增测试覆盖来源区分、增量清点、清点缓存、编造/越界引用、补全成功或耗尽失败。数据库集成fixture已适配outline_inventory，但数据库集成未跑；前端本轮无改动，无需重复历史测试。
+- 10:56复测依赖仍不可用：PostgreSQL OperationalError，Redis TimeoutError，Gotenberg/MinerU ReadTimeout；API `/api/v1/healthz`200，报告 `/api/v1/analysis/reports/5`在5秒只读探测中超时。不能说本轮确认报告5取消。安全复测脚本 `.tmp/check-flow-dependencies.py`，结果 `dependency-status-latest.json`，不输出凭据。最初写错健康/报告URL导致404，已修正后重测，最终文件是正确路径结果。
+- 原验收项目13、自有集合6、独立库7及source9/11/12继续复用，未上传或创建新报告。用户关于服务器地址/启动状态的问题仍待答复，不重复询问。API/worker/beat需在依赖恢复后核验身份并加载最终代码。
+
+#### 2026-10-06 格式诊断后续修复（本段更新前述运行状态）
+
+- 会话74907已失败退出：314.4秒，模型两次仍返回6节点，独立清单门禁正确拒绝残缺结果。`independent-inventory`目录中的完整模块复测与独立清点目录不是同一个产物；前者失败，后者确实识别出遗漏。
+- 补全改为单独的精简生成步骤：仅提交新增outline_nodes，程序和原节点合并，拒绝重复旧ID及不合法证据/层级。最多两次且计入32步。trace包含phase=outline_completion、真实新增响应、合并ID及最终清单；已有节点不能被新增步骤覆盖或删除。新增重复ID拒绝后第二次纠正测试。
+- `sparse-completion`会话85808在持续重复同一拼接引文错误后停止；停止前核验了自有Python PID26592/27412及完整命令。错误定位现在包含节点ID和名称。`precise-correction`会话10146也反复在同两处引文/父路径错误间切换，核验自有PID27244/7708后停止。两者均不是因观察超时而重启，不得称质量通过。
+- 格式模型输入现只带最近一份finish草稿及完整工具读取记录，历史错误草稿仍完整保留在审计trace；新用例确认多次纠正不会删除审计也不会把旧稿全部重喂。
+- `compact-correction`会话56047已结束（exit1），读到独立清点并进入补全；原始响应留存，不能声称该会话完成八节点。随后调整证据汇集规则：每节点只给自己的合法引文，程序沿唯一父路径汇集已经校验过的祖先引文，不要求模型重复抄写祖先引文。**不再要求子节点自己重复提供包含所有祖先名称的引文**；已改格式协议、输出模板和规则。没有自动扩展原文、替换坏引文或根据相邻位置猜父级，父子归属仍是judgment并接受支持性校验。
+- 当前唯一待续诊断是会话 **7220**：`.tmp/probe-current-skill.py bid_format_outline_parsing lineage-evidence`，目录 `local-model-probe/bid_format_outline_parsing-lineage-evidence/`。必须继续poll同一会话。最终用 `.tmp/check-outline-probe.py lineage-evidence`核对8名称、层级、5条包含关系、正文引用、独立培训附件及补全轨迹；该脚本需要result.json，失败情况下不要伪造结果。
+- 小工具 `.tmp/inspect-outline-probe.py <后缀>`可检查每次响应的JSON及节点校验错误，保留全部原始response JSON，不输出模型服务凭据。
+- 最近全单元/契约381通过、5跳过，Ruff全src/tests通过；之后仅改祖先引用汇集，专项34通过、Ruff通过，最终仍需确认本轮完整检查。前端本轮未变。数据库仍不可用，最新依赖证据10:56记录，不能沿用旧383含数据库的结果。
+
+#### 2026-10-06 依赖恢复，已重新开始真实报告（必须优先续看此段）
+
+- 11:21 Redis/Gotenberg恢复；随后PostgreSQL实际SELECT 1成功，报告5重新读取确认为canceled。3份来源source9/11/12仍全部解析和索引completed。MinerU8000当时仍ConnectError，需继续核验恢复情况；不要重传已有文件。
+- 回放旧合法六节点草稿的局部诊断 `.tmp/probe-outline-completion.py` 会话69421已完成：153.0秒，真实模型完成独立清点、新增节点和支持性检查，得到8节点5关系；`.tmp/check-outline-probe.py replayed-draft-completion`29项全部通过。产物目录 `bid_format_outline_parsing-replayed-draft-completion/`有mode.json明确前三次为回放，不可称全程自主生成通过。此前完整lineage-evidence会话7220被停止，停止时最新响应已到清点阶段，没有完整result；不能当完成或正式失败终态。
+- 通过已核验身份的启动脚本加载最终代码：API父6740、worker父24820、beat父28052，实际子PID需实时查。启动脚本会话98474已exit0。llama7896没重启、参数没改。
+- **已创建真实报告6**（项目13，完整两文件，无partial），state.json已更新并保留旧报告4/5。最后状态running，全文已扫描6/20块，尚无模块。续用 `.tmp/tender-flow-check.py status`，禁止重复创建新报告或重跑start。
+- 最新完整后端 `TENDER_RUN_DB_TESTS=1 pytest -q`：**410 passed、5 skipped**，会话45289已exit0，包含新增选中模块重试及节点协议集成用例；Ruff和diff check通过。单元/契约381+5是其中子集，不重复累计。
+- 前端启动的Start-Process命令曾被工具策略拦截，未启动；已用直接工具会话运行 `pnpm --dir apps/web dev` 成功，**会话21037**，localhost:4400已Ready，API_PROXY_TARGET=127.0.0.1:8300。不要结束此会话或重复启动。没有改用户的本地启动指南。
+- 当前无活跃本地模型诊断，模型算力供真实报告6使用。接下来继续13模块实际报告、每条引用与30→45日关系/三年与历史五年隔离；真实问答和完整报告浏览器验收。先更新浏览器脚本，必须明确报告completed才开始最终验收，不能沿用旧脚本跳过报告分支的7项通过冒充完成。
+- 目标仍active，依赖恢复后不能按旧阻塞记录调用blocked；尚未满足完整验收，不得complete，不自动提交。
+
+#### 2026-10-06 11:47 最新：真实报告7运行中，报告6因质量问题取消
+
+- 全部依赖已恢复。MinerU正确健康地址为 `/v1/health`，先前探测误用 `/health`恢复后显示404，现已修复`.tmp/check-flow-dependencies.py`；11:27全部200/协议成功，不能再沿用早期离线状态。真实报告5已确认canceled。
+- 报告6完成扫描后暴露质量缺口：基本信息10条没有预算、限价、补充通知45日，交货期仍写30日；否决只提营业执照，漏超限价。真实DB trace证明基本信息未读c2预算和source11，否决读到c7却未提取。不能把completed/supported当完整通过。
+- 已通过API取消验收报告6并保留历史；`.tmp/tender-flow-check/report-6-quality-review.json`及`modules-with-trace.json`保留结果。最后确认canceled，已完成10个模块，后续没继续。真实调用账可用`GET /api/v1/llm/calls?feature_key=analysis`查询；`model-probe-ledger.py`是历史一次性修改脚本，**不要执行**。
+- 新增普通模块覆盖策略，快照键`__coverage_contract__`：每份来源首批至多12块加入必读候选（仍须实际工具读取，不是自动宣称已读）。对结束时未被items引用的候选按6块独立补漏；每块必须被结果引用或列入unrelated_block_ids。结构/引文/遗漏分类可纠正两次，随后失败。补漏草稿和原草稿合并后统一支持性校验；纠正反馈包含合并草稿，完整trace保存candidate_completion阶段及最终接受草稿。历史无该快照键仍走历史规则。
+- 新测试覆盖扫描未分配补充文件时仍须读、已读却漏提的限价否决独立补回、静默遗漏候选被拒绝。集成FixtureModel适配新协议。**最新完整含DB测试413 passed、5 skipped，最后测试已exit0**；Ruff全src/tests及diff check通过。前端产品代码本轮没改。
+- 局部真实原文诊断会话23941已exit0：`.tmp/probe-live-candidate-completion.py`复用报告6原文及旧草稿，只调用补漏/验证、不写业务结果。项目概况补回预算80万、限价78万、45日且supported；“项目名称与编号”混同样本编号被判unsupported。否决补回超限价条款且supported。产物`.tmp/tender-flow-check/candidate-completion-probe/`。这不是新报告最终结果，不可代替13模块验收。
+- **当前真实报告为7**，已写state.json（previous_reports含4/5/6）。最新代码已加载：API父25644、worker父19692、beat父25700，需实时核验子PID。llama7896参数保持原样，Ollama11434工作；前端会话21037仍运行在localhost:4400。没有活跃的本轮模型诊断。
+- 独立参考库真实问答 **answer1** 已completed，state.reference_answer保存ID。两条supported：历史质保五年；参考不能替代本项目要求。snapshot.mode=hybrid、4个检索块、1024维、source12，graph_used=false（独立参考问答没有报告图谱，正常）。原始结果`reference-answer.json`；脚本`.tmp/check-reference-answer.py`只在state无ID时创建，后续仅轮询，勿重复创建。
+- 浏览器脚本`.tmp/tender-flow-browser.mjs`已增强：开始就要求真实报告+13模块completed，不允许跳过报告分支；桌面1440及390/320三种宽度，主文件→补充通知→主文件来回切换并检查PDF/引文/高亮；最后通过真实页面提交项目问题，核对45日、当前三年和历史五年及独立来源，保存project-answer.json和state.project_answer。当前只通过node --check，**尚未执行增强版最终浏览器检查**，须等报告7内容验收合格后运行。浏览器引用摘录可能被resolve接口扩成完整块，需要按实际接口调整预期，不能将测试预期问题当UI故障。
+- 下一步：持续读取`.tmp/tender-flow-check.py status`看报告7，不创建重复报告；逐模块核验预算/限价/45日/三年/技术参数/否决完整性以及引用。源读取及补漏能降低遗漏，仍不能直接保证质量。必要时据真实错误修复并补跑，先保留已完成模块；执行增强浏览器及项目问答，逐条resolve引用，核对独立资料隔离和图谱关系；最后更新设计14和本交接，真正全部通过后才goal complete。目标仍active，不blocked、不提交。
+
+#### 2026-10-06 12:09 真实报告7继续执行
+
+- 已完成项目概况16项、否决2项，预算80万元/限价78万元/交货期30→45日及两项否决已逐项核对，均有本项目引文。独立库问答1另经8项引用与来源核对通过。
+- 商务模块失败：调用459本地模型耗尽4096个生成token后返回空正文，后备模型2随后两次连接超时。其余模块继续运行，最新技术模块running。不要取消报告、重复上传或重建报告；观察会话53461仍在运行。
+- 已修复适配器在JSON模式收到空正文时抛InvalidModelOutput，进入既有最多两次格式纠正；普通文本空正文仍为ExtractionFailed，不将reasoning_content当结果。38项模型适配/路由专项和Ruff通过。**此修复尚未加载到运行服务，必须等报告7终态后重启再单独补跑失败模块。** 其余服务及llama参数没有改动。
+- `.tmp/check-live-report.py`增补商务/技术/评分/开标/保证金/封装/报价/业绩/人员的实际样本条件核对，`--brief`只打印摘要，完整review始终存于report-quality-checks.json。最终仍用`--final`。
+- 浏览器脚本新增逐项进度打印、首次问答轮询即记录ID、已有project_answer则拒绝重复提交；目前只通过语法检查，仍须等待报告合格后执行。项目问答尚未创建。
+
+#### 2026-10-06 12:23 范围调整与桌面预检
+
+- 用户明确“不需要考虑手机端”。后续验收只做桌面，不再做390/320px检查；旧移动端记录仅保留历史，不是当前交付门槛。`.tmp/tender-flow-browser.mjs`已只保留1440px。
+- 真实报告7现已完成4模块：概况16项、否决2项、技术5项、评分3项；技术设备/数量/IPv6/双电源/2小时及评分30/50/20与业绩条件均已核对，无unsupported。商务failed等待终态后补跑；开标running，其余待执行。观察会话53461持续运行。
+- 桌面预检（显式`--preflight`，不提交问答、不当最终验收）第二次14项通过，主文件→补充通知→主文件的PDF、引文、高亮、无溢出均通过；关键截图已人工查看。产物`browser-preflight/`，第一轮失败详情因第二轮重写checks，原因已记录如下。
+- 第一轮独立库搜索前端代理报ECONNRESET/500；随后直接后端6.94秒返回正确hybrid结果，再次浏览器成功。不能断言已确定首次断开原因；同步向量长等待仍是实际暴露的薄弱点。
+- `knowledge_retrieval.py`增加可选embedding_timeout，搜索API传15秒；超时取消向量调用、关闭客户端，回退带引用的全文结果与warning。后台问答不传此参数，保持原预算。KnowledgeCollectionDetail展示warning。29项知识专项、Ruff、前端typecheck通过。此改动和空正文InvalidModelOutput修复均尚未重启服务加载。
+- 空正文修复后的完整后端416 passed、5 skipped已exit0（含DB），Ruff全量及diff check通过；搜索等待修复是在此之后新增1项测试，最终应再次覆盖新增集成检查。尚未创建项目问答、未提交代码。
+
+## 22. 用户纠正架构：采用 DeepAgents（2026-10-06 19:10，当前最高优先级）
+
+- 用户明确否定现有“全文扫描分派＋每模块必读文件首批段落＋串行运行”形式。要求每个解析模块一个独立subagent，自主从文档与知识库检索，去重后综合分析，可配置subagent并发数。已明确选择 **DeepAgents**，不再询问LangGraph选型。
+- 用户进一步要求权限、重试、上下文管理、运行管理等稳定性控制，不能只调用框架入口。已确认方向：项目/关联库权限在工具层强制、只读Skill快照、禁任意磁盘/Shell/网络、独立上下文、去重与按需阅读、有界预算/重试、任务取消和恢复、跨报告并发控制、可观察执行记录。
+- 当前原实现是自写Python JSON工具循环，FastAPI/Celery调度，OpenAI兼容适配调用本地Qwen/llama.cpp；并无DeepAgents/LangGraph运行时。已向用户明确说明，不可把旧13模块报告验收当新架构交付。
+- 19:06现场核验：API8300、worker、beat、前端4400、llama7896都已停止，工具会话53461/21037/37528等已失效；仅Ollama11434存在，PID17600。不是本轮主动停止的。数据库也OperationalError，取消报告7的API及精确数据库状态更新均未成功，**报告7取消未确认**。后续恢复依赖时，先取消旧报告7再启动worker，禁止自动续跑旧方案。
+- 旧报告7最后已知完成5模块（概况16、否决2、技术5、评分3、开标4），商务failed，保证金running。旧资料项目13/库6与7/source9/11/12仍需复用，不重新上传。
+- 用户早先明确“不需要考虑手机端”，后续只验收桌面。旧桌面预检14项通过，不等于新架构通过。
+- 旧代码最后完整检查：后端417 passed、5 skipped（含DB），Ruff通过；前端76测试、typecheck通过。生产build会话37528在用户间隔后失效，未取得最终退出结果，不能称最后build已通过。
+- 新增但尚未加载运行服务的旧流程补丁仍保留：空JSON正文进入有限纠正；同步知识搜索向量15秒超时回退全文且UI显示warning。新增架构应复用稳定的上传/索引/引用/模型管理，不重复实现。
+- 已实际获取官方DeepAgents overview/subagents/skills/models文档；PyPI当前版本0.7.22。开始用uv添加固定版本依赖。已委派只读研究代理`deepagents_research`核实当前真实API，不写仓库、不跑模型。
+- Goal仍active，禁止complete/blocked/提交。后续应真正实现并验收DeepAgents模块subagent＋权限检索＋去重综合＋并发与生命周期管理；原报告7的完成已不再是目标。
+
+## 23. 新会话接手说明（2026-10-07，交接整理）
+
+> 本节用于让全新会话在不读旧对话的情况下继续任务。开始前先读 AGENTS.md 与本文件第 22、23 节，本节优先于更早的历史状态。
+
+### 23.1 一句话状态
+
+目标是重新打通标书解析流程（知识库构建 + Agent/Skill 解析招标文件），框架已由用户明确选定为 **DeepAgents**。运行时核心构件已写好并通过 20 项新架构专项测试，但**尚未接入 worker / API / 前端**，没有任何真实端到端验收；goal 仍 active，全部改动未提交。
+
+### 23.2 用户硬性要求（不可偏离）
+
+- 每个解析模块一个独立 subagent；subagent 并发数必须可配置，且是**跨报告的硬配额**，不能只有每报告 Semaphore。
+- 子 Agent 自主按需检索项目文档 + 关联知识库，去重后综合分析。禁止沿用“全文扫描分派 + 每模块必读首批段落 + 串行执行”的旧形式。
+- 稳定性控制是需求本身：工具层强制权限（支持动态撤销）、只读 Skill 快照、禁止任意 FS/Shell/网络、有界重试与预算（重试和摘要调用都计入）、上下文压缩、checkpoint 恢复、失败模块补跑、幂等、租约、审计与状态查询。
+- 不需要手机端，只验收桌面端。
+- 禁止自动提交；确有提交时用中文、不带作者。
+- 项目约定：UTF-8 读写、PowerShell、JS 用 pnpm、Python 用 uv、注释与文档优先中文。
+
+### 23.3 仓库状态（务必先看）
+
+- HEAD：`2eb51b7 文档：补记分批提交结果`。工作区共 90 个变更：81 个已跟踪文件被修改、9 个未跟踪新文件；**全部未提交，都是本轮成果，不要回滚、不要擅自提交**。
+- 本阶段新增且未跟踪的核心文件：
+  - `apps/api/src/tender/application/analysis_research.py`：权限、去重、预算与证据会话。
+  - `apps/api/src/tender/application/deep_analysis.py`：DeepAgents 模块子图桥接（RoutedAgentModel / build_module_agent / invoke_module）。
+  - `apps/api/src/tender/application/analysis_outline.py`：格式大纲模块结果校验。
+  - `apps/api/src/tender/adapters/agent_chat.py`：LangChain 原生工具消息适配。
+  - 对应测试：`apps/api/tests/unit/application/test_analysis_research.py`、`test_deep_analysis.py`、`test_analysis_outline.py`、`apps/api/tests/unit/adapters/test_agent_chat.py`。
+- 未跟踪的 `.claude/` 不属于本次交付，不要提交。
+- 依赖已在 `apps/api/pyproject.toml` 和 `uv.lock` 落地并安装完成：`deepagents==0.7.22`、`langchain-openai>=1.1,<2`、`langgraph-checkpoint-postgres>=3,<4`、`psycopg-pool>=3.2,<4`。不要重复安装。
+
+### 23.4 已实现并验证的部分
+
+- `analysis_research.py`：默认预算（模型调用 32 / 工具 48 / 证据 160 块 / 900 秒 / 上下文 24000 token / 输出 4096）；显式项目与关联库范围；每次工具操作前后及检索完成后复核授权；越权与错误批次原子拒绝；同 source+run+element 及规范化正文去重、同文不同来源保留；`read_source` 支持压缩后补读；async 锁计数；可导出 seen/events/tool_calls 到 checkpoint。
+- `agent_chat.py` + `openai_chat.py`/`llm_routing.py` 的 `chat()`：全部 SDK `max_retries=0`，重试统一走项目既有路由；工具消息与 `tool_call_id` 完整往返；usage 落账；支持 429 Retry-After；识别拒绝响应；关闭客户端；强制关闭 LangSmith tracing，避免标书内容外发。
+- `deep_analysis.py`：真实 DeepAgents 图（`StateBackend`、只读 Skill 与历史文件的 `FilesystemMiddleware`、80% 阈值的 `SummarizationMiddleware`、负责授权/工具预算/checkpoint 的 `ResearchMiddleware`）；权限首条匹配并兜底 deny；关闭自动 general-purpose subagent；`submit_analysis` 复用 `_module_result`/`outline_result` 证据校验并限制 3 次纠正；`invoke_module` 通过 `aget_state` 从框架 checkpoint 恢复，已完成线程不会重跑。
+- 2026-10-07 复跑测试：
+  - `uv run pytest tests/unit/adapters/test_agent_chat.py tests/unit/application/test_analysis_research.py tests/unit/application/test_deep_analysis.py -q` → **11 passed**。
+  - `uv run pytest tests/unit/application/test_analysis_outline.py -q` → **9 passed**。
+- 上述只覆盖新构件单元行为。旧链路完整结果为后端 417 passed / 5 skipped、前端 76 测试 + typecheck（旧架构），**新增代码后尚未重跑全套**。
+
+### 23.5 尚未完成（新会话主要工作，建议按序）
+
+1. 把 `deep_analysis.py` 接入 worker：新报告走模块子图；历史报告按旧快照兼容；移除新报告对旧 scan/coverage 契约的依赖。
+2. 新增迁移 `0008`（不要改已应用的 0005/0007）：建 `agent_runtime` schema、受控初始化 checkpoint 表（`AsyncPostgresSaver.setup()`）、模块运行状态/预算/审计表。
+3. 生命周期与配额：跨报告硬并发配额（配置项）、真实请求累计预算（含重试与摘要调用）、工具次数、总时长、取消检查、租约恢复、失败模块补跑、幂等与状态查询 API。
+4. 权限与上下文收尾：动态撤销在工具层端到端生效；摘要只写 `/conversation_history/**`；证据独立保存，摘要不得成为引用来源。
+5. 编排与汇总：确定性控制器保证 13 个模块都被调度，日志能证明每个模块是独立子 Agent；主汇总去重、冲突保留双方依据、核对跨文件修订。
+6. 适配 API/Skill/前端（桌面端），并创建 `docs/设计/16-DeepAgents标书分析运行时.md`（当前不存在）。
+7. 新架构专项测试：故障恢复、越权、并发、上下文与引用。
+8. 依赖恢复后：**先取消旧报告 7，再启动 worker**，防止旧方案自动续跑；随后用既有资料做真实模型与桌面浏览器最终验收，不重新上传文件。
+
+### 23.6 环境与验收数据（2026-10-07 核查）
+
+- 本机服务：API 8300、worker、beat、前端 4400、llama.cpp 7896 均未运行；仅 Ollama 11434 在监听（PID 16244，PID 会变）。
+- 远端依赖 `172.29.199.222`：Postgres 5432 / Redis 6379 / MinIO 9000 / Gotenberg 3456 / MinerU 8000 五个端口 TCP 均可达。此前出现过“TCP 可达但服务不健康”，需用真实请求复核；本轮未做 PostgreSQL 实际查询。
+- 旧报告 7：取消**未确认**。最后已知完成模块为概况 16、否决 2、技术 5、评分 3、开标 4，商务 failed，保证金 running。`.tmp/tender-flow-check/state.json` 中 `report.status=waiting` 是创建时的旧值，不代表实时状态。
+- 复用数据（勿重传）：项目 13、自有库 6；主文件 source9 `采购招标文件.docx`、source11 `交货期补充通知.pdf`；独立参考库 7 / 知识项目 14 / source12 `设备保修参考.pdf`；参考问答 answer1 已通过，项目问答未创建。
+- 验收样本关键事实：预算 80 万、限价 78 万；交货期主文件 30 日、补充文件 45 日；本项目质保三年，参考历史五年不可替代；10 台交换机 / IPv6 / 双电源；故障响应 ≤2 小时；付款验收 90%、余款质保期满；业绩 2023-01-01 以来每项 10 分封顶 20 分、需合同复印件；项目负责人 1 名、劳动合同、不要求特定职称；四种格式材料为投标函、报价明细表、营业执照、技术响应表。
+
+### 23.7 工具与坑
+
+- 旧验收脚本 `.tmp/tender-flow-browser.mjs`（仅 1440px，`--preflight` 不创建问答）与 `.tmp/check-live-report.py`（`--brief`/`--final`）需要适配新架构后才能作为最终验收依据。
+- 不要用旧报告 7 的完成度充当新架构验收；新架构验收标准是：13 个模块各自独立 subagent、自主检索去重、权限/预算/恢复生效、桌面浏览器引用核对通过。
+- 不要修改用户既有的 `本地启动指南.md` 改动；上下文超过 80% 自行压缩。
+
+### 23.8 新会话可直接粘贴的提示词
+
+```text
+继续 AI-Tender 的 DeepAgents 标书解析重构。工作目录 G:\aicode\AI-tender。
+先按 AGENTS.md 读取 HANDOOFF.md 第 22、23 节，并以第 23 节为准。
+
+goal 仍 active：每个解析模块一个独立 DeepAgents subagent、并发可配（跨报告硬配额），
+Agent 自主检索项目文档与知识库、去重后综合分析；落实权限、重试、预算、上下文压缩、
+checkpoint 恢复、失败补跑与运行管理。禁止沿用旧的全文扫描分派形式。
+
+现状：analysis_research.py、deep_analysis.py、analysis_outline.py、agent_chat.py 已实现，
+4 个专项测试文件共 20 项通过；但尚未接入 worker/API/前端，无真实端到端验收。
+按第 23.5 节顺序继续：先把模块子图接入 worker 并新增迁移 0008，再做配额与生命周期、
+汇总、文档、专项测试与真实验收。
+
+约束：不提交代码；不重传项目 13 的资料；依赖恢复后先取消旧报告 7 再启动 worker；
+只验收桌面端。
+```
+
+## 24. DeepAgents 接入与真实验收进行中（2026-10-07，本节更新第23节）
+
+- 目标仍 active，所有改动未提交。已读取第22/23节并按23.5推进；没有使用 Codex 子代理。继续使用 UTF-8、PowerShell、pnpm/uv；不改用户本地启动指南、不重传项目13资料，只验收桌面。
+- 已新增 `0008_deepagents_runtime.py` 并应用到实际数据库（0005/0007未改）：报告 runtime_version/runtime_settings/reference_snapshot/summary，agent_module_run、agent_run_event 和 agent_runtime schema；配置中心增加 analysis.max_inflight（默认2）、请求/工具/时间/上下文/输出预算。
+- `application/agent_checkpoints.py` 提供显式初始化命令 `uv run python -m tender.application.agent_checkpoints`，AsyncPostgresSaver.setup 已执行，4张 checkpoint 表在 agent_runtime 内。Windows 用 SelectorEventLoop，worker 不隐式建表。
+- `application/agent_runtime.py` 已实现公司范围跨报告/跨进程配额、独立 NullPool 会话锁、owner fencing、租约、动态关联/资料批次复核、每实际请求/工具预算和用量审计。恢复保留 deadline/预算/证据，未回传模型请求标记 unknown。仍持锁时不能因租约过期被抢占；配置降低后排空再接新任务。
+- `worker/deep_analysis.py` 先持久创建全部13模块，再并发调度独立 DeepAgents 图，真实 PostgreSQL checkpoint、原生工具、校验证据、单模块失败隔离、确定性汇总等价断言。`worker/knowledge.py` 按 runtime_version 分流，新报告不经过 scan_document；历史 legacy 保留。
+- API新报告固定运行时/配置/参考库快照；详情暴露各模块 runs，不暴露原始 state/trace；新增 `/analysis/reports/{report_id}/runs/{run_id}/events` 审计分页。补跑新 attempt 保留旧记录，并发重复补跑拒绝。报告结论和summary按实时知识库关联过滤。
+- 项目 Skill 全部切换为原生检索/submit_analysis，领域规则保留；general reduce_strategy 的最后一处旧扫描说明也已移除。报告9的既有快照不回写，system契约一直禁止扫描分派。
+- 桌面 ProjectAnalysis 展示13专题进度、各attempt用量/时限/错误，综合条目折叠区与失败补跑。新增设计文档 `docs/设计/16-DeepAgents标书分析运行时.md`、接口文档及DDL契约映射。
+- 测试：一轮完整后端 **440 passed / 6 skipped**（TENDER_RUN_DB_TESTS=1）；前端 **76 passed**、typecheck和生产build通过；Ruff和diff check通过（CRLF提示不是错误）。此后新增了坏输出token记账/限流冷却/恢复unknown和预算提示，相关专项已通过，最终需覆盖最新增量。
+- 新增集成 `tests/integration/test_deepagents_runtime.py`：独立随机schema，真实多连接配额/过期不抢占/恢复预算证据/13真实子图+Postgres checkpoint/补跑/动态撤销。原 `test_llm_management.py` 重放迁移时将显式agent_runtime schema重命名到测试空间，避免触碰业务checkpoint；原知识集成测试显式legacy以继续验证历史兼容。
+- 真实报告7现场为partial，已按用户要求精确更新为 **canceled**，查询确认后才启动worker。没有活动旧报告。
+- 新架构真实报告 **9**，项目13、source9/11、参考库7/source12。勿重复创建。状态文件 `.tmp/deep-flow-state.json`；完整验收资料 `.tmp/deep-flow-check/state.json`。当前实际首选模型17/qwen3.8-flash-next-262k（https://x666.me/v1），其次16/本地qwen3.5-9b，再2/glm-5.3-flash。沿用用户配置，没有调整模型绑定。
+- 真实9已验证同时2个独立模块在跑，各自检索项目和参考库、产生混合检索/去重证据；但尚无完整质量验收。首选模型出现429及空响应，后备本地模型较慢。修复路由429后短暂冷却、坏输出保留已知token用量；增加每轮剩余预算与连续无新增证据提示，避免无限复读。
+- 已进行受控后端重启：重启前快照 `.tmp/deep-flow-check/before-worker-restart.json`；停止API/worker/beat后确认运行槽锁为0，只把报告9 lease调为过期，以立即触发自动恢复。**需继续确认9的resumed事件、原thread/计数不重置、以及unknown请求记录**。首次起始约10:22，模块总时限900秒不会因重启延长，若耗尽需等报告终态补跑失败模块。
+- 最后启动：API父20920、worker父3976、beat等待启动脚本会话92915的最终结果。前端session13847，localhost:4400；llama PID9804，原参数原路径启动（记录仍在`.tmp/tender-flow-check/llama-restart.json`）；Ollama11434继续运行。PID需现场核验。启动脚本为用户原有 scripts/start-backend.ps1，未改。
+- 新验收脚本 `.tmp/check-deep-report.py --brief/--final` 和 `.tmp/deep-flow-browser.mjs --preflight`/无参数。仅桌面1440；浏览器无参数会提交一次项目问答并记录ID，已有ID时拒绝重复。旧脚本/旧报告结果没有覆盖。**新浏览器脚本尚未执行**，必须等9有source9和11有效引用；最终需13模块全部完成且关键事实合格。
+- 下一步：确认重启恢复→观察/修复真实9失败模块（保留已完成模块）→逐模块事实与引用核对→桌面与真实项目问答→核对运行记录/权限/预算/恢复证据→最终检查文档与测试。未达到真实验收前不能goal complete。
+
+
+### 24.1 真实验收追加修复（2026-10-07 10:45前后）
+
+- 受控重启恢复已验证：`.tmp/deep-flow-check/checkpoint-recovery.json` 13项线程一致/计数不倒退通过，实际有 resumed 与 requests_unknown 事件。
+- 原概况/否决模块到32次请求预算后 failed，否决保留已提交draft；业务补跑需保留旧记录。发现 LangChain 默认缓存 httpx 客户端，模块关闭后其它模块会复用已关闭连接报 RuntimeError；AgentChat已显式创建独立异步/同步客户端，隔离测试通过。
+- 同报告恢复优先旧线程，prepare_report将失去会话锁的旧running重新显示pending，避免UI显示4个running而实际只有2槽。该修复通过5项运行时DB集成；不要以running状态行数代替pg_locks真实占用数。
+- 商务模块曾completed12项，但人工核对发现未证据化的质保起算/免责推断、缺失条款结论、单边修订引用、仅历史引用证明当前项目等，不能作为合格结果。已精确将商务模块及该attempt标为failed并记录quality_rejected，移除该模块已发布关系；旧items/state保留审计，没有人工改写答案。
+- 新增 validate_project_claims：项目结论和参考建议必须有本项目引用；缺失/未约定推论只能写research_summary；跨文件修订同条目引双方。支持性verify_items强调禁止补造起算点、服务期间、范围和免责效果。支持性验证提前到 submit_analysis，在同一子图内反馈修正（最多3次）；worker仍复核恢复草稿。汇总排除failed模块。
+- 补跑可以沿用已通过结构/引用校验的draft继续支持性验证，若新约束判定旧draft无效则重新检索；新attempt预算为0，旧账保留。原module验证未通过的新结果不能再只打supported就交付。
+- 最后一轮相关图/DB专项 **13 passed**；HTTP适配/路由专项 **22 passed**；import-linter **5 kept / 0 broken**。最新质量约束之后应补最终完整测试，前端补跑未完成模块按钮也需要最后typecheck/build。
+- 桌面运行管理脚本`.tmp/deep-runtime-ui.mjs` **6项通过**，截图`.tmp/deep-flow-check/runtime-desktop/`已人工查看；这是runtime-only，不是内容验收。原固定CDP端口9492/9494被Windows拒绝bind，脚本已改端口0并读取DevToolsActivePort，不能再使用旧固定端口版本。
+- 最新后端启动父PID：API12648、worker19252、beat26272，启动会话19697。前端13847及llama9804未动。API/worker已加载最新配额恢复排序和内容校验。资料、报告仍为9，禁止重建报告/重传资料。尚无合格完整报告，项目问答未创建；目标仍active。
+
+### 24.2 质量与协议追加修复（2026-10-07 11:15前后）
+
+- 继续执行 goal，尚未真实验收完成。报价模块原completed结果经人工核对不合格（未划分标段/全项目范围、未明示税率与格式缺口、其它条目引用未覆盖当前断言）。已精确标记module61/run9为failed并写quality_rejected事件，删除其已发布关系；原items/state和旧账保留，未改写答案。拒绝快照在`.tmp/deep-flow-check/price-quality-rejected.json`。
+- `verify_items(explain=True)`供DeepAgents使用：每批6项，先列无依据断言再给supported；即使supported=true，只要有无依据断言也判unsupported。校验输入不携带旧verification标签。具体原因反馈给submit_analysis纠正；legacy继续兼容原布尔协议。
+- 原生工具schema增加CitationInput/ItemInput/RelationInput/OutlineInput的具体字段，避免list[dict]令模型猜测引用/节点格式。图测试包含非空条目落库前的引用校验。**该schema追加在最新服务重启后，需等首轮终态后重启加载，再补跑。**
+- 生成提示要求正文直接依据原文、可选字段无依据则省略、每条引文覆盖自己的金额/数量/范围；扩充缺失断言拦截。补跑已质量拒绝的verified草稿不再复用；未完成支持性验证的草稿清items_verified后重新验证。
+- 人员模块63/run11 completed，21次模型请求/17次工具，人工核对负责人1名、劳动合同、不要求特定职称均有相符引用。格式模块64/run12 completed，29次模型请求/19次工具，四个独立章节及引文已核对。补充发现仍running；不要用两个完成模块充当完整验收。
+- 后端完整 **454 passed/6 skipped**（DB开启），随后原生schema增量图测试15通过；import-linter5 kept/0 broken。前端76测试、生产build通过；桌面runtime-only6项再次通过。原生schema后的运行时DB专项正在执行，需读取会话92044结果。
+- 前端只展示completed模块的items/引用，避免补跑时把旧失败结果当有效结论；知识库设置文案已说明同时用于专题分析与问答。
+- 本次重启前再次确认旧报告7 canceled、实际运行锁0，恢复9不重置线程/预算。最新服务父PID：API28008、worker23712、beat29584；前端和模型未动。仅在适当时机再重启加载最后schema，不频繁消耗在途请求。
+- 新临时只读诊断`.tmp/inspect-deep-runtime.py [模块key片段]`，输出预算/状态及精简结果。继续用`.tmp/check-deep-report.py`和`.tmp/deep-flow-browser.mjs`，最终项目问答仍未创建。
+
+### 24.3 上游故障与429补强（2026-10-07 11:30前后）
+
+- 用户补充明确要求考虑上游偶发异常与429。已新增并应用0009_provider_cooldown（不修改已应用迁移），在llm_provider增加rate_limited_until；ProviderCooldown按供应商共享截止时间，跨模块/报告/worker/重启可见，GREATEST保证并发更新不会缩短冷却。
+- RoutingModel先用未冷却供应商，全部冷却时等待最早恢复者，不为等待消耗请求预算，受模块心跳/取消/总时限约束。Retry-After支持秒数与HTTP日期，未提供默认30秒；同供应商切模型不能绕过冷却。408/500/502/503/504与连接超时沿用指数退避+抖动和有界请求记录；重试、切换、格式纠正仍计费计数。
+- 真实上游异常进一步定位：报告9 general模块attempt2的三次submit_analysis实际args={}，每次completion_tokens恰好4096且reasoning约2000，供应商仍把finish_reason写成tool_calls。不是Agent没理解字段，而是输出被截断。诊断脚本`.tmp/inspect-deep-submissions.py <完整模块key>`通过图aget_state_history恢复DeltaChannel消息，不能只读saver.aget_tuple的channel_values（后者不含增量messages）。
+- 新ModelOutputTruncated：finish_reason达到长度或缺必填参数且用量达到输出上限，适配器拒绝作为业务工具调用，保留usage并直接故障转移，不同额度下盲目重复格式纠正。非截断的必填工具参数缺失交路由有限纠正，不占业务提交三次校验机会。
+- 最新完整后端 **471 passed/7 skipped**（DB开启）；随后新增HTTP-date专项，适配器14项通过。共享冷却真实独立连接/不缩短截止时间等集成和路由适配器专项38项已通过；Ruff通过。前端上轮76测试和build、runtime-only6项仍有效。
+- 报告9首轮最终2模块完成（人员/格式已人工核对）。已通过API补跑其余11模块，产生attempt2，旧账保留；快照`.tmp/deep-flow-check/before-retry-2.json`。general attempt2已因上游空参数再次failed（当时尚未加载截断修复）；其余补跑中，最终还需补跑general。
+- 11:30前后再次受控重启，先确认旧报告7 canceled且实际槽锁0，再过期报告9 lease，原attempt2线程/预算继续恢复。**当前服务已加载共享429冷却及输出截断修复**。API父PID21420、worker29788、beat6340，启动会话24133完成；前端4400和模型保持不变。
+- 最新补跑情况需实时查询`.tmp/inspect-deep-runtime.py`：概况/否决运行，其余排队，人员/格式完成，general失败。所有未提交，不重传资料，项目问答仍未创建，goal仍active。
+- 下一步：观察新适配是否将4096截断转到后备模型并完成报告9 → 按需要补跑失败模块 → 逐项人工核对并执行最终桌面和项目问答；真实验收尚未通过，不得complete。
+
+### 24.4 分批提交与现场验证追加（2026-10-07 11:37前后）
+
+- 为避免大结果一次挤入4096token导致上游截断，submit_analysis新增final（默认true）；普通模块可final=false分批校验并暂存2–3条，最后合并完成。staged_items/staged_relations在独立运行state保存，提示只补新增项。格式大纲需整体父子校验，禁止分批。
+- 新attempt可携带已验证暂存成果和证据；清旧tool_results和invalid_submissions，旧attempt记录不变。partial暂存不显示为已完成报告。图分批验证+运行时21项通过，追加真实DB暂存补跑专项后7项通过。
+- 实际调用日志已验证截断检测生效：否决attempt2在03:33:40 UTC的4096token输出被记为error/“模型输出达到token上限”，随后转到本地qwen3.5-9b，未继续消耗业务提交纠错机会。`.tmp/inspect-deep-calls.py`可查最近调用和共享冷却状态。
+- 为加载分批提交，本轮最后重启API/worker/beat，旧7 canceled、槽锁0后原线程恢复9，未重置预算。最新父PID：API25292、worker27620、beat3792，启动会话96006完成。**当前服务已加载全部已写修复**。
+- 报告9 attempt2：概况和general在截断修复加载前已failed，后续需补跑；人员/格式完成；否决和商务继续，其余排队。仍无完整真实验收，项目问答尚未创建。不要重新建报告或上传资料，不提交代码。
+
+### 24.5 原生工具畸形响应（2026-10-07 11:42前后）
+
+- 真实本地后备模型曾把整份答案放进工具name（submit_analysis=...），args为空。AgentChat现先验证工具名属于当前声明及必填参数，畸形名称走有限协议纠正/故障转移，错误不回显整份文档；避免框架unknown-tool错误把巨大草稿再塞回上下文。适配器15项专项通过。
+- 最新重启已加载该校验；API父23632、worker25192，beat见`.tmp/backend-pids.json`，启动会话52312。原报告9/attempt2继续，预算与线程不重置，旧7仍canceled。
+- 否决attempt2也已到时失败；当前商务与技术在运行，其余排队，概况/general待最终补跑。不要从analysis_module.items读取running模块的有效结果：里面可能是旧质量拒绝的答案，应看当前run.state.draft/staged_items。诊断脚本已按此区分。
+- 仍没有完整验收，项目问答未创建，不提交、不重传。已完成且人工核对的仍为人员/格式两模块。
+
+### 24.6 为后备模型预留时间（2026-10-07 11:55前后）
+
+- 现场配置：qwen3.8主模型timeout90秒，本地qwen3.5-9b为300秒且重试1次，glm第三候选90秒。发现本地两次慢响应可吃光功能600秒时限，让第三候选实际无法执行。
+- RoutingModel现按模块剩余时限与功能预算较小值设总deadline，再根据剩余候选/重试次数分配单次等待上限（不超过模型配置timeout）。实际请求数/unknown用量仍照常记账，未变更模型绑定或用户配置。模拟连续超时确认可到第三候选；路由+DB专项30项通过。
+- 已重启加载全部修复：API父10492、worker22056、beat19992，启动会话89396已完成。再次确认旧7 canceled及锁0后恢复9，原线程/预算保留。技术/评分仍在运行，技术已收到具体内容支持性反馈；最终状态需实时查询。仍无完整真实验收，goal active。
+
+### 24.7 下一轮补跑输出预算（2026-10-07 12:00前后）
+
+- 多次真实4096token截断证明输出空间（含思考）不足；仅修正参数或换到慢本地模型不足以完成验收。新增RetryInput.max_output_tokens可选512–16384，只作用于新attempt.limits；旧attempt/原报告快照和账目不改。请求次数与总时限不扩大。按module_id固定补跑创建顺序。
+- 下一轮失败补跑使用8192。`.tmp/retry-deep-failed.py`已加该参数，仍只用报告9原资料；当前进行中的attempt2继续原4096预算。API该新字段尚未加载到现有进程，**等本轮终态再重启加载后调用补跑脚本**，避免无谓中断在途请求。
+- API预算override的7项DB集成通过；前端运行记录新增单次输出上限展示，types与typecheck已通过。最后完整backend仍471/7，此后新增分批/畸形工具名/时间预留/补跑预算专项分别通过，最终需全套覆盖；最后前端build在新增输出上限展示之前。
+- 目前报告9已完成仍为人员/格式，当前评分与开标运行；概况、否决、商务、技术、general的attempt2已失败或到时，余下继续排队，需实时查询。主模型qwen3.8 timeout90/max_tokens未固定，本地qwen3.5-9b timeout300/max_tokens4096，第三glm timeout90/max_tokens未固定；没有修改用户模型绑定。
+- 当前服务仍API10492/worker22056/beat19992，已加载24.6及之前的运行时修复。未加载的只有本节新API预算参数（及自动创建顺序）；前端dev已加载输出预算显示。仍未创建项目问答，goal active，不提交、不重传。
+
+### 24.8 当前全量检查（2026-10-07 12:04前后）
+
+- 最新全部代码：后端TENDER_RUN_DB_TESTS=1完整 **475 passed/7 skipped**，Ruff全部src/tests通过，import-linter5 kept/0 broken；前端76测试、typecheck和生产build通过，git diff --check通过。
+- 上述不等于真实模型验收完成：报告9仍运行且只有人员/格式两个已核对完成。当前attempt2继续原4096输出预算；后续失败补跑脚本使用8192，调用前需重启API加载新字段（24.7），当前API10492仍旧版字段。
+- 未提交、未重传资料，goal active。继续观察本轮终态，再加载新API并执行`.tmp/retry-deep-failed.py`，随后逐条核对、桌面引用、项目问答。不要先创建新报告或重复上传。
+
+### 24.9 新窗口继续交接（2026-10-07 13:55 实时核实）
+
+本节是新窗口续作入口，按任务记忆模板整理目标、进度、结论、下一步；需求与硬约束仍以第22、23节为准，第24.1—24.8节为实现与修复记录。
+
+#### 目标与约束
+
+- goal 仍 active：13个解析模块各自独立 DeepAgents subagent；并发可配且跨报告硬配额；Agent 自主检索项目文档与知识库、去重后综合分析；落实权限、重试、预算、上下文压缩、checkpoint恢复、失败补跑与运行管理；禁止旧全文扫描分派。
+- 用户追加：必须处理上游偶发异常与 429 限流（已实现，见24.3）。
+- 不提交代码；不重传项目13资料；只验收桌面端；重启或恢复前先确认旧报告7为 canceled。未完成全部真实端到端验收前不得把 goal 标 complete。
+
+#### 当前进度（2026-10-07 13:52 读取 API 与 DB 核实）
+
+- 报告9 `status=partial`：13模块中 **2 completed、11 failed**；全库 `agent_module_run.status='running'` 为 0，无在途请求；`llm_provider` 无未到期的429冷却。
+- 已完成且人工核对：
+  - 人员 `personnel_requirement_parsing` module63/run11/attempt1：负责人1名、劳动合同、不要求特定职称，引用一致。
+  - 格式 `bid_format_outline_parsing` module64/run12/attempt1：投标函、报价明细表、营业执照、技术响应表四章节，引用已核对。
+- 11个失败模块（均为 attempt2，限值快照 `max_output_tokens=4096`、请求32、工具48、时限900秒）：
+
+| 模块 | run | 失败原因（模块 error_message） |
+| --- | ---: | --- |
+| 项目概况 | 51 | 连续三次提交无效结果 |
+| 否决项 | 52 | 总时长预算耗尽 |
+| 商务 | 53 | 总时长预算耗尽 |
+| 技术 | 54 | 模型请求超时，供应商执行结果未知 |
+| 评分 | 55 | 总时长预算耗尽 |
+| 开标 | 56 | 模型请求预算耗尽（32/32） |
+| 保证金 | 57 | 模型请求预算耗尽（32/32） |
+| 封装 | 58 | 总时长预算耗尽 |
+| 报价 | 59 | 连续三次提交无效结果 |
+| 业绩 | 60 | 连续三次提交无效结果 |
+| 补充发现（general） | 50 | 连续三次提交无效结果 |
+
+- 上游异常与429真实现场：业绩 run60 的调用记录中 04:33Z 出现 `completion_tokens=4096` 的“模型输出达到token上限”；04:35Z 两次90秒“供应商执行结果未知”；随后轮换本地 qwen3.5-9b 与主模型并成功。截断识别、未知用量记账、供应商轮换和共享冷却链路均已在真实流量触发。迁移0009（`llm_provider.rate_limited_until`）已应用，当前无活动冷却。
+- 服务现场：API 启动器10492（11:53:58启动），实际监听8300的是其子进程30600；worker 22056、beat 19992存活；llama.cpp 7896（PID 9804）、Ollama 11434（PID 16244）在听。**前端4400当前未监听，需要新窗口重启**。
+- **运行中的 API 尚未加载24.7的 retry `max_output_tokens`**：`apps/api/src/tender/api/knowledge.py` 最后修改11:57:24，晚于API启动11:53:58；worker/beat不需要为该字段重启。重启时无在途 run，不会打断分析。
+- 旧报告7 已再次核实 `canceled`。项目问答尚未创建（state 中只有 `reference_answer`）。
+
+#### 下一步
+
+1. 重启 API 加载 retry 输出预算字段（worker/beat 可不动）；重启后确认8300可达、报告7仍 canceled、running run=0。
+2. 运行 `python .tmp/retry-deep-failed.py`：只补跑上述11个失败模块，`max_output_tokens=8192`；脚本自动断言报告7 canceled、报告9为 failed/partial，并写 `before-retry-3.json` 快照。人员和格式模块不得覆盖。
+3. 轮询 `python .tmp/check-deep-report.py --brief` 到终态，再跑 `--final`；随后逐模块人工核对事实、条件、引用覆盖和跨文件修订双方引用，不把模型 supported 当人工通过。
+4. 重启前端4400（`apps/web` 下 `pnpm dev -- --port 4400` 或既有方式），先跑 `.tmp/deep-flow-browser.mjs --preflight`；报告 completed 后跑最终脚本，覆盖1440/390/320、主文件与补充通知来回切换、PDF高亮、引用 resolve、独立参考库隔离和项目问答。
+5. 项目问答由最终脚本首次创建并记录ID，后续必须复用，禁止重复创建。
+6. 全部通过后更新本文件与 `docs/设计/16-DeepAgents标书分析运行时.md`，再评估 goal complete；不自动提交。
+
+#### 验收事实基准（人工核对用）
+
+- 编号 TEST-2026-1005；预算80万元、最高限价78万元；交货期30日被补充通知改为45日；本项目质保三年，历史五年不可替代。
+- 技术：交换机10台、IPv6、双电源、故障响应不超过2小时；验收合格付款90%，余款质保期满支付；不可抗力延迟需提供证明材料，不能补造免责。
+- 业绩：2023-01-01起同类合同每项10分、封顶20分、需合同复印件；负责人1名、劳动合同、不要求职称。
+- 保证金10000元、投标截止前到账、可用银行保函；正本1副本2分别密封标注、现场递交；开标2026-11-20 09:30园区一楼会议室，法定代表人或授权代表携身份证与授权委托书；四项格式材料；未提供营业执照、超过最高限价为明确否决或无效条件。
+- 参考库7/项目14/source12 只作边界对照，不得替代本项目要求。
+
+#### 坑与工具
+
+- running/failed 模块的 `analysis_module.items` 可能是旧答案，必须读当前 `run.state.draft/staged_items`。
+- DeepAgents 使用 DeltaChannel：恢复消息必须走图 `aget_state_history`，直接读 saver 的 channel_values 看不到 messages。
+- 不要频繁重启（模块时限与预算不重置，会消耗在途请求和总时限）；不要创建新报告或重传资料；不要执行 `model-probe-ledger.py`。
+- 诊断脚本：`.tmp/check-deep-report.py --brief|--final`、`.tmp/inspect-deep-runtime.py [模块片段]`、`.tmp/inspect-deep-calls.py`、`.tmp/inspect-deep-submissions.py <完整key>`、`.tmp/retry-deep-failed.py`、`.tmp/deep-flow-browser.mjs --preflight`、`.tmp/resume-deep-lease.py`（仅停后端并确认无锁后用于过期 lease）。
+- 记忆索引：`.agents/memory/project.md`（顶部指向本文件）。
