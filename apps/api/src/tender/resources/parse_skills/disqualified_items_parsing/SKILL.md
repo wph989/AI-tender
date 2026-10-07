@@ -7,8 +7,8 @@ description: "废标项解析专家。从招标文件中提取废标条件、否
 
 ## 适用场景
 - 触发：主 Agent 委派废标项解析任务时调用。
-- 输入：归一化 Markdown 文件，由运行时文件清单和受限工具提供。
-- 输出：废标项结构化列表（markdown 格式），直接作为最终回复返回，由父级代码统一入库。
+- 输入：授权资料清单与按需检索得到的原文块，不预先灌入全文。
+- 输出：submit_analysis 原生工具中的动态 JSON 条目，每条附已读取原文块的引用。
 
 ## 领域知识
 
@@ -32,37 +32,42 @@ description: "废标项解析专家。从招标文件中提取废标条件、否
 
 ## 执行流程
 
-1. **精确检索**：使用 `grep` 搜索"废标""否决投标""投标无效"等相关章节标题
-2. **扩展上下文**：根据命中位置使用 `read_file` 读取完整条款；资格审查为列表时，必须覆盖列表起点、全部子项和列表后的结论句
+1. **精确检索**：使用 `search_document` 搜索"废标""否决投标""投标无效"等相关章节标题
+2. **扩展上下文**：根据命中位置使用 `read_document` 读取完整条款；资格审查为列表时，必须覆盖列表起点、全部子项和列表后的结论句
 3. **后果验证**：确认每条候选存在明确后果；列表后的“资格审查不通过则否决”等结论必须继承到列表中的每一项
 4. **逐项分类**：先把资格、证照、业绩、人员、财务等复合条件拆成可独立核验的废标项，再按五类互斥归类
-5. **输出结果**：按规范格式生成完整 Markdown，直接作为最终回复返回，由父级代码统一入库
+5. **输出结果**：按本 Skill 的输出协议调用 submit_analysis；没有依据的条目省略。
 
-## 输出规范
+## 输出协议
 
-- 输出格式已拆分到 `references/output_format.md`。
-- 执行输出前必须读取并严格遵循该文件中的专属模板和输出细节。
-- 命中规则时，结果正文只能包含按专属模板整理的实际废标项，禁止附加解释性说明。
-- `主体资格类` 必须逐项写明具体资格门槛及不满足情形，禁止用“资格审查不通过将废标”等概括句替代明细。
-- 未命中任何明确废标、否决、无效或不予受理条款时，结果正文只能是 `无相关内容`，禁止补充判断原因、检索过程或风险提示。
+通过原生工具调用 `submit_analysis(items, relations, research_summary)` 提交结果。
+每条 item 包含 kind、title、text、presentation、cells、citations；kind 可为 fact、judgment、suggestion、conflict、insufficient。
+presentation 使用 paragraph、list、table；cells 为文字键值，每个表格行或列表项分别成项。
+引用使用 {"block_id":"工具实际返回的块ID","quote":"块内连续原文"}；不能引用 Skill、压缩摘要或常识。
+没有相关依据可提交空 items，但 research_summary 必须说明检索过的主题、缺口与不确定性。
+补充文件明确修改条款时保留修改前后双方引用；参考库内容只作建议，不能替代本项目要求。
 
 ## 参考文件（按标类型加载）
-根据当前项目的标类型（bid_type），加载对应子目录下的参考文件：
+根据任务 category 及 lots 中的类别覆盖，加载对应子目录下的参考文件：
 - `references/output_format.md`：本 Skill 专属输出模板和格式约束
 - `references/<type_dir>/extraction_rules.md`：详细的提取规则、分类编码、关键词种子清单、严禁行为、边界案例处理、自检清单
 - `references/<type_dir>/examples.md`：输入原文 → 期望输出的完整样例
-- bid_type 取值：service（服务类）、engineering（工程类）、goods（货物类）
-- 如无法确定标类型，默认加载 service 目录
+- category 取值：service（服务类）、engineering（工程类）、goods（货物类）；type_dir 使用相同值
+- 类别由用户选择并由运行时提供；不能自行默认成服务类，标段有覆盖类别时同时参考对应规则
 
-## 工具
-- `grep`：在归一化 Markdown 中精确检索；具体路径、glob 和输出模式由运行时上下文与工具护栏约束
-- `read_file`：围绕命中位置分页扩展读取上下文
-- `list_extracted_files`：列出当前任务可用 Markdown 文件
-- 无保存工具：模块结果直接作为最终回复返回，无相关内容也必须在最终回复正文中返回
+## 工具与证据
+
+- `list_documents()`：获取本项目及关联知识库的授权资料清单。
+- `search_document(query, source_id?)`：自主检索项目条款，可限定清单中的某个来源。
+- `search_knowledge(query, source_id?)`：检索关联参考库，历史依据不能证明本次满足要求。
+- `read_document(source_id, offset, limit)`：按命中位置扩展原文，每次最多12块；压缩后也可补读。
+- `read_file(file_path)`：只读 `/skills/disqualified_items_parsing/SKILL.md` 及其 references，或会话压缩历史。
+- `submit_analysis`：提交本模块综合结果和检索总结。相同命中先去重，再分析条件、例外与修订。
+不进行全文顺序扫描；基于本专题问题选择检索角度，核对各份相关补充文件。
 
 ## 注意
 - 废标项是投标合规的底线要求，必须**完整提取，不得遗漏**
 - 后置否决结论只用于证明前置清单具有否决效力，不能代替前置清单本身
 - 注意区分"废标项"（强制性）和"评分项"（加分/扣分）
-- 执行前必须阅读 `references/extraction_rules.md` 中的关键词种子清单和严禁行为
+- 执行前阅读对应类别 `references/<type_dir>/extraction_rules.md` 中的关键词种子清单和严禁行为
 - 同一废标情形只能归入一个最匹配类别，不得重复

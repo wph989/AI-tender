@@ -61,13 +61,15 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     return () => { ++loadSequence.current; locateAbort.current?.abort(); };
   }, [projectId, reload]);
   const running = state?.reports.some((r) => ["waiting", "pending", "running"].includes(r.status)) ?? false;
+  const processingFiles = state?.sources.some((source) => source.state === "processing") ?? false;
   useEffect(() => {
-    if (!running) return;
+    if (!running && !processingFiles) return;
     const timer = setInterval(() => { void reload().catch((e: Error) => setError(e.message)); }, 3000);
     return () => clearInterval(timer);
-  }, [running, reload]);
+  }, [running, processingFiles, reload]);
 
-  const refs = useMemo(() => [...(report?.modules.flatMap((m) => m.items.flatMap((i) => i.citations)) ?? []), ...answerRefs], [report, answerRefs]);
+  // 失败补跑仍保留旧结果用于审计，页面只使用已完成模块，避免旧结论混入新一轮定位。
+  const refs = useMemo(() => [...(report?.modules.filter((m) => m.status === "completed").flatMap((m) => m.items.flatMap((i) => i.citations)) ?? []), ...answerRefs], [report, answerRefs]);
   const locate = useCallback(async (ref: Citation) => {
     locateAbort.current?.abort();
     const controller = new AbortController(); locateAbort.current = controller;
@@ -111,7 +113,8 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
           </div>)}</fieldset>}
           <label className="block"><input type="checkbox" checked={allowPartial} onChange={(e) => setAllowPartial(e.target.checked)} /> 文件未全部就绪时，先分析可用材料并标明缺失</label>
           <div className="source-coverage">{state?.sources.map((source) => <span key={source.source_id} data-state={source.state} title={source.error_message ?? source.file_name}><span className="truncate">{source.file_name}</span><b>{STATE_LABELS[source.state] ?? source.state}</b></span>)}</div>
-          {collections.length > 0 && <fieldset><legend>问答可参考的知识库</legend><p className="mb-2 text-xs text-slate-500">综合报告以本项目材料为依据；关联资料用于问答中的补充参考。</p><div className="flex flex-wrap gap-4">{collections.map((collection) => <label key={collection.id}><input type="checkbox" disabled={busy} checked={linked.includes(collection.id)} onChange={(e) => {
+          {state?.sources.filter((source) => ["failed", "partial"].includes(source.state)).map((source) => <div key={source.source_id} className="notice"><span>{source.file_name}：{source.error_message ?? "原文未完整解析"}</span><button className={BUTTON_CLASS} disabled={busy} onClick={() => void perform(() => knowledgeRequest("/knowledge/sources/" + source.source_id + "/process", "POST", {}))}>重新处理</button></div>)}
+          {collections.length > 0 && <fieldset><legend>分析与问答参考知识库</legend><p className="mb-2 text-xs text-slate-500">关联资料可供各专题和问答检索参考；本项目要求仍以项目材料为依据。</p><div className="flex flex-wrap gap-4">{collections.map((collection) => <label key={collection.id}><input type="checkbox" disabled={busy} checked={linked.includes(collection.id)} onChange={(e) => {
             const next = e.target.checked ? [...linked, collection.id] : linked.filter((i) => i !== collection.id);
             void perform(async () => { await knowledgeRequest("/projects/" + projectId + "/knowledge/collections", "PUT", { collection_ids: next }); setLinked(next); });
           }} /> {collection.name}</label>)}</div></fieldset>}
@@ -129,20 +132,23 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                 {state?.reports.map((r) => <option key={r.id} value={r.id}>报告 #{r.id} · {STATE_LABELS[r.status] ?? r.status}</option>)}
               </select>
             </div>
-            {report.coverage.total_blocks ? <p className="mb-3 text-sm text-slate-500">全文阅读覆盖：{report.coverage.scanned_blocks} / {report.coverage.total_blocks} 个原文块</p> : null}
+            {report.coverage.mode === "agent_research" ? <p className="mb-3 text-sm text-slate-500">已完成 {report.modules.filter((m) => m.status === "completed").length} / 13 个专题 · 各专题独立检索并核对依据</p> : report.coverage.total_blocks ? <p className="mb-3 text-sm text-slate-500">全文阅读覆盖：{report.coverage.scanned_blocks} / {report.coverage.total_blocks} 个原文块</p> : null}
             {report.coverage.partial && <p className="notice mb-3">本报告覆盖不完整，请在范围设置中核对缺失或部分解析的文件。</p>}
             {report.status === "waiting" && <p className="notice mb-3">正在等待本次全部文件可用。请到文件管理查看失败原因；需要先分析可用材料时，可取消本次任务后勾选部分分析。</p>}
             {report.error_message && <p role="alert" className="notice mb-3">{report.error_message}</p>}
             {["waiting", "pending", "running"].includes(report.status) && <button className={BUTTON_CLASS + " mb-3"} disabled={busy} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/cancel", "POST", {}))}>取消任务</button>}
-            {report.status === "failed" && <button className={BUTTON_CLASS + " mb-3"} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", {}))}>重试分析</button>}
+            {["failed", "partial"].includes(report.status) && report.modules.some((module) => ["failed", "canceled"].includes(module.status)) && <button className={BUTTON_CLASS + " mb-3"} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", {}))}>补跑未完成模块</button>}
+            {report.status === "failed" && !report.modules.length && <button className={BUTTON_CLASS + " mb-3"} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", {}))}>重试分析</button>}
+            {!!report.summary?.length && <details className="report-module mb-4"><summary className="cursor-pointer text-sm font-medium">综合条目 · {report.summary.length} 项</summary><p className="my-3 text-xs text-slate-500">合并重复事项，保留各份来源与不同结论。详细专题见下方。</p><ReportItems items={report.summary.map((item) => ({ ...item, id: "summary-" + item.id }))} activeId={activeItem} onLocate={(ref) => void locate(ref)} /></details>}
             {report.modules.map((module) => <section key={module.id} className="report-module"><div className="report-module-heading"><h3>{module.title}</h3><span>{STATE_LABELS[module.status] ?? module.status}</span></div>
+              {!!module.runs?.length && <details className="mb-3 text-xs text-slate-500"><summary className="cursor-pointer">运行记录 · 第 {module.runs.at(-1)?.attempt} 次</summary><ul className="mt-2 space-y-2">{module.runs.map((run) => <li key={run.id}>第 {run.attempt} 次 · {STATE_LABELS[run.status] ?? run.status} · 模型请求 {run.model_calls}/{run.limits.max_model_calls} · 工具调用 {run.tool_calls}/{run.limits.max_tool_calls} · 单次输出上限 {run.limits.max_output_tokens} token{run.started_at && <> · 开始于 {new Date(run.started_at).toLocaleTimeString("zh-CN")}</>}{run.error_message && <p className="mt-1 text-red-600">{run.error_message}</p>}</li>)}</ul></details>}
               {module.status === "failed" ? <div className="notice"><span>{module.error_message}</span><button className={BUTTON_CLASS} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", { module_keys: [module.module_key] }))}>补跑本模块</button></div>
-                : module.items.length ? <ReportItems items={module.items} activeId={activeItem} onLocate={(ref) => void locate(ref)} /> : <p className="py-3 text-sm text-slate-500">{module.status === "completed" ? "当前材料中未找到该主题的明确要求。" : "正在阅读与核对原文…"}</p>}
+                : module.status === "completed" && module.items.length ? <ReportItems items={module.items} activeId={activeItem} onLocate={(ref) => void locate(ref)} /> : <p className="py-3 text-sm text-slate-500">{module.status === "completed" ? "当前检索未找到该主题的明确要求。" : module.status === "pending" ? "排队等待分析…" : module.status === "canceled" ? "本模块已停止。" : "正在检索与核对原文…"}</p>}
             </section>)}
           </>}
         </section>
         <aside className="analysis-document">{selected ? <CitationViewer key={selected.version_id + ":" + selected.parse_run_id} selected={selected} citations={refs.includes(selected) ? refs : [...refs, selected]} onReverse={(ref) => {
-          const item = report?.modules.flatMap((m) => m.items).find((i) => i.citations.some((r) => r.source_id === ref.source_id && r.element_id === ref.element_id));
+          const item = report?.modules.filter((m) => m.status === "completed").flatMap((m) => m.items).find((i) => i.citations.some((r) => r.source_id === ref.source_id && r.element_id === ref.element_id));
           if (item) { setTab("report"); setActiveItem(item.id); setMobileDocument(false); setTimeout(() => document.getElementById("report-item-" + item.id)?.scrollIntoView({ block: "center" }), 0); }
         }} /> : <div className="empty-state"><Icon name="book" size={32} /><h3>原文就在结论旁边</h3><p>点击报告或回答中的引用，查看对应文件、页码和高亮位置。</p></div>}</aside>
       </div>

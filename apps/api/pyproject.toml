@@ -31,6 +31,10 @@ dependencies = [
     "pillow>=12.3",
     # 供应商密钥加密（Fernet）：主密钥来自 LLM_SECRET_KEYS，见 core/secrets.py。
     "cryptography>=43.0",
+    "deepagents==0.7.22",
+    "langchain-openai>=1.1,<2",
+    "langgraph-checkpoint-postgres>=3,<4",
+    "psycopg-pool>=3.2,<4",
 ]
 
 [dependency-groups]

@@ -125,6 +125,59 @@ def test_rate_limit_preserves_retry_after_without_echoing_body():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("content", [None, "", "  "])
+def test_empty_json_body_can_be_corrected_without_using_reasoning(content):
+    from tender.domain.errors import InvalidModelOutput
+
+    async def run():
+        payload = {"choices": [{"finish_reason": "length", "message": {
+            "content": content, "reasoning_content": '{"items":[]}',
+        }}]}
+        async with httpx.AsyncClient(
+            base_url="http://test/",
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload)),
+        ) as client:
+            model = OpenAIChatModel("http://test", "fixture", client=client)
+            with pytest.raises(InvalidModelOutput, match="空文本"):
+                await model.complete("测试")
+            # 普通文本业务不采用 JSON 纠正；推理字段即使像合法结果也不能作为正式正文。
+            with pytest.raises(ExtractionFailed) as caught:
+                await model.complete("测试", json_mode=False)
+            assert not isinstance(caught.value, InvalidModelOutput)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "content,accepted",
+    [
+        ('```json\n{"金额":"80万元"}\n```', True),
+        ('```\r\n{"金额":"80万元"}\r\n```', True),
+        ('说明文字\n```json\n{"金额":"80万元"}\n```', False),
+        ('```json\n{"金额":"80万元"}\n```\n附言', False),
+        ('```json\n{"金额":\n```', False),
+        ('```json\n{"金额":NaN}\n```', False),
+    ],
+)
+def test_only_complete_json_fences_are_unwrapped(content, accepted):
+    async def run():
+        payload = {"choices": [{"message": {"content": content}}]}
+        async with httpx.AsyncClient(
+            base_url="http://test/",
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload)),
+        ) as client:
+            model = OpenAIChatModel("http://test", "fixture", client=client)
+            if accepted:
+                assert json.loads((await model.complete("测试")).content) == {"金额": "80万元"}
+            else:
+                with pytest.raises(ExtractionFailed):
+                    await model.complete("测试")
+            # 普通文本模式须保留原响应，不能因为看起来像 JSON 就改写用户文本。
+            assert (await model.complete("测试", json_mode=False)).content == content
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     "rows",
     [

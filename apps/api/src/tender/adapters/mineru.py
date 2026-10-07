@@ -101,6 +101,9 @@ class MinerUParser:
             raise ParseFailed("PDF 存储键不能为空")
 
         filename = PurePosixPath(pdf_key.replace("\\", "/")).name or "document.pdf"
+        # 对象存储按哈希寻址，键名未必带扩展名；MinerU 按文件名判断类型，MIME 不足以替代后缀。
+        if not filename.lower().endswith(".pdf"):
+            filename += ".pdf"
         provider_job_id, provider_version = await self._start_job(
             pdf_key,
             filename,

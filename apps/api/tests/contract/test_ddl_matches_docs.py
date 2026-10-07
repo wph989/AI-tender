@@ -58,6 +58,13 @@ class _MigrationSpec:
 
 
 _MIGRATIONS: tuple[_MigrationSpec, ...] = (
+    _MigrationSpec(
+        "0009_provider_cooldown.py",
+        (("设计/16-DeepAgents标书分析运行时.md", 1),),
+        require_tables=False,
+        require_indexes=False,
+    ),
+    _MigrationSpec("0008_deepagents_runtime.py", (("设计/16-DeepAgents标书分析运行时.md", 0),)),
     _MigrationSpec("0001_initial_schema.py", _SOURCES_0001),
     _MigrationSpec("0002_storage_and_jobs.py", _SOURCES_0002),
     _MigrationSpec("0003_llm_management.py", _SOURCES_0003),

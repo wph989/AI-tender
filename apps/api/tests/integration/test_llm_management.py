@@ -45,6 +45,8 @@ def env():
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             for statement in module._STATEMENTS:
+                # 0008 有显式 schema，测试必须重命名它，不能触碰业务 checkpoint 空间。
+                statement = statement.replace("SCHEMA agent_runtime", f"SCHEMA {schema}_agents")
                 c.execute(text(statement))
         facade = SimpleNamespace(connect=lambda: nullcontext(c), begin=lambda: nullcontext(c))
         request = SimpleNamespace(

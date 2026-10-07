@@ -87,9 +87,11 @@ class KnowledgeStore:
             """SELECT s.id AS source_id, k.id AS collection_id, k.purpose,
             p.id AS project_id, f.id AS project_file_id, f.display_name AS file_name,
             f.role, f.is_parseable, f.sha256, f.version_id,
-            r.id AS parse_run_id, r.status AS parse_status, r.error_message,
+            r.id AS parse_run_id, r.status AS parse_status,
+            COALESCE(failure.error_message, r.error_message) AS error_message,
             r.page_count AS parsed_pages, v.page_count,
             active.id AS active_job_id, active.stage AS active_stage,
+            failure.status AS processing_status,
             idx.id AS index_id, idx.status AS index_status, idx.embedding_signature,
             idx.embedding_model_id, idx.dimension, idx.error_message AS index_error
             FROM knowledge_source s JOIN knowledge_collection k ON k.id = s.collection_id
@@ -102,6 +104,10 @@ class KnowledgeStore:
                 AND stage IN ('probing','converting','submitting','parsing')
                 AND status IN ('pending','running','submitting') AND finished_at IS NULL
                 ORDER BY created_at DESC LIMIT 1) active ON true
+            LEFT JOIN LATERAL (SELECT status,error_message FROM job
+                WHERE project_file_id=f.id
+                  AND stage IN ('probing','converting','submitting','parsing')
+                ORDER BY created_at DESC,id DESC LIMIT 1) failure ON true
             LEFT JOIN LATERAL (SELECT * FROM knowledge_index
                 WHERE source_id = s.id AND run_id = r.id ORDER BY id DESC LIMIT 1) idx ON true
             WHERE k.id = ANY(:ids) AND k.company_id = :company_id AND p.company_id = :company_id
@@ -205,7 +211,8 @@ class KnowledgeStore:
                     row["base_url"],
                     row["protocol"],
                     row["api_mode"],
-                    row["config_revision"],
+                    row["embedding_space_id"],
+                    row["parameters"],
                 ]
             )
         }
@@ -224,6 +231,9 @@ def source_state(source: dict) -> str:
         return "unsupported"
     if source.get("active_job_id"):
         return "processing"
+    # 转换或提交失败可能尚无 parse_run，必须回显最新文件处理错误，不能一直显示待处理。
+    if source.get("processing_status") in {"failed", "canceled"}:
+        return "failed"
     if source.get("parse_status") == "completed":
         return "ready"
     if source.get("parse_status") == "partial":

@@ -21,6 +21,8 @@ class Completion:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     registry_model_id: int | None = None
+    # Agent 消息单独保留工具调用及供应商元数据，不能塞进普通 JSON 正文冒充工具协议。
+    agent_message: dict | None = None
 
 
 class StructuredTextModel(Protocol):
@@ -41,6 +43,10 @@ class ChatGateway(StructuredTextModel, Protocol):
     async def complete(
         self, prompt: str, *, images: tuple[ModelImage, ...] = (), json_mode: bool = True
     ) -> Completion: ...
+
+    async def chat(self, messages: list[dict], tools: list[dict]) -> Completion:
+        """原生多轮工具调用；消息为可持久化的中立字典，不携带连接或凭证。"""
+        ...
 
     async def list_models(self) -> list[str]:
         """读取供应商侧的模型 id 列表，仅用于页面勾选导入。"""

@@ -15,7 +15,9 @@ from tender.api.common import engine, project_row
 from tender.api.errors import ApiProblem
 from tender.api.parsing import ParseRequest, _create_parse_job
 from tender.api.project_files import _role_is_parseable
+from tender.application.agent_runtime import limits_snapshot
 from tender.application.analysis_skills import MODULES, skill_snapshot, skill_version
+from tender.application.deep_analysis import CONTRACT, RUNTIME_VERSION, validate_project_claims
 from tender.application.knowledge import CATEGORIES, TOPICS
 from tender.application.knowledge_retrieval import retrieve_chunks
 from tender.application.knowledge_store import (
@@ -63,6 +65,7 @@ class AnalysisInput(StrictModel):
 
 class RetryInput(StrictModel):
     module_keys: list[str] = Field(default_factory=list, max_length=13)
+    max_output_tokens: int | None = Field(default=None, ge=512, le=16384)
 
 
 class AskInput(StrictModel):
@@ -152,9 +155,20 @@ def create_collection(payload: CollectionInput, request: Request) -> dict:
 def get_collection(collection_id: int, request: Request) -> dict:
     collection = collection_or_404(request, collection_id)
     embedding = store(request).embedding_config()
+    sources = public_sources(request, [collection_id])
+    for source in sources:
+        source["semantic_ready"] = bool(
+            embedding
+            and source["index_status"] == "completed"
+            and source["embedding_signature"] == embedding["signature"]
+            and source["dimension"]
+        )
+        source["needs_reindex"] = bool(
+            embedding and source["index_status"] == "completed" and not source["semantic_ready"]
+        )
     return {
         **collection,
-        "sources": public_sources(request, [collection_id]),
+        "sources": sources,
         "embedding_configured": embedding is not None,
         "embedding_model": embedding["model_id"] if embedding else None,
     }
@@ -231,6 +245,7 @@ async def search_collection(
         q,
         lambda: None,
         create_embedding_gateway,
+        embedding_timeout=15,
     )
     for hit in hits:
         hit.pop("embedding", None)
@@ -432,6 +447,14 @@ def start_analysis(project_id: int, payload: AnalysisInput, request: Request) ->
                 if exc.code not in {"process_in_flight", "parse_in_flight"}:
                     raise
     rules = skill_snapshot()
+    rules["__deep_contract__"] = CONTRACT
+    db = store(request)
+    references = [
+        s
+        for s in db.sources(db.collections_for_project(project_id))
+        if s["project_id"] != project_id
+    ]
+    runtime_settings = limits_snapshot(db)
     with engine(request).begin() as connection:
         connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": project_id})
         active = connection.execute(
@@ -445,10 +468,12 @@ def start_analysis(project_id: int, payload: AnalysisInput, request: Request) ->
             connection.execute(
                 text("""INSERT INTO analysis_report
             (project_id,company_id,allow_partial,category,topics,lot_settings,source_snapshot,
-             skill_version,skill_snapshot)
+             skill_version,skill_snapshot,runtime_version,runtime_settings,reference_snapshot)
             VALUES (:project,:company,:partial,:category,
                     CAST(:topics AS JSONB),CAST(:lots AS JSONB),
-                    CAST(:sources AS JSONB),:skill,CAST(:rules AS JSONB)) RETURNING id,status"""),
+                    CAST(:sources AS JSONB),:skill,CAST(:rules AS JSONB),:runtime,
+                    CAST(:runtime_settings AS JSONB),CAST(:references AS JSONB))
+                    RETURNING id,status"""),
                 {
                     "project": project_id,
                     "company": settings.company_id(),
@@ -459,6 +484,9 @@ def start_analysis(project_id: int, payload: AnalysisInput, request: Request) ->
                     "sources": encode(state["sources"]),
                     "skill": skill_version(rules),
                     "rules": encode(rules),
+                    "runtime": RUNTIME_VERSION,
+                    "runtime_settings": encode(runtime_settings),
+                    "references": encode(references),
                 },
             )
             .mappings()
@@ -520,16 +548,36 @@ def get_report(report_id: int, request: Request) -> dict:
     modules = db.rows(
         "SELECT * FROM analysis_module WHERE report_id=:id ORDER BY id", {"id": report_id}
     )
+    allowed = db.collections_for_project(report["project_id"])
     for module in modules:
-        module["items"] = visible_items(db, module["items"])
+        module["items"] = visible_items(db, module["items"], allowed)
         # 工具日志只供服务端重放，不在产品界面暴露整段中间提示词。
         module.pop("trace", None)
+    if report.get("runtime_version", "legacy") != "legacy":
+        runs = db.rows(
+            """SELECT a.id,a.module_id,a.attempt,a.thread_id,a.status,a.started_at,
+            a.deadline_at,a.finished_at,a.lease_until,a.model_calls,a.tool_calls,
+            a.prompt_tokens,a.completion_tokens,a.limits,a.error_message
+            FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
+            WHERE m.report_id=:id AND a.company_id=:company_id ORDER BY a.attempt""",
+            {"id": report_id},
+        )
+        for module in modules:
+            module["runs"] = [r for r in runs if r["module_id"] == module["id"]]
+        report["summary"] = visible_items(db, report["summary"], allowed)
     current = analysis_status(report["project_id"], request)
     stale = (
         source_signature(current["sources"]) != source_signature(report["source_snapshot"])
         or current["analysis_category"] != report["category"]
         or current["analysis_topics"] != report["topics"]
         or current["lots"] != report["lot_settings"]
+        or (
+            report.get("runtime_version", "legacy") != "legacy"
+            and source_signature(
+                [s for s in db.sources(allowed) if s["project_id"] != report["project_id"]]
+            )
+            != source_signature(report["reference_snapshot"])
+        )
     )
     return {**report, "modules": modules, "stale": stale}
 
@@ -538,11 +586,37 @@ def get_report(report_id: int, request: Request) -> dict:
 def cancel_report(report_id: int, request: Request) -> dict:
     report_row(request, report_id)
     store(request).execute(
-        """UPDATE analysis_report SET status='canceled',finished_at=now()
+        """UPDATE analysis_report SET status='canceled',finished_at=now(),lease_until=NULL
         WHERE id=:id AND company_id=:company_id AND status IN ('waiting','pending','running')""",
         {"id": report_id},
     )
-    return {"status": "canceled"}
+    return {"status": report_row(request, report_id)["status"]}
+
+
+@router.get("/analysis/reports/{report_id}/runs/{run_id}/events")
+def run_events(
+    report_id: int,
+    run_id: int,
+    request: Request,
+    after: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=200),
+) -> dict:
+    report_row(request, report_id)
+    db = store(request)
+    runs = db.rows(
+        """SELECT a.id FROM agent_module_run a
+        JOIN analysis_module m ON m.id=a.module_id
+        WHERE a.id=:run AND m.report_id=:report AND a.company_id=:company_id""",
+        {"run": run_id, "report": report_id},
+    )
+    if not runs:
+        raise ApiProblem(404, "not_found", "模块运行记录不存在")
+    rows = db.rows(
+        """SELECT id,kind,detail,created_at FROM agent_run_event
+        WHERE run_id=:run AND id>:after ORDER BY id LIMIT :limit""",
+        {"run": run_id, "after": after, "limit": limit},
+    )
+    return {"events": rows, "next_after": rows[-1]["id"] if rows else after}
 
 
 @router.post("/analysis/reports/{report_id}/retry", status_code=202)
@@ -555,6 +629,12 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
         raise ApiProblem(400, "invalid_module", "未知解析模块")
     with engine(request).begin() as connection:
         connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": report["project_id"]})
+        # 并发点击补跑只能有一个请求创建新 attempt，不能重复重置预算。
+        current_status = connection.execute(
+            text("SELECT status FROM analysis_report WHERE id=:id FOR UPDATE"), {"id": report_id}
+        ).scalar_one()
+        if current_status not in {"partial", "failed"}:
+            raise ApiProblem(409, "report_not_retryable", "任务已进入执行，请勿重复补跑")
         other = connection.execute(
             text("""SELECT id FROM analysis_report WHERE project_id=:project
             AND id<>:id AND status IN ('waiting','pending','running')"""),
@@ -562,17 +642,89 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
         ).first()
         if other:
             raise ApiProblem(409, "analysis_in_flight", "项目已有其它分析任务")
-        connection.execute(
-            text("""UPDATE analysis_module SET status='pending',error_message=NULL
-            WHERE report_id=:id AND module_key=ANY(:keys) AND status='failed' """),
-            {"id": report_id, "keys": keys},
+        retried = (
+            connection.execute(
+                text("""UPDATE analysis_module SET status='pending',error_message=NULL
+            WHERE report_id=:id AND module_key=ANY(:keys) AND status IN ('failed','canceled')
+            RETURNING id"""),
+                {"id": report_id, "keys": keys},
+            )
+            .scalars()
+            .all()
+        )
+        if report.get("runtime_version", "legacy") != "legacy":
+            limits = dict(report["runtime_settings"])
+            if payload.max_output_tokens is not None:
+                limits["max_output_tokens"] = payload.max_output_tokens
+            # 新attempt可以显式调整输出上限，旧报告快照及运行账不回写。
+            for module_id in sorted(retried):
+                attempt = connection.execute(
+                    text(
+                        "SELECT COALESCE(max(attempt),0)+1"
+                        " FROM agent_module_run WHERE module_id=:id"
+                    ),
+                    {"id": module_id},
+                ).scalar_one()
+                previous_state = (
+                    connection.execute(
+                        text(
+                            "SELECT state FROM agent_module_run WHERE module_id=:id "
+                            "ORDER BY attempt DESC LIMIT 1"
+                        ),
+                        {"id": module_id},
+                    ).scalar_one_or_none()
+                    or {}
+                )
+                # 已通过结构/引文校验的草稿可接着做支持性验证，避免预算末尾失败后重复检索。
+                # 已完成后被质量拒绝的结果必须重新生成，不能携带旧verified绕过新的校验。
+                carry = (
+                    previous_state
+                    if (previous_state.get("draft") or previous_state.get("staged_items"))
+                    and not previous_state.get("verified")
+                    else {}
+                )
+                if carry:
+                    carry.pop("items_verified", None)
+                    # 新attempt保留成果和证据，但不能继承旧调用ID缓存与纠错次数。
+                    carry.pop("tool_results", None)
+                    carry.pop("invalid_submissions", None)
+                    try:
+                        validate_project_claims(
+                            carry.get("draft", {}).get("items", carry.get("staged_items", [])),
+                            report["project_id"],
+                        )
+                    except ValueError:
+                        carry = {}
+                connection.execute(
+                    text("""INSERT INTO agent_module_run
+                    (module_id,company_id,attempt,thread_id,limits,state)
+                    VALUES (:module,:company,:attempt,:thread,CAST(:limits AS JSONB),
+                            CAST(:state AS JSONB))"""),
+                    {
+                        "module": module_id,
+                        "company": settings.company_id(),
+                        "attempt": attempt,
+                        "thread": f"analysis:{report_id}:{module_id}:{attempt}",
+                        "limits": encode(limits),
+                        "state": encode(carry),
+                    },
+                )
+        # 全文扫描前失败的任务尚未固定可用解析批次，重试时重新等候原范围内的资料。
+        status = (
+            "pending"
+            if (
+                report["coverage"].get("total_blocks")
+                or report["coverage"].get("mode") == "agent_research"
+                and retried
+            )
+            else "waiting"
         )
         connection.execute(
-            text("""UPDATE analysis_report SET status='pending',lease_until=NULL,
+            text("""UPDATE analysis_report SET status=:status,lease_until=NULL,
             error_message=NULL,finished_at=NULL WHERE id=:id"""),
-            {"id": report_id},
+            {"id": report_id, "status": status},
         )
-    return {"id": report_id, "status": "pending"}
+    return {"id": report_id, "status": status}
 
 
 def enqueue_question(

@@ -1,25 +1,9 @@
-# 通用模块解析输出格式规范
+# 补充分析输出协议
 
-> TODO: 定义各模块解析结果的结构化格式（字段、类型、JSON Schema）。
-
-## 单模块结果
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| module_code | string | 模块编码 |
-| final_result | string | 最终解析结果 |
-| status | string | parsed / error |
-| source_files | array | 使用到的 Markdown 文件名 |
-| source_ranges | array | 引用来源范围，如文件名 + 行号范围 |
-| search_queries | array | 实际使用的检索词，便于复核召回情况 |
-
-## 保存字段（tender_interpretation_document）
-- tender_code
-- content_type（= module_code）
-- content_text（= final_result）
-- parse_status
-
-## 未找到内容
-如果当前模块没有在招标文件中找到明确依据，仍需在最终消息正文中返回结果，内容建议包含：
-- `## 未找到项`：列出未找到的字段或章节。
-- `## 检索说明`：列出尝试过的关键词种子、命中文件或未命中情况。
-- `## 后续建议`：说明需要人工确认或补充文件的事项。
+完成时调用 submit_analysis，参数包含 items、relations 和说明检索范围及缺口的 research_summary。
+条目字段为 kind（fact/judgment/suggestion/conflict/insufficient）、title、text、presentation（paragraph/list/table）、cells（可选文字键值）和 citations。
+每条独立引用：{"block_id":"实际读到的块ID","quote":"该块内连续原文"}。
+跨文件差异和冲突引用双方，前提不足的建议不能作为确定要求。
+表格每行、列表每项各是一个 item，不把整表放进 Markdown 字符串。
+关系字段为 subject、predicate、object、scope、condition、citations。保留真实标段、主体和且/或/例外条件。
+每条关系须有直接证据；无关系返回 relations=[]，无补充发现返回 items=[]。

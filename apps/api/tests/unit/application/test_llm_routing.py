@@ -10,19 +10,28 @@ from typing import Any
 import pytest
 
 from tender.application.llm_routing import CallRecord, ModelCandidate, RoutingModel
-from tender.domain.errors import ExtractionFailed, ExtractionUnavailable, ModelRefused, TenderError
+from tender.domain.errors import (
+    ExtractionFailed,
+    ExtractionUnavailable,
+    InvalidModelOutput,
+    ModelOutputTruncated,
+    ModelRefused,
+    TenderError,
+)
 from tender.ports.llm import ChatGateway, Completion
 
 
 class _ScriptedClient:
     """按脚本执行：脚本项是异常就抛出，否则返回成功补全。"""
 
-    def __init__(self, model: str, script: list[Any]) -> None:
+    def __init__(self, model: str, script: list[Any], prompts: list[str]) -> None:
         self.model = model
         self.script = script
+        self.prompts = prompts
         self.closed = False
 
     async def complete(self, prompt: str) -> Completion:
+        self.prompts.append(prompt)
         action = self.script.pop(0) if self.script else ExtractionFailed("脚本用尽")
         if isinstance(action, Exception):
             raise action
@@ -46,6 +55,7 @@ class _ScriptedGateway:
     def __init__(self, scripts: dict[str, list[Any]]) -> None:
         self._scripts = scripts
         self.created: list[str] = []
+        self.prompts: list[str] = []
 
     def __call__(
         self,
@@ -58,13 +68,13 @@ class _ScriptedGateway:
         max_tokens: int | None = None,
     ) -> ChatGateway:
         self.created.append(model)
-        return _ScriptedClient(model, list(self._scripts.get(model, [])))
+        return _ScriptedClient(model, list(self._scripts.get(model, [])), self.prompts)
 
 
 def _candidate(model: str, registry_id: int) -> ModelCandidate:
     return ModelCandidate(
         registry_model_id=registry_id,
-        provider_id=1,
+        provider_id=registry_id,
         display_name=model,
         model=model,
         base_url="http://gateway",
@@ -115,6 +125,53 @@ def test_all_unavailable_raises_unavailable_for_job_level_retry() -> None:
                 "b": [ExtractionUnavailable("限流", http_status=503)],
             },
         )
+
+
+def test_invalid_json_is_corrected_before_trying_an_unavailable_fallback():
+    completion, records, gateway = _run(
+        [_candidate("a", 1), _candidate("b", 2)],
+        {"a": [InvalidModelOutput("非法 JSON"), None], "b": [ExtractionUnavailable("超时")]},
+    )
+    assert completion.model == "a"
+    assert gateway.created == ["a"]
+    assert [record.status for record in records] == ["error", "ok"]
+    assert gateway.prompts[0] == "prompt"
+    assert "上次响应不符合 JSON 协议" in gateway.prompts[1]
+
+
+def test_invalid_json_exhausts_two_corrections_then_fails_over():
+    completion, records, _ = _run(
+        [_candidate("a", 1), _candidate("b", 2)],
+        {"a": [InvalidModelOutput("非法 JSON")] * 3, "b": [None]},
+    )
+    assert completion.model == "b"
+    assert [record.model_id for record in records] == [1, 1, 1, 2]
+
+
+def test_output_truncation_fails_over_without_repeating_same_output_budget():
+    completion, records, _ = _run(
+        [_candidate("a", 1), _candidate("b", 2)],
+        {"a": [ModelOutputTruncated("输出额度耗尽")], "b": [None]},
+    )
+    assert completion.model == "b"
+    assert [record.model_id for record in records] == [1, 2]
+
+
+def test_format_correction_does_not_reset_total_request_budget():
+    records = []
+    router = RoutingModel(
+        "analysis",
+        "analysis",
+        [_candidate("a", 1), _candidate("b", 2)],
+        _ScriptedGateway({name: [InvalidModelOutput("非法 JSON")] * 3 for name in "ab"}),
+        records.append,
+    )
+    from tender.application.analysis_skills import json_completion
+
+    with pytest.raises(ExtractionFailed):
+        asyncio.run(json_completion(router, "分析"))
+    assert len(records) == 6
+    assert len({record.invocation_id for record in records}) == 1
 
 
 def test_mixed_failure_raises_failed_so_field_goes_to_review() -> None:
@@ -169,7 +226,7 @@ def test_default_retries_try_a_a_b_b_c_c():
 def test_total_budget_prevents_starting_next_candidate():
     records = []
     gateway = _ScriptedGateway(
-        {"a": [ExtractionUnavailable("忙", http_status=429)] * 11, "b": [None]}
+        {"a": [ExtractionUnavailable("忙", http_status=503)] * 11, "b": [None]}
     )
     router = RoutingModel(
         "extract",
@@ -240,3 +297,189 @@ def test_retry_after_larger_than_deadline_stops_without_retry():
     with pytest.raises(ExtractionFailed, match="时间预算"):
         asyncio.run(router.complete("测试"))
     assert len(records) == 1
+
+
+def test_rate_limit_cooldown_avoids_repeated_requests_and_invalid_usage_is_recorded():
+    async def run():
+        records = []
+        invalid = InvalidModelOutput("无效输出", http_status=200)
+        invalid.prompt_tokens, invalid.completion_tokens = 7, 11
+        gateway = _ScriptedGateway(
+            {
+                "limited": [ExtractionUnavailable("限流", http_status=429)],
+                "fallback": [invalid, True, True],
+            }
+        )
+        model = RoutingModel(
+            "analysis",
+            "analysis",
+            [_candidate("limited", 1), _candidate("fallback", 2)],
+            gateway,
+            records.append,
+        )
+        try:
+            await model.complete("第一轮")
+            await model.complete("第二轮")
+        finally:
+            await model.aclose()
+        assert [r.model_id for r in records] == [1, 2, 2, 2]
+        assert (records[1].prompt_tokens, records[1].completion_tokens) == (7, 11)
+
+    asyncio.run(run())
+
+
+def test_transient_503_recovers_within_same_candidate_and_counts_each_request():
+    records, reservations = [], []
+    router = RoutingModel(
+        "analysis",
+        "analysis",
+        [replace(_candidate("a", 1), extra_retries=1)],
+        _ScriptedGateway({"a": [ExtractionUnavailable("繁忙", http_status=503), None]}),
+        records.append,
+        reserve=reservations.append,
+        retry_base_seconds=0,
+    )
+    assert asyncio.run(router.complete("测试")).model == "a"
+    assert [r.status for r in records] == ["error", "ok"]
+    assert len(reservations) == 2
+
+
+def test_provider_cooldown_is_shared_between_independent_routers():
+    deadlines = {}
+
+    def remaining(c):
+        return deadlines.get(c.provider_id, 0)
+
+    def defer(c, seconds):
+        deadlines[c.provider_id] = seconds
+
+    async def run():
+        all_records = []
+        for _ in range(2):
+            gateway = _ScriptedGateway(
+                {
+                    "primary": [ExtractionUnavailable("限流", http_status=429)],
+                    "backup": [None],
+                }
+            )
+            router = RoutingModel(
+                "analysis",
+                "analysis",
+                [_candidate("primary", 1), _candidate("backup", 2)],
+                gateway,
+                all_records.append,
+                cooldown_remaining=remaining,
+                defer_provider=defer,
+            )
+            assert (await router.complete("测试")).model == "backup"
+            await router.aclose()
+        assert [r.model_id for r in all_records] == [1, 2, 2]
+        assert deadlines[1] == 30
+
+    asyncio.run(run())
+
+
+def test_switching_models_of_same_provider_cannot_bypass_429():
+    records = []
+    router = RoutingModel(
+        "analysis",
+        "analysis",
+        [_candidate("a", 1), replace(_candidate("b", 2), provider_id=1), _candidate("c", 3)],
+        _ScriptedGateway({"a": [ExtractionUnavailable("限流", http_status=429)], "c": [None]}),
+        records.append,
+    )
+    assert asyncio.run(router.complete("测试")).model == "c"
+    assert [r.model_id for r in records] == [1, 3]
+
+
+def test_retry_after_waits_without_burning_requests(monkeypatch):
+    from tender.application import llm_routing
+
+    now, sleeps, records = [100.0], [], []
+    monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(llm_routing.asyncio, "sleep", sleep)
+    error = ExtractionUnavailable("限流", http_status=429)
+    error.retry_after = 2
+    router = RoutingModel(
+        "analysis",
+        "analysis",
+        [replace(_candidate("a", 1), extra_retries=1)],
+        _ScriptedGateway({"a": [error, None]}),
+        records.append,
+        retry_base_seconds=0,
+    )
+    assert asyncio.run(router.complete("测试")).model == "a"
+    assert sum(sleeps) >= 2
+    assert len(records) == 2
+
+
+def test_cancel_during_shared_cooldown_sends_no_request():
+    async def run():
+        checked = asyncio.Event()
+        records = []
+
+        def remaining(_):
+            checked.set()
+            return 60
+
+        gateway = _ScriptedGateway({"a": [None]})
+        router = RoutingModel(
+            "analysis",
+            "analysis",
+            [_candidate("a", 1)],
+            gateway,
+            records.append,
+            cooldown_remaining=remaining,
+        )
+        task = asyncio.create_task(router.complete("测试"))
+        await checked.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not records and not gateway.created
+
+    asyncio.run(run())
+
+
+def test_slow_candidates_leave_time_for_final_fallback_within_module_deadline(monkeypatch):
+    from tender.application import llm_routing
+
+    now, timeouts, records = [100.0], [], []
+    monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
+
+    async def wait_for(request, timeout):
+        timeouts.append(timeout)
+        try:
+            return await request
+        except TimeoutError:
+            now[0] += timeout
+            raise
+
+    monkeypatch.setattr(llm_routing.asyncio, "wait_for", wait_for)
+    router = RoutingModel(
+        "analysis",
+        "analysis",
+        [
+            replace(_candidate(name, index), timeout=300, extra_retries=1)
+            for index, name in enumerate("abc", 1)
+        ],
+        _ScriptedGateway(
+            {
+                "a": [TimeoutError(), TimeoutError()],
+                "b": [TimeoutError(), TimeoutError()],
+                "c": [None],
+            }
+        ),
+        records.append,
+        retry_base_seconds=0,
+        deadline_seconds=600,
+        remaining_seconds=lambda: 60,
+    )
+    assert asyncio.run(router.complete("测试")).model == "c"
+    assert [r.model_id for r in records] == [1, 1, 2, 2, 3]
+    assert now[0] < 160 and all(timeout <= 10.01 for timeout in timeouts)

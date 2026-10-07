@@ -34,6 +34,12 @@ def _load_migration() -> ModuleType:
 def _seed_rows() -> list[tuple[str, str, str, str, str, bool]]:
     module = _load_migration()
     sql = "\n".join(module._STATEMENTS)
+    spec = importlib.util.spec_from_file_location(
+        "_seed_0008", _MIGRATION.parent / "0008_deepagents_runtime.py"
+    )
+    extension = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(extension)
+    sql += "\n" + "\n".join(extension._STATEMENTS)
     rows = [
         (key, layer, value_type, default, description, requires_gate == "true")
         for key, layer, value_type, default, description, requires_gate in _ROW_RE.findall(sql)

@@ -16,6 +16,8 @@ async def retrieve_chunks(
     heartbeat: Callable[[], None],
     gateway: Callable[[dict], EmbeddingModel],
     rerank_gateway: Callable[[dict], RerankModel] | None = None,
+    *,
+    embedding_timeout: float | None = None,
 ) -> tuple[list[dict], dict]:
     rows = []
     # 同步数据库访问移到线程池，避免大表查询阻塞进程内事件循环（模型页轮询等）。
@@ -27,7 +29,12 @@ async def retrieve_chunks(
         client = None
         try:
             client = gateway(config)
-            vector = (await client.embed([question]))[0]
+            # 页面搜索不能等到代理断开才回退；后台问答仍采用模型自身的等待预算。
+            vector = (await asyncio.wait_for(
+                client.embed([question]), timeout=embedding_timeout,
+            ))[0]
+        except TimeoutError:
+            warning = "语义检索等待超时，本次已使用全文检索，可稍后重试语义检索。"
         except Exception as exc:
             warning = f"语义检索暂不可用，使用全文检索：{str(exc)[:200]}"
         finally:

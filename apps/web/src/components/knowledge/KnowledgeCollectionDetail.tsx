@@ -20,6 +20,7 @@ export function KnowledgeCollectionDetail({ collectionId }: { collectionId: numb
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [hits, setHits] = useState<SearchHit[] | null>(null);
+  const [searchWarning, setSearchWarning] = useState<string | null>(null);
   const [selected, setSelected] = useState<Citation | null>(null);
   const [answerRefs, setAnswerRefs] = useState<Citation[]>([]);
   const [mobileDocument, setMobileDocument] = useState(false);
@@ -30,7 +31,8 @@ export function KnowledgeCollectionDetail({ collectionId }: { collectionId: numb
     setCollection(await knowledgeRequest<KnowledgeCollection>("/knowledge/collections/" + collectionId));
   }, [collectionId]);
   useEffect(() => { void reload().catch((e: Error) => setError(e.message)); return () => abort.current?.abort(); }, [reload]);
-  const processing = collection?.sources?.some((s) => ["pending", "processing"].includes(s.state) || ["pending", "running"].includes(s.index_status ?? ""));
+  // 解析完成到定时派发索引之间存在间隔，此时仍需轮询，才能自动显示最终入库状态。
+  const processing = collection?.sources?.some((s) => ["pending", "processing"].includes(s.state) || ["pending", "running"].includes(s.index_status ?? "") || (["ready", "partial"].includes(s.state) && !s.index_status));
   useEffect(() => {
     if (!processing) return;
     const timer = setInterval(() => { void reload().catch((e: Error) => setError(e.message)); }, 3000);
@@ -64,16 +66,22 @@ export function KnowledgeCollectionDetail({ collectionId }: { collectionId: numb
         <button className={BUTTON_CLASS} disabled={busy} onClick={() => void perform(async () => { const result = await knowledgeRequest<{ queued_count: number }>("/knowledge/collections/" + collectionId + "/reindex", "POST", {}); setMessage("已安排 " + result.queued_count + " 份资料重建索引"); })}>重建索引</button>
       </div>
       <details className="analysis-options mb-4"><summary>资料处理状态 <span>{collection.sources?.length ?? 0} 份</span></summary><div className="knowledge-source-list">{collection.sources?.map((source) => <div key={source.source_id}>
-        <span className="min-w-0 flex-1"><strong>{source.file_name}</strong><small>{STATE_LABELS[source.state] ?? source.state} · {source.index_status === "completed" ? source.embedding_model_id ? "全文与向量索引就绪" : "全文索引就绪" : source.index_error ?? "等待建立索引"}</small></span>
+        <span className="min-w-0 flex-1"><strong>{source.file_name}</strong><small>{STATE_LABELS[source.state] ?? source.state} · {source.index_status === "completed" ? source.semantic_ready ? "全文与向量索引就绪" : source.needs_reindex ? "全文可用 · 请重建当前模型的向量索引" : "全文索引就绪" : source.index_error ?? (source.index_status === "running" ? "正在构建索引" : "等待建立索引")}</small>{source.error_message && <small className="text-rose-700">{source.error_message}</small>}</span>
         {["pending", "failed", "unsupported"].includes(source.state) && <button className={BUTTON_CLASS} disabled={busy} onClick={() => void perform(() => knowledgeRequest("/knowledge/sources/" + source.source_id + "/process", "POST", {}))}>重新处理</button>}
         <button className={BUTTON_CLASS} disabled={busy} onClick={() => { if (window.confirm("移除这份资料？对应引用将变为不可用。")) void perform(() => deleteProjectFile(collection.upload_project_id, source.project_file_id)); }}>移除</button>
       </div>)}</div></details>
       <div className="analysis-mobile-switch"><button aria-pressed={!mobileDocument} onClick={() => setMobileDocument(false)}>资料检索</button><button aria-pressed={mobileDocument} disabled={!selected} onClick={() => setMobileDocument(true)}>引用原文</button></div>
       <div className="analysis-split knowledge-detail-split" data-document={mobileDocument}>
         <div className="analysis-content">
-          <form className="mb-5 flex gap-2" onSubmit={(e) => { e.preventDefault(); void perform(async () => setHits((await knowledgeRequest<{ items: SearchHit[] }>("/knowledge/collections/" + collectionId + "/search?q=" + encodeURIComponent(search))).items)); }}>
+          <form className="mb-5 flex gap-2" onSubmit={(e) => { e.preventDefault(); setSearchWarning(null); void perform(async () => {
+            const result = await knowledgeRequest<{ items: SearchHit[]; warning?: string | null }>("/knowledge/collections/" + collectionId + "/search?q=" + encodeURIComponent(search));
+            setHits(result.items);
+            // 模型冷启动时全文结果仍可用，明确告知本次回退，避免误以为已完成语义召回。
+            setSearchWarning(result.warning ?? null);
+          }); }}>
             <input className={INPUT_CLASS + " min-w-0 flex-1"} aria-label="搜索原文" placeholder="搜索名称、条款或关键词" value={search} onChange={(e) => setSearch(e.target.value)} maxLength={2000} required /><button className={PRIMARY_BUTTON_CLASS} disabled={busy}>搜索</button>
           </form>
+          {searchWarning && <p role="status" className="notice mb-4">{searchWarning}</p>}
           {hits?.length === 0 && <p className="notice mb-4">当前可用原文中没有匹配内容。</p>}
           {hits?.map((hit, i) => <button key={hit.source_id + ":" + hit.element_id + ":" + i} className="knowledge-hit" onClick={() => void locate({ ...hit, quote: hit.content })}><span>{hit.file_name} · 第 {hit.page_no} 页 ↗</span><p>{hit.content}</p></button>)}
           <QuestionPanel endpoint={"/knowledge/collections/" + collectionId + "/ask"} onLocate={(ref) => void locate(ref)} onCitations={setAnswerRefs} />

@@ -1,39 +1,40 @@
 ---
 name: general_module_parsing
-description: "招标文件通用模块解析兜底参考。仅当没有专用模块 Skill 可用时，用于基于归一化 Markdown 文件检索、扩展上下文并返回结构化结果。"
+description: "检查招标文件补充发现与跨文件关联，覆盖专门模块之外的重要条件、例外、澄清及材料冲突，逐项引用原文。"
 ---
 
-# 通用模块解析 Skill
+# 补充发现与跨文件关联
 
-> 对应 v1 `lg_agent/tender_documents_agent/general_module_parsing`。
-> 当前 12 个标准解析模块应优先使用各自专用 Skill，本 Skill 只作为兜底参考。
+## 任务
 
-## 适用场景
-- 触发：没有匹配的专用模块 Skill，或需要临时解析非标准模块。
-- 输入：运行时文件清单中的归一化 Markdown 文件 + 模块配置列表（module_code / prompt_code / 模板内容）。
-- 输出：各模块解析结果（结构化文本/JSON），直接作为最终回复返回，由父级代码统一入库。
+在必检专题之外自主发现影响投标决策的重要内容，比较主文件、澄清、补遗及附件的范围和差异。
+原文由检索工具按需提供 source_id、offset、block_id，无需访问磁盘。
+本模块始终参与综合分析，不能因为有专门模块就跳过补充发现。
 
-## 执行流程
+## 工作方法
 
-1. **发现文件**：使用 `list_extracted_files` 查看当前任务可用 Markdown 文件。
-2. **构造检索词**：根据模块目标和 bid_type 的参考规则，整理章节名、字段名、同义词和强约束关键词。
-3. **精确检索**：使用 `grep` 搜索关键章节或关键词；内置 grep 是字面量匹配，组合条件请拆成多个关键词分别检索。
-4. **扩展上下文**：根据命中位置调用 `read_file(file_path, offset, limit)` 分页读取相邻上下文；命中不足时更换关键词或扩大读取范围。
-5. **结构化输出**：仅基于检索命中和扩展读取内容提取结果，引用尽量标注文件名和位置线索。
-6. **保存状态**：单模块完成后必须将完整结果直接作为最终回复返回；即使未找到有效内容，也要返回“未找到项”和检索说明。
+1. 围绕补充条款、澄清、例外和跨文件差异自主检索，再按需补读其它版本和条件。
+2. 查清是否同一标段、主体、时间和范围，保留且/或、例外、前提和否定。
+3. 补充通知明确修改某条时同时引用原条款和修改条款；无明确关系则并列为冲突，不以上传时间裁定。
+4. 未被专题覆盖的重要义务、不可抗力及关联风险可独立成项，不重复复制普通事实。
+5. 事实、判断、建议、冲突、证据不足使用不同 kind。建议须引用事实前提。
+6. 仅共同出现的实体不能形成关系；关系须有直接引用及范围/条件。
 
-## 工具
-- `list_extracted_files`：列出当前任务可用 Markdown 文件。
-- `grep`：在 Markdown 中执行字面量精确检索；具体路径、glob 和输出模式由运行时上下文与工具护栏约束。
-- `read_file`：通过 offset/limit 围绕命中位置分页读取上下文。
-- 无保存工具：模块结果直接作为最终回复返回。
+## 工具与证据
 
-## 输出规范
-参见 `references/output_format.md`。
+- `list_documents()`：获取本项目及关联知识库的授权资料清单。
+- `search_document(query, source_id?)`：自主检索项目条款，可限定清单中的某个来源。
+- `search_knowledge(query, source_id?)`：检索关联参考库，历史依据不能证明本次满足要求。
+- `read_document(source_id, offset, limit)`：按命中位置扩展原文，每次最多12块；压缩后也可补读。
+- `read_file(file_path)`：只读 `/skills/general_module_parsing/SKILL.md` 及其 references，或会话压缩历史。
+- `submit_analysis`：提交本模块综合结果和检索总结。相同命中先去重，再分析条件、例外与修订。
+不进行全文顺序扫描；基于本专题问题选择检索角度，核对各份相关补充文件。
 
-## 注意
-- 不要默认读取整篇 Markdown；除非文件很小且确有必要，必须优先使用检索和分页扩展控制上下文。
-- 不依赖 `manifest.json` 或 `chunks.jsonl`；当前解析链路通过 file_manifest.json 维护 original 与 Markdown 的 file_id 映射。
-- ★ 提示词不在 .env 管理，就近放业务模块：本 Skill 相关的提示词放
-  `app/agents/tools/parse/prompts/*.md`（工具层直调）或本 Skill 的 `references/`（Skill 渐进加载），
-  经 `app/prompts.load_prompt("agents/tools/parse", <name>)` 读取（见 `app/prompts/README.md`）。
+## 输出协议
+
+通过原生工具调用 `submit_analysis(items, relations, research_summary)` 提交结果。
+每条 item 包含 kind、title、text、presentation、cells、citations；kind 可为 fact、judgment、suggestion、conflict、insufficient。
+presentation 使用 paragraph、list、table；cells 为文字键值，每个表格行或列表项分别成项。
+引用使用 {"block_id":"工具实际返回的块ID","quote":"块内连续原文"}；不能引用 Skill、压缩摘要或常识。
+没有相关依据可提交空 items，但 research_summary 必须说明检索过的主题、缺口与不确定性。
+补充文件明确修改条款时保留修改前后双方引用；参考库内容只作建议，不能替代本项目要求。

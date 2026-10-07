@@ -11,6 +11,8 @@ import asyncio
 import base64
 import io
 from collections.abc import Awaitable, Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 import httpx
 import pytest
@@ -41,6 +43,38 @@ def pdf_response(request: httpx.Request, *, trace: str | None = None) -> httpx.R
 
 def version_response() -> httpx.Response:
     return httpx.Response(200, json={"version": "8.34.0"})
+
+
+def test_intranet_conversion_ignores_terminal_proxy(monkeypatch):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"8.37.0")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    # 用不可连接的代理证明真实 HTTP 请求走直连，MockTransport 会绕过代理选择逻辑。
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+
+    async def check():
+        converter = GotenbergConverter(f"http://127.0.0.1:{server.server_port}")
+        try:
+            assert await converter.version() == "8.37.0"
+        finally:
+            await converter.aclose()
+
+    try:
+        asyncio.run(check())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @pytest.fixture

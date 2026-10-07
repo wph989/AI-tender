@@ -670,6 +670,24 @@ data: {"status":"completed","version_id":2048}
 独立知识库上传复用 `/projects/{upload_project_id}/files`，集合详情提供该标识。
 报告与问答返回逐项引用，定位前通过 `/knowledge/citations/resolve` 校验完整身份。
 
+集合详情的每个来源增加 `semantic_ready`、`needs_reindex`：前者表示已完成且与当前绑定模型空间匹配，
+后者表示全文已就绪但须重建当前空间的向量索引。不能仅凭 `embedding_model_id` 非空宣称语义检索可用。
+
+同步知识库搜索对查询向量最多等待15秒，超时取消该请求并回退全文检索，返回 `mode=keyword` 和
+可读的 `warning`；页面展示该提示，避免冷启动拖到代理断开后只返回500。后台问答仍使用模型配置的等待预算。
+来源的 `processing_status` 保留最新转换/提交/解析任务状态，`error_message` 优先返回这条任务的错误，
+从而在尚无解析批次时也能显示文件失败原因。
+
+完整分析等待阶段如发现资料已失败、仅部分解析或格式不支持，报告转为 `failed`，错误列出文件。
+修复后可重试，或重新发起 `allow_partial=true` 的分析。扫描前失败的重试返回 `waiting`；
+已固定全文的报告重试仍返回 `pending` 并保留原解析批次。覆盖进度在首个模型请求前初始化块总数。
+`retry` 的 `module_keys` 只将选中的失败模块置为待处理；未选中的失败模块和已完成模块保持原状态。
+不传 `module_keys` 时选择全部模块，仍只重置失败项。恢复进程中断留下的 `running` 模块不受此限制。
+
+DeepAgents 报告补跑可选 `max_output_tokens`（512–16384），只调整新 attempt 的单次输出上限；旧 attempt、报告原配置和累计用量保留，请求次数与总时限不扩大。省略时沿用报告配置。
+模型路由收到非法 JSON 时，在换候选前最多追加两次格式纠正提示，计入既有总请求/时间预算；该行为不放宽引用校验，也不把连接、配置、权限或明确拒绝错误当作格式问题重试。
+结论的支持性检查最多反馈两次供 Agent 补读或修正，仍受模块总步数限制；最终不支持的条目明确标记 `insufficient` / `unsupported`。
+
 
 ## AI 模型管理接口
 
@@ -702,3 +720,16 @@ data: {"status":"completed","version_id":2048}
 `GET /llm/calls` 可使用 feature_key、model_id、status、invocation_id、limit、offset。测试响应包含 test_id、status、latency_ms、http_status、error；HTTP 200 仅表示操作完成，status 为 error/unsupported 时不能显示通过。
 
 模型测试成功时还返回适用的 vector_count、embedding_dimensions、document_count；不适用项为 null，供应商目录测试可省略。这些诊断字段不包含向量内容，维度信息当前仅在本次响应展示。
+
+
+## DeepAgents 模块运行管理
+
+新报告执行与恢复契约见 [16-DeepAgents标书分析运行时](16-DeepAgents标书分析运行时.md)。历史报告保留原快照兼容。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/analysis/reports/{report_id}/runs/{run_id}/events` | 模块审计分页，after默认为0，limit为1到200；验证公司及报告归属 |
+
+报告详情增加 runtime_version、runtime_settings、reference_snapshot、summary 及各模块 runs。
+新报告 coverage.mode=agent_research，界面显示13个专题的完成数，不使用 scanned_blocks/total_blocks。
+补跑为选中的失败模块创建新 attempt；原运行记录和已完成模块保留。取消停止后续模型与工具请求。

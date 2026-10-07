@@ -7,8 +7,8 @@ description: "商务标准解析专家。从招标文件中提取付款、交付
 
 ## 适用场景
 - 触发：主 Agent 委派商务标准解析任务时调用。
-- 输入：归一化 Markdown 文件，由运行时文件清单和受限工具提供。
-- 输出：商务标准结构化列表（markdown 格式），直接作为最终回复返回，由父级代码统一入库。
+- 输入：授权资料清单与按需检索得到的原文块，不预先灌入全文。
+- 输出：submit_analysis 原生工具中的动态 JSON 条目，每条附已读取原文块的引用。
 
 ## 领域知识
 
@@ -25,27 +25,33 @@ description: "商务标准解析专家。从招标文件中提取付款、交付
 
 ## 执行流程
 
-1. **精确检索**：使用 `grep` 搜索商务要求、合同条款及九类履约主题
-2. **扩展上下文**：根据命中位置使用 `read_file` 读取相邻条款
+1. **精确检索**：使用 `search_document` 搜索商务要求、合同条款及九类履约主题
+2. **扩展上下文**：根据命中位置使用 `read_document` 读取相邻条款
 3. **边界判断**：确认条款约束合同交易或履约，而非资格、评分、技术或报价
 4. **分类整理**：同一条款只归入最相关的一类，保留期限、比例、条件和责任
-5. **输出结果**：按规范格式生成完整 Markdown，直接作为最终回复返回，由父级代码统一入库
+5. **输出结果**：按本 Skill 的输出协议调用 submit_analysis；没有依据的条目省略。
 
-## 输出规范
+## 输出协议
 
-- 输出格式已拆分到 `references/output_format.md`。
-- 执行输出前必须读取并严格遵循该文件中的专属模板和输出细节。
-- 命中规则时，结果正文只能包含按专属模板整理的实际解析结果，禁止附加解释性说明。
-- 未命中任何商务标准时，结果正文只能是 `无相关内容`，禁止补充未命中原因、检索过程或建议。
+通过原生工具调用 `submit_analysis(items, relations, research_summary)` 提交结果。
+每条 item 包含 kind、title、text、presentation、cells、citations；kind 可为 fact、judgment、suggestion、conflict、insufficient。
+presentation 使用 paragraph、list、table；cells 为文字键值，每个表格行或列表项分别成项。
+引用使用 {"block_id":"工具实际返回的块ID","quote":"块内连续原文"}；不能引用 Skill、压缩摘要或常识。
+没有相关依据可提交空 items，但 research_summary 必须说明检索过的主题、缺口与不确定性。
+补充文件明确修改条款时保留修改前后双方引用；参考库内容只作建议，不能替代本项目要求。
 
 ## 参考文件
 - `references/output_format.md`：本 Skill 专属输出模板和格式约束
 
-## 工具
-- `grep`：在归一化 Markdown 中精确检索；具体路径、glob 和输出模式由运行时上下文与工具护栏约束
-- `read_file`：围绕命中位置分页扩展读取上下文
-- `list_extracted_files`：列出当前任务可用 Markdown 文件
-- 无保存工具：模块结果直接作为最终回复返回，无相关内容也必须在最终回复正文中返回
+## 工具与证据
+
+- `list_documents()`：获取本项目及关联知识库的授权资料清单。
+- `search_document(query, source_id?)`：自主检索项目条款，可限定清单中的某个来源。
+- `search_knowledge(query, source_id?)`：检索关联参考库，历史依据不能证明本次满足要求。
+- `read_document(source_id, offset, limit)`：按命中位置扩展原文，每次最多12块；压缩后也可补读。
+- `read_file(file_path)`：只读 `/skills/biz_standard_parsing/SKILL.md` 及其 references，或会话压缩历史。
+- `submit_analysis`：提交本模块综合结果和检索总结。相同命中先去重，再分析条件、例外与修订。
+不进行全文顺序扫描；基于本专题问题选择检索角度，核对各份相关补充文件。
 
 ## 注意
 - 商务验收只提取流程、期限、主体和付款关联，不展开具体技术指标

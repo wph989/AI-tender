@@ -22,6 +22,8 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def environment(monkeypatch):
+    # 本文件验证已发布的历史快照；DeepAgents 多连接/恢复场景有独立集成用例。
+    monkeypatch.setattr(knowledge, "RUNTIME_VERSION", "legacy")
     db = create_engine(settings.database_url())
     with db.connect() as connection, connection.begin() as transaction:
         tables = (
@@ -118,7 +120,12 @@ def add_source(connection, pid, content, status="completed"):
 
 class FixtureModel:
     async def complete(self, prompt):
-        if "校验每项结论" in prompt:
+        if "独立列出格式正文中的材料清单" in prompt:
+            result = {"outline_inventory": []}
+        elif "候选补漏阶段" in prompt:
+            packet = json.loads(prompt.split("\n原文：")[1])
+            result = {"items": [], "unrelated_block_ids": [row["block_id"] for row in packet]}
+        elif "校验每项结论" in prompt:
             items = json.loads(prompt.split("\n", 1)[1])
             result = {"supported": [True] * len(items)}
         elif "全文扫描阶段" in prompt:
@@ -129,7 +136,18 @@ class FixtureModel:
             }
         elif "\n任务：" in prompt:
             history = json.loads(prompt.split("\n工具记录：")[1])
-            if not history:
+            context = json.loads(prompt.split("\n任务：")[1].split("\n工具记录：")[0])
+            if context.get("output_schema") == "outline_nodes":
+                read_ids = {
+                    row["block_id"] for step in history
+                    for row in step["response"].get("blocks", [])
+                }
+                unread = next((loc for loc in context["candidate_locations"]
+                               if loc["block_id"] not in read_ids), None)
+                result = ({"action": "read", "source_id": unread["source_id"],
+                           "offset": unread["offset"]} if unread
+                          else {"action": "finish", "outline_nodes": []})
+            elif not history:
                 result = {"action": "search", "terms": ["资质"]}
             else:
                 hits = history[-1]["response"]["blocks"]
@@ -210,13 +228,62 @@ def test_wait_for_all_and_explicit_partial_analysis(environment):
     configure(request, pid)
     result = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
     asyncio.run(worker._analyze_project(result["id"]))
-    assert knowledge.get_report(result["id"], request)["status"] == "waiting"
-    knowledge.cancel_report(result["id"], request)
+    failed = knowledge.get_report(result["id"], request)
+    assert failed["status"] == "failed"
+    assert "未完整解析" in failed["error_message"]
     partial = knowledge.start_analysis(pid, knowledge.AnalysisInput(allow_partial=True), request)
     asyncio.run(worker._analyze_project(partial["id"]))
     report = knowledge.get_report(partial["id"], request)
     assert report["status"] == "partial" and report["coverage"]["partial"]
     assert report["coverage"]["scanned_blocks"] == 1
+
+
+def test_retry_before_scan_waits_for_repaired_sources(environment):
+    request, conn, pid = environment
+    _, run = add_source(conn, pid, "要求甲级资质。", status="failed")
+    configure(request, pid)
+    result = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    asyncio.run(worker._analyze_project(result["id"]))
+    assert knowledge.get_report(result["id"], request)["status"] == "failed"
+    conn.execute(text("UPDATE parse_run SET status='completed' WHERE id=:id"), {"id": run})
+    retried = knowledge.retry_report(result["id"], knowledge.RetryInput(), request)
+    assert retried["status"] == "waiting"
+    asyncio.run(worker._analyze_project(result["id"]))
+    assert knowledge.get_report(result["id"], request)["status"] == "completed"
+
+
+def test_retry_only_executes_selected_failed_modules(environment, monkeypatch):
+    request, conn, pid = environment
+    add_source(conn, pid, "要求甲级资质。")
+    configure(request, pid)
+    result = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    original = worker.run_module
+    selected = "project_basic_info_parsing"
+    untouched = "disqualified_items_parsing"
+    calls = []
+
+    async def fail_two(model, key, *args, **kwargs):
+        if key in {selected, untouched}:
+            raise ValueError("测试供应商故障")
+        return await original(model, key, *args, **kwargs)
+
+    monkeypatch.setattr(worker, "run_module", fail_two)
+    asyncio.run(worker._analyze_project(result["id"]))
+    assert knowledge.get_report(result["id"], request)["status"] == "partial"
+
+    async def record(model, key, *args, **kwargs):
+        calls.append(key)
+        return await original(model, key, *args, **kwargs)
+
+    monkeypatch.setattr(worker, "run_module", record)
+    knowledge.retry_report(result["id"], knowledge.RetryInput(module_keys=[selected]), request)
+    asyncio.run(worker._analyze_project(result["id"]))
+    report = knowledge.get_report(result["id"], request)
+    states = {module["module_key"]: module["status"] for module in report["modules"]}
+    assert calls == [selected]
+    assert states[selected] == "completed"
+    assert states[untouched] == "failed"
+    assert report["status"] == "partial"
 
 
 def test_collections_isolate_retrieval_and_answers(environment):
@@ -255,6 +322,38 @@ def test_index_without_embedding_retains_full_text(environment):
     assert conn.execute(text("SELECT count(*) FROM knowledge_chunk")).scalar_one() > 1
 
 
+def test_empty_parsing_result_cannot_be_a_completed_index(environment):
+    request, conn, pid = environment
+    add_source(conn, pid, "")
+    collection = knowledge.project_knowledge(pid, request)["collection_id"]
+    knowledge.reindex_collection(collection, request)
+    index_id = conn.execute(text("SELECT id FROM knowledge_index")).scalar_one()
+    asyncio.run(worker._build_index(index_id))
+    source = knowledge.get_collection(collection, request)["sources"][0]
+    assert source["index_status"] == "failed"
+    assert "没有可索引的文字" in source["index_error"]
+
+
+def test_failed_preprocessing_is_visible_without_parse_run(environment):
+    request, conn, pid = environment
+    version, _ = add_source(conn, pid, "暂存原文")
+    file_id = conn.execute(
+        text("SELECT id FROM project_file WHERE version_id=:v"), {"v": version}
+    ).scalar_one()
+    conn.execute(text("DELETE FROM element"))
+    conn.execute(text("DELETE FROM parse_run"))
+    conn.execute(
+        text("""INSERT INTO job (id,company_id,project_id,project_file_id,status,stage,
+        error_message,finished_at) VALUES ('failed-convert',1,:p,:f,'failed','converting',
+        '转换服务拒绝此文件',now())"""),
+        {"p": pid, "f": file_id},
+    )
+    source = knowledge.project_knowledge(pid, request)["sources"][0]
+    assert source["state"] == "failed"
+    assert source["parse_run_id"] is None
+    assert source["error_message"] == "转换服务拒绝此文件"
+
+
 def test_vectors_only_reused_in_same_embedding_space(environment, monkeypatch):
     request, conn, pid = environment
     add_source(conn, pid, "资质等级要求。")
@@ -278,9 +377,13 @@ def test_vectors_only_reused_in_same_embedding_space(environment, monkeypatch):
     sources = db.sources([own])
     hits, info = asyncio.run(worker.retrieve(db, sources, "注册证书", lambda: None))
     assert hits and info["mode"] == "hybrid"
+    current = knowledge.get_collection(own, request)["sources"][0]
+    assert current["semantic_ready"] and not current["needs_reindex"]
     config["signature"] = "space-two"
     hits, info = asyncio.run(worker.retrieve(db, sources, "注册证书", lambda: None))
     assert not hits and info["mode"] == "keyword"
+    changed = knowledge.get_collection(own, request)["sources"][0]
+    assert not changed["semantic_ready"] and changed["needs_reindex"]
 
 
 def test_graph_expansion_rejects_old_parse_evidence(environment):

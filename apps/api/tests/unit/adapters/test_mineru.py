@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -142,6 +143,17 @@ def test_submit_accepts_openai_style_id(make_parser) -> None:
     for key in (b'"filename"', b'"bytes"', b'"mime_type"', b'"purpose"', b'"sha256sum"'):
         assert key in body
     # 上传字节走 PUT，且必须原样带上传内容
+    assert seen["put_body"] == PDF_BYTES
+
+
+@pytest.mark.parametrize("key", ["pdf/" + PDF_SHA256, "original/document.docx", "pdf/file.PDF"])
+def test_storage_keys_are_submitted_as_pdf_filenames(make_parser, key) -> None:
+    seen = {}
+    parser = make_parser(upload_flow_handler(id_key="id", seen=seen))
+    run(parser.submit(key, pdf_sha256=PDF_SHA256))
+    body = json.loads(seen["create_body"])
+    assert body["filename"].lower().endswith(".pdf")
+    assert body["sha256sum"] == PDF_SHA256
     assert seen["put_body"] == PDF_BYTES
 
 

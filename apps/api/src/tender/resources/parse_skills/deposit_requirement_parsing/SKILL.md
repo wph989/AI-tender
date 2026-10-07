@@ -7,8 +7,8 @@ description: "保证金要求解析专家。从招标文件中分别提取投标
 
 ## 适用场景
 - 触发：主 Agent 委派保证金要求解析任务时调用。
-- 输入：归一化 Markdown 文件，由运行时文件清单和受限工具提供。
-- 输出：保证金要求结构化文档（markdown 格式），直接作为最终回复返回，由父级代码统一入库。
+- 输入：授权资料清单与按需检索得到的原文块，不预先灌入全文。
+- 输出：submit_analysis 原生工具中的动态 JSON 条目，每条附已读取原文块的引用。
 
 ## 领域知识
 
@@ -25,30 +25,35 @@ description: "保证金要求解析专家。从招标文件中分别提取投标
 
 ## 执行流程
 
-1. **精确检索**：分别使用 `grep` 搜索投标保证金、履约保证金及其同义表述
-2. **扩展上下文**：根据命中位置使用 `read_file` 读取相邻条款
+1. **精确检索**：分别使用 `search_document` 搜索投标保证金、履约保证金及其同义表述
+2. **扩展上下文**：根据命中位置使用 `read_document` 读取相邻条款
 3. **类型与适用性判断**：根据投标阶段、中标后、合同金额等上下文区分类型，并判断要求、不要求及适用标段或条件
 4. **提取要求**：按类型分别提取金额或比例、形式、提交方式和时间、有效期、退还或解除规则
-5. **输出结果**：按规范格式生成完整 Markdown，直接作为最终回复返回，由父级代码统一入库
+5. **输出结果**：按本 Skill 的输出协议调用 submit_analysis；没有依据的条目省略。
 
-## 输出规范
+## 输出协议
 
-- 输出格式已拆分到 `references/output_format.md`。
-- 执行输出前必须读取并严格遵循该文件中的专属模板和输出细节。
-- 命中规则时，结果正文只能包含按专属模板分别整理的投标保证金和履约保证金实际要求。
-- 原文明示不要求某类保证金时，按输出格式保留该类完整结论原文。
-- 两类保证金均未命中要求或不要求结论时，结果正文只能是 `无相关内容`，禁止补充未命中原因、检索过程或建议。
+通过原生工具调用 `submit_analysis(items, relations, research_summary)` 提交结果。
+每条 item 包含 kind、title、text、presentation、cells、citations；kind 可为 fact、judgment、suggestion、conflict、insufficient。
+presentation 使用 paragraph、list、table；cells 为文字键值，每个表格行或列表项分别成项。
+引用使用 {"block_id":"工具实际返回的块ID","quote":"块内连续原文"}；不能引用 Skill、压缩摘要或常识。
+没有相关依据可提交空 items，但 research_summary 必须说明检索过的主题、缺口与不确定性。
+补充文件明确修改条款时保留修改前后双方引用；参考库内容只作建议，不能替代本项目要求。
 
 ## 参考文件
 - `references/output_format.md`：本 Skill 专属输出模板和格式约束
 - `references/extraction_rules.md`：两类保证金识别、金额精确提取、边界和自检清单
 - `references/examples.md`：投标保证金与履约保证金联合提取样例
 
-## 工具
-- `grep`：在归一化 Markdown 中精确检索；具体路径、glob 和输出模式由运行时上下文与工具护栏约束
-- `read_file`：围绕命中位置分页扩展读取上下文
-- `list_extracted_files`：列出当前任务可用 Markdown 文件
-- 无保存工具：模块结果直接作为最终回复返回，无相关内容也必须在最终回复正文中返回
+## 工具与证据
+
+- `list_documents()`：获取本项目及关联知识库的授权资料清单。
+- `search_document(query, source_id?)`：自主检索项目条款，可限定清单中的某个来源。
+- `search_knowledge(query, source_id?)`：检索关联参考库，历史依据不能证明本次满足要求。
+- `read_document(source_id, offset, limit)`：按命中位置扩展原文，每次最多12块；压缩后也可补读。
+- `read_file(file_path)`：只读 `/skills/deposit_requirement_parsing/SKILL.md` 及其 references，或会话压缩历史。
+- `submit_analysis`：提交本模块综合结果和检索总结。相同命中先去重，再分析条件、例外与修订。
+不进行全文顺序扫描；基于本专题问题选择检索角度，核对各份相关补充文件。
 
 ## 注意
 - 金额数字必须**精确提取**，注意大写/小写金额的一致性

@@ -247,7 +247,18 @@ def _load_candidates(feature_key: str, purpose: str) -> list[ModelCandidate]:
     return candidates
 
 
-def _routing_model(feature_key: str, purpose: str) -> RoutingModel:
+def _routing_model(
+    feature_key: str,
+    purpose: str,
+    *,
+    before_request=None,
+    output_limit: int | None = None,
+    on_call=None,
+    remaining_seconds=None,
+) -> RoutingModel:
+    from tender.application.provider_cooldown import ProviderCooldown
+
+    cooldown = ProviderCooldown(_engine)
     candidates = _load_candidates(feature_key, purpose)
     with _engine.connect() as c:
         policy = (
@@ -273,17 +284,27 @@ def _routing_model(feature_key: str, purpose: str) -> RoutingModel:
         # 参数与次数固定于调用创建时；端点和密钥必须取同一最新供应商行。
         return replace(snapshot, base_url=current.base_url, api_key=current.api_key)
 
+    def record_call(record):
+        _log_call(record)
+        if on_call:
+            on_call(record)
+
     return RoutingModel(
         feature_key,
         purpose,
         candidates,
         create_model_gateway,
-        _log_call,
+        record_call,
         failover_limit=policy["failover_limit"] if policy else 3,
         max_total_requests=policy["max_total_requests"] if policy else 6,
         deadline_seconds=policy["deadline_seconds"] if policy else 600,
         recheck=recheck,
         reserve=_log_call,
+        before_request=before_request,
+        output_limit=output_limit,
+        cooldown_remaining=cooldown.remaining,
+        defer_provider=cooldown.defer,
+        remaining_seconds=remaining_seconds,
     )
 
 

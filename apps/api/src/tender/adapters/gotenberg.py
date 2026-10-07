@@ -96,6 +96,8 @@ class GotenbergConverter:
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
             auth=(username, password) if username and password else None,
             transport=transport,
+            # 内网转换服务与 MinerU 保持一致，避免启动终端的代理把标书和健康探针转发出去。
+            trust_env=False,
         )
         self._backoff_seconds = backoff_seconds
         self._sleep = sleep

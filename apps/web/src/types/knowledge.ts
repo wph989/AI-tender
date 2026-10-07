@@ -40,6 +40,8 @@ export interface KnowledgeSource {
   index_error: string | null;
   error_message: string | null;
   embedding_model_id: number | null;
+  semantic_ready?: boolean;
+  needs_reindex?: boolean;
 }
 
 export interface KnowledgeCollection {
@@ -61,6 +63,23 @@ export interface AnalysisModule {
   status: string;
   items: AnalysisItem[];
   error_message: string | null;
+  runs?: AgentRun[];
+}
+
+export interface AgentRun {
+  id: number;
+  attempt: number;
+  status: string;
+  thread_id: string;
+  started_at: string | null;
+  deadline_at: string | null;
+  finished_at: string | null;
+  model_calls: number;
+  tool_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  limits: { max_model_calls: number; max_tool_calls: number; timeout_seconds: number; max_output_tokens: number };
+  error_message: string | null;
 }
 
 export interface AnalysisReport {
@@ -72,7 +91,10 @@ export interface AnalysisReport {
   stale: boolean;
   error_message: string | null;
   modules: AnalysisModule[];
+  runtime_version?: string;
+  summary?: AnalysisItem[];
   coverage: {
+    mode?: string;
     partial?: boolean;
     scanned_blocks?: number;
     total_blocks?: number;

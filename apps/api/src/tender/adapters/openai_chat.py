@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -11,7 +12,12 @@ from urllib.parse import quote
 
 import httpx
 
-from tender.domain.errors import ExtractionFailed, ExtractionUnavailable, ModelRefused
+from tender.domain.errors import (
+    ExtractionFailed,
+    ExtractionUnavailable,
+    InvalidModelOutput,
+    ModelRefused,
+)
 from tender.ports.llm import Completion
 from tender.ports.model_media import ModelImage
 
@@ -74,6 +80,12 @@ class OpenAIChatModel:
         self._max_tokens = max_tokens
         self._protocol = protocol
         self._api_mode = api_mode
+        self._agent_settings = {
+            "base_url": base_url, "model": model, "api_key": api_key, "timeout": timeout,
+            "temperature": temperature, "max_tokens": max_tokens, "protocol": protocol,
+            "api_mode": api_mode, "parameters": parameters or {},
+        }
+        self._agent_client = None
         self._parameters = parameters or {}
         self._capabilities = (
             capabilities if capabilities is not None else ["text_input", "json_output"]
@@ -254,14 +266,24 @@ class OpenAIChatModel:
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ExtractionFailed("模型响应不符合所选接口的文本结构") from exc
         if not isinstance(content, str) or not content.strip():
-            raise ExtractionFailed("LLM 网关返回空文本")
-        # 结构错误交给路由换候选，不重发相同的无效结果。
+            # 已成功收到空正文也属于 JSON 协议错误，应先走有限纠正，避免直接切到不可达的后备。
+            # 不读取或拼接 reasoning_content，它不能替代模型正式提交的报告。
+            error = InvalidModelOutput if json_mode else ExtractionFailed
+            raise error("LLM 网关返回空文本")
+        if json_mode:
+            # 部分兼容服务仍给完整 JSON 加 Markdown 围栏；只移除完整外包装，绝不猜测正文中的 JSON。
+            fenced = re.fullmatch(
+                r"\s*```(?:json)?[ \t]*\r?\n(.*?)\r?\n```\s*", content, re.S | re.I
+            )
+            if fenced:
+                content = fenced.group(1).strip()
+        # 结构错误交给路由有限纠正；仍不合法才按既有策略换候选。
         try:
             parsed = json.loads(content, parse_constant=_reject_constant) if json_mode else {}
             if not isinstance(parsed, dict):
                 raise ValueError("需要 JSON 对象")
         except ValueError as exc:
-            raise ExtractionFailed("模型输出不是合法 JSON") from exc
+            raise InvalidModelOutput("模型输出不是合法 JSON 对象") from exc
         if not isinstance(usage, dict):
             usage = {}
         return Completion(
@@ -277,6 +299,13 @@ class OpenAIChatModel:
                 )
             ),
         )
+
+    async def chat(self, messages: list[dict], tools: list[dict]) -> Completion:
+        from tender.adapters.agent_chat import AgentChat
+
+        if self._agent_client is None:
+            self._agent_client = AgentChat(**self._agent_settings)
+        return await self._agent_client.chat(messages, tools)
 
     async def list_models(self) -> list[str]:
         """读供应商的 /v1/models。
@@ -312,5 +341,9 @@ class OpenAIChatModel:
         ]
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        try:
+            if self._agent_client is not None:
+                await self._agent_client.aclose()
+        finally:
+            if self._owns_client:
+                await self._client.aclose()

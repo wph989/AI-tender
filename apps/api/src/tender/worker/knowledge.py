@@ -1,4 +1,4 @@
-"""知识索引、全文 Skill 分析及检索问答；租约与数据库锁支持进程重启恢复。"""
+"""知识索引、按版本路由分析及检索问答；历史快照保留原执行契约。"""
 
 from __future__ import annotations
 
@@ -151,6 +151,8 @@ async def _build_index(index_id: int) -> None:
             raise ValueError("资料已更新或删除，请使用最新解析结果重建索引")
         db.execute("UPDATE knowledge_index SET status='running' WHERE id=:id", {"id": index_id})
         chunks = db.readable_chunks(source)
+        if not chunks:
+            raise ValueError("解析结果没有可索引的文字，请检查原文或使用 OCR 重新解析")
         config = db.embedding_config()
         vectors = None
         if config:
@@ -195,9 +197,11 @@ async def _build_index(index_id: int) -> None:
 
 @celery_app.task(name="tender.worker.knowledge.analyze_project")
 def analyze_project(report_id: int) -> None:
+    from tender.application.agent_checkpoints import run_async
+
     with _advisory_lock(f"analysis_report:{report_id}") as acquired:
         if acquired:
-            asyncio.run(_analyze_project(report_id))
+            run_async(_analyze_project(report_id))
 
 
 async def _analyze_project(report_id: int) -> None:
@@ -210,6 +214,15 @@ async def _analyze_project(report_id: int) -> None:
     if not rows or rows[0]["status"] not in {"waiting", "pending", "running"}:
         return
     report = rows[0]
+    if report.get("runtime_version", "legacy") != "legacy":
+        from tender.application.deep_analysis import RUNTIME_VERSION
+        from tender.worker.deep_analysis import analyze_report
+
+        if report["runtime_version"] != RUNTIME_VERSION:
+            _finish("analysis_report", report_id, "failed", "不支持的分析运行时版本")
+            return
+        await analyze_report(db, report)
+        return
     model = _model("analysis")
     try:
         snapshots = report["source_snapshot"]
@@ -238,6 +251,15 @@ async def _analyze_project(report_id: int) -> None:
                 {"id": report_id, "coverage": encode(coverage)},
             )
             if not usable or (missing and not report["allow_partial"]):
+                blocked = [
+                    r for r in missing if source_state(r) in {"failed", "unsupported", "partial"}
+                ]
+                if blocked and (not report["allow_partial"] or len(missing) == len(blocked)):
+                    # 已终止的文件任务不会自行恢复；结束等待让用户能修复材料后重新分析。
+                    names = "、".join(r["file_name"] for r in blocked)
+                    raise ValueError(
+                        f"以下资料未完整解析：{names}。请重新处理后重试，或选择部分分析。"
+                    )
                 db.execute(
                     "UPDATE analysis_report SET lease_until=now()+interval '30 seconds' "
                     "WHERE id=:id",
@@ -275,7 +297,9 @@ async def _analyze_project(report_id: int) -> None:
                 {"id": report_id, "coverage": encode(coverage)},
             )
 
-        candidates, discoveries = await scan_document(model, DocumentTools(blocks), checkpoint)
+        candidates, discoveries = await scan_document(
+            model, DocumentTools(blocks), checkpoint, snapshot=report.get("skill_snapshot")
+        )
         for key, title in MODULES.items():
             _touch("analysis_report", report_id)
             with _engine.begin() as connection:
@@ -289,7 +313,9 @@ async def _analyze_project(report_id: int) -> None:
                     .mappings()
                     .one()
                 )
-            if module["status"] == "completed":
+            # 重试入口只把用户选中的失败模块置为 pending，未选中的失败项保持原状态。
+            # running 则可能来自进程中断，需要恢复；新模块由插入时默认置为 pending。
+            if module["status"] in {"completed", "failed"}:
                 continue
             db.execute(
                 "UPDATE analysis_module SET status='running' WHERE id=:id", {"id": module["id"]}
@@ -316,6 +342,8 @@ async def _analyze_project(report_id: int) -> None:
                         "text": r["subject"]
                         + r["predicate"]
                         + r["object"]
+                        + "；适用范围："
+                        + r["scope"]
                         + "；条件："
                         + r["condition"],
                         "citations": r["citations"],
