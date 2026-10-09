@@ -15,15 +15,21 @@ export interface Citation {
   quote: string;
 }
 
-export interface AnalysisItem {
-  id: string;
-  kind: "fact" | "judgment" | "suggestion" | "conflict" | "insufficient";
-  title: string;
-  text: string;
-  presentation: "paragraph" | "list" | "table";
-  cells: Record<string, string>;
+export interface FieldValue {
+  value: string;
   citations: Citation[];
+}
+
+/** 解析字段：字段名 + 展示分类/顺序 + 解析值列表，证据逐值绑定，前端据此分组并分别定位。 */
+export interface AnalysisField {
+  id: string;
+  field: string;
+  group: string;
+  sort_order: number;
+  values: FieldValue[];
+  note: string;
   verification: string;
+  module_keys?: string[];
 }
 
 export interface KnowledgeSource {
@@ -61,7 +67,7 @@ export interface AnalysisModule {
   module_key: string;
   title: string;
   status: string;
-  items: AnalysisItem[];
+  items: AnalysisField[];
   error_message: string | null;
   runs?: AgentRun[];
 }
@@ -89,10 +95,11 @@ export interface AnalysisReport {
   topics: string[];
   created_at: string;
   stale: boolean;
+  runtime_retired?: boolean;
   error_message: string | null;
   modules: AnalysisModule[];
   runtime_version?: string;
-  summary?: AnalysisItem[];
+  summary?: AnalysisField[];
   coverage: {
     mode?: string;
     partial?: boolean;
@@ -116,7 +123,7 @@ export interface KnowledgeAnswer {
   id: number;
   status: string;
   question: string;
-  items: AnalysisItem[];
+  items: AnalysisField[];
   error_message: string | null;
   snapshot: { mode?: string; no_evidence?: boolean; warning?: string; graph_used?: boolean };
   relations: { subject: string; predicate: string; object: string; condition: string; scope: string; citations: Citation[] }[];

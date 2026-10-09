@@ -1,4 +1,4 @@
-"""知识索引、按版本路由分析及检索问答；历史快照保留原执行契约。"""
+"""知识索引、标书分析与检索问答；解析统一交给 DeepAgents 运行时执行。"""
 
 from __future__ import annotations
 
@@ -7,20 +7,11 @@ from collections.abc import Callable
 
 from sqlalchemy import create_engine, text
 
-from tender.application.analysis_skills import (
-    MODULES,
-    REPORT_CONTRACT,
-    DocumentTools,
-    json_completion,
-    run_module,
-    scan_document,
-    verify_items,
-)
-from tender.application.knowledge import validate_items
 from tender.application.knowledge_retrieval import retrieve_chunks
 from tender.application.knowledge_store import KnowledgeStore, encode, source_state
 from tender.application.llm_routing import RoutingModel
 from tender.application.model_test_maintenance import maintain_model_tests
+from tender.application.qa_agent import answer_with_agent
 from tender.core import settings
 from tender.core.di import create_embedding_gateway, create_rerank_gateway
 from tender.worker.celery_app import celery_app
@@ -33,8 +24,8 @@ def _store() -> KnowledgeStore:
     return KnowledgeStore(_engine, settings.company_id())
 
 
-def _model(feature: str) -> RoutingModel:
-    return _routing_model(feature, feature)
+def _model(feature: str, **limits) -> RoutingModel:
+    return _routing_model(feature, feature, **limits)
 
 
 def _touch(table: str, record_id: int) -> None:
@@ -214,191 +205,14 @@ async def _analyze_project(report_id: int) -> None:
     if not rows or rows[0]["status"] not in {"waiting", "pending", "running"}:
         return
     report = rows[0]
-    if report.get("runtime_version", "legacy") != "legacy":
-        from tender.application.deep_analysis import RUNTIME_VERSION
-        from tender.worker.deep_analysis import analyze_report
+    from tender.application.deep_analysis import RUNTIME_VERSION
+    from tender.worker.deep_analysis import analyze_report
 
-        if report["runtime_version"] != RUNTIME_VERSION:
-            _finish("analysis_report", report_id, "failed", "不支持的分析运行时版本")
-            return
-        await analyze_report(db, report)
+    # 旧的固定字段解析流程已下线：历史报告只读展示，不能继续执行；版本不一致同样拒绝。
+    if report["runtime_version"] != RUNTIME_VERSION:
+        _finish("analysis_report", report_id, "failed", "报告使用已下线的解析流程，请重新发起分析")
         return
-    model = _model("analysis")
-    try:
-        snapshots = report["source_snapshot"]
-        if report["status"] == "waiting":
-            live = {
-                r["source_id"]: r
-                for r in db.sources(sorted({r["collection_id"] for r in snapshots}))
-            }
-            sources = [
-                live.get(r["source_id"], r | {"parse_status": "failed", "is_parseable": False})
-                for r in snapshots
-            ]
-            missing = [r for r in sources if source_state(r) != "ready"]
-            usable = [r for r in sources if source_state(r) in {"ready", "partial"}]
-            coverage = {
-                "files": [
-                    {"name": r["file_name"], "source_id": r["source_id"], "state": source_state(r)}
-                    for r in sources
-                ],
-                "partial": bool(missing),
-                "scanned_blocks": 0,
-                "total_blocks": 0,
-            }
-            db.execute(
-                "UPDATE analysis_report SET coverage=CAST(:coverage AS JSONB) WHERE id=:id",
-                {"id": report_id, "coverage": encode(coverage)},
-            )
-            if not usable or (missing and not report["allow_partial"]):
-                blocked = [
-                    r for r in missing if source_state(r) in {"failed", "unsupported", "partial"}
-                ]
-                if blocked and (not report["allow_partial"] or len(missing) == len(blocked)):
-                    # 已终止的文件任务不会自行恢复；结束等待让用户能修复材料后重新分析。
-                    names = "、".join(r["file_name"] for r in blocked)
-                    raise ValueError(
-                        f"以下资料未完整解析：{names}。请重新处理后重试，或选择部分分析。"
-                    )
-                db.execute(
-                    "UPDATE analysis_report SET lease_until=now()+interval '30 seconds' "
-                    "WHERE id=:id",
-                    {"id": report_id},
-                )
-                return
-            snapshots = sources
-            db.execute(
-                """UPDATE analysis_report SET status='running',
-                    source_snapshot=CAST(:sources AS JSONB)
-                WHERE id=:id AND status<>'canceled' """,
-                {"id": report_id, "sources": encode(snapshots)},
-            )
-        else:
-            usable = [r for r in snapshots if source_state(r) in {"ready", "partial"}]
-            coverage = report["coverage"]
-            db.execute(
-                "UPDATE analysis_report SET status='running' WHERE id=:id AND status<>'canceled'",
-                {"id": report_id},
-            )
-        blocks = []
-        for source in usable:
-            read = db.readable_chunks(source)
-            if not read:
-                raise ValueError(f"无法读取已固定的原文：{source['file_name']}")
-            blocks.extend(read)
-        if not blocks:
-            raise ValueError("当前材料没有可分析的文字块")
-
-        def checkpoint(scanned: int, total: int) -> None:
-            _touch("analysis_report", report_id)
-            coverage.update(scanned_blocks=scanned, total_blocks=total)
-            db.execute(
-                "UPDATE analysis_report SET coverage=CAST(:coverage AS JSONB) WHERE id=:id",
-                {"id": report_id, "coverage": encode(coverage)},
-            )
-
-        candidates, discoveries = await scan_document(
-            model, DocumentTools(blocks), checkpoint, snapshot=report.get("skill_snapshot")
-        )
-        for key, title in MODULES.items():
-            _touch("analysis_report", report_id)
-            with _engine.begin() as connection:
-                module = dict(
-                    connection.execute(
-                        text("""INSERT INTO analysis_module (report_id,module_key,title)
-                    VALUES (:report,:key,:title) ON CONFLICT (report_id,module_key)
-                    DO UPDATE SET title=EXCLUDED.title RETURNING *"""),
-                        {"report": report_id, "key": key, "title": title},
-                    )
-                    .mappings()
-                    .one()
-                )
-            # 重试入口只把用户选中的失败模块置为 pending，未选中的失败项保持原状态。
-            # running 则可能来自进程中断，需要恢复；新模块由插入时默认置为 pending。
-            if module["status"] in {"completed", "failed"}:
-                continue
-            db.execute(
-                "UPDATE analysis_module SET status='running' WHERE id=:id", {"id": module["id"]}
-            )
-            try:
-                items, relations, trace = await run_module(
-                    model,
-                    key,
-                    blocks,
-                    report["category"],
-                    report["topics"],
-                    report["lot_settings"],
-                    candidates[key],
-                    lambda: _touch("analysis_report", report_id),
-                    snapshot=report.get("skill_snapshot") or None,
-                )
-                if key == "general_module_parsing":
-                    items = await verify_items(model, discoveries) + items
-                # 关系单独验证后才用于图谱扩展；路径存在不能自动证明关系成立。
-                relation_items = [
-                    {
-                        "kind": "judgment",
-                        "title": r["subject"],
-                        "text": r["subject"]
-                        + r["predicate"]
-                        + r["object"]
-                        + "；适用范围："
-                        + r["scope"]
-                        + "；条件："
-                        + r["condition"],
-                        "citations": r["citations"],
-                    }
-                    for r in relations
-                ]
-                await verify_items(model, relation_items)
-                with _engine.begin() as connection:
-                    connection.execute(
-                        text("""UPDATE analysis_module SET status='completed',
-                        items=CAST(:items AS JSONB),
-                        trace=CAST(:trace AS JSONB),error_message=NULL WHERE id=:id"""),
-                        {"id": module["id"], "items": encode(items), "trace": encode(trace)},
-                    )
-                    connection.execute(
-                        text("DELETE FROM knowledge_relation WHERE module_id=:id"),
-                        {"id": module["id"]},
-                    )
-                    for rel, verdict in zip(relations, relation_items, strict=True):
-                        if verdict["verification"] != "supported":
-                            continue
-                        connection.execute(
-                            text("""INSERT INTO knowledge_relation
-                            (report_id,module_id,subject,predicate,object,scope,condition,citations,verified)
-                            VALUES (:report,:module,:subject,:predicate,:object,:scope,
-                                    :condition,CAST(:citations AS JSONB),true)"""),
-                            {
-                                **rel,
-                                "report": report_id,
-                                "module": module["id"],
-                                "citations": encode(rel["citations"]),
-                            },
-                        )
-            except InterruptedError:
-                raise
-            except Exception as exc:
-                db.execute(
-                    "UPDATE analysis_module SET status='failed',error_message=:error WHERE id=:id",
-                    {"id": module["id"], "error": str(exc)[:1000]},
-                )
-        failed = db.rows(
-            "SELECT id FROM analysis_module WHERE report_id=:id AND status='failed'",
-            {"id": report_id},
-        )
-        _finish(
-            "analysis_report",
-            report_id,
-            "partial" if failed or coverage.get("partial") else "completed",
-        )
-    except InterruptedError:
-        pass
-    except Exception as exc:
-        _finish("analysis_report", report_id, "failed", str(exc)[:1000])
-    finally:
-        await model.aclose()
+    await analyze_report(db, report)
 
 
 async def retrieve(
@@ -451,6 +265,9 @@ def graph_expand(
             break
         text_hits = ""
         names = next_names
+    if not selected:
+        # 问答每次检索都会尝试扩展；无关联时无需反复读取全部资料。
+        return hits, []
     seen = {r["block_id"] for r in hits}
     wanted = {ref["element_id"] for rel in selected for ref in rel["citations"]}
     for source in sources:
@@ -476,7 +293,6 @@ async def _answer_question(answer_id: int) -> None:
     if not answers or answers[0]["status"] not in {"pending", "running"}:
         return
     answer = answers[0]
-    model = _model("knowledge_ask")
     try:
         ids = answer["collection_ids"]
         if answer["project_id"] and set(ids) - set(
@@ -487,39 +303,61 @@ async def _answer_question(answer_id: int) -> None:
             db.collection(cid)
         sources = answer["snapshot"]["sources"]
         db.execute("UPDATE knowledge_answer SET status='running' WHERE id=:id", {"id": answer_id})
-        hits, info = await retrieve(
-            db, sources, answer["question"], lambda: _touch("knowledge_answer", answer_id)
-        )
-        relations = []
-        if answer["project_id"]:
-            hits, relations = graph_expand(db, answer["project_id"], hits, sources)
-        tools = DocumentTools(hits)
-        context = tools.reveal(hits)
-        items = []
-        if hits:
-            result = await json_completion(
-                model,
-                REPORT_CONTRACT + '\n回答问题，返回 {"items":[...]}。'
-                "当前招标材料说明本项目要求；企业资料提供企业事实；历史和参考资料只用于建议。"
-                "引用的用途见原文元数据，禁止混同。不得声称本次 top-k 问答穷尽全部风险；"
-                "涉及全部要求时提示查看全文分析报告。\n问题："
-                + answer["question"]
-                + "\n来源用途："
-                + encode(
-                    [{k: s[k] for k in ("source_id", "purpose", "file_name")} for s in sources]
-                )
-                + "\n原文："
-                + encode(context)
-                + "\n已校验关系："
-                + encode(relations),
+
+        async def authorize() -> None:
+            await asyncio.to_thread(_touch, "knowledge_answer", answer_id)
+
+        async def retrieve_selected(selected: list[dict], query: str):
+            return await retrieve_chunks(
+                db,
+                selected,
+                query,
+                lambda: _touch("knowledge_answer", answer_id),
+                create_embedding_gateway,
+                create_rerank_gateway,
             )
-            items = await verify_items(model, validate_items(result.get("items"), tools.seen))
+
+        async def read_source(source: dict) -> list[dict]:
+            return await asyncio.to_thread(db.readable_chunks, source)
+
+        async def expand_selected(selected: list[dict], hits: list[dict]):
+            return await asyncio.to_thread(graph_expand, db, answer["project_id"], hits, selected)
+
+        # 问答由独立 Agent 检索、核对并作答；项目范围取其自身，集合问答回落到资料来源的项目。
+        project_id = answer["project_id"]
+        if project_id is None and sources:
+            project_id = sources[0]["project_id"]
+        draft, research = await answer_with_agent(
+            model_factory=lambda **limits: _model("knowledge_ask", **limits),
+            sources=sources,
+            project_id=project_id,
+            question=answer["question"],
+            retrieve=retrieve_selected,
+            read=read_source,
+            authorize=authorize,
+            expand=expand_selected if answer["project_id"] else None,
+        )
+        items = draft["fields"]
+        searches = [event for event in research.events if event["action"] == "search_result"]
+        # 只展示 Agent 实际检索并读到的图谱依据，不能把图外预检结果冒充作答上下文。
+        graph_relations = []
+        for event in searches:
+            for link in event["relations"]:
+                if link not in graph_relations:
+                    graph_relations.append(link)
+        relations = graph_relations + [r for r in draft["relations"] if r not in graph_relations]
         snapshot = {
             **answer["snapshot"],
-            **info,
-            "retrieved_blocks": len(hits),
-            "graph_used": bool(relations),
-            "graph_relation_count": len(relations),
+            "mode": "hybrid" if any(e.get("mode") == "hybrid" for e in searches) else "keyword",
+            "reranked": any(e.get("reranked") for e in searches),
+            "embedding_configured": any(e.get("embedding_configured") for e in searches),
+            "semantic_source_ids": sorted(
+                {sid for e in searches for sid in e.get("semantic_source_ids", [])}
+            ),
+            "warning": "；".join(dict.fromkeys(e["warning"] for e in searches if e.get("warning"))),
+            "retrieved_blocks": len(research.seen),
+            "graph_used": bool(graph_relations),
+            "graph_relation_count": len(graph_relations),
             "no_evidence": not bool(items),
         }
         db.execute(
@@ -536,5 +374,3 @@ async def _answer_question(answer_id: int) -> None:
         _finish("knowledge_answer", answer_id, "completed")
     except Exception as exc:
         _finish("knowledge_answer", answer_id, "failed", str(exc)[:1000])
-    finally:
-        await model.aclose()

@@ -679,12 +679,15 @@ data: {"status":"completed","version_id":2048}
 从而在尚无解析批次时也能显示文件失败原因。
 
 完整分析等待阶段如发现资料已失败、仅部分解析或格式不支持，报告转为 `failed`，错误列出文件。
-修复后可重试，或重新发起 `allow_partial=true` 的分析。扫描前失败的重试返回 `waiting`；
-已固定全文的报告重试仍返回 `pending` 并保留原解析批次。覆盖进度在首个模型请求前初始化块总数。
-`retry` 的 `module_keys` 只将选中的失败模块置为待处理；未选中的失败模块和已完成模块保持原状态。
-不传 `module_keys` 时选择全部模块，仍只重置失败项。恢复进程中断留下的 `running` 模块不受此限制。
+修复后可重试，或重新发起 `allow_partial=true` 的分析。从未固定检索批次的报告重试返回 `waiting`，
+等待资料可用；已经开始的报告重试返回 `pending` 并保留原资料批次。
+`retry` 接受 `failed`、`partial`、`canceled` 报告；`module_keys` 只将选中的失败、已取消模块置为待处理，
+未选中的失败模块和已完成模块保持原状态。不传 `module_keys` 时选择全部模块，仍只重置未完成项。
+恢复进程中断留下的 `running` 模块不受此限制。`runtime_version` 与当前运行时不一致的历史报告只读展示，
+补跑返回 409 `runtime_retired`。历史报告不比较参考来源快照：旧流程不记录该快照，否则库中只要有参考来源
+就会恒判为“材料已变化”。
 
-DeepAgents 报告补跑可选 `max_output_tokens`（512–16384），只调整新 attempt 的单次输出上限；旧 attempt、报告原配置和累计用量保留，请求次数与总时限不扩大。省略时沿用报告配置。
+DeepAgents 报告补跑可选 `max_output_tokens`（512–16384）和 `timeout_seconds`（300–3600），只覆盖新 attempt 的对应字段；其余限值（模型/工具次数、证据块、上下文、时长）取配置中心当前值，用户调大预算后补跑立即生效。旧 attempt、报告创建时的快照和累计用量保留不回写，请求次数不随之扩大。
 模型路由收到非法 JSON 时，在换候选前最多追加两次格式纠正提示，计入既有总请求/时间预算；该行为不放宽引用校验，也不把连接、配置、权限或明确拒绝错误当作格式问题重试。
 结论的支持性检查最多反馈两次供 Agent 补读或修正，仍受模块总步数限制；最终不支持的条目明确标记 `insufficient` / `unsupported`。
 
@@ -732,4 +735,5 @@ DeepAgents 报告补跑可选 `max_output_tokens`（512–16384），只调整�
 
 报告详情增加 runtime_version、runtime_settings、reference_snapshot、summary 及各模块 runs。
 新报告 coverage.mode=agent_research，界面显示13个专题的完成数，不使用 scanned_blocks/total_blocks。
-补跑为选中的失败模块创建新 attempt；原运行记录和已完成模块保留。取消停止后续模型与工具请求。
+补跑为选中的失败、已取消模块创建新 attempt；原运行记录和已完成模块保留。取消停止后续模型与工具请求；
+已取消报告重新发起后只重跑未完成模块。

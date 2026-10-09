@@ -1,6 +1,7 @@
 """独立 PostgreSQL schema 验证多连接硬配额、恢复和真实 DeepAgents 调度。"""
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 from uuid import uuid4
@@ -195,8 +196,10 @@ def test_resume_preserves_budget_evidence_and_deadline(env):
 
 
 class NativeRouter:
-    def __init__(self, *, before_request, **kwargs):
-        self.reserve = before_request
+    def __init__(self, *, purpose="", **kwargs):
+        self.reserve = kwargs["before_request"]
+        # _routing_model 的 purpose 含模块键，据此区分格式模块的提交协议。
+        self.outline = "bid_format_outline_parsing" in purpose
         self.calls = 0
 
     async def chat(self, messages, tools):
@@ -205,14 +208,24 @@ class NativeRouter:
         self.calls += 1
         if self.calls == 1:
             name, args = "search_document", {"query": "质保"}
+        elif self.outline:
+            # 格式模块的 submit_analysis 绑定 submit_outline，必须按 outline 协议提交。
+            name, args = (
+                "submit_analysis",
+                {
+                    "outline_nodes": [],
+                    "research_summary": "已检索质保，无格式层级新增",
+                    "final": True,
+                },
+            )
         else:
             name, args = (
                 "submit_analysis",
                 {
-                    "items": [],
+                    "fields": [],
                     "relations": [],
-                    "outline_nodes": [],
                     "research_summary": "已检索质保，当前专题无新增事项",
+                    "final": True,
                 },
             )
         return Completion(
@@ -233,8 +246,9 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     row = report(env)
     routers = []
 
-    def model(*args, **kwargs):
-        router = NativeRouter(**kwargs)
+    def model(feature_key, purpose, **kwargs):
+        # _routing_model 的 purpose 含模块键，格式模块须走 outline 协议提交。
+        router = NativeRouter(purpose=purpose, **kwargs)
 
         async def broken_close():
             raise RuntimeError("模拟SDK清理失败")
@@ -250,7 +264,12 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     monkeypatch.setattr(worker, "retrieve_chunks", retrieve)
     run_async(worker.analyze_report(env.db, row))
     result = knowledge.get_report(row["id"], env.request)
-    assert result["status"] == "completed", (result["error_message"], result["modules"])
+    bad = [
+        (m["module_key"], m["status"], m.get("error_message"))
+        for m in result["modules"]
+        if m["status"] != "completed"
+    ]
+    assert result["status"] == "completed", (result["error_message"], bad)
     assert len(routers) == len(result["modules"]) == 13
     runs = env.db.rows("SELECT * FROM agent_module_run")
     assert len({r["thread_id"] for r in runs}) == 13
@@ -308,25 +327,35 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     runtime = prepared_runtime(env)
     assert runtime.claim()
     runtime.reserve("model")
-    saved_state = {"draft": {"items": [], "relations": [], "research_summary": "已经检索"}}
+    saved_state = {"draft": {"fields": [], "relations": [], "research_summary": "已经检索"}}
     if staged:
         saved_state = {
             "staged_items": [
                 {
                     "id": "part1",
-                    "kind": "fact",
-                    "title": "质保",
-                    "text": "质保三年",
-                    "citations": [
+                    "field": "质保",
+                    "group": "",
+                    "sort_order": 0,
+                    "values": [
                         {
-                            "source_id": runtime.sources[0]["source_id"],
-                            "project_id": runtime.report["project_id"],
-                            "quote": "质保三年",
+                            "value": "质保三年",
+                            "citations": [
+                                {
+                                    "source_id": runtime.sources[0]["source_id"],
+                                    "project_id": runtime.report["project_id"],
+                                    "quote": "质保三年",
+                                }
+                            ],
                         }
                     ],
+                    "note": "",
                 }
             ],
             "invalid_submissions": 3,
+            "consecutive_invalid_submissions": 3,
+            "staged_items_verified": True,
+            "consecutive_unsubmitted_responses": 2,
+            "last_unsubmitted_message_id": "old-response",
         }
     runtime.save(saved_state)
     runtime.finish("failed", "故障注入")
@@ -357,10 +386,45 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     carried_key = "staged_items" if staged else "draft"
     assert rows[1]["state"][carried_key] == rows[0]["state"][carried_key]
     assert "invalid_submissions" not in rows[1]["state"]
+    assert "consecutive_invalid_submissions" not in rows[1]["state"]
+    assert "staged_items_verified" not in rows[1]["state"]
+    assert "consecutive_unsubmitted_responses" not in rows[1]["state"]
+    assert "last_unsubmitted_message_id" not in rows[1]["state"]
     with pytest.raises(knowledge.ApiProblem):
         knowledge.retry_report(
             runtime.report["id"], knowledge.RetryInput(module_keys=[key]), env.request
         )
+
+
+def test_canceled_report_retries_failed_and_canceled_modules(env):
+    """取消不是终态：重新发起只重跑失败与已取消模块，完成的模块保持原结果。"""
+    runtime = prepared_runtime(env)
+    assert runtime.claim()
+    runtime.finish("failed", "故障注入")
+    runtime.release()
+    report_id = runtime.report["id"]
+    with env.engine.begin() as conn:
+        # 模拟用户取消：未完成的模块停在取消态，报告本身也进入 canceled。
+        conn.execute(
+            text("""UPDATE analysis_module SET status='canceled'
+            WHERE report_id=:id AND id<>:module"""),
+            {"id": report_id, "module": runtime.run["module_id"]},
+        )
+        conn.execute(
+            text("UPDATE analysis_report SET status='canceled' WHERE id=:id"),
+            {"id": report_id},
+        )
+    result = knowledge.retry_report(report_id, knowledge.RetryInput(), env.request)
+    assert result["status"] == "pending"
+    runs = env.db.rows(
+        """SELECT m.module_key,m.status,a.attempt FROM analysis_module m
+        JOIN agent_module_run a ON a.module_id=m.id
+        AND a.attempt=(SELECT max(attempt) FROM agent_module_run WHERE module_id=m.id)
+        WHERE m.report_id=:id ORDER BY m.id""",
+        {"id": report_id},
+    )
+    assert runs and all(row["status"] == "pending" and row["attempt"] == 2 for row in runs)
+    assert knowledge.get_report(report_id, env.request)["status"] == "pending"
 
 
 def test_dynamic_reference_revocation_stops_tool_and_hides_existing_result(env):
@@ -392,10 +456,13 @@ def test_dynamic_reference_revocation_stops_tool_and_hides_existing_result(env):
         # 服务端展示规则也使用实时关联，不能借旧报告继续读取参考引文。
         item = {
             "id": "test",
-            "kind": "suggestion",
-            "title": "历史参考",
-            "text": "五年",
-            "citations": [{"collection_id": cid}],
+            "field": "历史参考",
+            "group": "",
+            "sort_order": 0,
+            "values": [
+                {"value": "五年", "citations": [{"collection_id": cid}]}
+            ],
+            "note": "",
         }
         shown = knowledge.visible_items(
             env.db, [item], env.db.collections_for_project(runtime.report["project_id"])
@@ -403,3 +470,38 @@ def test_dynamic_reference_revocation_stops_tool_and_hides_existing_result(env):
         assert shown[0]["verification"] == "unavailable"
     finally:
         runtime.release()
+
+
+def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
+    """用户改大预算后补跑必须按配置中心当前值执行，不能被创建时的旧快照锁死。"""
+    runtime = prepared_runtime(env)
+    old = env.db.rows(
+        "SELECT limits FROM agent_module_run WHERE id=:id", {"id": runtime.run["id"]}
+    )[0]["limits"]
+    assert old["max_model_calls"] == 32 and old["context_tokens"] == 24000
+    assert runtime.claim()
+    runtime.finish("failed", "故障注入")
+    runtime.release()
+    env.db.execute(
+        "UPDATE analysis_report SET status='partial' WHERE id=:id", {"id": runtime.report["id"]}
+    )
+    # 模拟用户在配置中心调大预算（values 只含覆盖项，读取时会与默认值合并）。
+    env.db.execute(
+        """INSERT INTO config_release (company_id, version_no, values, status, created_by)
+        VALUES (1, 1, CAST(:values AS JSONB), 'active', '测试')""",
+        {"values": json.dumps({"analysis.max_model_calls": 80, "analysis.context_tokens": 200000})},
+    )
+    knowledge.retry_report(runtime.report["id"], knowledge.RetryInput(), env.request)
+    runs = env.db.rows(
+        "SELECT * FROM agent_module_run WHERE module_id=:id ORDER BY attempt",
+        {"id": runtime.run["module_id"]},
+    )
+    assert runs[-1]["attempt"] == 2
+    assert runs[-1]["limits"]["max_model_calls"] == 80
+    assert runs[-1]["limits"]["context_tokens"] == 200000
+    # 未在配置中心显式调整的键回落默认值，同样不沿用旧快照。
+    assert runs[-1]["limits"]["max_tool_calls"] == 48
+    # 报告创建时的快照保持原值，只作为历史记录，不被补跑改写。
+    assert knowledge.report_row(env.request, runtime.report["id"])["runtime_settings"][
+        "max_model_calls"
+    ] == 32

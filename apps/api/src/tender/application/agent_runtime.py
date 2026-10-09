@@ -329,7 +329,7 @@ class AgentRuntime:
                     "id": self.run["module_id"],
                     "status": status,
                     "error": error,
-                    "items": encode((draft or {}).get("items", [])),
+                    "items": encode((draft or {}).get("fields", [])),
                 },
             )
             if draft is not None:

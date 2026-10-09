@@ -182,17 +182,22 @@ def validate_value(key: str, value: Any) -> str | None:
     if not ok:
         return f"{key} 期望 {entry.value_type}，收到 {type(value).__name__}"
     if key.startswith("analysis."):
-        bounds = {
+        # 上限只是防止误配的护栏；上下文预算不设上限，可用范围由所绑定模型的实际窗口决定。
+        bounds: dict[str, tuple[int, int | None]] = {
             "analysis.max_inflight": (1, 32),
             "analysis.max_model_calls": (4, 256),
             "analysis.max_tool_calls": (4, 512),
             "analysis.timeout_seconds": (60, 7200),
-            "analysis.context_tokens": (4096, 128000),
+            "analysis.context_tokens": (4096, None),
             "analysis.max_output_tokens": (512, 16384),
         }
         low, high = bounds[key]
-        if not low <= value <= high:
-            return f"{key} 必须在 {low} 到 {high} 之间"
+        if value < low or (high is not None and value > high):
+            return (
+                f"{key} 必须在 {low} 到 {high} 之间"
+                if high is not None
+                else f"{key} 不能小于 {low}"
+            )
     return None
 
 

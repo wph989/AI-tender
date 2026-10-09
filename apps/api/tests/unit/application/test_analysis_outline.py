@@ -21,7 +21,7 @@ def node(key, name, parent=None, node_type="section", requirements=None):
     }
 
 
-def test_independent_attachment_has_no_second_parent_in_text_cells_or_relations():
+def test_independent_attachment_has_no_second_parent_in_values_or_relations():
     nodes = [
         node("business", "商务标", node_type="group"),
         node("qualification", "资格材料", "business"),
@@ -32,13 +32,19 @@ def test_independent_attachment_has_no_second_parent_in_text_cells_or_relations(
     ]
     items, relations = outline_result({"outline_nodes": nodes}, SEEN)
     training = items[-1]
-    assert training["text"] == "培训安排；编制要求：单独提交"
-    assert training["cells"]["逻辑标"] == "独立章节"
-    assert training["cells"]["层级"] == "1" and training["cells"]["上级路径"] == ""
+    # 节点名是字段，编制要求各成一个值，层级/上级路径改由程序生成的 note 表达。
+    assert training["field"] == "培训安排"
+    assert training["group"] == "独立章节"
+    assert [value["value"] for value in training["values"]] == ["单独提交"]
+    assert "节点类型：材料章节" in training["note"]
+    assert "层级：1" in training["note"] and "上级路径：无" in training["note"]
     assert all("培训安排" not in rel["object"] for rel in relations)
-    assert items[2]["cells"]["上级路径"] == "商务标 / 资格材料"
-    assert items[2]["cells"]["层级"] == "2"
-    assert items[2]["citations"][0]["element_id"] == 7
+    license_item = items[2]
+    assert license_item["group"] == "商务标"
+    assert license_item["values"][0]["value"] == "营业执照须盖章"
+    assert "上级路径：商务标 / 资格材料" in license_item["note"]
+    assert "层级：2" in license_item["note"]
+    assert license_item["values"][0]["citations"][0]["element_id"] == 7
     assert relations[1]["object"] == "商务标 / 资格材料 / 营业执照"
 
 
@@ -77,9 +83,11 @@ def test_node_name_requirement_and_parent_must_have_read_evidence():
     child = node("b", "营业执照", "a")
     child["citations"] = [{"block_id": "b1", "quote": "营业执照须盖章"}]
     items, relations = outline_result({"outline_nodes": [node("a", "资格材料"), child]}, SEEN)
-    assert [ref["quote"] for ref in items[1]["citations"]] == ["营业执照须盖章", TEXT]
-    assert relations[0]["citations"] == items[1]["citations"]
-    assert items[1]["kind"] == "judgment"  # 汇集证据不会直接把模型判断升级成事实。
+    assert [ref["quote"] for ref in items[1]["values"][0]["citations"]] == ["营业执照须盖章", TEXT]
+    # 关系引文必须复用校验后的引文行，携带块身份元数据，前端才能定位和高亮。
+    assert relations[0]["citations"] == items[1]["values"][0]["citations"]
+    # 汇集到的祖先引文只是值的证据，程序不会把模型判断升级成事实。
+    assert items[1]["verification"] == "pending"
     unread = deepcopy(child)
     unread["citations"][0]["block_id"] = "outside"
     with pytest.raises(ValueError, match="未读取"):

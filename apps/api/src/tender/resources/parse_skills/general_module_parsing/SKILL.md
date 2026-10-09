@@ -17,7 +17,7 @@ description: "检查招标文件补充发现与跨文件关联，覆盖专门模
 2. 查清是否同一标段、主体、时间和范围，保留且/或、例外、前提和否定。
 3. 补充通知明确修改某条时同时引用原条款和修改条款；无明确关系则并列为冲突，不以上传时间裁定。
 4. 未被专题覆盖的重要义务、不可抗力及关联风险可独立成项，不重复复制普通事实。
-5. 事实、判断、建议、冲突、证据不足使用不同 kind。建议须引用事实前提。
+5. 补充义务、例外、冲突与证据不足分别成字段或值；建议须引用事实前提，无依据的判断不写入解析值。
 6. 仅共同出现的实体不能形成关系；关系须有直接引用及范围/条件。
 
 ## 工具与证据
@@ -32,9 +32,9 @@ description: "检查招标文件补充发现与跨文件关联，覆盖专门模
 
 ## 输出协议
 
-通过原生工具调用 `submit_analysis(items, relations, research_summary)` 提交结果。
-每条 item 包含 kind、title、text、presentation、cells、citations；kind 可为 fact、judgment、suggestion、conflict、insufficient。
-presentation 使用 paragraph、list、table；cells 为文字键值，每个表格行或列表项分别成项。
+通过原生工具调用 `submit_analysis(fields, relations, research_summary)` 提交结果。
+每个字段包含 field、group、sort_order、values、note；values 中每个值包含 value 与 citations，证据逐值绑定。
 引用使用 {"block_id":"工具实际返回的块ID","quote":"块内连续原文"}；不能引用 Skill、压缩摘要或常识。
-没有相关依据可提交空 items，但 research_summary 必须说明检索过的主题、缺口与不确定性。
+同一字段出现多个值时每个值各自成条并带自己的引用，不合并成一段文字；一个值可有多条引用。
+没有相关依据可提交空 fields，但 research_summary 必须说明检索过的主题、缺口与不确定性。
 补充文件明确修改条款时保留修改前后双方引用；参考库内容只作建议，不能替代本项目要求。

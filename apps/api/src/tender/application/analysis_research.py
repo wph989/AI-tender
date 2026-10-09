@@ -11,10 +11,19 @@ from tender.application.knowledge import normalized
 
 Retrieve = Callable[[list[dict], str], Awaitable[tuple[list[dict], dict]]]
 Read = Callable[[dict], Awaitable[list[dict]]]
+Expand = Callable[[list[dict], list[dict]], Awaitable[tuple[list[dict], list[dict]]]]
 
 
 class SourceNotAllowed(PermissionError):
     """工具参数引用了清单外的来源；拒绝读取后允许模型按清单纠正。"""
+
+
+class ToolArgumentError(ValueError):
+    """工具参数越界或类型不符；属于可自纠正错误，回传给模型修正而不是终止模块。"""
+
+
+class EvidenceBudgetError(ValueError):
+    """证据块预算已满；拒绝新增原文但允许模型基于已有证据完成分析，属于可自纠正错误。"""
 
 
 @dataclass(frozen=True)
@@ -40,6 +49,7 @@ class ResearchSession:
     seen: dict[str, dict] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
     tool_calls: int = 0
+    expand: Expand | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def _begin(self, action: str, arguments: dict) -> None:
@@ -66,6 +76,7 @@ class ResearchSession:
     def _remember(self, rows: list[dict], *, deduplicate: bool) -> dict:
         allowed = {(s["source_id"], s["parse_run_id"], s["version_id"]) for s in self.sources}
         blocks, duplicates = [], []
+        omitted = 0
         remembered = dict(self.seen)
         for row in rows:
             if (row["source_id"], row["parse_run_id"], row["version_id"]) not in allowed:
@@ -87,7 +98,10 @@ class ResearchSession:
                 duplicates.append(identical["block_id"])
                 continue
             if key not in remembered and len(remembered) >= self.limits.max_evidence_blocks:
-                raise ValueError("本模块已达到证据块预算，请基于已有证据完成分析")
+                # 预算只限制新增证据；混合批次仍须返回可容纳的新块和已读块，避免补读死路。
+                # 继续检查后续行的权限，不能因预算已满而跳过越权结果。
+                omitted += 1
+                continue
             remembered[key] = dict(row)
             blocks.append(
                 {
@@ -105,8 +119,17 @@ class ResearchSession:
                     )
                 }
             )
+        if omitted and not blocks and not duplicates:
+            raise EvidenceBudgetError("本模块已达到证据块预算，请基于已有证据完成分析")
         self.seen = remembered
-        return {"blocks": blocks, "already_read": list(dict.fromkeys(duplicates))}
+        result = {"blocks": blocks, "already_read": list(dict.fromkeys(duplicates))}
+        if omitted:
+            result.update(
+                budget_exhausted=True,
+                omitted_blocks=omitted,
+                warning="证据块预算已满，本批只返回预算内及已读原文；请据此提交并说明检索缺口",
+            )
+        return result
 
     async def documents(self) -> list[dict]:
         await self._begin("list_documents", {})
@@ -126,29 +149,43 @@ class ResearchSession:
 
     async def search(self, query: str, scope: str, source_id: int | None = None) -> dict:
         if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:
-            raise ValueError("检索问题须为1到500个字符")
+            raise ToolArgumentError("检索问题须为1到500个字符")
         await self._begin("search_" + scope, {"query": query, "source_id": source_id})
         sources = self._sources(scope, source_id)
         if not sources:
             return {"blocks": [], "already_read": [], "warning": "当前没有关联参考资料"}
         rows, info = await self.retrieve(sources, query.strip())
+        rows, relations = rows[:12], []
+        if self.expand:
+            # 扩展必须处于同一次检索工具内，让 Agent 真正读到关联原文；范围仍是本次所选资料。
+            rows, relations = await self.expand(sources, rows)
         # 查询等待期间可能撤销关联，结果进入模型上下文前再次检查。
         await self.authorize()
         async with self._lock:
-            result = self._remember(rows[:12], deduplicate=True)
+            result = self._remember(rows, deduplicate=True)
+            # 超预算未进入证据账的块不能通过关系引文旁路进入上下文。
+            relations = [
+                link
+                for link in relations
+                if link.get("citations")
+                and all(str(ref.get("block_id")) in self.seen for ref in link["citations"])
+            ]
+        if self.expand:
+            result["relations"] = relations
         self.events.append(
             {
                 "action": "search_result",
                 "scope": scope,
                 "block_ids": [b["block_id"] for b in result["blocks"]],
                 **info,
+                "relations": relations,
             }
         )
         return result | {"retrieval": info}
 
     async def read_source(self, source_id: int, offset: int, limit: int = 6) -> dict:
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 12:
-            raise ValueError("阅读偏移须非负，每次只能读取1到12块")
+            raise ToolArgumentError("阅读偏移须非负，每次只能读取1到12块")
         sources = [s for s in self.sources if s["source_id"] == source_id]
         if len(sources) != 1:
             raise SourceNotAllowed("资料不在本模块授权范围，请先 list_documents 核对 source_id")

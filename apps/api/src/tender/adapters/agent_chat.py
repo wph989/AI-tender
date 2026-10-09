@@ -93,10 +93,17 @@ class AgentChat:
                 result = await runnable.ainvoke(messages_from_dict(messages))
         except Exception as exc:
             status = getattr(exc, "status_code", None)
-            if status in {408, 429, 500, 502, 503, 504} or any(
-                token in type(exc).__name__ for token in ("Timeout", "Connection")
+            # 524 等非标准 5xx 同样是上游超时，必须可重试，不能直接判失败。
+            if (
+                status in {408, 429}
+                or (status is not None and status >= 500)
+                or any(token in type(exc).__name__ for token in ("Timeout", "Connection"))
             ):
-                error = ExtractionUnavailable("Agent 模型连接失败或暂不可用", http_status=status)
+                # SDK 会包装传输异常；保留原因类型便于区分超时与断连，不暴露原异常内容。
+                cause = exc.__cause__ if exc.__cause__ is not None else exc
+                error = ExtractionUnavailable(
+                    f"Agent 模型连接失败或暂不可用（{type(cause).__name__}）", http_status=status
+                )
                 response = getattr(exc, "response", None)
                 if response is not None:
                     from tender.adapters.openai_chat import _retry_after

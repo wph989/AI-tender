@@ -8,7 +8,7 @@ description: "废标项解析专家。从招标文件中提取废标条件、否
 ## 适用场景
 - 触发：主 Agent 委派废标项解析任务时调用。
 - 输入：授权资料清单与按需检索得到的原文块，不预先灌入全文。
-- 输出：submit_analysis 原生工具中的动态 JSON 条目，每条附已读取原文块的引用。
+- 输出：submit_analysis 原生工具提交的字段（field/group/sort_order/values/note），每个值附已读取原文块的引用。
 
 ## 领域知识
 
@@ -40,11 +40,11 @@ description: "废标项解析专家。从招标文件中提取废标条件、否
 
 ## 输出协议
 
-通过原生工具调用 `submit_analysis(items, relations, research_summary)` 提交结果。
-每条 item 包含 kind、title、text、presentation、cells、citations；kind 可为 fact、judgment、suggestion、conflict、insufficient。
-presentation 使用 paragraph、list、table；cells 为文字键值，每个表格行或列表项分别成项。
+通过原生工具调用 `submit_analysis(fields, relations, research_summary)` 提交结果。
+每个字段包含 field、group、sort_order、values、note；values 中每个值包含 value 与 citations，证据逐值绑定。
 引用使用 {"block_id":"工具实际返回的块ID","quote":"块内连续原文"}；不能引用 Skill、压缩摘要或常识。
-没有相关依据可提交空 items，但 research_summary 必须说明检索过的主题、缺口与不确定性。
+同一字段出现多个值时每个值各自成条并带自己的引用，不合并成一段文字；一个值可有多条引用。
+没有相关依据可提交空 fields，但 research_summary 必须说明检索过的主题、缺口与不确定性。
 补充文件明确修改条款时保留修改前后双方引用；参考库内容只作建议，不能替代本项目要求。
 
 ## 参考文件（按标类型加载）

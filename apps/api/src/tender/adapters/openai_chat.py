@@ -16,6 +16,7 @@ from tender.domain.errors import (
     ExtractionFailed,
     ExtractionUnavailable,
     InvalidModelOutput,
+    ModelOutputTruncated,
     ModelRefused,
 )
 from tender.ports.llm import Completion
@@ -81,9 +82,15 @@ class OpenAIChatModel:
         self._protocol = protocol
         self._api_mode = api_mode
         self._agent_settings = {
-            "base_url": base_url, "model": model, "api_key": api_key, "timeout": timeout,
-            "temperature": temperature, "max_tokens": max_tokens, "protocol": protocol,
-            "api_mode": api_mode, "parameters": parameters or {},
+            "base_url": base_url,
+            "model": model,
+            "api_key": api_key,
+            "timeout": timeout,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "protocol": protocol,
+            "api_mode": api_mode,
+            "parameters": parameters or {},
         }
         self._agent_client = None
         self._parameters = parameters or {}
@@ -97,6 +104,75 @@ class OpenAIChatModel:
         if self._protocol == "gemini":
             return {"x-goog-api-key": self._api_key} if self._api_key else {}
         return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+
+    async def _post_completion(self, path: str, body: dict) -> httpx.Response:
+        if self._api_mode != "chat_completions":
+            return await self._client.post(path, headers=self._headers(), json=body)
+        # 长推理的非流式响应会被部分网关在约60秒无数据时断开；接收增量保持连接，
+        # 但业务层仍只拿完整正文，reasoning_content 和未结束的片段绝不能作为校验结论。
+        body = body | {"stream": True, "stream_options": {"include_usage": True}}
+        async with self._client.stream(
+            "POST", path, headers=self._headers(), json=body
+        ) as response:
+            if not response.is_success or "text/event-stream" not in response.headers.get(
+                "content-type", ""
+            ):
+                # 某些兼容服务忽略 stream 并返回完整JSON；沿用原结构与状态码校验。
+                await response.aread()
+                return response
+            content: list[str] = []
+            refusal: list[str] = []
+            usage, model, finish = {}, self._model, None
+            done = False
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    done = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                    if not isinstance(chunk, dict) or chunk.get("error"):
+                        raise ValueError("流式服务错误")
+                    model = chunk.get("model") or model
+                    usage = chunk.get("usage") or usage
+                    for choice in chunk.get("choices", []):
+                        if choice.get("index", 0) != 0:
+                            continue
+                        delta = choice.get("delta") or {}
+                        for field, parts in (("content", content), ("refusal", refusal)):
+                            value = delta.get(field)
+                            if value is not None:
+                                if not isinstance(value, str):
+                                    raise ValueError("流式正文类型无效")
+                                parts.append(value)
+                        finish = choice.get("finish_reason") or finish
+                except (ValueError, TypeError, AttributeError) as exc:
+                    raise ExtractionUnavailable("LLM 流式响应无效或中断", http_status=200) from exc
+            if not done or finish is None:
+                raise ExtractionUnavailable("LLM 流式响应未完整结束", http_status=200)
+            if finish == "length":
+                error = ModelOutputTruncated(
+                    "模型输出达到token上限，流式正文不完整", http_status=200
+                )
+                if isinstance(usage, dict):
+                    error.prompt_tokens = _int_or_none(usage.get("prompt_tokens"))
+                    error.completion_tokens = _int_or_none(usage.get("completion_tokens"))
+                raise error
+            return httpx.Response(
+                response.status_code,
+                json={
+                    "model": model,
+                    "usage": usage,
+                    "choices": [
+                        {
+                            "finish_reason": finish,
+                            "message": {"content": "".join(content), "refusal": "".join(refusal)},
+                        }
+                    ],
+                },
+            )
 
     async def complete(
         self, prompt: str, *, images: tuple[ModelImage, ...] = (), json_mode: bool = True
@@ -209,10 +285,12 @@ class OpenAIChatModel:
             ):
                 body["max_completion_tokens"] = body.pop("max_tokens")
         try:
-            response = await self._client.post(path, headers=self._headers(), json=body)
+            response = await self._post_completion(path, body)
         except httpx.HTTPError as exc:
-            raise ExtractionUnavailable("模型连接失败或请求超时") from exc
-        if response.status_code in {408, 429, 500, 502, 503, 504}:
+            # 仅保留异常类型，区分应用超时和上游断连；原异常文本可能含密钥或请求正文。
+            raise ExtractionUnavailable(f"模型连接失败或请求超时（{type(exc).__name__}）") from exc
+        # 网关可能在供应商超时后返回非标准 5xx（如 Cloudflare 524）；一律按可重试处理。
+        if response.status_code in {408, 429} or response.status_code >= 500:
             error = ExtractionUnavailable(
                 f"LLM 网关暂不可用：HTTP {response.status_code}",
                 http_status=response.status_code,
@@ -266,10 +344,10 @@ class OpenAIChatModel:
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ExtractionFailed("模型响应不符合所选接口的文本结构") from exc
         if not isinstance(content, str) or not content.strip():
-            # 已成功收到空正文也属于 JSON 协议错误，应先走有限纠正，避免直接切到不可达的后备。
+            # 子 Agent 实测：慢请求被网关在约110秒后截成 200+空正文，重发同一请求仍可能成功。
+            # 空正文不是模型能自行纠正的格式问题，按暂不可用重试同一模型，既不降级也不误判为拒绝。
             # 不读取或拼接 reasoning_content，它不能替代模型正式提交的报告。
-            error = InvalidModelOutput if json_mode else ExtractionFailed
-            raise error("LLM 网关返回空文本")
+            raise ExtractionUnavailable("LLM 网关返回空文本", http_status=200)
         if json_mode:
             # 部分兼容服务仍给完整 JSON 加 Markdown 围栏；只移除完整外包装，绝不猜测正文中的 JSON。
             fenced = re.fullmatch(

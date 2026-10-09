@@ -2,14 +2,13 @@
 
 ## 输出协议
 
-通过原生工具 submit_analysis 提交 items、relations 和 research_summary，不在普通正文中模拟工具动作。
-每个条目包含 `kind`、`title`、`text`、`presentation`、`cells`、`citations`。
-`kind` 是 fact、judgment、suggestion、conflict 或 insufficient；`presentation` 是 paragraph、list 或 table。
-引用为 `{"block_id":"实际读到的块ID","quote":"该块内的连续原文"}`。
-每个事实、列表项、表格行各自成为一个条目并附引用，这样前端才能逐项定位原文。
-有多段依据时提供多条引用，保留且/或、例外、否定、金额单位及标段条件。
-表格数据放在 `cells` 的文字键值中，完整条件同时写入 `text`；不生成 Markdown 表格或 HTML。
-没有相关依据返回 空 items/relations，并填写说明检索缺口的 research_summary，不补造“未提及”记录。
+通过原生工具 submit_analysis 提交 fields、relations 和 research_summary，不在普通正文中模拟工具动作。
+每个字段包含 `field`、`group`、`sort_order`、`values`、`note`。
+`values` 是解析值数组，每个值形如 `{"value":"解析值原文表述","citations":[{"block_id":"实际读到的块ID","quote":"该块内的连续原文"}]}`，证据逐值绑定。
+`group` 是展示分类（可留空），`sort_order` 是非负整数展示顺序，`note` 是备注（可留空）。
+同一字段出现多个值（如不同文件或补充通知不一致）时，每个值各自成一条并带自己的引用，不合并成一段文字。
+保留且/或、例外、否定、金额单位及标段条件；一个值可有多条引用。
+没有相关依据返回 空 fields/relations，并填写说明检索缺口的 research_summary，不补造“未提及”记录。
 参考清单只定义要核对的内容，不是另一套输出格式。文件名、页码和坐标由服务端从引用补齐。
 
 ## 内容检查清单
@@ -28,5 +27,5 @@
 
 - 金额、比例、折扣、下浮系数必须保留原文措辞，不得自行换算或补单位。
 - 同一条款不得在“投标限价”和“折扣/下浮”重复出现；金额限价归入投标限价，比例下浮归入折扣/下浮。
-- 多个标段分别输出限价条目，在 cells 和 text 中保留具体标段，每条独立引用；同一原文明确共同适用时可合并并写明全部适用标段。
+- 多个标段分别输出限价解析值，在 value 中保留具体标段，每个值独立引用；同一原文明确共同适用时可合并并写明全部适用标段。
 - 禁止输出模板占位金额、空白金额、示例金额或“详见附件”类无效内容。

@@ -1,4 +1,4 @@
-"""真实 PostgreSQL 临时表验证完整分析链路；模型用可控适配器，业务数据不写入。"""
+"""真实 PostgreSQL 临时表验证索引、检索、问答与报告展示；解析链路由 DeepAgents 专项用例覆盖。"""
 
 import asyncio
 import json
@@ -7,13 +7,16 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import AIMessage, message_to_dict
 from sqlalchemy import create_engine, text
 
 from tender.api import knowledge, projects
+from tender.application.knowledge import validate_items
 from tender.application.knowledge_store import KnowledgeStore, sync_sources
 from tender.core import settings
 from tender.ports.llm import Completion
 from tender.worker import knowledge as worker
+from tender.worker.deep_analysis import prepare_report
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TENDER_RUN_DB_TESTS") != "1", reason="需要数据库集成验证"
@@ -22,8 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def environment(monkeypatch):
-    # 本文件验证已发布的历史快照；DeepAgents 多连接/恢复场景有独立集成用例。
-    monkeypatch.setattr(knowledge, "RUNTIME_VERSION", "legacy")
+    # 本文件聚焦索引、检索、问答与报告展示；DeepAgents 并发与恢复场景有独立集成用例。
     db = create_engine(settings.database_url())
     with db.connect() as connection, connection.begin() as transaction:
         tables = (
@@ -43,6 +45,8 @@ def environment(monkeypatch):
             "knowledge_chunk",
             "analysis_report",
             "analysis_module",
+            # 运行行必须与临时模块表一起隔离，不能引用真实库里碰巧同 ID 的历史模块。
+            "agent_module_run",
             "knowledge_relation",
             "knowledge_answer",
             "llm_feature_model",
@@ -72,7 +76,7 @@ def environment(monkeypatch):
         )
         monkeypatch.setattr(settings, "company_id", lambda: 1)
         monkeypatch.setattr(worker, "_engine", facade)
-        monkeypatch.setattr(worker, "_model", lambda _: FixtureModel())
+        monkeypatch.setattr(worker, "_model", lambda _, **_limits: FixtureModel())
         project = projects.create_project(projects.ProjectCreate(name="综合分析专项"), request)
         yield request, connection, project["id"]
         transaction.rollback()
@@ -119,65 +123,66 @@ def add_source(connection, pid, content, status="completed"):
 
 
 class FixtureModel:
+    """问答链路用可控适配器：以原生工具动作驱动独立问答 Agent，并应答支持性校验。"""
+
+    def __init__(self):
+        self.rounds = 0
+
     async def complete(self, prompt):
-        if "独立列出格式正文中的材料清单" in prompt:
-            result = {"outline_inventory": []}
-        elif "候选补漏阶段" in prompt:
-            packet = json.loads(prompt.split("\n原文：")[1])
-            result = {"items": [], "unrelated_block_ids": [row["block_id"] for row in packet]}
-        elif "校验每项结论" in prompt:
-            items = json.loads(prompt.split("\n", 1)[1])
-            result = {"supported": [True] * len(items)}
-        elif "全文扫描阶段" in prompt:
-            packet = json.loads(prompt.split("原文：", 1)[1])
-            result = {
-                "candidates": {"project_basic_info_parsing": [r["block_id"] for r in packet]},
-                "items": [],
+        # 支持性校验：待审字段逐项返回“无未支持断言”。
+        items = json.loads(prompt.rsplit("\n", 1)[1])
+        return Completion(
+            json.dumps({"reviews": [{"unsupported_claims": [], "supported": True} for _ in items]}),
+            "fixture",
+        )
+
+    async def chat(self, messages, tools):
+        self.rounds += 1
+        if self.rounds == 1:
+            call = {
+                "name": "search_document",
+                "args": {"query": "资质"},
+                "id": "qa_call_1",
+                "type": "tool_call",
             }
-        elif "\n任务：" in prompt:
-            history = json.loads(prompt.split("\n工具记录：")[1])
-            context = json.loads(prompt.split("\n任务：")[1].split("\n工具记录：")[0])
-            if context.get("output_schema") == "outline_nodes":
-                read_ids = {
-                    row["block_id"] for step in history
-                    for row in step["response"].get("blocks", [])
-                }
-                unread = next((loc for loc in context["candidate_locations"]
-                               if loc["block_id"] not in read_ids), None)
-                result = ({"action": "read", "source_id": unread["source_id"],
-                           "offset": unread["offset"]} if unread
-                          else {"action": "finish", "outline_nodes": []})
-            elif not history:
-                result = {"action": "search", "terms": ["资质"]}
-            else:
-                hits = history[-1]["response"]["blocks"]
-                result = {
-                    "action": "finish",
-                    "relations": [],
-                    "items": [
-                        {
-                            "kind": "fact",
-                            "title": h["file_name"],
-                            "text": h["content"],
-                            "citations": [{"block_id": h["block_id"], "quote": h["content"]}],
-                        }
-                        for h in hits
-                    ],
-                }
         else:
-            hits = json.loads(prompt.split("\n原文：")[1].split("\n已校验关系：")[0])
-            result = {
-                "items": [
-                    {
-                        "kind": "fact",
-                        "title": "资质要求",
-                        "text": h["content"],
-                        "citations": [{"block_id": h["block_id"], "quote": h["content"]}],
-                    }
-                    for h in hits
-                ]
+            blocks = []
+            for message in messages:
+                data = message.get("data", {})
+                if message.get("type") == "tool" and data.get("name") == "search_document":
+                    blocks = json.loads(data["content"]).get("blocks", [])
+            call = {
+                "name": "submit_analysis",
+                "args": {
+                    "fields": [
+                        {
+                            "field": block.get("chapter") or "原文要点",
+                            "group": "",
+                            "sort_order": index,
+                            "values": [
+                                {
+                                    "value": block["content"],
+                                    "citations": [
+                                        {"block_id": block["block_id"], "quote": block["content"]}
+                                    ],
+                                }
+                            ],
+                            "note": "",
+                        }
+                        for index, block in enumerate(blocks)
+                    ],
+                    "relations": [],
+                    "research_summary": "已检索并核对原文",
+                    "final": True,
+                },
+                "id": "qa_call_2",
+                "type": "tool_call",
             }
-        return Completion(json.dumps(result, ensure_ascii=False), "fixture")
+        return Completion(
+            content="",
+            model="fixture",
+            agent_message=message_to_dict(AIMessage(content="", tool_calls=[call])),
+        )
 
     async def aclose(self):
         pass
@@ -187,103 +192,164 @@ def configure(request, pid):
     knowledge.save_settings(pid, knowledge.AnalysisSettings(category="engineering"), request)
 
 
-def test_all_files_report_and_old_run_citation_survive_reparse(environment):
+def attach_completed_module(connection, report_id, blocks):
+    """手工写入已完成模块：不跑解析，专测报告展示与关系检索如何处理既有证据。"""
+    items = validate_items(
+        [
+            {
+                "field": row["chapter"] or "原文要点",
+                "group": "",
+                "sort_order": index,
+                "values": [
+                    {
+                        "value": row["content"],
+                        "citations": [{"block_id": row["block_id"], "quote": row["content"]}],
+                    }
+                ],
+                "note": "",
+            }
+            for index, row in enumerate(blocks)
+        ],
+        {row["block_id"]: row for row in blocks},
+    )
+    module_id = connection.execute(
+        text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
+        VALUES (:report,'project_basic_info_parsing','项目概况','completed',CAST(:items AS JSONB))
+        RETURNING id"""),
+        {"report": report_id, "items": json.dumps(items, ensure_ascii=False)},
+    ).scalar_one()
+    return module_id, items
+
+
+def test_report_items_survive_reparse_and_show_unavailable_when_deleted(environment):
+    """报告的读取路径统一：重解析后旧引文仍可溯源，资料删除后降级为不可用而不是消失。"""
     request, conn, pid = environment
-    first_version, first_run = add_source(conn, pid, "要求甲级资质。")
-    add_source(conn, pid, "补遗：要求乙级资质。")
+    version, run = add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
-    result = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
-    asyncio.run(worker._analyze_project(result["id"]))
-    report = knowledge.get_report(result["id"], request)
-    assert report["status"] == "completed"
-    assert report["coverage"]["scanned_blocks"] == report["coverage"]["total_blocks"] == 2
-    refs = [item["citations"][0] for item in report["modules"][0]["items"]]
-    assert len({ref["version_id"] for ref in refs}) == 2
-    assert {ref["anchor"] for ref in refs} == {"p1b1"}
-    ref = next(r for r in refs if r["version_id"] == first_version)
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    # 历史报告（runtime_version=legacy）与新报告共用展示路径，但会被标记为不可再执行。
+    conn.execute(
+        text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
+        {"id": report["id"]},
+    )
+    store = KnowledgeStore(request.app.state.components.engine, 1)
+    collection = knowledge.project_knowledge(pid, request)["collection_id"]
+    block = store.readable_chunks(store.sources([collection])[0])[0]
+    attach_completed_module(conn, report["id"], [block])
+    loaded = knowledge.get_report(report["id"], request)
+    assert loaded["runtime_retired"] is True
+    reference = loaded["modules"][0]["items"][0]["values"][0]["citations"][0]
+    assert reference["version_id"] == version
+    assert store.resolve(reference)["parse_run_id"] == run
     conn.execute(
         text("""INSERT INTO parse_run(version_id,provider_version,tier,schema_version,status)
         VALUES (:version,'test','standard','1','completed')"""),
-        {"version": first_version},
+        {"version": version},
     )
-    store = KnowledgeStore(request.app.state.components.engine, 1)
-    assert store.resolve(ref)["parse_run_id"] == first_run
-    assert knowledge.get_report(result["id"], request)["stale"] is True
+    assert knowledge.get_report(report["id"], request)["stale"] is True
     conn.execute(
         text("UPDATE project_file SET deleted_at=now() WHERE id=:id"),
-        {"id": ref["project_file_id"]},
+        {"id": reference["project_file_id"]},
     )
     with pytest.raises(LookupError):
-        store.resolve(ref)
-    assert any(
-        item["verification"] == "unavailable"
-        for item in knowledge.get_report(result["id"], request)["modules"][0]["items"]
+        store.resolve(reference)
+    assert (
+        knowledge.get_report(report["id"], request)["modules"][0]["items"][0]["verification"]
+        == "unavailable"
     )
 
 
-def test_wait_for_all_and_explicit_partial_analysis(environment):
+def test_retired_runtime_report_cannot_run_or_retry(environment):
+    """旧流程报告只读：worker 拒绝执行，补跑接口报错而不是静默改写历史数据。"""
+    request, conn, pid = environment
+    add_source(conn, pid, "要求甲级资质。")
+    configure(request, pid)
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    conn.execute(
+        text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
+        {"id": report["id"]},
+    )
+    asyncio.run(worker._analyze_project(report["id"]))
+    retired = knowledge.get_report(report["id"], request)
+    assert retired["status"] == "failed" and "已下线" in retired["error_message"]
+    with pytest.raises(knowledge.ApiProblem) as exc:
+        knowledge.retry_report(report["id"], knowledge.RetryInput(), request)
+    assert exc.value.status_code == 409 and exc.value.code == "runtime_retired"
+
+
+def test_reference_snapshot_change_marks_only_current_runtime_reports_stale(environment):
+    """参考来源快照只有当前运行时会记录：旧报告不能因库里存在参考来源就被误判为已变化。"""
+    request, conn, pid = environment
+    add_source(conn, pid, "要求甲级资质。")
+    configure(request, pid)
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    # 另一项目的历史资料以参考库方式关联进来：当前运行时的报告未记录该来源，应判为已变化。
+    reference = projects.create_project(projects.ProjectCreate(name="参考专项"), request)
+    add_source(conn, reference["id"], "历史质保五年。")
+    collection = conn.execute(
+        text("""UPDATE knowledge_collection SET is_project=false,purpose='reference'
+        WHERE upload_project_id=:id RETURNING id"""),
+        {"id": reference["id"]},
+    ).scalar_one()
+    conn.execute(
+        text("INSERT INTO project_knowledge_collection VALUES (:pid,:cid)"),
+        {"pid": pid, "cid": collection},
+    )
+    assert knowledge.get_report(report["id"], request)["stale"] is True
+    # 同一份报告标记为旧运行时后，同样的参考来源不能触发 stale：旧流程从不记录参考快照。
+    conn.execute(
+        text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
+        {"id": report["id"]},
+    )
+    retired = knowledge.get_report(report["id"], request)
+    assert retired["runtime_retired"] is True and retired["stale"] is False
+
+
+def test_wait_for_missing_sources_or_explicit_partial_analysis(environment):
+    """深运行时的准备阶段：资料不完整且未勾选部分分析时中止，勾选后只固定可用批次。"""
     request, conn, pid = environment
     add_source(conn, pid, "要求甲级资质。")
     add_source(conn, pid, "未完成解析的资质要求。", status="failed")
     configure(request, pid)
-    result = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
-    asyncio.run(worker._analyze_project(result["id"]))
-    failed = knowledge.get_report(result["id"], request)
-    assert failed["status"] == "failed"
-    assert "未完整解析" in failed["error_message"]
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    with pytest.raises(ValueError, match="未完整解析"):
+        prepare_report(worker._store(), knowledge.report_row(request, report["id"]))
+    knowledge.cancel_report(report["id"], request)
     partial = knowledge.start_analysis(pid, knowledge.AnalysisInput(allow_partial=True), request)
-    asyncio.run(worker._analyze_project(partial["id"]))
-    report = knowledge.get_report(partial["id"], request)
-    assert report["status"] == "partial" and report["coverage"]["partial"]
-    assert report["coverage"]["scanned_blocks"] == 1
+    fixed, sources = prepare_report(worker._store(), knowledge.report_row(request, partial["id"]))
+    assert fixed["coverage"]["partial"] is True
+    assert [source["file_name"] for source in sources] == ["材料1.pdf"]
+    assert knowledge.get_report(partial["id"], request)["status"] == "running"
 
 
-def test_retry_before_scan_waits_for_repaired_sources(environment):
+def test_graph_expansion_rejects_old_parse_evidence(environment):
     request, conn, pid = environment
-    _, run = add_source(conn, pid, "要求甲级资质。", status="failed")
+    add_source(conn, pid, "甲级资质应提供证书。")
     configure(request, pid)
-    result = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
-    asyncio.run(worker._analyze_project(result["id"]))
-    assert knowledge.get_report(result["id"], request)["status"] == "failed"
-    conn.execute(text("UPDATE parse_run SET status='completed' WHERE id=:id"), {"id": run})
-    retried = knowledge.retry_report(result["id"], knowledge.RetryInput(), request)
-    assert retried["status"] == "waiting"
-    asyncio.run(worker._analyze_project(result["id"]))
-    assert knowledge.get_report(result["id"], request)["status"] == "completed"
-
-
-def test_retry_only_executes_selected_failed_modules(environment, monkeypatch):
-    request, conn, pid = environment
-    add_source(conn, pid, "要求甲级资质。")
-    configure(request, pid)
-    result = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
-    original = worker.run_module
-    selected = "project_basic_info_parsing"
-    untouched = "disqualified_items_parsing"
-    calls = []
-
-    async def fail_two(model, key, *args, **kwargs):
-        if key in {selected, untouched}:
-            raise ValueError("测试供应商故障")
-        return await original(model, key, *args, **kwargs)
-
-    monkeypatch.setattr(worker, "run_module", fail_two)
-    asyncio.run(worker._analyze_project(result["id"]))
-    assert knowledge.get_report(result["id"], request)["status"] == "partial"
-
-    async def record(model, key, *args, **kwargs):
-        calls.append(key)
-        return await original(model, key, *args, **kwargs)
-
-    monkeypatch.setattr(worker, "run_module", record)
-    knowledge.retry_report(result["id"], knowledge.RetryInput(module_keys=[selected]), request)
-    asyncio.run(worker._analyze_project(result["id"]))
-    report = knowledge.get_report(result["id"], request)
-    states = {module["module_key"]: module["status"] for module in report["modules"]}
-    assert calls == [selected]
-    assert states[selected] == "completed"
-    assert states[untouched] == "failed"
-    assert report["status"] == "partial"
+    store = KnowledgeStore(request.app.state.components.engine, 1)
+    collection = knowledge.project_knowledge(pid, request)["collection_id"]
+    sources = store.sources([collection])
+    block = store.readable_chunks(sources[0])[0]
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    conn.execute(
+        text("UPDATE analysis_report SET status='completed' WHERE id=:id"), {"id": report["id"]}
+    )
+    module_id, items = attach_completed_module(conn, report["id"], [block])
+    conn.execute(
+        text("""INSERT INTO knowledge_relation
+        (report_id,module_id,subject,predicate,object,citations,verified)
+        VALUES (:r,:m,'甲级资质','需要','证书',CAST(:refs AS JSONB),true)"""),
+        {
+            "r": report["id"],
+            "m": module_id,
+            "refs": json.dumps(items[0]["values"][0]["citations"], ensure_ascii=False),
+        },
+    )
+    _, relations = worker.graph_expand(store, pid, [block], sources)
+    assert len(relations) == 1
+    changed_sources = [sources[0] | {"parse_run_id": sources[0]["parse_run_id"] + 1}]
+    _, relations = worker.graph_expand(store, pid, [block], changed_sources)
+    assert not relations
 
 
 def test_collections_isolate_retrieval_and_answers(environment):
@@ -305,7 +371,50 @@ def test_collections_isolate_retrieval_and_answers(environment):
     asyncio.run(worker._answer_question(question["id"]))
     answer = knowledge.get_answer(question["id"], request)
     assert answer["status"] == "completed"
-    assert all(ref["collection_id"] == own_id for i in answer["items"] for ref in i["citations"])
+    assert all(
+        ref["collection_id"] == own_id
+        for item in answer["items"]
+        for value in item["values"]
+        for ref in value["citations"]
+    )
+
+
+def test_question_agent_reads_graph_only_evidence(environment, monkeypatch):
+    request, conn, pid = environment
+    add_source(conn, pid, "本项目要求甲级资质。")
+    add_source(conn, pid, "履约保函应在签约前提交。")
+    configure(request, pid)
+    store = worker._store()
+    own_id = knowledge.project_knowledge(pid, request)["collection_id"]
+    sources = store.sources([own_id])
+    blocks = [row for source in sources for row in store.readable_chunks(source)]
+    direct = next(row for row in blocks if "甲级资质" in row["content"])
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    conn.execute(
+        text("UPDATE analysis_report SET status='completed' WHERE id=:id"), {"id": report["id"]}
+    )
+    module_id, items = attach_completed_module(conn, report["id"], blocks)
+    refs = [ref for item in items for value in item["values"] for ref in value["citations"]]
+    conn.execute(
+        text("""INSERT INTO knowledge_relation
+        (report_id,module_id,subject,predicate,object,citations,verified)
+        VALUES (:r,:m,'甲级资质','需要','履约保函',CAST(:refs AS JSONB),true)"""),
+        {"r": report["id"], "m": module_id, "refs": json.dumps(refs, ensure_ascii=False)},
+    )
+
+    async def retrieve_direct(*args, **kwargs):
+        # 普通检索只命中资质，保函只能通过数据库图谱扩展进入 Agent 的工具结果。
+        return [direct], {"mode": "keyword"}
+
+    monkeypatch.setattr(worker, "retrieve_chunks", retrieve_direct)
+    question = knowledge.ask_project(pid, knowledge.AskInput(question="资质"), request)
+    asyncio.run(worker._answer_question(question["id"]))
+    answer = knowledge.get_answer(question["id"], request)
+    assert answer["status"] == "completed", answer["error_message"]
+    assert any("履约保函" in value["value"] for item in answer["items"] for value in item["values"])
+    assert answer["snapshot"]["retrieved_blocks"] == 2
+    assert answer["snapshot"]["graph_used"] is True
+    assert answer["snapshot"]["graph_relation_count"] == 1
 
 
 def test_index_without_embedding_retains_full_text(environment):
@@ -384,28 +493,3 @@ def test_vectors_only_reused_in_same_embedding_space(environment, monkeypatch):
     assert not hits and info["mode"] == "keyword"
     changed = knowledge.get_collection(own, request)["sources"][0]
     assert not changed["semantic_ready"] and changed["needs_reindex"]
-
-
-def test_graph_expansion_rejects_old_parse_evidence(environment):
-    request, conn, pid = environment
-    add_source(conn, pid, "甲级资质应提供证书。")
-    own = knowledge.project_knowledge(pid, request)["collection_id"]
-    configure(request, pid)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
-    asyncio.run(worker._analyze_project(report["id"]))
-    db = KnowledgeStore(request.app.state.components.engine, 1)
-    sources = db.sources([own])
-    blocks = db.readable_chunks(sources[0])
-    module = knowledge.get_report(report["id"], request)["modules"][0]
-    reference = module["items"][0]["citations"][0]
-    conn.execute(
-        text("""INSERT INTO knowledge_relation
-        (report_id,module_id,subject,predicate,object,citations,verified)
-        VALUES (:r,:m,'甲级资质','需要','证书',CAST(:refs AS JSONB),true)"""),
-        {"r": report["id"], "m": module["id"], "refs": json.dumps([reference], ensure_ascii=False)},
-    )
-    _, relations = worker.graph_expand(db, pid, blocks[:1], sources)
-    assert len(relations) == 1
-    changed_sources = [sources[0] | {"parse_run_id": sources[0]["parse_run_id"] + 1}]
-    _, relations = worker.graph_expand(db, pid, blocks[:1], changed_sources)
-    assert not relations

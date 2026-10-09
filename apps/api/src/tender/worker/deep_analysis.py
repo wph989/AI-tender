@@ -1,4 +1,4 @@
-"""确定性调度全部模块，模块内部的阅读与检索由独立 DeepAgents 子图决定。"""
+﻿"""确定性调度全部模块，模块内部的阅读与检索由独立 DeepAgents 子图决定。"""
 
 from __future__ import annotations
 
@@ -119,18 +119,58 @@ def prepare_report(db: KnowledgeStore, report: dict) -> tuple[dict, list[dict]] 
     return report, usable
 
 
+async def expand_evidence(
+    items: list[dict],
+    *,
+    seen: dict,
+    sources: list[dict],
+    read,
+) -> dict:
+    """校验要能看到引文在原文里的物理邻域，不能只看本模块读过的块。
+
+    章节标题（如前附表、第六章）往往没被模块读取，只给已读块会把正确归属判成无依据；
+    这里按引文所属资料补读整份原文用于取窗口。引文本身仍由 validate_items 限定为
+    已读块，所以不会放宽“只能引用读过的原文”这条底线。读不到时退回已读块，
+    校验仍可进行，只是归属证据更少。
+    """
+    wanted: set[object] = set()
+    for item in items:
+        for value in item.get("values", []):
+            for ref in value.get("citations", []):
+                if not isinstance(ref, dict):
+                    continue
+                source_id = ref.get("source_id")
+                if source_id is None:
+                    # 引文缺少 source_id 时用已读块回查所属资料。
+                    row = seen.get(str(ref.get("block_id")))
+                    source_id = row.get("source_id") if isinstance(row, dict) else None
+                if source_id is not None:
+                    wanted.add(source_id)
+    evidence = dict(seen)
+    for source in sources:
+        if source["source_id"] not in wanted:
+            continue
+        try:
+            rows = await read(source)
+        except Exception:
+            continue
+        for row in rows:
+            evidence.setdefault(str(row["block_id"]), row)
+    return evidence
+
+
 def summarize(modules: list[dict]) -> list[dict]:
-    """只合并等价断言；不同结论连同各自引文保留，不按上传时间裁决冲突。"""
+    """只合并等价的字段断言；不按上传时间裁决冲突，不同结论各自保留。"""
     grouped = {}
     for module in modules:
         if module["status"] != "completed":
             continue
         for item in module["items"]:
             key = (
-                item["kind"],
-                normalized(item["title"]),
-                normalized(item["text"]),
-                json.dumps(item.get("cells", {}), sort_keys=True, ensure_ascii=False),
+                normalized(item["field"]),
+                normalized(item.get("group", "")),
+                json.dumps(item.get("values", []), sort_keys=True, ensure_ascii=False, default=str),
+                normalized(item.get("note", "")),
             )
             if key not in grouped:
                 grouped[key] = copy.deepcopy(item) | {"module_keys": [module["module_key"]]}
@@ -138,9 +178,11 @@ def summarize(modules: list[dict]) -> list[dict]:
             result = grouped[key]
             if module["module_key"] not in result["module_keys"]:
                 result["module_keys"].append(module["module_key"])
-            for ref in item["citations"]:
-                if ref not in result["citations"]:
-                    result["citations"].append(ref)
+            # 同一字段的多个值按顺序一一对应，合并各自引用而不改动值本身。
+            for target, source in zip(result["values"], item["values"], strict=True):
+                for ref in source["citations"]:
+                    if ref not in target["citations"]:
+                        target["citations"].append(ref)
             if item.get("verification") != "supported":
                 result["verification"] = item.get("verification", "unsupported")
     return list(grouped.values())
@@ -209,16 +251,22 @@ async def execute_module(
         )
 
         async def work():
+            async def verification_evidence(items):
+                return await expand_evidence(items, seen=research.seen, sources=sources, read=read)
+
             async def validate_support(items):
-                await verify_items(model, items, explain=True)
+                # 校验需要同块原文与邻近块才能判断章节归属，不能只看摘录文本。
+                evidence = await verification_evidence(items)
+                await verify_items(model, items, explain=True, evidence=evidence)
+                # 关系条目按支持性过滤而非终止模块；只有字段结论未获支持才回退重提。
                 unsupported = [
-                    item["title"] + "：" + "；".join(item.get("verification_issues", []))
+                    item["field"] + "：" + "；".join(item.get("verification_issues", []))
                     for item in items
-                    if item["verification"] != "supported"
+                    if item.get("kind") != "relation" and item["verification"] != "supported"
                 ]
                 if unsupported:
                     raise ValueError(
-                        "以下条目包含引用未支持的断言，请删除推断、补齐双方引文或移入检索缺口："
+                        "以下字段包含引用未支持的断言，请删除推断、补齐双方引文或移入检索缺口："
                         + "；".join(unsupported)
                     )
 
@@ -259,33 +307,8 @@ async def execute_module(
             if "draft" not in state:
                 raise ValueError("子 Agent 结束但没有提交通过校验的分析")
             draft = state["draft"]
-            validate_project_claims(draft["items"], report["project_id"])
-            if not state.get("verified"):
-                if not state.get("items_verified"):
-                    await validate_support(draft["items"])
-                relation_items = [
-                    {
-                        "kind": "judgment",
-                        "title": r["subject"],
-                        "text": r["subject"]
-                        + r["predicate"]
-                        + r["object"]
-                        + "；范围："
-                        + r["scope"]
-                        + "；条件："
-                        + r["condition"],
-                        "citations": r["citations"],
-                    }
-                    for r in draft["relations"]
-                ]
-                await verify_items(model, relation_items)
-                draft["relations"] = [
-                    r
-                    for r, item in zip(draft["relations"], relation_items, strict=True)
-                    if item["verification"] == "supported"
-                ]
-                state["verified"] = True
-                await save(state)
+            # 字段与关系的支持性校验都在子 Agent 的提交工具内完成，此处只做最终权限复核。
+            validate_project_claims(draft["fields"], report["project_id"])
             await asyncio.to_thread(runtime.finish, "completed", draft=draft)
 
         task = asyncio.create_task(work())

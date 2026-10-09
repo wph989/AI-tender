@@ -4,6 +4,7 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+.claude/
 
 # 前端生成物：pdfjs 的 worker/cMaps/字体由 scripts/copy-pdfjs-assets.mjs 从 node_modules 复制
 apps/web/public/pdfjs/

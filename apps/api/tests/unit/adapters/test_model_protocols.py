@@ -8,7 +8,12 @@ import pytest
 
 from tender.adapters.openai_chat import OpenAIChatModel
 from tender.adapters.rerank_http import HttpRerankModel
-from tender.domain.errors import ExtractionFailed, ExtractionUnavailable, ModelRefused
+from tender.domain.errors import (
+    ExtractionFailed,
+    ExtractionUnavailable,
+    InvalidModelOutput,
+    ModelRefused,
+)
 
 
 @pytest.mark.parametrize(
@@ -109,6 +114,19 @@ def test_invalid_or_refused_output_has_safe_error(payload, error):
     asyncio.run(run())
 
 
+def test_nonstandard_gateway_5xx_is_retryable():
+    async def run():
+        async with httpx.AsyncClient(
+            base_url="http://test/",
+            transport=httpx.MockTransport(lambda _: httpx.Response(524, text="timeout")),
+        ) as client:
+            with pytest.raises(ExtractionUnavailable) as caught:
+                await OpenAIChatModel("http://test", "fixture", client=client).complete("测试")
+            assert caught.value.http_status == 524
+
+    asyncio.run(run())
+
+
 def test_rate_limit_preserves_retry_after_without_echoing_body():
     async def run():
         async with httpx.AsyncClient(
@@ -126,9 +144,7 @@ def test_rate_limit_preserves_retry_after_without_echoing_body():
 
 
 @pytest.mark.parametrize("content", [None, "", "  "])
-def test_empty_json_body_can_be_corrected_without_using_reasoning(content):
-    from tender.domain.errors import InvalidModelOutput
-
+def test_empty_body_is_retryable_and_never_uses_reasoning(content):
     async def run():
         payload = {"choices": [{"finish_reason": "length", "message": {
             "content": content, "reasoning_content": '{"items":[]}',
@@ -138,12 +154,13 @@ def test_empty_json_body_can_be_corrected_without_using_reasoning(content):
             transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload)),
         ) as client:
             model = OpenAIChatModel("http://test", "fixture", client=client)
-            with pytest.raises(InvalidModelOutput, match="空文本"):
+            # 200+空正文是网关截断，不是模型输出：必须归类为可重试，不能直接失败或降级。
+            with pytest.raises(ExtractionUnavailable, match="空文本") as caught:
                 await model.complete("测试")
-            # 普通文本业务不采用 JSON 纠正；推理字段即使像合法结果也不能作为正式正文。
-            with pytest.raises(ExtractionFailed) as caught:
+            assert caught.value.http_status == 200
+            with pytest.raises(ExtractionUnavailable) as plain:
                 await model.complete("测试", json_mode=False)
-            assert not isinstance(caught.value, InvalidModelOutput)
+            assert not isinstance(plain.value, InvalidModelOutput)
 
     asyncio.run(run())
 

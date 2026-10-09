@@ -418,6 +418,40 @@ def test_retry_after_waits_without_burning_requests(monkeypatch):
     assert len(records) == 2
 
 
+@pytest.mark.parametrize("already_cooling", [False, True])
+def test_disabled_failover_waits_for_primary_instead_of_using_a_lower_priority_model(
+    monkeypatch, already_cooling
+):
+    from tender.application import llm_routing
+
+    now, records = [100.0], []
+    monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
+
+    async def sleep(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr(llm_routing.asyncio, "sleep", sleep)
+    error = ExtractionUnavailable("限流", http_status=429)
+    error.retry_after = 2
+    gateway = _ScriptedGateway({"a": [None] if already_cooling else [error, None], "b": [None]})
+    router = RoutingModel(
+        "analysis",
+        "analysis",
+        [replace(_candidate("a", 1), extra_retries=1), _candidate("b", 2)],
+        gateway,
+        records.append,
+        failover_limit=1,
+        retry_base_seconds=0,
+        cooldown_remaining=lambda c: (
+            max(0, 102 - now[0]) if already_cooling and c.model == "a" else 0
+        ),
+    )
+    assert asyncio.run(router.complete("测试")).model == "a"
+    assert gateway.created == ["a"]
+    assert now[0] >= 102
+    assert len(records) == (1 if already_cooling else 2)
+
+
 def test_cancel_during_shared_cooldown_sends_no_request():
     async def run():
         checked = asyncio.Event()

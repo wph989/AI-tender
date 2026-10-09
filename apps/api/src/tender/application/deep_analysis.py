@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from deepagents import (
     GeneralPurposeSubagentProfile,
@@ -22,6 +22,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
+    HumanMessage,
     SystemMessage,
     message_to_dict,
     messages_from_dict,
@@ -34,10 +35,22 @@ from pydantic import Field
 from typing_extensions import TypedDict
 
 from tender.application.analysis_outline import outline_result
-from tender.application.analysis_research import ResearchSession, SourceNotAllowed
+from tender.application.analysis_research import (
+    EvidenceBudgetError,
+    ResearchSession,
+    SourceNotAllowed,
+    ToolArgumentError,
+)
 from tender.application.analysis_skills import MODULES, _module_result
+from tender.domain.errors import ExtractionFailed, ExtractionUnavailable, ModelOutputTruncated
 
 RUNTIME_VERSION = "deepagents-0.7.22-v1"
+
+
+class ReviewUnavailable(Exception):
+    """校验服务故障不代表结果无效，交给中间件单独记账并允许在总预算内重试。"""
+
+
 CONTRACT = """你是当前解析模块的独立子 Agent。使用原生工具调用完成任务。
 先按需阅读当前模块 Skill，根据专题自主检索项目文档和关联知识库，再读取必要的邻近原文。
 不要逐段扫描全文。通过不同检索问题核对关键条件、例外、澄清和缺口，命中重复时换角度检索。
@@ -46,22 +59,28 @@ CONTRACT = """你是当前解析模块的独立子 Agent。使用原生工具调
 补充文件明确修改原条款时同时引用双方；无明确修订关系则保留冲突，不按上传时间裁定。
 只引用工具实际返回的 block_id 和该块连续原文，不引用摘要、Skill 或常识作为证据。
 保留金额单位、否定、且/或、例外、标段和主体条件。相同事项的重复命中去重后再综合分析。
-完成时调用 submit_analysis。每个 item 包含 kind(fact/judgment/suggestion/conflict/insufficient)、
-title、text、presentation(paragraph/list/table)、cells(文字键值)、citations([{block_id,quote}])。
-每个列表项和表格行单独成项并引用。没有相关证据可返回空 items，但须在 research_summary
+完成时调用 submit_analysis。每个 field 条目包含 field(解析字段名)、group(展示分类，无则留空)、
+sort_order(展示顺序，非负整数)、values(解析值数组)、note(备注，无则留空)。
+每个 value 包含 value(解析值原文表述)和 citations([{block_id,quote}])；证据逐值绑定。
+同一字段出现多个值时（如原文与补充通知不一致）每个值各自成项并带自己的引用，
+不能把多个值合并成一段文字；没有相关证据可返回空 fields，但须在 research_summary
 说明实际检索的问题、未找到的主题和剩余不确定性，不能声称检索穷尽全部条款。
 relations 包含 subject、predicate、object、scope、condition、citations；没有直接依据返回空数组。
 未找到的条款只写入 research_summary，不生成“文件未约定/条款缺失”的结论条目。
+已找到字段的 value 中也不能夹带“未写明人数/学历/分值”等缺席性断言；
+没有依据的值直接省略，检索缺口写入 research_summary；原文明确写“不要求”时保留原意。
 不得补造原文未写明的质保起算点、服务适用期间、免责效果或标段范围。
 参考建议也要同时引用本项目相关要求，以说明适用性。展示正文使用中文业务表述，不夹带配置key。
 read_file 只用于读取当前 Skill 及会话压缩历史，不是读取招标文件的入口。
 当已有证据被压缩，可用 read_document 按 source_id/offset 补读；摘要不是新证据。
 """
-OUTLINE_INSTRUCTIONS = """本模块只提交 outline_nodes，items和relations使用空数组。
+OUTLINE_INSTRUCTIONS = """本模块只提交 outline_nodes 与 research_summary，不编写fields和relations。
 每个节点有id/name/node_type(group或section)/parent_id/requirements/citations。
 group是逻辑标根容器，section是最多三级具体材料；没有明确父级时parent_id为null。
 requirements为逐字编制要求数组；节点名称和要求都须引用格式正文，目录只作定位。
-不能将命名子材料合并到父节点，不能凭相邻位置推定归属。"""
+不能将命名子材料合并到父节点，不能凭相邻位置推定归属。
+每批最多6个节点，先提交父级再提交子级，final=false暂存；同id可修正，最后final=true完成。
+运行时对累计节点整体校验父子关系，无须一次生成整个大纲。"""
 
 
 # 把字段直接暴露在原生工具schema中，避免模型只看到list[dict]而反复猜测引用和节点格式。
@@ -70,13 +89,17 @@ class CitationInput(TypedDict):
     quote: str
 
 
-class ItemInput(TypedDict):
-    kind: Literal["fact", "judgment", "suggestion", "conflict", "insufficient"]
-    title: str
-    text: str
-    presentation: Literal["paragraph", "list", "table"]
-    cells: dict[str, str]
+class ValueInput(TypedDict):
+    value: str
     citations: list[CitationInput]
+
+
+class FieldInput(TypedDict):
+    field: str
+    group: str
+    sort_order: int
+    values: list[ValueInput]
+    note: str
 
 
 class RelationInput(TypedDict):
@@ -157,14 +180,16 @@ ABSENCE_TERMS = (
 )
 
 
-def is_absence_claim(item: dict) -> bool:
-    """识别无法由单段引文证明的“文件未约定”类断言。"""
-    body = item["title"] + item["text"] + json.dumps(item.get("cells", {}), ensure_ascii=False)
-    quotes = "\n".join(ref["quote"] for ref in item["citations"])
+def is_absence_claim(field: dict) -> bool:
+    """识别无法由单段引文证明的“文件未约定”类断言；证据逐值绑定后按全部值检查。"""
+    body = field["field"] + "".join(value["value"] for value in field["values"])
+    quotes = "\n".join(
+        ref["quote"] for value in field["values"] for ref in value["citations"]
+    )
     return any(term in body and term not in quotes for term in ABSENCE_TERMS)
 
 
-def split_absence_claims(items: list[dict], project_id: int) -> tuple[list[dict], list[dict]]:
+def split_absence_claims(fields: list[dict], project_id: int) -> tuple[list[dict], list[dict]]:
     """把检索缺口条目从结论中拆出，交由运行时写入 research_summary。
 
     弱模型会反复把缺口断言当结论提交；契约已规定缺口属于检索总结，
@@ -172,24 +197,43 @@ def split_absence_claims(items: list[dict], project_id: int) -> tuple[list[dict]
     """
     kept: list[dict] = []
     gaps: list[dict] = []
-    for item in items:
-        own = any(ref["project_id"] == project_id for ref in item["citations"])
-        (gaps if own and is_absence_claim(item) else kept).append(item)
+    for field in fields:
+        refs = [ref for value in field["values"] for ref in value["citations"]]
+        own = any(ref["project_id"] == project_id for ref in refs)
+        (gaps if own and is_absence_claim(field) else kept).append(field)
     return kept, gaps
 
 
-def validate_project_claims(items: list[dict], project_id: int) -> None:
+def _relation_unit(link: dict) -> dict:
+    """把关系包装成字段形状以便复用同一套值级支持性校验，kind 标记其可过滤性。"""
+    return {
+        "kind": "relation",
+        "field": link["subject"],
+        "values": [
+            {
+                "value": (
+                    link["predicate"] + link["object"] + link["scope"] + link["condition"]
+                ),
+                "citations": link["citations"],
+            }
+        ],
+    }
+
+
+def validate_project_claims(fields: list[dict], project_id: int) -> None:
     """拒绝可确定的证据范围错误，不能把模型的 supported 当成权限或缺失证明。"""
-    for item in items:
-        refs = item["citations"]
+    for field in fields:
+        refs = [ref for value in field["values"] for ref in value["citations"]]
         own = {ref["source_id"] for ref in refs if ref["project_id"] == project_id}
         if not own:
             raise ValueError("项目结论及参考建议都须引用本项目相关要求；参考建议还须保留参考来源")
-        body = item["title"] + item["text"] + json.dumps(item.get("cells", {}), ensure_ascii=False)
-        if is_absence_claim(item):
+        body = field["field"] + field.get("note", "") + "".join(
+            value["value"] for value in field["values"]
+        )
+        if is_absence_claim(field):
             raise ValueError("检索缺口只能写入 research_summary，单段引文不能证明整份文件未约定")
         if "补充" in body and re.search("调整|更正|修订|修改", body) and len(own) < 2:
-            raise ValueError("跨文件修订结论须在同一条目同时引用原条款与补充文件")
+            raise ValueError("跨文件修订结论须在同一字段同时引用原条款与补充文件")
 
 
 class ResearchMiddleware(AgentMiddleware):
@@ -211,25 +255,30 @@ class ResearchMiddleware(AgentMiddleware):
     async def awrap_model_call(self, request, handler):
         await self.research.authorize()
         status = self.budget_status() if self.budget_status else {}
+        evidence_remaining = max(
+            0, self.research.limits.max_evidence_blocks - len(self.research.seen)
+        )
+        status = status | {"evidence_blocks_remaining": evidence_remaining}
         searches = [e for e in self.research.events if e["action"] == "search_result"]
         hint = (
             "运行控制：证据账已保留 " + str(len(self.research.seen)) + " 块原文。"
             "本次剩余预算："
             + json.dumps(status, ensure_ascii=False)
             + "。已有依据足以覆盖本专题时请提交，不必反复读取相同 Skill 或相同原文。"
-            + "只输出原文明示的有效要求，正文可直接沿用原文，不写长篇推演或缺失检查表；"
-            "检索缺口写 research_summary，提交缺口条目时运行时会自动转入检索总结。"
-            "cells只填有依据的字段，没有依据的可选字段直接省略。"
-            "每条引用须覆盖该条全部金额、数量、条件和范围，不能借用其它条目的引用。"
-            "结果较多时每次提交2至3条，使用submit_analysis(final=false)暂存，"
+            + "只输出原文明示的有效要求，value可直接沿用原文，不写长篇推演或缺失检查表；"
+            "检索缺口写 research_summary，提交缺口字段时运行时会自动转入检索总结。"
+            "每个值须由自己的引用覆盖全部金额、数量、条件和范围，不能借用其它值的引用。"
+            "结果较多时每次提交2至3个字段，使用submit_analysis(final=false)暂存，"
             "最后一次final=true结束；检索总结简短说明即可，不复述全部原文。"
         )
         if self.state.get("staged_items"):
-            hint += f"已有{len(self.state['staged_items'])}条通过校验并暂存，只提交新增事项。"
+            hint += f"已有{len(self.state['staged_items'])}个字段通过校验并暂存，只提交新增字段。"
         if len(searches) >= 3 and not any(e["block_ids"] for e in searches[-3:]):
             hint += "最近连续三次检索没有新增证据，请综合已有原文提交并说明缺口。"
         if status.get("model_calls_remaining", 99) <= 6:
             hint += "模型请求预算将耗尽，请立即提交现有结果，预留支持性校验的请求。"
+        if evidence_remaining <= 12:
+            hint += "新增证据额度即将用完，请优先分批提交已核对事项；补读仍可返回已读原文。"
         content = request.system_message.content if request.system_message else ""
         content = (
             content + "\n" + hint
@@ -245,6 +294,37 @@ class ResearchMiddleware(AgentMiddleware):
             return {"jump_to": "end"}
         return None
 
+    @hook_config(can_jump_to=["model"])
+    async def aafter_model(self, state, runtime):
+        await self.research.authorize()
+        message = state["messages"][-1]
+        if not isinstance(message, AIMessage) or message.tool_calls or "draft" in self.state:
+            self.state.pop("consecutive_unsubmitted_responses", None)
+            return None
+        # 自然语言完成会使框架直接退出；必须回到同一图纠正，不能把未校验文本当结果。
+        # 以消息ID幂等计数，checkpoint在保存后重放此节点时不能多扣一次纠正机会。
+        if self.state.get("last_unsubmitted_message_id") != message.id:
+            self.state["last_unsubmitted_message_id"] = message.id
+            self.state["consecutive_unsubmitted_responses"] = (
+                self.state.get("consecutive_unsubmitted_responses", 0) + 1
+            )
+            await self.save(self.state)
+        if self.state.get("consecutive_unsubmitted_responses", 0) >= 3:
+            raise ValueError("模型连续三次未调用分析工具，无法获得通过校验的提交")
+        return {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "分析尚未提交。自然语言或Markdown总结不能作为完成结果。"
+                        "请调用 submit_analysis，用已读取的 block_id 和连续原文给每个值附引用；"
+                        "普通模块每批2至3个字段、final=false暂存，最后final=true结束。"
+                        "缺口只写research_summary，不把刚才的总结当作原文证据。"
+                    )
+                )
+            ],
+            "jump_to": "model",
+        }
+
     async def awrap_tool_call(self, request, handler):
         # 同模块工具串行写入证据账；模块之间并发由上层硬配额控制。
         async with self.lock:
@@ -254,12 +334,16 @@ class ResearchMiddleware(AgentMiddleware):
             if cached is not None:
                 return messages_from_dict([cached])[0]
             await self.reserve_tool()
-            corrections = self.state.get("invalid_submissions", 0)
             try:
                 try:
                     result = await handler(request)
-                except SourceNotAllowed as exc:
-                    # 错误来源参数不返回资料；动态撤销/批次错误仍原样上抛，不能靠纠正绕过。
+                except (
+                    SourceNotAllowed,
+                    ToolArgumentError,
+                    EvidenceBudgetError,
+                    ReviewUnavailable,
+                ) as exc:
+                    # 可自纠正的参数错误回传提示给模型修正；动态撤销、预算耗尽等仍上抛终止模块。
                     from langchain_core.messages import ToolMessage
 
                     result = ToolMessage(
@@ -267,17 +351,35 @@ class ResearchMiddleware(AgentMiddleware):
                         tool_call_id=call_id,
                         name=request.tool_call["name"],
                         status="error",
+                        additional_kwargs=(
+                            {"error_kind": "review_unavailable"}
+                            if isinstance(exc, ReviewUnavailable)
+                            else {}
+                        ),
                     )
                 await self.research.authorize()
-                if (
-                    request.tool_call["name"] == "submit_analysis"
-                    and getattr(result, "status", None) == "error"
-                    and self.state.get("invalid_submissions", 0) == corrections
-                ):
-                    self.state["invalid_submissions"] = corrections + 1
-                    if corrections >= 2:
-                        raise ValueError("模块连续三次提交无效结果")
+                # 先保留最后一次失败反馈，终止时也能定位具体条目，而不是只剩“三次无效”。
                 self.state["tool_results"][call_id] = message_to_dict(result)
+                if request.tool_call["name"] == "submit_analysis":
+                    if getattr(result, "status", None) == "error":
+                        if result.additional_kwargs.get("error_kind") == "review_unavailable":
+                            # 外部故障不消耗或重置内容纠错次数；模型/工具次数和总时限仍照常约束。
+                            self.state["unavailable_submissions"] = (
+                                self.state.get("unavailable_submissions", 0) + 1
+                            )
+                            return result
+                        self.state["invalid_submissions"] = (
+                            self.state.get("invalid_submissions", 0) + 1
+                        )
+                        consecutive = self.state.get("consecutive_invalid_submissions", 0) + 1
+                        self.state["consecutive_invalid_submissions"] = consecutive
+                        if consecutive >= 3:
+                            raise ValueError(
+                                "模块连续三次提交无效结果：" + str(result.content)[:700]
+                            )
+                    else:
+                        # 分批已成功后不能把后续独立错误累计成“连续三次”。总请求预算仍不重置。
+                        self.state["consecutive_invalid_submissions"] = 0
                 return result
             finally:
                 self.state["research"] = self.research.checkpoint()
@@ -325,55 +427,87 @@ def build_module_agent(
         return await research.read_source(source_id, offset, limit)
 
     async def submit_analysis(
-        items: list[ItemInput],
+        fields: list[FieldInput],
         relations: list[RelationInput],
         research_summary: str,
         outline_nodes: list[OutlineInput] | None = None,
         final: bool = True,
     ) -> dict:
-        """提交有据结果；较多时final=false分批暂存，最后final=true。格式大纲须一次提交。"""
+        """先核对累计结果，再暂存或完成；不同批次共用同一证据和运行预算。"""
         try:
             if not research_summary.strip() or len(research_summary) > 4000:
                 raise ValueError("需要4000字以内的检索总结与未决问题")
             if not any(e["action"].startswith("search_") for e in research.events):
                 raise ValueError("请先检索相关证据再提交分析")
-            if key == "bid_format_outline_parsing" and not final:
-                raise ValueError(
-                    "格式大纲的父子节点需一起校验，请一次提交outline_nodes并使用final=true"
-                )
-            draft = {"items": items, "relations": relations}
+            is_outline = key == "bid_format_outline_parsing"
+            nodes = []
+            if is_outline:
+                if outline_nodes is None:
+                    raise ValueError("格式模块必须提供outline_nodes")
+                ids = {node["id"] for node in outline_nodes}
+                if len(ids) != len(outline_nodes):
+                    raise ValueError("同一批格式节点的id不能重复")
+                # 累计节点每次整体过树结构校验，先父后子分批不会放松父级/循环/层级约束。
+                nodes = [n for n in state.get("staged_outline_nodes", []) if n["id"] not in ids]
+                nodes += outline_nodes
+            draft = {"fields": fields, "relations": relations}
             checked, links = (
-                outline_result({"outline_nodes": outline_nodes}, research.seen)
-                if key == "bid_format_outline_parsing"
+                outline_result({"outline_nodes": nodes}, research.seen)
+                if is_outline
                 else _module_result(draft, research.seen)
             )
             gaps: list[dict] = []
-            if key != "bid_format_outline_parsing":
+            if not is_outline:
                 checked, gaps = split_absence_claims(checked, research.project_id)
+            previous = {entry["id"]: entry for entry in state.get("staged_items", [])}
+            if not is_outline:
+                combined = previous | {entry["id"]: entry for entry in checked}
+                checked = list(combined.values())
+                links = state.get("staged_relations", []) + [
+                    link for link in links if link not in state.get("staged_relations", [])
+                ]
+            checked = [dict(entry) for entry in checked]
             validate_project_claims(checked, research.project_id)
             if validate_support:
-                await validate_support(checked)
-            # 每批先验证再暂存，压缩和重启不会丢失已验证的条目；重复工具调用由call_id去重。
-            combined = {item["id"]: item for item in state.get("staged_items", [])}
-            combined.update({item["id"]: item for item in checked})
-            checked = list(combined.values())
-            links = state.get("staged_relations", []) + [
-                link for link in links if link not in state.get("staged_relations", [])
-            ]
-            validate_project_claims(checked, research.project_id)
+                pending = []
+                for entry in checked:
+                    old = previous.get(entry["id"], {})
+                    # id未包含group/sort_order，须逐字段比较；修改过的字段重新送审。
+                    reusable = state.get("staged_items_verified") and all(
+                        entry.get(k) == old.get(k)
+                        for k in ("field", "group", "sort_order", "values", "note")
+                    )
+                    entry["verification"] = "supported" if reusable else "pending"
+                    if not reusable:
+                        pending.append(entry)
+                # 关系同样在 Agent 内送支持性校验；未获支持的直接丢弃，不终止模块。
+                relation_units = (
+                    [_relation_unit(link) for link in links] if final else []
+                )
+                batch = pending + relation_units
+                if batch:
+                    await validate_support(batch)
+                if relation_units:
+                    links = [
+                        link
+                        for link, unit in zip(links, relation_units, strict=True)
+                        if unit["verification"] == "supported"
+                    ]
             state.setdefault("gap_notes", []).extend(
-                f"- {item['title']}：{item['text']}" for item in gaps
+                f"- {entry['field']}：{entry['values'][0]['value']}" for entry in gaps
             )
             if not final:
                 state["staged_items"], state["staged_relations"] = checked, links
+                if is_outline:
+                    state["staged_outline_nodes"] = nodes
+                if validate_support:
+                    state["staged_items_verified"] = True
                 return {
                     "accepted": True,
                     "final": False,
                     "staged_items": len(checked),
                     "gap_items_moved": len(gaps),
                 }
-            if validate_support:
-                state["items_verified"] = True
             summary = research_summary.strip()
             gap_notes = state.get("gap_notes", [])
             if gap_notes:
@@ -381,23 +515,55 @@ def build_module_agent(
                 notes = "\n".join(gap_notes)
                 summary = (summary + "\n\n检索缺口（不作为结论条目）：\n" + notes)[:4000]
             state["draft"] = {
-                "items": checked,
+                "fields": checked,
                 "relations": links,
                 "research_summary": summary,
             }
-            return {"accepted": True, "items": len(checked), "gap_items_moved": len(gaps)}
+            return {"accepted": True, "fields": len(checked), "gap_items_moved": len(gaps)}
         except ValueError as exc:
-            state["invalid_submissions"] = state.get("invalid_submissions", 0) + 1
-            if state["invalid_submissions"] > 2:
-                raise ValueError("模块连续三次提交无效结果") from exc
             raise ToolException(str(exc)) from exc
+        except ModelOutputTruncated as exc:
+            # 校验输出达限时原样重提无法收敛；要求拆分独立事实，不能删掉必要依据或降级通过。
+            raise ReviewUnavailable(
+                "引用校验输出达到token上限，本次结果未暂存。请每次只提交1条；"
+                "单条包含多项要求时拆为独立事实，分别保留完整引用后重交。"
+            ) from exc
+        except (ExtractionFailed, ExtractionUnavailable) as exc:
+            # 校验请求可能被上游截断（524/空正文），属于外部暂不可用而不是草稿错误；
+            # 直接抛出会终结模块并丢掉已检索证据，回传可纠正错误让模型在预算内重交同一批。
+            raise ReviewUnavailable(
+                f"引用校验暂时不可用（{str(exc)[:120]}），本次结果未暂存，请重新提交同一批结果"
+            ) from exc
+
+    async def submit_items(
+        fields: Annotated[list[FieldInput], Field(max_length=3)],
+        relations: Annotated[list[RelationInput], Field(max_length=3)],
+        research_summary: str,
+        final: bool = False,
+    ) -> dict:
+        """每批最多3个字段，默认暂存；全部字段提交后须显式final=true结束。"""
+        return await submit_analysis(fields, relations, research_summary, final=final)
+
+    async def submit_outline(
+        outline_nodes: Annotated[list[OutlineInput], Field(max_length=6)],
+        research_summary: str,
+        final: bool = False,
+    ) -> dict:
+        """每批最多6个格式节点，先父后子、默认暂存；全部节点提交后显式final=true结束。"""
+        return await submit_analysis([], [], research_summary, outline_nodes, final)
 
     def validation_feedback(error):
         # 默认错误包含完整kwargs，会把整份坏草稿重复塞回上下文并浪费摘要/纠正预算。
         fields = ", ".join(".".join(map(str, e["loc"])) for e in error.errors())[:400]
+        required = (
+            "outline_nodes（每批最多6个，先父后子）"
+            if key == "bid_format_outline_parsing"
+            else "fields和relations（每批各最多3条）"
+        )
         return (
             "工具参数缺失或类型不符：" + fields + "。请按工具定义修正；"
-            "submit_analysis 必须提供 items、relations 和非空 research_summary。"
+            "submit_analysis 必须提供 " + required + " 和非空 research_summary。"
+            "剩余结果用后续批次提交，final=false暂存，最后final=true完成。"
         )
 
     tools = [
@@ -407,7 +573,8 @@ def build_module_agent(
     # 直接返回结束当前子图；不为已接受的报告再消费一次无意义模型请求。
     tools.append(
         StructuredTool.from_function(
-            coroutine=submit_analysis,
+            name="submit_analysis",
+            coroutine=submit_outline if key == "bid_format_outline_parsing" else submit_items,
             handle_tool_error=True,
             handle_validation_error=validation_feedback,
         )

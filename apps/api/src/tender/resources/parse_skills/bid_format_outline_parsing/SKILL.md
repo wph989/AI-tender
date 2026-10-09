@@ -31,6 +31,6 @@ description: "从全部招标材料的 PDF 原文块识别投标文件格式、�
 
 ## 输出
 
-通过 submit_analysis 提交 outline_nodes，items/relations 为 []，另填写 research_summary。
+通过 submit_analysis 提交 outline_nodes，fields 留空，另填写 research_summary。
 没有格式依据时 outline_nodes 为空。名称保留原文，归属按内容语义判断，不按编号机械建树。
-每节点只填写一次 parent_id，不另外编写展示正文、层级、cells或relations；程序会统一生成，避免同一材料出现矛盾归属。详细字段见 references/output_format.md。
+每节点只填写一次 parent_id，不另外编写 fields、relations、层级或父路径。详细字段见 references/output_format.md。

@@ -63,6 +63,12 @@ def test_validate_value_accepts_expected_types(key: str, value: object) -> None:
     assert schema.validate_value(key, value) is None
 
 
+def test_context_budget_has_no_upper_bound() -> None:
+    """上下文预算不该被人工上限卡死：可用范围由当前绑定模型的窗口决定。"""
+    assert schema.validate_value("analysis.context_tokens", 262144) is None
+    assert schema.validate_value("analysis.context_tokens", 4095) is not None
+
+
 def test_diff_values_only_lists_changes() -> None:
     old = {"a": 1, "b": [1, 2]}
     new = {"a": 1, "b": [1, 2, 3], "c": 5}

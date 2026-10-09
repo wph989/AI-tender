@@ -19,7 +19,7 @@ requirements逐字摘录填写、签署、证明、响应等要求；不要在�
 引用覆盖本节点名称和编制要求；程序会汇集父路径上各节点的引文，不必重复抄写祖先引文。
 父子归属必须有原文依据，不能仅凭同块或相邻位置推定归属。
 没有明确归属的附件保留parent_id=null。目录只用于找正文，最终引用来自正文。
-不要输出items、cells、text、relations、层级或父路径；程序由节点统一生成这些字段。
+不要输出fields、relations、层级或父路径；程序由节点统一生成展示字段。
 """
 
 
@@ -54,10 +54,8 @@ def outline_result(command: dict, seen: dict) -> tuple[list[dict], list[dict]]:
             item = validate_items(
                 [
                     {
-                        "kind": "fact",
-                        "title": node["name"],
-                        "text": "",
-                        "citations": node["citations"],
+                        "field": node["name"],
+                        "values": [{"value": node["name"], "citations": node["citations"]}],
                     }
                 ],
                 seen,
@@ -65,7 +63,7 @@ def outline_result(command: dict, seen: dict) -> tuple[list[dict], list[dict]]:
         except (ValueError, TypeError) as exc:
             # 通用引文错误不包含节点位置，模型会反复重写无关节点却留下同一处拼接错误。
             raise ValueError(f"节点 {node['id']}（{node['name']}）引用校验失败：{exc}") from exc
-        quotes = [normalized(ref["quote"]) for ref in item["citations"]]
+        quotes = [normalized(ref["quote"]) for ref in item["values"][0]["citations"]]
         if any(
             not any(normalized(value) in quote for quote in quotes)
             for value in [node["name"], *requirements]
@@ -74,7 +72,7 @@ def outline_result(command: dict, seen: dict) -> tuple[list[dict], list[dict]]:
         nodes[node["id"]] = node
 
     items, relations = [], []
-    for node in raw:
+    for order, node in enumerate(raw):
         path = [node]
         visited = {node["id"]}
         while path[0]["parent_id"] is not None:
@@ -89,10 +87,6 @@ def outline_result(command: dict, seen: dict) -> tuple[list[dict], list[dict]]:
         names = [part["name"] for part in path]
         parent_path = " / ".join(names[:-1])
         group = path[0]["name"] if path[0]["node_type"] == "group" else "独立章节"
-        # 展示文字和图谱关系都由这条路径生成，不再接纳模型另外写的一套归属。
-        text = " / ".join(names)
-        if node["requirements"]:
-            text += "；编制要求：" + "；".join(node["requirements"])
         # 父路径本来已有独立证据，由程序汇集，避免要求模型重复抄写时拼接出不存在的原文。
         # 只复用上面已校验的引用；这能覆盖祖先名称，但归属是否成立仍交给支持性校验。
         references = []
@@ -100,27 +94,35 @@ def outline_result(command: dict, seen: dict) -> tuple[list[dict], list[dict]]:
             for ref in part["citations"]:
                 if ref not in references:
                     references.append(ref)
+        # 每条编制要求单独成为一个值，前端可分别定位；无要求时以节点名称作为该字段的值。
+        requirements = node["requirements"] or [node["name"]]
         item = validate_items(
             [
                 {
-                    "kind": "judgment" if len(path) > 1 or node["node_type"] == "group" else "fact",
-                    "title": node["name"],
-                    "text": text,
-                    "presentation": "table",
-                    "cells": {
-                        "节点类型": "逻辑标" if node["node_type"] == "group" else "材料章节",
-                        "逻辑标": group,
-                        "层级": str(level),
-                        "上级路径": parent_path,
-                        "编制要求": "；".join(node["requirements"]),
-                    },
-                    "citations": references,
+                    "field": node["name"],
+                    "group": group,
+                    "sort_order": order,
+                    "values": [
+                        {"value": requirement, "citations": references}
+                        for requirement in requirements
+                    ],
+                    "note": (
+                        f"节点类型：{'逻辑标' if node['node_type'] == 'group' else '材料章节'}；"
+                        f"层级：{level}；上级路径：{parent_path or '无'}"
+                    ),
                 }
             ],
             seen,
         )[0]
         items.append(item)
         if len(path) > 1:
+            # 关系引文复用上面已清洗的引文行（含 source_id/element_id/page_no 等块身份），
+            # 否则前端拿到原始 {block_id, quote} 无法定位和高亮。
+            clean_references = []
+            for value in item["values"]:
+                for ref in value["citations"]:
+                    if ref not in clean_references:
+                        clean_references.append(ref)
             relations.append(
                 {
                     "subject": parent_path,
@@ -128,7 +130,7 @@ def outline_result(command: dict, seen: dict) -> tuple[list[dict], list[dict]]:
                     "object": " / ".join(names),
                     "scope": group,
                     "condition": "",
-                    "citations": item["citations"],
+                    "citations": clean_references,
                 }
             )
     return items, relations

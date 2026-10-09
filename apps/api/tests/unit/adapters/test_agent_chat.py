@@ -114,7 +114,7 @@ def test_native_tool_call_round_trip():
 @pytest.mark.parametrize(
     "status,expected",
     [
-        *[(status, ExtractionUnavailable) for status in (408, 429, 500, 502, 503, 504)],
+        *[(status, ExtractionUnavailable) for status in (408, 429, 500, 502, 503, 504, 524, 599)],
         (401, ExtractionFailed),
     ],
 )

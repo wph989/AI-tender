@@ -513,28 +513,30 @@ def visible_items(
     result = []
     for item in items:
         accessible = True
-        for ref in item["citations"]:
-            try:
-                if (
-                    allowed_collections is not None
-                    and ref["collection_id"] not in allowed_collections
-                ):
-                    raise LookupError("已解除知识库关联")
-                db.resolve(ref)
-            except LookupError:
-                accessible = False
+        for value in item.get("values", []):
+            for ref in value.get("citations", []):
+                try:
+                    if (
+                        allowed_collections is not None
+                        and ref["collection_id"] not in allowed_collections
+                    ):
+                        raise LookupError("已解除知识库关联")
+                    db.resolve(ref)
+                except LookupError:
+                    accessible = False
+                    break
+            if not accessible:
                 break
         result.append(
             item
             if accessible
             else {
                 "id": item["id"],
-                "kind": "insufficient",
-                "title": "来源已不可用",
-                "text": "资料已删除或解除关联，请更新分析。",
-                "presentation": "paragraph",
-                "cells": {},
-                "citations": [],
+                "field": item.get("field", "来源已不可用"),
+                "group": item.get("group", ""),
+                "sort_order": item.get("sort_order", 0),
+                "values": [],
+                "note": "资料已删除或解除关联，请更新分析。",
                 "verification": "unavailable",
             }
         )
@@ -554,33 +556,40 @@ def get_report(report_id: int, request: Request) -> dict:
         module["items"] = visible_items(db, module["items"], allowed)
         # 工具日志只供服务端重放，不在产品界面暴露整段中间提示词。
         module.pop("trace", None)
-    if report.get("runtime_version", "legacy") != "legacy":
-        runs = db.rows(
-            """SELECT a.id,a.module_id,a.attempt,a.thread_id,a.status,a.started_at,
-            a.deadline_at,a.finished_at,a.lease_until,a.model_calls,a.tool_calls,
-            a.prompt_tokens,a.completion_tokens,a.limits,a.error_message
-            FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
-            WHERE m.report_id=:id AND a.company_id=:company_id ORDER BY a.attempt""",
-            {"id": report_id},
-        )
-        for module in modules:
-            module["runs"] = [r for r in runs if r["module_id"] == module["id"]]
-        report["summary"] = visible_items(db, report["summary"], allowed)
+    runs = db.rows(
+        """SELECT a.id,a.module_id,a.attempt,a.thread_id,a.status,a.started_at,
+        a.deadline_at,a.finished_at,a.lease_until,a.model_calls,a.tool_calls,
+        a.prompt_tokens,a.completion_tokens,a.limits,a.error_message
+        FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
+        WHERE m.report_id=:id AND a.company_id=:company_id ORDER BY a.attempt""",
+        {"id": report_id},
+    )
+    for module in modules:
+        module["runs"] = [r for r in runs if r["module_id"] == module["id"]]
+    report["summary"] = visible_items(db, report["summary"], allowed)
     current = analysis_status(report["project_id"], request)
+    # 旧运行时报告只读展示：前端据此隐藏补跑入口，服务端补跑也会拒绝。
+    retired = report["runtime_version"] != RUNTIME_VERSION
     stale = (
         source_signature(current["sources"]) != source_signature(report["source_snapshot"])
         or current["analysis_category"] != report["category"]
         or current["analysis_topics"] != report["topics"]
         or current["lots"] != report["lot_settings"]
+        # 参考来源快照只有当前运行时才会记录；旧报告该列为空，比较会恒判为已变化。
         or (
-            report.get("runtime_version", "legacy") != "legacy"
+            not retired
             and source_signature(
                 [s for s in db.sources(allowed) if s["project_id"] != report["project_id"]]
             )
             != source_signature(report["reference_snapshot"])
         )
     )
-    return {**report, "modules": modules, "stale": stale}
+    return {
+        **report,
+        "modules": modules,
+        "stale": stale,
+        "runtime_retired": retired,
+    }
 
 
 @router.post("/analysis/reports/{report_id}/cancel")
@@ -623,8 +632,11 @@ def run_events(
 @router.post("/analysis/reports/{report_id}/retry", status_code=202)
 def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
     report = report_row(request, report_id)
-    if report["status"] not in {"partial", "failed"}:
-        raise ApiProblem(409, "report_not_retryable", "只有失败或部分完成的报告可以补跑")
+    # 旧固定字段流程已下线：历史报告只读展示，补跑必须先重新发起分析。
+    if report["runtime_version"] != RUNTIME_VERSION:
+        raise ApiProblem(409, "runtime_retired", "该报告由已下线的解析流程生成，请重新发起分析")
+    if report["status"] not in {"partial", "failed", "canceled"}:
+        raise ApiProblem(409, "report_not_retryable", "只有失败、部分完成或已取消的报告可以补跑")
     keys = payload.module_keys or list(MODULES)
     if set(keys) - MODULES.keys():
         raise ApiProblem(400, "invalid_module", "未知解析模块")
@@ -634,7 +646,7 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
         current_status = connection.execute(
             text("SELECT status FROM analysis_report WHERE id=:id FOR UPDATE"), {"id": report_id}
         ).scalar_one()
-        if current_status not in {"partial", "failed"}:
+        if current_status not in {"partial", "failed", "canceled"}:
             raise ApiProblem(409, "report_not_retryable", "任务已进入执行，请勿重复补跑")
         other = connection.execute(
             text("""SELECT id FROM analysis_report WHERE project_id=:project
@@ -653,73 +665,68 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             .scalars()
             .all()
         )
-        if report.get("runtime_version", "legacy") != "legacy":
-            limits = dict(report["runtime_settings"])
-            if payload.max_output_tokens is not None:
-                limits["max_output_tokens"] = payload.max_output_tokens
-            if payload.timeout_seconds is not None:
-                limits["timeout_seconds"] = payload.timeout_seconds
-            # 新attempt可以显式调整输出与时限上限，旧报告快照及运行账不回写。
-            for module_id in sorted(retried):
-                attempt = connection.execute(
+        # 限值取配置中心当前值：用户调整预算后补跑必须生效，不能被创建时的旧快照锁死。
+        limits = limits_snapshot(store(request))
+        if payload.max_output_tokens is not None:
+            limits["max_output_tokens"] = payload.max_output_tokens
+        if payload.timeout_seconds is not None:
+            limits["timeout_seconds"] = payload.timeout_seconds
+        # 显式参数只覆盖对应字段；报告创建时的旧快照与既有运行账均不回写。
+        for module_id in sorted(retried):
+            attempt = connection.execute(
+                text("SELECT COALESCE(max(attempt),0)+1 FROM agent_module_run WHERE module_id=:id"),
+                {"id": module_id},
+            ).scalar_one()
+            previous_state = (
+                connection.execute(
                     text(
-                        "SELECT COALESCE(max(attempt),0)+1"
-                        " FROM agent_module_run WHERE module_id=:id"
+                        "SELECT state FROM agent_module_run WHERE module_id=:id "
+                        "ORDER BY attempt DESC LIMIT 1"
                     ),
                     {"id": module_id},
-                ).scalar_one()
-                previous_state = (
-                    connection.execute(
-                        text(
-                            "SELECT state FROM agent_module_run WHERE module_id=:id "
-                            "ORDER BY attempt DESC LIMIT 1"
-                        ),
-                        {"id": module_id},
-                    ).scalar_one_or_none()
-                    or {}
-                )
-                # 已通过结构/引文校验的草稿可接着做支持性验证，避免预算末尾失败后重复检索。
-                # 已完成后被质量拒绝的结果必须重新生成，不能携带旧verified绕过新的校验。
-                carry = (
-                    previous_state
-                    if (previous_state.get("draft") or previous_state.get("staged_items"))
-                    and not previous_state.get("verified")
-                    else {}
-                )
-                if carry:
-                    carry.pop("items_verified", None)
-                    # 新attempt保留成果和证据，但不能继承旧调用ID缓存与纠错次数。
-                    carry.pop("tool_results", None)
-                    carry.pop("invalid_submissions", None)
-                    try:
-                        validate_project_claims(
-                            carry.get("draft", {}).get("items", carry.get("staged_items", [])),
-                            report["project_id"],
-                        )
-                    except ValueError:
-                        carry = {}
-                connection.execute(
-                    text("""INSERT INTO agent_module_run
-                    (module_id,company_id,attempt,thread_id,limits,state)
-                    VALUES (:module,:company,:attempt,:thread,CAST(:limits AS JSONB),
-                            CAST(:state AS JSONB))"""),
-                    {
-                        "module": module_id,
-                        "company": settings.company_id(),
-                        "attempt": attempt,
-                        "thread": f"analysis:{report_id}:{module_id}:{attempt}",
-                        "limits": encode(limits),
-                        "state": encode(carry),
-                    },
-                )
-        # 全文扫描前失败的任务尚未固定可用解析批次，重试时重新等候原范围内的资料。
+                ).scalar_one_or_none()
+                or {}
+            )
+            # 已通过结构/引文校验的草稿可接着做支持性验证，避免预算末尾失败后重复检索。
+            # 补跑只针对失败/已取消模块；携带的暂存结果在新 attempt 内重新校验，不继承旧验证标签。
+            carry = (
+                previous_state
+                if previous_state.get("draft") or previous_state.get("staged_items")
+                else {}
+            )
+            if carry:
+                carry.pop("staged_items_verified", None)
+                # 新attempt保留成果和证据，但不能继承旧调用ID缓存与纠错次数。
+                carry.pop("tool_results", None)
+                carry.pop("invalid_submissions", None)
+                carry.pop("consecutive_invalid_submissions", None)
+                carry.pop("consecutive_unsubmitted_responses", None)
+                carry.pop("last_unsubmitted_message_id", None)
+                try:
+                    validate_project_claims(
+                        carry.get("draft", {}).get("fields", carry.get("staged_items", [])),
+                        report["project_id"],
+                    )
+                except ValueError:
+                    carry = {}
+            connection.execute(
+                text("""INSERT INTO agent_module_run
+                (module_id,company_id,attempt,thread_id,limits,state)
+                VALUES (:module,:company,:attempt,:thread,CAST(:limits AS JSONB),
+                        CAST(:state AS JSONB))"""),
+                {
+                    "module": module_id,
+                    "company": settings.company_id(),
+                    "attempt": attempt,
+                    "thread": f"analysis:{report_id}:{module_id}:{attempt}",
+                    "limits": encode(limits),
+                    "state": encode(carry),
+                },
+            )
+        # 已固定检索批次的报告直接进入执行；从未开始的报告需要重新等候资料可用。
         status = (
             "pending"
-            if (
-                report["coverage"].get("total_blocks")
-                or report["coverage"].get("mode") == "agent_research"
-                and retried
-            )
+            if retried and report["coverage"].get("mode") == "agent_research"
             else "waiting"
         )
         connection.execute(
@@ -794,7 +801,10 @@ def get_answer(answer_id: int, request: Request) -> dict:
     answer["items"] = visible_items(db, answer["items"], allowed)
     relations = []
     for relation in answer["relations"]:
-        candidate = {"id": str(relation.get("id", "relation")), "citations": relation["citations"]}
+        candidate = {
+            "id": str(relation.get("id", "relation")),
+            "values": [{"value": "", "citations": relation["citations"]}],
+        }
         if visible_items(db, [candidate], allowed)[0].get("verification") != "unavailable":
             relations.append(relation)
     answer["relations"] = relations

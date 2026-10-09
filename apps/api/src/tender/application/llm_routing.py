@@ -154,8 +154,15 @@ class RoutingModel:
         request_count = candidate_count = 0
         first_error: TenderError | None = None
         unavailable_only = True
-        # 先用可用供应商；全在冷却时等待最早恢复者，等待不占请求预算。
-        candidates = sorted(self._candidates, key=lambda c: self._remaining(c))
+        candidates = self._candidates
+        if self._failover_limit == 1:
+            # 禁止降级时先固定最高优先级的启用模型；限流排序和429重试不能偷换成后备模型。
+            # 管理员停用的候选仍可跳过，但选定后只等待/重试该模型。
+            candidates = tuple(
+                c for c in candidates if self._recheck is None or self._recheck(c) is not None
+            )[:1]
+        # 允许降级时先用可用供应商；全在冷却时等待最早恢复者，等待不占请求预算。
+        candidates = sorted(candidates, key=lambda c: self._remaining(c))
         for position, snapshot in enumerate(candidates):
             if candidate_count >= self._failover_limit:
                 break
