@@ -282,6 +282,18 @@ class AgentRuntime:
                 text("UPDATE agent_module_run SET state=CAST(:state AS JSONB) WHERE id=:id"),
                 params | {"state": encode(state)},
             )
+            if state.get("staged_items_verified"):
+                # 运行状态与成果分开：未完成/失败仍可展示已核实字段，且与检查点同事务保存。
+                conn.execute(
+                    text("UPDATE analysis_module SET items=CAST(:items AS JSONB) WHERE id=:id"),
+                    {
+                        "id": self.run["module_id"],
+                        "items": encode([
+                            item for item in state.get("staged_items", [])
+                            if item.get("verification") == "supported"
+                        ]),
+                    },
+                )
             for call_id in (
                 state.get("tool_results", {}).keys() - previous.get("tool_results", {}).keys()
             ):

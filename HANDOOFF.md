@@ -4,7 +4,7 @@
 
 工作目录：`G:\aicode\AI-tender`
 
-> **新会话先读**：当前工作与真实运行现场以第 25 节末尾的「2026-10-09 补记」为准（在文件末尾）：解析结果已改为「字段—值—证据」结构，支持性验证移入 Agent 提交工具内，问答改为独立问答 Agent；有待完成的真实报告验收。此前的「2026-10-08 21:20 补记」及顶部、第 22—24 节的运行状态均为历史记录。禁止自动提交。
+> **新会话先读**：当前代码以文件末尾「2026-10-10 审查问题修复」为准：已修复校验失败后提前结束、改引丢失双边证据、大纲跨父级合并三处问题；单元与契约测试 490 passed / 7 skipped，数据库集成 25 passed。真实报告运行状态仍以此前 2026-10-10 补跑记录为历史参考，本轮未重启业务服务或调用真实模型，继续操作前须重新确认现场。禁止自动提交。
 
 状态：前端重构、现有后端接口对接及审查问题修复已完成，构建、测试与浏览器验证通过；本次按用户要求提交相关代码、测试与文档。
 
@@ -1167,3 +1167,204 @@ $env:PYTHONPATH='G:\aicode\AI-tender\apps\api\src'
 - 前端类型检查通过、原76项测试通过；另验证组内排序、同序稳定性及输入数组不被修改。
 - `ruff check`、`lint-imports`（5 kept / 0 broken）、`git diff --check` 通过。
 - 本轮没有发起真实模型报告或问答，没有补做桌面浏览器验收；上方的真实报告验收待办仍保留。
+
+#### 2026-10-09 优化实施补记（新会话从这里读起；工作区未提交、未验证）
+
+用户要求：承接「900 秒是模块总时限而非单次请求」的结论，按建议优化——校验协议与反馈、分类重试上限、逐字段保存、失败仍能展示已完成成果、补跑继承、时间分配、原生调用流式接收。
+
+##### 已实施（全部在本轮未提交工作区，12 个文件，见 `git status`）
+
+- 校验结果结构前置校验：`application/analysis_skills.py` 的 `json_completion` 新增 `validate` 回调；`verify_items` 用 `validate_review` 在 JSON 重试循环**内部**检查 `reviews`/`supported` 结构，格式错误会带「每字段一条 review、多个 values 合并、必须恰好 N 条」的明确纠正提示重发，最多首次+2 次；`ModelOutputTruncated` 直接抛出，不再用同一输出上限重发。
+- 分类重试上限：`application/deep_analysis.py` 的 `submit_analysis` 改为逐字段处理，单个字段结构/支持性失败记入 `state['field_failures']`（同一字段 3 次终止）；校验格式纠正失败在第 3 次以 `RuntimeError` 终止，不再回传「请重交同一批」；`ExtractionFailed`/`ExtractionUnavailable` 同样改为 `RuntimeError`，网络重试完全交给路由。`worker/deep_analysis.py` 传 `extra_retries_limit=2`，`worker/extraction.py::_routing_model` 支持按候选收敛 `extra_retries`。
+- 逐字段保存与部分成果：每通过一项即写 `state['staged_items']` 并 `await save(state)`；`application/agent_runtime.py::save` 在 `state['staged_items_verified']` 时同事务把 `verification == "supported"` 的字段写入 `analysis_module.items`（运行状态与成果分离，检查点同事务）；`api/knowledge.py::get_report` 对**未完成**模块合并 `agent_module_run.state->'staged_items'` 展示；前端 `apps/web/src/components/knowledge/ProjectAnalysis.tsx` 对未完成但有成果的模块显示「已保存 N 项核实成果…补跑会保留」并去掉只遍历 completed 模块的限制。
+- 补跑继承：`api/knowledge.py::retry_report` 把旧 `draft` 转成 `staged_items`/`staged_relations`/`staged_items_verified`，并清空 `field_failures`、`unavailable_submissions`，保证新 attempt 接着补齐而不是直接结束。
+- 时间分配：`application/analysis_research.py::AgentLimits.timeout_seconds` 与 `config/schema.py` 的 `analysis.timeout_seconds` 默认值 900→1800；`application/llm_routing.py` 在存在 `remaining_seconds`（Agent 多轮）时不再把剩余时间按计划请求数切分；`worker/deep_analysis.py` 的 `budget_status` 新增 `seconds_remaining`/`finish_reserve_seconds`，进入收尾窗口时中间件提示提交并拒绝新的 `search_document`/`search_knowledge`。
+- 流式接收：`adapters/agent_chat.py` 对 `openai`/`openai_compatible` + `chat_completions` 改用 `astream` 聚合（`stream_usage=True`），并校验 `finish_reason`，半截流不进提交工具；异常链改为取根因类型。
+
+##### 已核对的事实（只读诊断，2026-10-09 21:07 SGT 前后）
+
+- 报告 11（项目 15）：`status=failed`，`finished_at=2026-10-09 12:44:56Z`（20:44 SGT）；13 个模块全部 attempt1 失败——连接类 `APIConnectionError`/`RateLimitError` 7 项、模块总时限耗尽 3 项、模型调用时间预算不足 1 项；每个 run 的 deadline 都是 start+900 秒；**没有暂存成果**（旧代码不落部分成果）。
+- 配置中心 active release id=8（company 1）：`analysis.timeout_seconds=1800`、`max_model_calls=80`、`max_tool_calls=100`、`max_output_tokens=12000`，已与新默认一致；报告 11 的限值快照 900 秒属历史记录，不回写。
+- 运行中的进程：API(8300)/worker/beat 与前端(4400) 均于 19:15 启动，而本轮源码改动时间为 20:28–20:36，**进程仍是旧代码，验证前必须重启**；MinerU 8000 在跑。
+- 只读语法检查（`ast.parse`）：10 个改动的 Python 源文件可解析（`worker/deep_analysis.py` 的 BOM 属 HEAD 既有，不影响编译）；**`apps/api/tests/unit/adapters/test_agent_chat.py` 第 107 行有语法错误**（`return … async def run():` 被并到同一行），当前测试无法收集。
+- 本轮新增只读诊断脚本：`.tmp/status-report-11.py`、`.tmp/check-syntax.py`、`.tmp/check-config-limits.py`（均不写业务数据）。
+
+##### 待办（按顺序执行）
+
+1. 修 `apps/api/tests/unit/adapters/test_agent_chat.py:107` 的语法错误（把 `async def run():` 拆回独立行）。
+2. 为新行为补测试：逐字段落库（`agent_runtime.save`→`analysis_module.items`）、未完成模块展示 `saved_items`、补跑 `draft`→`staged` 继承、`field_failures`/`unavailable_submissions` 上限、`extra_retries_limit`、`json_completion` 的 `validate`/截断分支、`agent_chat` 流式聚合。
+3. 验证：`uv run pytest tests/unit -q`、`uv run ruff check src/tender/`、`uv run lint-imports`；DB 集成 `TENDER_RUN_DB_TESTS=1 uv run pytest tests/integration/test_knowledge_flow.py tests/integration/test_deepagents_runtime.py -q`；前端 `pnpm typecheck`、`pnpm test`。
+4. 同步文档：`docs/设计/16-DeepAgents标书分析运行时.md` 第 19、124 行仍写「900 秒」，`05`/`14` 涉及限值的表述需一并复核。
+5. 重启 API/worker/beat 后（记录新 pid），对项目 15 重新发起分析；失败时按「已保存成果」验证部分展示与补跑继承。
+6. 桌面浏览器验收仍待做；`.tmp/deep-flow-browser-10.mjs` 仍用旧字段 `item.text`/`item.citations`，需改成 `values[].citations` 再跑。
+
+**禁止自动提交**：本轮改动未经测试，提交前必须完成第 1–3 步。
+
+#### 2026-10-09 校验架构与预算补记（新会话从这里读起）
+
+用户反馈：报告11 第2次运行 `模型请求 80/80 · 工具调用 17/100` 失败，质疑「80次调用耗尽说明设计有问题」「80次模型调用只有17次工具调用不合理」，并给出架构要求：**工具内部发模型请求不对，AI 调用应由 Agent 来做**。已确认框架就是 deepagents：`apps/api/pyproject.toml` 固定 `deepagents==0.7.22`，模块子图与问答 Agent 都由 `create_deep_agent` 构建（`application/deep_analysis.py:771`、`application/qa_agent.py:198`），`RUNTIME_VERSION="deepagents-0.7.22-v1"`，venv 实测 0.7.22。
+
+##### 诊断（只读，交叉验证）
+
+- `llm_call_log` 80 行按 `invocation_id` 归并 = 68 次逻辑请求：主循环 12 次（13 行，1 次连接重试）+ 提交工具内部 56 次（67 行）。4 次 `submit_analysis`，旧实现逐字段 `validate_support`，且 `reusable` 依赖整轮才置位的 `staged_items_verified`，导致每轮整批失败、已继承字段重复送审（16+16+16+8）。
+- 工具结果 17 条与 `run.tool_calls` 一致：read_document 8、submit_analysis 4、search_document 3、list_documents 1、read_file 1。
+
+##### 改造（工作区未提交）
+
+- `submit_analysis` 只做确定性登记（结构/引用归属校验、`staged_items`、`verification="pending"`、`pending_final`），返回 `awaiting_review`，不再调用模型。
+- `ResearchMiddleware.run_review_step()` 在 `abefore_model` 执行：本批 pending + final 关系单元一次批量送审，未通过返回反馈消息让主 Agent 修正；字段纠错上限 3 次；全通过才 `build_draft`；`ModelOutputTruncated` 单独计入 `unavailable_submissions`，`InvalidModelOutput`/`ExtractionFailed`/`ExtractionUnavailable` 终止模块但保留已通过字段。
+- 删除已死的工具内校验残留（`ReviewUnavailable` 类与 `review_unavailable` 工具错误分支），避免文档与实现不一致。
+- `analysis_skills._verification_batches` explain 模式 limit 1→3、chars 6000；`build_module_agent(validate_support=...)` 改名 `review_support=...`。
+- 限值：默认 32→40、`max_output_tokens` 4096→8192（`config/schema.py`、`analysis_research.AgentLimits`、alembic 0008 同步）。
+
+##### 重跑暴露的新问题与修正（关键）
+
+- 发布版本9（40/48/24000/8192/1800/并发1）后重跑：模块521（旧限值 80/12000）完成，22 字段全部 supported、5 关系、draft 生成，用掉 57 次模型/23 次工具；但模块522 在新限值下**失败**——连续三次 `模型输出达到token上限，工具参数或正文不完整`（ctok=8192，84~91 秒），报错来自 deepagents 的 `SummarizationMiddleware` 摘要调用（ptok≈10.5k 的整段对话提示）。
+- 24k 上下文预算让 522 的 8 轮主循环里出现 4 次摘要压缩调用（输出 2k~6k token，且 1 小时窗口内该 run 只有 8 条带工具调用的 AI 消息）——摘要调用既烧次数又烧输出 token。checkpoint 里的 `_summarization_session_id` 证实压缩确实发生。
+- 因此发布**版本10**：`analysis.max_output_tokens` 8192→**16384**（RetryInput/配置中心上限内），`analysis.context_tokens` 24000→**96000**（减少压缩次数）；其余 40/48/1800/并发1 不变。代码默认值仍是 8192，是否同步改默认待定（需要更长时间的真实数据）。
+- 取消并补跑报告11：模块522 起的 12 个模块创建 attempt3，限值快照已是 16384/96000/40，522 重新运行中。
+
+##### 验证
+
+- `apps/api`：`uv run pytest tests/unit -q` → **384 passed**；`tests/contract` → 93 passed / 7 skipped；`ruff check src/tender/` 通过；`lint-imports` 5 kept / 0 broken。
+- `docs/设计/16-DeepAgents标书分析运行时.md` 已同步：按批送审、`abefore_model` 校验步骤、40 次/8192（DDL 契约值）、摘要/截断处理表述。
+
+##### 补跑限制收敛（同日追加）
+
+用户反馈「只要不是正在跑，应该都能重新跑」。原实现只允许 failed/partial/canceled 报告补跑，且重置只作用于
+失败/已取消模块，对已完成模块的 `module_keys` 请求会被静默忽略。现改为：报告处于 waiting/pending/running 时
+以 `report_running` 拒绝（提示等待或先取消），其余状态都允许；未指定模块时仍只补跑失败/已取消模块（需有可补跑
+模块，否则 `nothing_to_retry`），显式指定模块时已完成的专题也重新解析且**不继承旧草稿**（从零开始）。前端新增
+「重新解析全部专题」（显式传全部模块键）与已完成专题内的「重新解析本专题」；已在跑的报告按钮保持禁用。
+验证：`tests/integration/test_deepagents_runtime.py` 10 passed（新增显式重跑已完成模块的用例）、unit 384 passed、
+ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
+
+##### 运行现场与待办
+
+- 后端手动重启（`.tmp/start-backend-manual.ps1`）：api=42876 / worker=33588 / beat=36064，uvicorn 实际监听 8300；`-Status` 不识别手动进程。
+- 监控脚本 `.tmp/watch-report-11-cost.py`（已修 `analysis_module` 无 `attempt` 列的问题，改取每模块最新 run）；另有 `.tmp/inspect-*.py` 系列只读诊断。
+- 待办：1) 观察 522–533 在新限值下的完成情况与调用数（目标每模块 ≤40，且主循环/校验/摘要三类请求可解释）；2) 完成后核对 `staged_items` 落库、draft、失败时前端「已保存成果」与补跑继承；3) 桌面浏览器验收（`.tmp/deep-flow-browser-10.mjs` 需改用 `values[].citations`，前端 4400 未启动）；4) 评估是否把 `analysis.max_output_tokens` 代码默认值同步到 16384；5) `.agents/memory/project.md` 指针已更新。
+- **禁止自动提交**：改动未提交，提交前先完成上述验收。
+
+
+#### 2026-10-10 表格展示与真实定位补记（新一轮会话）
+
+用户要求：1) 解析结果改成 Markdown 表格展示，定位做成图标点击定位；2) 产出真实有用的数据，定位要是真实数据的定位，不要无关定位与重复定位。
+
+##### 已实施
+
+- 前端表格化（上一轮完成，本轮复验）：`ModuleMarkdown.tsx` 列为「字段 / 解析值 / 定位」，定位为 target 图标按钮，同一行内按
+  `[source_id, element_id, page_no, quote]` 去重；`Icon.tsx` 新增 target，`globals.css` 新增 `.module-table*`。
+  浏览器复验（`.tmp/check-table-render.mjs`，改用时间戳 profile 避免 DevToolsActivePort 残留）：3 列表头、行数正常；
+  点击定位（新脚本 `.tmp/check-locate-click.mjs`）能打开右侧原文并显示对应摘录。
+- 值级真实定位（`application/knowledge.py`）：`validate_items` 登记引用时调用 `align_citation`——摘录已含该值就保留；
+  同块另有该值就收敛到值所在原文切片（表格里命中片段占值大半时收窄到单元格，只是零头时保留窗口避免摘掉金额等事实）；
+  本块没有、其它已读块唯一含该值才改引；找不到时保持原引用交给支持性校验（值本身是概括时不能伪造位置）。
+  引入 `match_text`（NFKC+去空白）与 `core_is_specific`（命中片段需 ≥6 字或占值 1/3，防止表头等短词把定位带偏）。
+  同一字段内相同取值合并、同一处原文按位置去重。
+- 字段级合并（`merge_field_entries`）：同一 `group:字段名` 的多个已核实版本在校验通过后合并成一行（值并集去重、
+  引用去重、id 按合并内容重算），替代原先“新版覆盖旧版”的写法，分批补交不再丢值；`get_report` 对已完成模块同样合并，
+  历史报告不再出现重复行。`visible_items` 顺带按元素原文回查收敛历史错位摘录（`resolve(with_content=True)`，按元素缓存）。
+- 提示词收紧：提交侧提示“引用摘录必须包含该值本身的文字”，校验侧提示“同一块里的其它事实不能当作依据（如用单位名称
+  的摘录支撑地址），应判 false”。
+
+##### 验证
+
+- `apps/api`：unit **391 passed**；`tests/contract` 93 passed / 7 skipped；`lint-imports` 5 kept / 0 broken；`ruff` 通过。
+- 集成：`test_knowledge_flow.py` 13 passed（新增“同字段多版本合并 + 历史错位摘录收敛”用例）、
+  `test_deepagents_runtime.py` 10 passed；合计 23 passed。
+- 只读核对报告11 模块521 的完整存储引文（`.tmp/dump-521-full-quotes.py`）：多数摘录确含取值；确存的重复定位是
+  element 571 的标段行被「分标名称/中标份额/分标预估监理费」三个字段共用（同一行确实同时写着三件事）。
+  展示路径复算（`.tmp/diff-align-report11.py`）本轮对 521 改写 0 处——旧数据没有更多可确定性纠正的错位，
+  新分析才会走新的收敛/合并逻辑（改定位不改取值，找不到就保持原引用）。
+- 后端已用新代码重启（`.tmp/start-backend-manual.ps1`）：api=24056 / worker=23916 / beat=41408，8300 监听正常；
+  报告11 的 523 运行行由 `requeue_unlocked_runs` 回到 pending 后从 checkpoint 继续，522 之后模块按新代码产出。
+
+##### 待办
+
+1. 观察报告11 剩余模块在新代码下的产出：定位应为值本身的原文（表格行收窄到单元格），同字段不再重复成行。
+2. 前端表格在窄栏下的观感（`.tmp/table-check/analysis-table.png`）已可用；如需更紧凑可再收定位列宽度。
+3. 桌面浏览器验收（`.tmp/deep-flow-browser-10.mjs` 需改用 `values[].citations`，前端 4400 在跑）。
+4. `.agents/memory/project.md` 指针已更新；**禁止自动提交**，改动仍未提交。
+
+
+#### 2026-10-10 晚间复核补记（表格/真实定位验收 + 两个单测失败定性）
+
+##### 现场恢复
+
+- 上轮会话结束 18 小时后，WSL 与后端均已停机：`wsl -d Ubuntu-22.04 -- true` 拉起容器，
+  `powershell -NoProfile -ExecutionPolicy Bypass -File .tmp\start-backend-manual.ps1` 重启（api=23088 / worker=24188 / beat=24480），
+  前端改用 `.tmp\start-web.ps1`（`pnpm exec next dev -p 4400`）重启，8300/4400 监听正常。
+
+##### 两个单测失败的定性（都来自同一处去重语义，不改运行时逻辑）
+
+- `test_knowledge.py::test_merge_field_entries_unions_values_and_locations`：夹具把不同块的 `element_id` 都写成 1，
+  于是两处原文被当成“同一元素里互相包含的摘录”合并成一条。真实库里块与元素一一对应（`blocks()` 返回 `element.id`），
+  夹具改为按块推导 `element_id`，用例本意（同值出现在两处就保留两条定位）保持不变。
+- `test_analysis_outline.py::test_node_name_requirement_and_parent_must_have_read_evidence`：子节点窄摘录与父节点整块摘录
+  来自同一元素，按新语义只保留更完整的一条，断言随之更新为 `[TEXT]`（关系引文仍复用校验后的引文行）。
+- 保留“更完整的一条”而不是“更窄的一条”的原因：包含合并只在同一 `(source_id, element_id)` 内生效，更长的一条必然覆盖较短的一条，
+  不会削弱证据；反之保留更窄的摘录可能让同一值在展示时指向不含该值的摘录。
+
+##### 验证（本轮全部复跑）
+
+- `apps/api`：`uv run pytest tests/unit -q` → **392 passed**；`ruff check src/tender/` 通过；`lint-imports` 5 kept / 0 broken。
+- 集成（`$env:TENDER_RUN_DB_TESTS=1`）：`test_deepagents_runtime.py` + `test_knowledge_flow.py` → **23 passed**。
+- 前端：`pnpm typecheck` 通过；`pnpm test` → 12 文件 / **76 passed**。
+- CDP 复验：`.tmp/check-table-render.mjs` 三列表格正常（字段/解析值/定位，定位为 target 图标 + 页码）；
+  `.tmp/check-locate-click.mjs` 点击定位打开右侧原文并显示摘录（`element 93` 与值同块）。截图在 `.tmp/table-check/`。
+- 新代码首个完成模块 525（`.tmp/dump-module.py 525`）：6 行无重复；`分值构成`/`评分标准` 的每个分项各自命中一个元素，
+  没有同位置重复；引文均为取值所在原文（含小节标题）。模块 521（旧代码）仍有历史噪音，属重解析后才消失的范围。
+
+##### 报告11 现状与补跑口径
+
+- 521 completed（旧代码 57 调用）｜522 failed：模型调用时间预算不足以再次请求｜523 failed：模块总时长（1800s）耗尽｜
+  524 failed：证据校验请求输出达到 16384 token 上限｜525 completed（新代码 13 调用）｜526 卡在 running（停机前的租约，已被
+  `requeue_unlocked_runs` 识别为过期，任务启动时复位）｜527–530 pending｜531–533 canceled；报告整体 failed。
+- 活跃配置（release 10）：`max_model_calls=40`、`max_tool_calls=48`、`timeout_seconds=1800`、`context_tokens=96000`、
+  `max_output_tokens=16384`（代码默认 8192 只是兜底值，实际生效已是 16384）。
+- 补跑口径确认：`retry` 只拒绝 waiting/pending/running（`report_running`）；未指定模块只补跑 failed/canceled，显式指定可重跑已完成
+  且不继承旧草稿。因此 522–524 与 526 现在都能重新分析，不需要先取消或等待。
+- 待办：是否补跑 522–524（上次失败是预算/延迟原因，未调整运行时预算）以及重解析 521 以应用新的定位收敛与同字段合并——
+  需要真实模型调用，交由用户决定后用界面「重新解析」或 `POST /analysis/reports/11/retry` 触发。
+
+##### 补跑执行记录（2026-10-10 18:55，与上条同一会话内接着做）
+
+- 已调用界面同一接口 `POST /api/v1/analysis/reports/11/retry`，显式指定 `disqualified_items_parsing`、
+  `biz_standard_parsing`、`tech_requirement_parsing`（未指定时不会重跑已完成模块），返回 `{"id":11,"status":"pending"}`。
+- 复跑后控制器按模块 id 串行执行：522–524 新建第 4 次尝试（`agent_module_run` 784–786，从暂存成果继续，
+  不重复已核实字段）；526 因“恢复不重置时限”仍判失败（停机前那次运行已耗完 1800s，租约过期后再恢复必然再次超时）——
+  它是 failed，本轮被跳过，需要在报告本轮结束后再补跑一次（补跑会新建 attempt，时限才会重置）；
+  527 正在运行（本轮已 4 次模型调用），528–530 排队；531–533 保持 canceled 不动。
+- 结论：卡在 running 的历史模块不会自动复活为有效运行，正确姿势是失败后走补跑（新建 attempt）。
+
+#### 解析结果表格改为「字段 / 解析值 + 值后定位图标」（2026-10-10 19:20）
+
+用户要求：不要单独的定位列，定位图标直接跟在取值后面。
+
+- `ModuleMarkdown.tsx`：表格改为两列（字段 / 解析值）；`ValueLocates` 把某值的引用渲染成图标按钮放在该值末尾，
+  按“资料 + 元素 + 页 + 摘录”在**该值内**去重（`valueCitations`）；图标 `title/aria-label` 仍给出文件、页码与摘录，
+  点图标走同一条 `onLocate` 定位链路。
+- 排版：`renderMarkdown(text, trailing)` 把图标接进最后一段 `<p>` 的行内末尾（单段值必然同行），
+  列表结尾的值则在最后一块之后单独成行；`globals.css` 用 `.value-locates` 取代 `.field-locates`/`.module-table-locate`。
+- 验证：`pnpm typecheck` 通过、`pnpm test` 76 passed；CDP 实测（`.tmp/inspect-row.mjs`、`.tmp/find-row.mjs`）逐标签确认
+  图标父节点是值所在 `<p>` 且是段落最后一个子节点（`after: true`）；截图 `.tmp/table-check/analysis-table.png`。
+  辅助脚本 `.tmp/check-table-render.mjs` 的选择器同步改为 `.value-locates`。
+
+#### 2026-10-10 审查问题修复
+
+用户要求修复上一轮审查确认的三处问题，已完成代码与回归测试，改动未提交。
+
+- `deep_analysis.py`：最终提交标记只用于当前校验。校验不支持、截断或服务失败后不会让下一次补读/暂存提前结束；达到纠错上限前也先保存撤销标记后的状态。补跑接口同时清除历史 `pending_final`，新 attempt 必须重新确认完成。
+- `knowledge.py`：自动换块仅限同一 `source_id`，原条款与补充文件分别证明修订前后状态，不能互相替换。提交与校验提示同步说明双边证据的作用，同一文件内的错位定位仍可纠正。
+- `analysis_outline.py`：报告条目 id 按大纲节点 id 生成，同名同要求节点也能保持独立。运行时与报告展示统一跳过大纲的普通字段合并，保留不同父路径的材料节点；普通专题的同字段值合并保留。
+- 回归覆盖：失败/截断后补读、`final=false` 纠正后再次 `final=true`；终止和补跑时撤销收尾标记；修订结论保留双边引用；不同父级下同名同要求节点的分批暂存；新旧报告的大纲展示。
+- 验证：`uv run pytest tests/unit tests/contract -q` → **490 passed / 7 skipped**（unit 397 / contract 93）；`TENDER_RUN_DB_TESTS=1` 的 `test_deepagents_runtime.py` 与 `test_knowledge_flow.py` → **25 passed**；`ruff check src/tender/`、`lint-imports` 全部通过。
+- 本轮验证采用模拟模型与隔离数据库测试表/schema；未重启业务服务、未补跑真实报告。报告11 的实时状态需另行确认，已落库且已被错误合并/遗漏的旧结果需要重新解析才能恢复。
+
+#### 提交与下一步前端任务
+
+用户明确要求先提交当前代码，本次提交包含分析运行时、成果暂存、报告表格与定位，以及三处审查问题修复和测试。
+此前“未提交”均为当时状态；仍禁止未经后续明确要求自动提交新改动。
+
+下一步用户要求全面审查并修复前端体验，优先使用成熟框架与组件。已明确的问题：新增/编辑表单在页面上方展开，当前滚动位置看不到变化；应改为可见的弹窗或抽屉，并系统检查其它交互问题。该前端任务尚未实施，不包含在当前提交中。

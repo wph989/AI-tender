@@ -30,12 +30,12 @@ class EvidenceBudgetError(ValueError):
 class AgentLimits:
     """持久快照使用同一预算；恢复执行不能重置计数来绕过限制。"""
 
-    max_model_calls: int = 32
+    max_model_calls: int = 40
     max_tool_calls: int = 48
     max_evidence_blocks: int = 160
-    timeout_seconds: int = 900
+    timeout_seconds: int = 1800
     context_tokens: int = 24000
-    max_output_tokens: int = 4096
+    max_output_tokens: int = 8192
 
 
 @dataclass

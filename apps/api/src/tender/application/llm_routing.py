@@ -223,9 +223,12 @@ class RoutingModel:
                     max(1, snapshot.extra_retries - retry + 1)
                     + sum(c.extra_retries + 1 for c in future),
                 )
-                # 超时是上限而非必须等待时长；给后续重试/候选预留时间，避免慢端点吃光总预算。
+                # Agent 多轮运行已有模块总时限，给当前请求连续窗口；不能把末尾60秒
+                # 切成四次15秒并反复打断正常生成。其它功能保留候选之间的时间分配。
                 request_timeout = min(
-                    snapshot.timeout, max(0, deadline - time.monotonic()) / planned_requests
+                    snapshot.timeout,
+                    max(0, deadline - time.monotonic())
+                    / (1 if self._remaining_seconds else planned_requests),
                 )
                 try:
                     completion = await asyncio.wait_for(

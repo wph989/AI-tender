@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from tender.application.knowledge import fingerprint, normalized, validate_items
-from tender.domain.errors import InvalidModelOutput
+from tender.domain.errors import InvalidModelOutput, ModelOutputTruncated
 from tender.ports.llm import StructuredTextModel
 
 MODULES = {
@@ -64,7 +64,7 @@ def skill_version(snapshot: dict | None = None) -> str:
     return fingerprint(snapshot or skill_snapshot())[:24]
 
 
-async def json_completion(model: StructuredTextModel, prompt: str) -> dict:
+async def json_completion(model: StructuredTextModel, prompt: str, *, validate=None) -> dict:
     for attempt in range(3):
         try:
             result = await model.complete(prompt)
@@ -78,15 +78,20 @@ async def json_completion(model: StructuredTextModel, prompt: str) -> dict:
                 raise InvalidModelOutput("模型必须返回 JSON 对象") from exc
             if not isinstance(parsed, dict):
                 raise InvalidModelOutput("模型必须返回 JSON 对象")
+            if validate is not None:
+                validate(parsed)
             return parsed
-        except InvalidModelOutput:
+        except ModelOutputTruncated:
+            # 同一输出上限下重发截断结果无法修复，交由提交工具指导拆分。
+            raise
+        except InvalidModelOutput as exc:
             if attempt == 2:
                 raise
             # 只纠正已收到的格式错误；连接、配置、拒绝和权限错误仍由原调用策略处理。
             # 不猜测自然语言中的动作，也不把未经校验的模型文本拼进工具结果。
             prompt += (
-                "\n上次响应不符合 JSON 协议。请重新返回一个完整 JSON 对象，"
-                "遵守当前阶段的字段要求；工具动作也必须用 action 对象表达，不能只说明计划。"
+                "\n上次响应结构错误：" + str(exc)[:400]
+                + "。请按上述结构重新返回完整 JSON 对象，不输出解释或额外字段。"
             )
     raise AssertionError("不可达的 JSON 重试状态")
 
@@ -323,10 +328,11 @@ async def verify_items(
     # 否则“前附表第1.4.1项”这类正确归属会因标题不在摘录里被反复判无依据。
     windows = EvidenceWindows(evidence)
     # 新运行时要求先找出具体无依据断言；只返回布尔值容易因核心关键词正确而忽略附加推论。
-    # 每项多处引用展开上下文后远大于草稿体积；真实批次耗尽12000输出token，
-    # 解释型审查逐条调用，避免对多项同时推理时截断并丢失整批审查结果。
+    # 逐条送审会让“字段数×提交轮次”次模型请求成为主要成本（一次真实运行 80 次预算里
+    # 64 次耗在这里）；改为按提交批次一次送审多条，结论仍逐条返回、互不混用。
+    # 批上限取 3，与提交工具的批次一致：再多会让解释型输出逼近输出上限而整批截断。
     batches = _verification_batches(
-        items, limit=1 if explain else 16, chars=6000 if explain else 24000
+        items, limit=3 if explain else 16, chars=6000 if explain else 24000
     )
     context_rule = (
         "citations.block_context 是引文所在块及其原文物理邻域（同一资料，按 offset 排列）："
@@ -351,11 +357,16 @@ async def verify_items(
         else ""
     )
     for batch in batches:
-        # 邻近块总量按调用封顶，避免个别长条目把校验提示重新推回超时区间。
-        neighbour_budget = [8000]
+        # 邻近块总量按调用封顶，避免个别长条目把校验提示重新推回超时区间；
+        # 批量送审时按条目数放大，单条仍保留原额度，避免多条字段互相挤占章节上下文。
+        neighbour_budget = [max(8000, 4000 * len(batch))]
         output_rule = (
             '只返回 {"reviews":[{"unsupported_claims":["具体无依据断言及原因"],'
-            '"supported":false},...]}，每项一条，顺序和长度必须一致。'
+            '"supported":false},...]}。reviews 与输入字段一一对应，'
+            f"本次必须恰好返回 {len(batch)} 条 reviews。"
+            "一个字段即使含多个 values，也只能返回一条 review；"
+            "逐值核对后合并为该字段的结论，全部值均有依据才为true。"
+            "unsupported_claims须写明值的序号、具体断言及缺少的依据，每条不超过40字、最多5条。"
             "先逐一找出field、group、note和每个value中无依据的断言，再给supported；"
             "只有unsupported_claims为空时才可为true。不要借用其它值或其它字段的证据。"
             "例如引用“最高限价78万元”不能支持“预算80万元、全部标段适用”；"
@@ -364,6 +375,37 @@ async def verify_items(
             if explain
             else '只返回 {"supported":[true,false,...]}，长度必须一致。'
         )
+        def validate_review(verdict, batch=batch):
+            reviews = verdict.get("reviews")
+            if explain:
+                if not isinstance(reviews, list) or len(reviews) != len(batch):
+                    actual = len(reviews) if isinstance(reviews, list) else "缺失"
+                    raise InvalidModelOutput(
+                        f"逐项断言审查 reviews 应有{len(batch)}条（每字段一条，非每值一条），"
+                        f"实际为{actual}"
+                    )
+                for index, review in enumerate(reviews):
+                    if (
+                        not isinstance(review, dict)
+                        or type(review.get("supported")) is not bool
+                        or not isinstance(review.get("unsupported_claims"), list)
+                        or any(
+                            not isinstance(claim, str) or not claim.strip()
+                            for claim in review["unsupported_claims"]
+                        )
+                    ):
+                        raise InvalidModelOutput(
+                            f"逐项断言审查 reviews[{index}] 必须包含布尔 supported 和"
+                            "字符串数组 unsupported_claims（无问题时为[]）"
+                        )
+            else:
+                flags = verdict.get("supported")
+                if (
+                    not isinstance(flags, list) or len(flags) != len(batch)
+                    or any(type(flag) is not bool for flag in flags)
+                ):
+                    raise InvalidModelOutput("证据支持性校验结果不完整")
+
         verdict = await json_completion(
             model,
             "校验每个解析值是否由其引用原文支持。"
@@ -371,6 +413,10 @@ async def verify_items(
             "允许不改变含义的同义改写和简洁表述，不因缺少完全相同的词语就判无依据；"
             "金额、时间、主体、适用范围、否定、前提与例外均不得增删或改变。"
             "同一字段的多个 value 分别校验，引用必须逐值对应，不能互相借用。"
+            "引用摘录必须直接写出该 value 的事实；同一块里的其它事实不能当作依据"
+            "（例如用单位名称的摘录支撑地址、用名称摘录支撑联系人），应判false并说明。"
+            "跨文件修订应结合该值引用的原条款与补充条款核对；原条款证明修订前状态，"
+            "不能因其未包含修订后的值就判为无关证据。"
             "note和group中的业务断言须由本字段的引用支持，不能借备注补造免责或适用条件。"
             "大纲note中的节点类型、层级数字是展示结构，不要求原文逐字写出；"
             "上级路径为“无”表示未声明从属，不是缺席性业务断言；"
@@ -414,22 +460,10 @@ async def verify_items(
                 ],
                 ensure_ascii=False,
             ),
+            validate=validate_review,
         )
         reviews = verdict.get("reviews") if explain else None
         if explain:
-            if (
-                not isinstance(reviews, list)
-                or len(reviews) != len(batch)
-                or any(
-                    not isinstance(r, dict)
-                    or type(r.get("supported")) is not bool
-                    or not isinstance(r.get("unsupported_claims"), list)
-                    or any(not isinstance(c, str) or not c.strip() for c in r["unsupported_claims"])
-                    for r in reviews
-                )
-            ):
-                # 这是校验模型的协议错误，不能归罪于待审结论、扣除其内容纠错次数。
-                raise InvalidModelOutput("证据支持性校验缺少逐项断言审查")
             flags = [r["supported"] and not r["unsupported_claims"] for r in reviews]
         else:
             flags = verdict.get("supported")

@@ -164,7 +164,7 @@ class KnowledgeStore:
             )
         return result
 
-    def resolve(self, ref: dict) -> dict:
+    def resolve(self, ref: dict, *, with_content: bool = False) -> dict:
         # 引文中的数字全部视作不可信输入，身份必须在一条带权限约束的查询中同时匹配。
         rows = self.rows(
             """SELECT e.id, e.page_no, e.anchor, e.text, e.html,
@@ -184,12 +184,18 @@ class KnowledgeStore:
             raise LookupError("引用原文已删除、撤销访问或与解析批次不符")
         row = rows[0]
         values = [row[f"bbox_{axis}"] for axis in ("x0", "y0", "x1", "y1")]
-        return {
+        resolved = {
             **ref,
             "page_no": row["page_no"],
             "file_name": row["file_name"],
             "bbox": [float(v) for v in values] if all(v is not None for v in values) else None,
         }
+        if with_content:
+            # 展示层要按元素原文回查值的位置，这里顺带返回，避免为同一权限再查一次。
+            from tender.application.knowledge import plain_text
+
+            resolved["content"] = plain_text(row)
+        return resolved
 
     def embedding_config(self) -> dict | None:
         rows = self.rows("""SELECT m.id, m.model_id, m.timeout_seconds, p.base_url,

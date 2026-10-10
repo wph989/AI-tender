@@ -480,7 +480,47 @@ def test_cancel_during_shared_cooldown_sends_no_request():
     asyncio.run(run())
 
 
-def test_slow_candidates_leave_time_for_final_fallback_within_module_deadline(monkeypatch):
+def test_slow_candidates_leave_time_for_final_fallback_within_deadline(monkeypatch):
+    """非 Agent 功能仍按计划请求切分剩余时间：慢候选不能吃光后备模型的窗口。"""
+    from tender.application import llm_routing
+
+    now, timeouts, records = [100.0], [], []
+    monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
+
+    async def wait_for(request, timeout):
+        timeouts.append(timeout)
+        try:
+            return await request
+        except TimeoutError:
+            now[0] += timeout
+            raise
+
+    monkeypatch.setattr(llm_routing.asyncio, "wait_for", wait_for)
+    router = RoutingModel(
+        "analysis",
+        "analysis",
+        [
+            replace(_candidate(name, index), timeout=300, extra_retries=1)
+            for index, name in enumerate("abc", 1)
+        ],
+        _ScriptedGateway(
+            {
+                "a": [TimeoutError(), TimeoutError()],
+                "b": [TimeoutError(), TimeoutError()],
+                "c": [None],
+            }
+        ),
+        records.append,
+        retry_base_seconds=0,
+        deadline_seconds=600,
+    )
+    assert asyncio.run(router.complete("测试")).model == "c"
+    assert [r.model_id for r in records] == [1, 1, 2, 2, 3]
+    assert now[0] < 700 and all(timeout <= 100.01 for timeout in timeouts)
+
+
+def test_agent_module_window_is_a_continuous_budget_for_the_current_request(monkeypatch):
+    """Agent 多轮已有模块总时限：当前请求用连续窗口，不能切成小片反复打断生成。"""
     from tender.application import llm_routing
 
     now, timeouts, records = [100.0], [], []
@@ -514,6 +554,8 @@ def test_slow_candidates_leave_time_for_final_fallback_within_module_deadline(mo
         deadline_seconds=600,
         remaining_seconds=lambda: 60,
     )
-    assert asyncio.run(router.complete("测试")).model == "c"
-    assert [r.model_id for r in records] == [1, 1, 2, 2, 3]
-    assert now[0] < 160 and all(timeout <= 10.01 for timeout in timeouts)
+    # 首次请求拿到完整的剩余 60 秒窗口；慢候选耗尽后按模块总时限结束，不再切片重发或换后备。
+    with pytest.raises(ExtractionFailed, match="总请求次数或时间上限"):
+        asyncio.run(router.complete("测试"))
+    assert timeouts == [60.0]
+    assert [r.model_id for r in records] == [1]

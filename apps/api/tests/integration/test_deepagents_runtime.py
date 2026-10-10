@@ -327,30 +327,41 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     runtime = prepared_runtime(env)
     assert runtime.claim()
     runtime.reserve("model")
-    saved_state = {"draft": {"fields": [], "relations": [], "research_summary": "已经检索"}}
+    carried_field = {
+        "id": "part1",
+        "field": "质保",
+        "group": "",
+        "sort_order": 0,
+        "values": [
+            {
+                "value": "质保三年",
+                "citations": [
+                    {
+                        "source_id": runtime.sources[0]["source_id"],
+                        "project_id": runtime.report["project_id"],
+                        "quote": "质保三年",
+                    }
+                ],
+            }
+        ],
+        "note": "",
+        "verification": "supported",
+    }
+    saved_state = {
+        "draft": {
+            "fields": [carried_field],
+            "relations": [],
+            "research_summary": "已经检索",
+        },
+        "invalid_submissions": 3,
+        "consecutive_invalid_submissions": 3,
+        "consecutive_unsubmitted_responses": 2,
+        "last_unsubmitted_message_id": "old-response",
+    }
     if staged:
         saved_state = {
-            "staged_items": [
-                {
-                    "id": "part1",
-                    "field": "质保",
-                    "group": "",
-                    "sort_order": 0,
-                    "values": [
-                        {
-                            "value": "质保三年",
-                            "citations": [
-                                {
-                                    "source_id": runtime.sources[0]["source_id"],
-                                    "project_id": runtime.report["project_id"],
-                                    "quote": "质保三年",
-                                }
-                            ],
-                        }
-                    ],
-                    "note": "",
-                }
-            ],
+            "staged_items": [carried_field],
+            "pending_final": {"research_summary": "旧的最终提交尚未完成校验"},
             "invalid_submissions": 3,
             "consecutive_invalid_submissions": 3,
             "staged_items_verified": True,
@@ -358,6 +369,12 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
             "last_unsubmitted_message_id": "old-response",
         }
     runtime.save(saved_state)
+    if staged:
+        # 逐字段落库：已核实成果写进模块结果，模块失败后前端仍能展示。
+        items = env.db.rows(
+            "SELECT items FROM analysis_module WHERE id=:id", {"id": runtime.run["module_id"]}
+        )[0]["items"]
+        assert [item["id"] for item in items] == ["part1"]
     runtime.finish("failed", "故障注入")
     runtime.release()
     env.db.execute(
@@ -368,7 +385,7 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     )[0]["module_key"]
     result = knowledge.retry_report(
         runtime.report["id"],
-        knowledge.RetryInput(module_keys=[key], max_output_tokens=8192, timeout_seconds=1800),
+        knowledge.RetryInput(module_keys=[key], max_output_tokens=16384, timeout_seconds=1200),
         env.request,
     )
     assert result["status"] == "pending"
@@ -378,16 +395,25 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     )
     assert [r["model_calls"] for r in rows] == [1, 0]
     assert [r["attempt"] for r in rows] == [1, 2]
-    assert rows[0]["limits"]["max_output_tokens"] == 4096
-    assert rows[1]["limits"]["max_output_tokens"] == 8192
-    assert rows[0]["limits"]["timeout_seconds"] == 900
-    assert rows[1]["limits"]["timeout_seconds"] == 1800
+    assert rows[0]["limits"]["max_output_tokens"] == 8192
+    assert rows[1]["limits"]["max_output_tokens"] == 16384
+    assert rows[0]["limits"]["timeout_seconds"] == 1800
+    assert rows[1]["limits"]["timeout_seconds"] == 1200
     assert rows[0]["thread_id"] != rows[1]["thread_id"]
-    carried_key = "staged_items" if staged else "draft"
-    assert rows[1]["state"][carried_key] == rows[0]["state"][carried_key]
+    if staged:
+        # 已核实字段连同验证标记恢复，补跑不需要再调用校验模型。
+        assert rows[1]["state"]["staged_items"] == rows[0]["state"]["staged_items"]
+        assert rows[1]["state"]["staged_items_verified"] is True
+    else:
+        # draft 会让新图直接结束，补跑必须转成暂存后继续补齐未完成内容。
+        assert "draft" not in rows[1]["state"]
+        assert rows[1]["state"]["staged_items"] == rows[0]["state"]["draft"]["fields"]
+        assert rows[1]["state"]["staged_items_verified"] is True
     assert "invalid_submissions" not in rows[1]["state"]
     assert "consecutive_invalid_submissions" not in rows[1]["state"]
-    assert "staged_items_verified" not in rows[1]["state"]
+    assert "field_failures" not in rows[1]["state"]
+    assert "unavailable_submissions" not in rows[1]["state"]
+    assert "pending_final" not in rows[1]["state"]
     assert "consecutive_unsubmitted_responses" not in rows[1]["state"]
     assert "last_unsubmitted_message_id" not in rows[1]["state"]
     with pytest.raises(knowledge.ApiProblem):
@@ -425,6 +451,59 @@ def test_canceled_report_retries_failed_and_canceled_modules(env):
     )
     assert runs and all(row["status"] == "pending" and row["attempt"] == 2 for row in runs)
     assert knowledge.get_report(report_id, env.request)["status"] == "pending"
+
+
+def test_explicit_retry_reparses_completed_module_from_scratch(env):
+    """显式指定模块时，已完成的专题也能重新解析：新 attempt 不继承旧草稿。"""
+    runtime = prepared_runtime(env)
+    assert runtime.claim()
+    runtime.reserve("model")
+    field = {
+        "id": "done1",
+        "field": "质保",
+        "group": "",
+        "sort_order": 0,
+        "values": [
+            {
+                "value": "质保三年",
+                "citations": [
+                    {
+                        "source_id": runtime.sources[0]["source_id"],
+                        "project_id": runtime.report["project_id"],
+                        "quote": "质保三年",
+                    }
+                ],
+            }
+        ],
+        "note": "",
+        "verification": "supported",
+    }
+    draft = {"fields": [field], "relations": [], "research_summary": "已经检索"}
+    runtime.save({"staged_items": [field], "staged_items_verified": True, "draft": draft})
+    runtime.finish("completed", draft=draft)
+    runtime.release()
+    report_id = runtime.report["id"]
+    module_id = runtime.run["module_id"]
+    key = env.db.rows(
+        "SELECT module_key FROM analysis_module WHERE id=:id", {"id": module_id}
+    )[0]["module_key"]
+    env.db.execute("UPDATE analysis_report SET status='completed' WHERE id=:id", {"id": report_id})
+    assert knowledge.retry_report(report_id, knowledge.RetryInput(module_keys=[key]), env.request)[
+        "status"
+    ] == "pending"
+    rows = env.db.rows(
+        "SELECT attempt,state FROM agent_module_run WHERE module_id=:id ORDER BY attempt",
+        {"id": module_id},
+    )
+    assert [row["attempt"] for row in rows] == [1, 2]
+    # 重新解析不能继承旧草稿，否则新图会直接以旧成果收尾，等于没有重跑。
+    assert rows[1]["state"] == {}
+    assert (
+        env.db.rows("SELECT status FROM analysis_module WHERE id=:id", {"id": module_id})[0][
+            "status"
+        ]
+        == "pending"
+    )
 
 
 def test_dynamic_reference_revocation_stops_tool_and_hides_existing_result(env):
@@ -478,7 +557,7 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
     old = env.db.rows(
         "SELECT limits FROM agent_module_run WHERE id=:id", {"id": runtime.run["id"]}
     )[0]["limits"]
-    assert old["max_model_calls"] == 32 and old["context_tokens"] == 24000
+    assert old["max_model_calls"] == 40 and old["context_tokens"] == 24000
     assert runtime.claim()
     runtime.finish("failed", "故障注入")
     runtime.release()
@@ -504,4 +583,4 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
     # 报告创建时的快照保持原值，只作为历史记录，不被补跑改写。
     assert knowledge.report_row(env.request, runtime.report["id"])["runtime_settings"][
         "max_model_calls"
-    ] == 32
+    ] == 40

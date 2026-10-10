@@ -6,7 +6,7 @@ import inspect
 from typing import Any
 
 import httpx
-from langchain_core.messages import message_to_dict, messages_from_dict
+from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
 from tender.domain.errors import (
@@ -35,6 +35,9 @@ class AgentChat:
         http_async_client: Any = None,
     ) -> None:
         self._max_tokens = max_tokens
+        self._stream_chat = (
+            protocol in {"openai", "openai_compatible"} and api_mode == "chat_completions"
+        )
         # SDK 默认重试会与项目路由相乘；所有供应商必须关掉自己的隐式重试。
         common: dict[str, Any] = {"model": model, "max_retries": 0, "timeout": timeout}
         if temperature is not None:
@@ -55,7 +58,7 @@ class AgentChat:
                 base_url=base_url,
                 api_key=api_key or "local-anonymous",
                 use_responses_api=api_mode == "responses",
-                stream_usage=False,
+                stream_usage=True,
                 http_async_client=self._owned_http,
                 http_client=self._owned_sync_http,
             )
@@ -87,10 +90,15 @@ class AgentChat:
 
     async def chat(self, messages: list[dict], tools: list[dict]) -> Completion:
         try:
-            runnable = self.model.bind_tools(tools) if tools else self.model
             # 业务调用记录保存在本项目，不能因终端残留 tracing 配置外发标书正文。
             with tracing_context(enabled=False):
-                result = await runnable.ainvoke(messages_from_dict(messages))
+                if self._stream_chat:
+                    # 先聚合完整工具参数再交给 Agent；增量接收避免长生成被网关闲置超时断开。
+                    merged = await self._aggregate_chat_stream(messages, tools)
+                    result = message_chunk_to_message(merged) if merged is not None else None
+                else:
+                    runnable = self.model.bind_tools(tools) if tools else self.model
+                    result = await runnable.ainvoke(messages_from_dict(messages))
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             # 524 等非标准 5xx 同样是上游超时，必须可重试，不能直接判失败。
@@ -100,7 +108,9 @@ class AgentChat:
                 or any(token in type(exc).__name__ for token in ("Timeout", "Connection"))
             ):
                 # SDK 会包装传输异常；保留原因类型便于区分超时与断连，不暴露原异常内容。
-                cause = exc.__cause__ if exc.__cause__ is not None else exc
+                cause = exc
+                while cause.__cause__ is not None:
+                    cause = cause.__cause__
                 error = ExtractionUnavailable(
                     f"Agent 模型连接失败或暂不可用（{type(cause).__name__}）", http_status=status
                 )
@@ -115,6 +125,11 @@ class AgentChat:
                 f"Agent 模型调用失败（{type(exc).__name__}）",
                 http_status=status,
             ) from exc
+        if result is None or (
+            self._stream_chat and not result.response_metadata.get("finish_reason")
+        ):
+            # 网络结束不等于模型完成；半截工具 JSON 绝不能进入提交工具。
+            raise ExtractionUnavailable("Agent 流式响应未完整结束")
         usage = result.usage_metadata or {}
 
         def invalid(error_type, message):
@@ -163,7 +178,52 @@ class AgentChat:
             agent_message=message_to_dict(result),
         )
 
+    async def _aggregate_chat_stream(self, messages: list[dict], tools: list[dict]) -> Any:
+        """消费供应商 SSE 增量并聚合成完整消息。
+
+        LangChain 的 delta 转换会丢弃 refusal 字段，明确拒绝会退化成
+        「既无正文也无工具调用」的协议错误；因此这里直接消费原始流，
+        复用其工具参数与用量聚合，只补回被丢弃的拒绝信息。
+        """
+        from langchain_core.messages import AIMessageChunk
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+        from langchain_openai.chat_models.base import _astream_with_chunk_timeout
+
+        payload = self.model._get_request_payload(
+            messages_from_dict(messages),
+            **({"tools": [convert_to_openai_tool(tool) for tool in tools]} if tools else {}),
+        )
+        payload["stream"] = True
+        if self.model._should_stream_usage(None):
+            payload["stream_options"] = {"include_usage": True}
+        response = await self.model.async_client.create(**payload)
+        merged = None
+        refusal = None
+        default_class = AIMessageChunk
+        async with response as stream:
+            async for raw in _astream_with_chunk_timeout(
+                stream, self.model.stream_chunk_timeout, model_name=self.model.model_name
+            ):
+                data = raw if isinstance(raw, dict) else raw.model_dump()
+                choices = data.get("choices") or []
+                delta = (choices[0].get("delta") or {}) if choices else {}
+                refusal = delta.get("refusal") or refusal
+                chunk = self.model._convert_chunk_to_generation_chunk(data, default_class, {})
+                if chunk is None:
+                    continue
+                default_class = chunk.message.__class__
+                # 与 LangChain 自身聚合一致：generation_info 合并进 response_metadata，
+                # 供上层读取 finish_reason，判断流是否完整结束。
+                if info := chunk.generation_info:
+                    chunk.message.response_metadata = {**info, **chunk.message.response_metadata}
+                merged = chunk.message if merged is None else merged + chunk.message
+        if merged is not None and refusal:
+            # 与静态响应的字段位置保持一致，复用同一处拒绝判断。
+            merged.additional_kwargs["refusal"] = refusal
+        return merged
+
     async def aclose(self) -> None:
+        # pad
         for name in self._client_names:
             client = getattr(self.model, name, None)
             if client is not None and hasattr(client, "close"):

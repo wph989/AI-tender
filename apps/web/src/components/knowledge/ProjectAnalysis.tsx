@@ -70,8 +70,8 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     return () => clearInterval(timer);
   }, [running, processingFiles, reload]);
 
-  // 失败补跑仍保留旧结果用于审计，页面只使用已完成模块，避免旧结论混入新一轮定位。
-  const refs = useMemo(() => [...(report?.modules.filter((m) => m.status === "completed").flatMap((m) => m.items.flatMap((i) => i.values.flatMap((v) => v.citations))) ?? []), ...answerRefs], [report, answerRefs]);
+  // 接口仅发布已核实成果；模块尚未完成时同样允许定位，避免失败后已有成果无法核对。
+  const refs = useMemo(() => [...(report?.modules.flatMap((m) => m.items.flatMap((i) => i.values.flatMap((v) => v.citations))) ?? []), ...answerRefs], [report, answerRefs]);
   const locate = useCallback(async (ref: Citation) => {
     locateAbort.current?.abort();
     const controller = new AbortController(); locateAbort.current = controller;
@@ -134,7 +134,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                 {state?.reports.map((r) => <option key={r.id} value={r.id}>报告 #{r.id} · {STATE_LABELS[r.status] ?? r.status}</option>)}
               </select>
             </div>
-            {report.coverage.mode === "agent_research" && <p className="mb-3 text-sm text-slate-500">已完成 {report.modules.filter((m) => m.status === "completed").length} / 13 个专题 · 各专题独立检索并核对依据</p>}
+            {report.coverage.mode === "agent_research" && <p className="mb-3 text-sm text-slate-500">已完成 {report.modules.filter((m) => m.status === "completed").length} / 13 个专题 · 已保存 {report.modules.reduce((count, module) => count + module.items.length, 0)} 项成果</p>}
             {report.coverage.partial && <p className="notice mb-3">本报告覆盖不完整，请在范围设置中核对缺失或部分解析的文件。</p>}
             {report.status === "waiting" && <p className="notice mb-3">正在等待本次全部文件可用。请到文件管理查看失败原因；需要先分析可用材料时，可取消本次任务后勾选部分分析。</p>}
             {report.error_message && <p role="alert" className="notice mb-3">{report.error_message}</p>}
@@ -142,11 +142,12 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
             {["waiting", "pending", "running"].includes(report.status) && <button className={BUTTON_CLASS + " mb-3"} disabled={busy} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/cancel", "POST", {}))}>取消任务</button>}
             {["failed", "partial", "canceled"].includes(report.status) && !report.runtime_retired && report.modules.some((module) => ["failed", "canceled"].includes(module.status)) && <button className={BUTTON_CLASS + " mb-3"} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", {}))}>补跑未完成模块</button>}
             {["failed", "canceled"].includes(report.status) && !report.runtime_retired && !report.modules.length && <button className={BUTTON_CLASS + " mb-3"} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", {}))}>重试分析</button>}
+            {["failed", "partial", "canceled", "completed"].includes(report.status) && !report.runtime_retired && !!report.modules.length && <button className={BUTTON_CLASS + " mb-3"} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", { module_keys: report.modules.map((module) => module.module_key) }))}>重新解析全部专题</button>}
             {!!report.summary?.length && <details className="report-module mb-4"><summary className="cursor-pointer text-sm font-medium">综合字段 · {report.summary.length} 项</summary><p className="my-3 text-xs text-slate-500">合并重复事项，保留各份来源与不同结论。详细专题见下方。</p><ModuleMarkdown items={report.summary.map((item) => ({ ...item, id: "summary-" + item.id }))} activeId={activeItem} onLocate={(ref) => void locate(ref)} /></details>}
             {(() => {
               // 模块标签按后端调度顺序（module.id）排列，与 worker 日志一致，便于对照运行记录排查。
               const modules = report.modules;
-              const firstCompleted = modules.find((m) => m.status === "completed")?.id;
+              const firstCompleted = modules.find((m) => m.items.length > 0)?.id ?? modules.find((m) => m.status === "completed")?.id;
               const currentId = modules.some((m) => m.id === activeModuleId) ? activeModuleId : (activeModuleId === null && firstCompleted !== undefined ? firstCompleted : (firstCompleted ?? modules[0]?.id));
               const current = modules.find((m) => m.id === currentId);
               if (!modules.length) return null;
@@ -155,20 +156,24 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                   {modules.map((module) => <button key={module.id} role="tab" aria-selected={module.id === currentId} data-status={module.status}
                     onClick={() => setActiveModuleId(module.id)}>
                     <span className="truncate">{module.title}</span>
-                    <span className="module-tab-status">{module.status === "completed" ? module.items.length + " 项" : STATE_LABELS[module.status] ?? module.status}</span>
+                    <span className="module-tab-status">{module.status === "completed" ? module.items.length + " 项" : (module.items.length ? "已保存 " + module.items.length + " 项 · " : "") + (STATE_LABELS[module.status] ?? module.status)}</span>
                   </button>)}
                 </div>
                 {current && <section className="report-module"><div className="report-module-heading"><h3>{current.title}</h3><span>{STATE_LABELS[current.status] ?? current.status}</span></div>
                   {!!current.runs?.length && <details className="mb-3 text-xs text-slate-500"><summary className="cursor-pointer">运行记录 · 第 {current.runs.at(-1)?.attempt} 次</summary><ul className="mt-2 space-y-2">{current.runs.map((run) => <li key={run.id}>第 {run.attempt} 次 · {STATE_LABELS[run.status] ?? run.status} · 模型请求 {run.model_calls}/{run.limits.max_model_calls} · 工具调用 {run.tool_calls}/{run.limits.max_tool_calls} · 单次输出上限 {run.limits.max_output_tokens} token{run.started_at && <> · 开始于 {new Date(run.started_at).toLocaleTimeString("zh-CN")}</>}{run.error_message && <p className="mt-1 text-red-600">{run.error_message}</p>}</li>)}</ul></details>}
-                  {current.status === "failed" ? <div className="notice"><span>{current.error_message}</span>{!report.runtime_retired && <button className={BUTTON_CLASS} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", { module_keys: [current.module_key] }))}>补跑本模块</button>}</div>
-                    : current.status === "completed" && current.items.length ? <ModuleMarkdown items={current.items} activeId={activeItem} onLocate={(ref) => void locate(ref)} /> : <p className="py-3 text-sm text-slate-500">{current.status === "completed" ? "当前检索未找到该主题的明确要求。" : current.status === "pending" ? "排队等待分析…" : current.status === "canceled" ? "本模块已停止。" : "正在检索与核对原文…"}</p>}
+                  {current.status === "failed" && <div className="notice"><span>{current.error_message}</span>{!report.runtime_retired && <button className={BUTTON_CLASS} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", { module_keys: [current.module_key] }))}>补跑本模块</button>}</div>}
+                  {current.status === "completed" && !report.runtime_retired && <p className="mb-3"><button className={BUTTON_CLASS} disabled={busy || running} onClick={() => void perform(() => knowledgeRequest("/analysis/reports/" + report.id + "/retry", "POST", { module_keys: [current.module_key] }))}>重新解析本专题</button></p>}
+                  {current.items.length > 0 ? <>
+                    {current.status !== "completed" && <p className="my-3 text-sm text-slate-500" role="status">已保存 {current.items.length} 项核实成果。本专题尚未完成，以下内容不代表完整分析；补跑会保留这些成果。</p>}
+                    <ModuleMarkdown items={current.items} activeId={activeItem} onLocate={(ref) => void locate(ref)} />
+                  </> : <p className="py-3 text-sm text-slate-500">{current.status === "completed" ? "当前检索未找到该主题的明确要求。" : current.status === "pending" ? "排队等待分析…" : current.status === "canceled" ? "本模块已停止，暂无已核实成果。" : current.status === "failed" ? "本次尚无通过校验的成果。" : "正在检索与核对原文…"}</p>}
                 </section>}
               </>;
             })()}
           </>}
         </section>
         <aside className="analysis-document">{selected ? <CitationViewer key={selected.version_id + ":" + selected.parse_run_id} selected={selected} citations={refs.includes(selected) ? refs : [...refs, selected]} onReverse={(ref) => {
-          const item = report?.modules.filter((m) => m.status === "completed").flatMap((m) => m.items.map((i) => ({ module: m, item: i }))).find(({ item }) => item.values.some((value) => value.citations.some((r) => r.source_id === ref.source_id && r.element_id === ref.element_id)));
+          const item = report?.modules.flatMap((m) => m.items.map((i) => ({ module: m, item: i }))).find(({ item }) => item.values.some((value) => value.citations.some((r) => r.source_id === ref.source_id && r.element_id === ref.element_id)));
           if (item) { setTab("report"); setActiveModuleId(item.module.id); setActiveItem(item.item.id); setMobileDocument(false); setTimeout(() => document.getElementById("report-item-" + item.item.id)?.scrollIntoView({ block: "center" }), 0); }
         }} /> : <div className="empty-state"><Icon name="book" size={32} /><h3>原文就在结论旁边</h3><p>点击报告或回答中的引用，查看对应文件、页码和高亮位置。</p></div>}</aside>
       </div>

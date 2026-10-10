@@ -1,4 +1,4 @@
-"""用真实 DeepAgents 图验证权限、工具执行、纠正与 checkpoint 恢复。"""
+﻿"""用真实 DeepAgents 图验证权限、工具执行、纠正与 checkpoint 恢复。"""
 
 import asyncio
 import copy
@@ -18,6 +18,7 @@ from tender.application.deep_analysis import (
     split_absence_claims,
     validate_project_claims,
 )
+from tender.application.knowledge import validate_items
 from tender.domain.errors import ExtractionUnavailable, InvalidModelOutput, ModelOutputTruncated
 from tender.ports.llm import Completion
 
@@ -420,6 +421,30 @@ def test_explicit_negative_requirement_and_two_sided_revision_are_accepted():
     )
 
 
+def test_revision_keeps_original_and_amendment_citations_after_alignment():
+    """原条款用于证明修订前状态，不能因不含修订后的值就改引到补充文件。"""
+    original = block() | {"content": "原交货期30日"}
+    amendment = block(2, 10) | {"content": "补充通知调整为45日"}
+    items = validate_items(
+        [{
+            "field": "交货期",
+            "values": [{
+                "value": "补充通知调整为45日",
+                "citations": [
+                    {"block_id": row["block_id"], "quote": row["content"]}
+                    for row in (original, amendment)
+                ],
+            }],
+        }],
+        {row["block_id"]: row for row in (original, amendment)},
+    )
+    validate_project_claims(items, 10)
+    refs = items[0]["values"][0]["citations"]
+    assert [(ref["source_id"], ref["quote"]) for ref in refs] == [
+        (1, "原交货期30日"), (2, "补充通知调整为45日")
+    ]
+
+
 def test_split_absence_claims_routes_gaps_and_keeps_scope_errors_strict():
     gap = {
         "field": "条款未约定",
@@ -791,6 +816,63 @@ def test_final_submission_error_is_saved_with_the_actionable_reason():
     asyncio.run(run())
 
 
+def test_same_field_submitted_in_two_batches_merges_into_one_row():
+    """同一字段跨批次补交只出现一行：值取并集去重，引用按位置去重。"""
+
+    async def run():
+        row = block() | {"content": "质保三年；质保五年"}
+        research = session([row])
+        script = [
+            call("search_document", {"query": "质保"}, 1),
+            call(
+                "submit_analysis",
+                {
+                    "fields": [submitted_field("质保期", "质保三年")],
+                    "relations": [],
+                    "research_summary": "先提交第一批",
+                    "final": False,
+                },
+                2,
+            ),
+            call(
+                "submit_analysis",
+                {
+                    "fields": [submitted_field("质保期", "质保五年", quote="质保五年")],
+                    "relations": [],
+                    "research_summary": "补充第二批",
+                    "final": True,
+                },
+                3,
+            ),
+        ]
+        router, state = ScriptedRouter(script), {}
+
+        async def noop(*args):
+            pass
+
+        async def verify(items):
+            for entry in items:
+                entry["verification"] = "supported"
+
+        graph, files = build_module_agent(
+            key=KEY,
+            model=RoutedAgentModel(router=router),
+            research=research,
+            state=state,
+            snapshot=SKILL,
+            checkpointer=InMemorySaver(),
+            reserve_tool=noop,
+            save=noop,
+            review_support=verify,
+        )
+        await invoke_module(graph, files, thread_id="merge-same-field", task="分析")
+        fields = state["draft"]["fields"]
+        assert len(fields) == 1
+        assert [value["value"] for value in fields[0]["values"]] == ["质保三年", "质保五年"]
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("relation_supported", [True, False])
 def test_outline_batches_preserve_parent_relationships_and_verify_each_result_once(
     relation_supported,
@@ -859,7 +941,7 @@ def test_outline_batches_preserve_parent_relationships_and_verify_each_result_on
             checkpointer=InMemorySaver(),
             reserve_tool=noop,
             save=noop,
-            validate_support=verify,
+            review_support=verify,
         )
         await invoke_module(graph, files, thread_id="outline-batches", task="分析格式")
         assert reviewed == ["投标文件", "投标函"]
@@ -869,6 +951,66 @@ def test_outline_batches_preserve_parent_relationships_and_verify_each_result_on
         assert "上级路径：投标文件" in state["draft"]["fields"][1]["note"]
         assert state["draft"]["fields"][1]["verification"] == "supported"
         assert len(state["draft"]["relations"]) == int(relation_supported)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("same_requirement", [False, True])
+def test_outline_keeps_same_named_nodes_under_different_parents(same_requirement):
+    """不同父级下的同名材料各自保留；同名同要求也不能共用结果 id 或重复送审。"""
+    async def run():
+        key = "bid_format_outline_parsing"
+        second_requirement = "须盖章" if same_requirement else "须签字"
+        content = f"商务标。甲标段营业执照须盖章。乙标段营业执照{second_requirement}。"
+        row = block() | {"content": content}
+        nodes = [{
+            "id": node_id, "name": name, "parent_id": parent, "node_type": kind,
+            "requirements": requirements,
+            "citations": [{"block_id": row["block_id"], "quote": content}],
+        } for node_id, name, parent, kind, requirements in [
+            ("root", "商务标", None, "group", []),
+            ("lot-a", "甲标段", "root", "section", []),
+            ("license-a", "营业执照", "lot-a", "section", ["须盖章"]),
+            ("lot-b", "乙标段", "root", "section", []),
+            ("license-b", "营业执照", "lot-b", "section", [second_requirement]),
+        ]]
+        router = ScriptedRouter([
+            call("search_document", {"query": "格式"}, 1),
+            call("submit_analysis", {
+                "outline_nodes": nodes[:3], "research_summary": "甲标段", "final": False,
+            }, 2),
+            call("submit_analysis", {
+                "outline_nodes": nodes[3:], "research_summary": "乙标段", "final": False,
+            }, 3),
+            call("submit_analysis", {
+                "outline_nodes": [], "research_summary": "已提交全部格式",
+            }, 4),
+        ])
+        state, reviewed = {}, []
+
+        async def noop(*args):
+            pass
+
+        async def verify(items):
+            reviewed.extend(copy.deepcopy(item) for item in items if item.get("kind") != "relation")
+            for item in items:
+                item["verification"] = "supported"
+
+        graph, files = build_module_agent(
+            key=key, model=RoutedAgentModel(router=router), research=session([row]),
+            state=state, snapshot={key + "/SKILL.md": SKILL[KEY + "/SKILL.md"]},
+            checkpointer=InMemorySaver(), reserve_tool=noop, save=noop, review_support=verify,
+        )
+        await invoke_module(graph, files, thread_id="outline-same-name", task="分析格式")
+        fields = state["draft"]["fields"]
+        assert len(fields) == len({item["id"] for item in fields}) == 5
+        licenses = [item for item in fields if item["field"] == "营业执照"]
+        assert [item["note"].split("上级路径：")[1] for item in licenses] == [
+            "商务标 / 甲标段", "商务标 / 乙标段"
+        ]
+        assert [item["values"][0]["value"] for item in licenses] == ["须盖章", second_requirement]
+        assert len([item for item in reviewed if item["field"] == "营业执照"]) == 2
+        assert len(state["draft"]["relations"]) == 4
 
     asyncio.run(run())
 
@@ -929,7 +1071,7 @@ def test_unmodified_staged_fields_are_reused_without_second_review_before_final_
             checkpointer=InMemorySaver(),
             reserve_tool=noop,
             save=noop,
-            validate_support=verify,
+            review_support=verify,
         )
         await invoke_module(graph, files, thread_id="carried-reuse", task="继续分析")
         assert reviewed == []
@@ -938,11 +1080,129 @@ def test_unmodified_staged_fields_are_reused_without_second_review_before_final_
     asyncio.run(run())
 
 
-@pytest.mark.parametrize(
-    "error_type", [ExtractionUnavailable, InvalidModelOutput, ModelOutputTruncated]
-)
-def test_transient_review_failure_keeps_module_alive_for_resubmission(error_type):
-    """校验被网关截断时模块不能直接失败：错误回给模型，可在同一预算内重新提交。"""
+@pytest.mark.parametrize("error_type", [ExtractionUnavailable, InvalidModelOutput])
+def test_review_failure_terminates_module_but_keeps_verified_fields(error_type):
+    """校验请求失败或格式纠正耗尽后不再让主 Agent 原样重交（次数会相乘），已通过字段必须保留。"""
+
+    async def run():
+        research = session([block()])
+        state = {}
+        router = ScriptedRouter(
+            [
+                call("search_document", {"query": "质保"}, 1),
+                call(
+                    "submit_analysis",
+                    {
+                        "fields": [submitted_field("质保", "质保三年")],
+                        "relations": [],
+                        "research_summary": "先暂存一条",
+                        "final": False,
+                    },
+                    2,
+                ),
+                call(
+                    "submit_analysis",
+                    {
+                        "fields": [submitted_field("质保期", "三年")],
+                        "relations": [],
+                        "research_summary": "提交第二条",
+                        "final": True,
+                    },
+                    3,
+                ),
+            ]
+        )
+        saved = []
+
+        async def noop(*args):
+            pass
+
+        async def verify(items):
+            # 一批一次送审：第一批通过后立即暂存；第二批服务失败只终止模块，不带坏已存成果。
+            if items[0]["field"] == "质保期":
+                raise error_type("校验服务失败或响应结构不完整")
+            for item in items:
+                item["verification"] = "supported"
+
+        async def save(current):
+            saved.append([entry["field"] for entry in current.get("staged_items", [])])
+
+        graph, files = build_module_agent(
+            key=KEY,
+            model=RoutedAgentModel(router=router),
+            research=research,
+            state=state,
+            snapshot=SKILL,
+            checkpointer=InMemorySaver(),
+            reserve_tool=noop,
+            save=save,
+            review_support=verify,
+        )
+        with pytest.raises(RuntimeError, match="已通过字段保留"):
+            await invoke_module(graph, files, thread_id="review-fatal", task="分析")
+        # 已通过批次逐条落库；失败批次不写成果，模型没有被要求重交整批，避免校验次数相乘。
+        assert [entry["field"] for entry in state["staged_items"]] == ["质保"]
+        assert ["质保"] in saved
+        assert router.calls == []
+        assert "pending_final" not in state
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["unsupported", "truncated"])
+def test_failed_final_review_requires_a_new_final_submission(failure):
+    """最终提交失败后允许补读和分批纠正，直到新的 final=true 才能完成。"""
+    async def run():
+        router = ScriptedRouter([
+            call("search_document", {"query": "质保"}, 1),
+            call("submit_analysis", {
+                "fields": [submitted_field("质保", "质保五年")],
+                "relations": [], "research_summary": "首次提交",
+            }, 2),
+            call("read_document", {"source_id": 1, "offset": 0, "limit": 1}, 3),
+            call("submit_analysis", {
+                "fields": [submitted_field("质保", "质保三年")],
+                "relations": [], "research_summary": "已纠正，继续核对", "final": False,
+            }, 4),
+            call("submit_analysis", {
+                "fields": [], "relations": [], "research_summary": "重新确认完成",
+            }, 5),
+        ])
+        state, saved, reviewed = {}, [], []
+
+        async def noop(*args):
+            pass
+
+        async def save(current):
+            saved.append(copy.deepcopy(current))
+
+        async def verify(items):
+            reviewed.append(items[0]["values"][0]["value"])
+            if len(reviewed) == 1 and failure == "truncated":
+                raise ModelOutputTruncated("校验输出截断")
+            for item in items:
+                item["verification"] = "unsupported" if len(reviewed) == 1 else "supported"
+                item["verification_issues"] = ["原文为三年"] if len(reviewed) == 1 else []
+
+        graph, files = build_module_agent(
+            key=KEY, model=RoutedAgentModel(router=router), research=session([block()]),
+            state=state, snapshot=SKILL, checkpointer=InMemorySaver(), reserve_tool=noop,
+            save=save, review_support=verify,
+        )
+        await invoke_module(graph, files, thread_id="failed-final-" + failure, task="分析")
+        assert router.calls == []
+        assert reviewed == ["质保五年", "质保三年"]
+        assert state["draft"]["research_summary"] == "重新确认完成"
+        assert state["draft"]["fields"][0]["values"][0]["value"] == "质保三年"
+        # 补读后的持久状态也必须撤销收尾意图，否则恢复检查点时仍可能提前结束。
+        after_read = next(s for s in saved if "call_3" in s.get("tool_results", {}))
+        assert "pending_final" not in after_read and "draft" not in after_read
+
+    asyncio.run(run())
+
+
+def test_truncated_review_asks_for_smaller_batches_and_stops_after_three():
+    """校验输出被截断时结果不算数：回传拆分提示，第三次仍截断则终止且不写任何成果。"""
 
     async def run():
         research = session([block()])
@@ -957,22 +1217,11 @@ def test_transient_review_failure_keeps_module_alive_for_resubmission(error_type
                             "fields": [submitted_field("质保", "质保三年")],
                             "relations": [],
                             "research_summary": "提交质保",
-                            "final": True,
                         },
                         number,
                     )
                     for number in (2, 3, 4)
                 ],
-                call(
-                    "submit_analysis",
-                    {
-                        "fields": [submitted_field("质保", "质保三年")],
-                        "relations": [],
-                        "research_summary": "重交上批结果并完成",
-                        "final": True,
-                    },
-                    5,
-                ),
             ]
         )
         attempts = []
@@ -982,8 +1231,75 @@ def test_transient_review_failure_keeps_module_alive_for_resubmission(error_type
 
         async def verify(items):
             attempts.append(len(items))
-            if len(attempts) <= 3:
-                raise error_type("校验服务失败或响应结构不完整")
+            raise ModelOutputTruncated("校验输出达到token上限")
+
+        graph, files = build_module_agent(
+            key=KEY,
+            model=RoutedAgentModel(router=router),
+            research=research,
+            state=state,
+            snapshot=SKILL,
+            checkpointer=InMemorySaver(),
+            reserve_tool=noop,
+            save=noop,
+            review_support=verify,
+        )
+        with pytest.raises(RuntimeError, match="拆分纠正已达3次上限"):
+            await invoke_module(graph, files, thread_id="review-truncated", task="分析")
+        assert attempts == [1, 1, 1]
+        # 校验是 Agent 图的节点：登记工具本身成功，截断反馈作为运行时消息回给主 Agent。
+        assert state["tool_results"]["call_2"]["data"]["status"] == "success"
+        assert any(
+            "每次只提交1条" in str(message.get("data", {}).get("content", ""))
+            for messages, _tools in router.requests
+            for message in messages
+        )
+        assert state["unavailable_submissions"] == 3
+        # 截断不是字段内容错误：不占用字段纠错次数，也没有任何成果被暂存。
+        assert "field_failures" not in state
+        assert state.get("staged_items", []) == [] and "draft" not in state
+
+    asyncio.run(run())
+
+
+def test_repeated_field_structure_errors_stop_after_three_but_keep_other_fields():
+    """同一字段连续三次结构错误才终止模块；同批其它字段不受牵连，已被逐字段暂存。"""
+
+    async def run():
+        research = session([block()])
+        state = {}
+        # 结构合法但引用了未读块：只有这种字段才走逐字段内容纠错，而不是工具参数被直接打回。
+        broken = {
+            "field": "报价",
+            "group": "",
+            "sort_order": 0,
+            "values": [
+                {"value": "100万", "citations": [{"block_id": "s9r9c9", "quote": "报价"}]}
+            ],
+            "note": "",
+        }
+        router = ScriptedRouter(
+            [
+                call("search_document", {"query": "质保"}, 1),
+                *[
+                    call(
+                        "submit_analysis",
+                        {
+                            "fields": [submitted_field("质保", "质保三年"), broken],
+                            "relations": [],
+                            "research_summary": "提交两条",
+                        },
+                        number,
+                    )
+                    for number in (2, 3, 4)
+                ],
+            ]
+        )
+
+        async def noop(*args):
+            pass
+
+        async def verify(items):
             for item in items:
                 item["verification"] = "supported"
 
@@ -996,18 +1312,12 @@ def test_transient_review_failure_keeps_module_alive_for_resubmission(error_type
             checkpointer=InMemorySaver(),
             reserve_tool=noop,
             save=noop,
-            validate_support=verify,
+            review_support=verify,
         )
-        await invoke_module(graph, files, thread_id="review-transient", task="分析")
-        assert attempts == [1, 1, 1, 1]
-        error = state["tool_results"]["call_2"]["data"]
-        assert error["status"] == "error" and "校验" in error["content"]
-        if error_type is ModelOutputTruncated:
-            assert "每次只提交1条" in error["content"]
-        assert error["additional_kwargs"]["error_kind"] == "review_unavailable"
-        assert state["unavailable_submissions"] == 3
-        assert state.get("invalid_submissions", 0) == 0
-        assert state["draft"]["fields"][0]["field"] == "质保"
+        with pytest.raises(RuntimeError, match="同一字段纠正已达3次上限"):
+            await invoke_module(graph, files, thread_id="field-failures", task="分析")
+        assert state["field_failures"] == {":报价": 3}
+        assert [entry["field"] for entry in state["staged_items"]] == ["质保"]
 
     asyncio.run(run())
 
@@ -1066,14 +1376,17 @@ def test_omitted_final_only_stages_results_until_explicit_completion():
     asyncio.run(run())
 
 
-def test_support_review_splits_realistic_items_without_mixing_their_verdicts():
+def test_support_review_batches_fields_without_mixing_their_verdicts():
     class Reviewer:
         def __init__(self):
             self.fields = []
+            self.batches = []
 
         async def complete(self, prompt):
             batch = json.loads(prompt.rsplit("\n", 1)[-1])
-            assert len(batch) == 1
+            # 批量送审：一次请求覆盖至多3条，避免“字段数×提交轮次”次模型请求。
+            assert 1 <= len(batch) <= 3
+            self.batches.append(len(batch))
             self.fields.extend(item["field"] for item in batch)
             assert all("bbox" not in item["values"][0]["citations"][0] for item in batch)
             return Completion(
@@ -1107,6 +1420,8 @@ def test_support_review_splits_realistic_items_without_mixing_their_verdicts():
         for title in ("有据", "范围无据", "有据", "有据")
     ]
     asyncio.run(verify_items(reviewer, items, explain=True))
+    # 4 条字段只发 2 次请求（3+1），逐条结论仍各自独立。
+    assert reviewer.batches == [3, 1]
     assert reviewer.fields == ["有据", "范围无据", "有据", "有据"]
     assert [item["verification"] for item in items] == [
         "supported",
@@ -1114,6 +1429,66 @@ def test_support_review_splits_realistic_items_without_mixing_their_verdicts():
         "supported",
         "supported",
     ]
+
+
+def test_submit_tool_issues_no_model_call_and_review_runs_once_per_batch():
+    """提交工具只做确定性登记；支持性校验由 Agent 图一次批量发起，3条字段只发1次请求。"""
+
+    async def run():
+        research = session([block()])
+        state = {}
+        router = ScriptedRouter(
+            [
+                call("search_document", {"query": "质保"}, 1),
+                call(
+                    "submit_analysis",
+                    {
+                        "fields": [
+                            submitted_field("质保", "质保三年"),
+                            submitted_field("质保期", "三年"),
+                            submitted_field("质保金", "三年"),
+                        ],
+                        "relations": [],
+                        "research_summary": "三条字段一次提交",
+                        "final": True,
+                    },
+                    2,
+                ),
+            ]
+        )
+        batches = []
+
+        async def noop(*args):
+            pass
+
+        async def verify(items):
+            # 批量送审：一批只调用一次，结论逐条写回；工具本身不得再单独送审。
+            batches.append([item["field"] for item in items])
+            for item in items:
+                item["verification"] = "supported"
+
+        graph, files = build_module_agent(
+            key=KEY,
+            model=RoutedAgentModel(router=router),
+            research=research,
+            state=state,
+            snapshot=SKILL,
+            checkpointer=InMemorySaver(),
+            reserve_tool=noop,
+            save=noop,
+            review_support=verify,
+        )
+        await invoke_module(graph, files, thread_id="batched-review", task="分析")
+        # 主循环请求数等于脚本轮次：提交工具没有夹带模型请求，校验不占主循环轮次。
+        assert len(router.requests) == 2
+        assert batches == [["质保", "质保期", "质保金"]]
+        assert [entry["field"] for entry in state["draft"]["fields"]] == [
+            "质保",
+            "质保期",
+            "质保金",
+        ]
+
+    asyncio.run(run())
 
 
 def test_support_review_receives_block_text_and_neighbours_for_section_attribution():

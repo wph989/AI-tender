@@ -54,12 +54,14 @@ def _item(
 ITEMS: tuple[ConfigItem, ...] = (
     _item("analysis.max_inflight", L1, "int", 2, "同公司所有报告共享的 DeepAgents 子代理并发上限"),
     _item(
-        "analysis.max_model_calls", L1, "int", 32, "每模块每次运行的实际模型请求上限，含重试和摘要"
+        "analysis.max_model_calls", L1, "int", 40, "每模块每次运行的实际模型请求上限，含重试和摘要"
     ),
     _item("analysis.max_tool_calls", L1, "int", 48, "每模块每次运行的工具调用上限"),
-    _item("analysis.timeout_seconds", L1, "int", 900, "模块从首次执行开始的总时限，恢复不重置"),
+    _item(
+        "analysis.timeout_seconds", L1, "int", 1800, "单个模块的总时限（非单次请求），恢复不重置"
+    ),
     _item("analysis.context_tokens", L1, "int", 24000, "模块上下文预算，达到百分之八十时压缩"),
-    _item("analysis.max_output_tokens", L1, "int", 4096, "模块单次模型输出上限"),
+    _item("analysis.max_output_tokens", L1, "int", 8192, "模块单次模型输出上限"),
     # L1 运行参数（08 第 2.1 节）：改了不影响结果，可以随便改、立即生效
     _item("convert.max_inflight", L1, "int", 4, "同时在途的 Gotenberg 转换请求数"),
     _item(

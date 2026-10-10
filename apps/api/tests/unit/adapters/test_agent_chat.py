@@ -56,6 +56,24 @@ def response(message):
     }
 
 
+
+def stream_response(body):
+    """模拟供应商完整 SSE，工具参数按增量协议聚合后才能交给业务层。"""
+    choice = body["choices"][0]
+    delta = dict(choice["message"])
+    if "tool_calls" in delta:
+        delta["tool_calls"] = [dict(call, index=i) for i, call in enumerate(delta["tool_calls"])]
+    chunks = [
+        {"id": "fixture", "object": "chat.completion.chunk", "model": "fixture",
+         "choices": [{"index": 0, "delta": delta, "finish_reason": choice["finish_reason"]}]},
+        {"id": "fixture", "object": "chat.completion.chunk", "model": "fixture",
+         "choices": [], "usage": body["usage"]},
+    ]
+    return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                          text="".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+                          + "data: [DONE]\n\n")
+
+
 def test_native_tool_call_round_trip():
     requests = []
 
@@ -64,9 +82,7 @@ def test_native_tool_call_round_trip():
         requests.append(body)
         assert body["tools"] == [TOOL]
         if len(requests) == 1:
-            return httpx.Response(
-                200,
-                json=response(
+            return stream_response(response(
                     {
                         "role": "assistant",
                         "content": None,
@@ -81,15 +97,14 @@ def test_native_tool_call_round_trip():
                             }
                         ],
                     }
-                ),
-            )
+                ))
         assert body["messages"][-2]["tool_calls"][0]["id"] == "call_123"
         assert body["messages"][-1] == {
             "role": "tool",
             "tool_call_id": "call_123",
             "content": "预算80万",
         }
-        return httpx.Response(200, json=response({"role": "assistant", "content": "完成"}))
+        return stream_response(response({"role": "assistant", "content": "完成"}))
 
     async def run():
         client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
@@ -110,6 +125,79 @@ def test_native_tool_call_round_trip():
 
     asyncio.run(run())
 
+
+def test_streaming_tool_arguments_split_across_chunks_are_reassembled():
+    """真实网关会把工具参数拆成多个增量：必须聚合完整后才能交给业务层。"""
+    requests = []
+
+    def split_stream():
+        first = {
+            "id": "fixture", "object": "chat.completion.chunk", "model": "fixture",
+            "choices": [{"index": 0, "finish_reason": None, "delta": {
+                "role": "assistant", "content": None,
+                "tool_calls": [{"index": 0, "id": "call_7", "type": "function",
+                                "function": {"name": "search_document", "arguments": '{"query":'}}],
+            }}],
+        }
+        second = {
+            "id": "fixture", "object": "chat.completion.chunk", "model": "fixture",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {
+                "tool_calls": [{"index": 0, "function": {"arguments": '"预算"}'}}],
+            }}],
+        }
+        usage = {
+            "id": "fixture", "object": "chat.completion.chunk", "model": "fixture",
+            "choices": [],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19},
+        }
+        return "".join(
+            "data: " + json.dumps(chunk) + "\n\n" for chunk in (first, second, usage)
+        ) + "data: [DONE]\n\n"
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=split_stream()
+        )
+
+    async def run():
+        model = agent(httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+        try:
+            reply = await model.chat([message_to_dict(HumanMessage(content="分析预算"))], [TOOL])
+        finally:
+            await model.aclose()
+        assert reply.agent_message["data"]["tool_calls"][0]["args"] == {"query": "预算"}
+        assert (reply.prompt_tokens, reply.completion_tokens) == (12, 7)
+
+    asyncio.run(run())
+    assert len(requests) == 1
+
+
+def test_stream_without_finish_reason_is_not_delivered_as_submission():
+    """流在收到 [DONE] 前断开时没有 finish_reason，半截工具参数绝不能进入提交工具。"""
+    body = response(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "search_document", "arguments": '{"query":"预算"'}}
+            ],
+        }
+    )
+    body["choices"][0]["finish_reason"] = None
+    model = agent(
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda _: stream_response(body)))
+    )
+
+    async def run():
+        try:
+            with pytest.raises(ExtractionUnavailable, match="未完整结束"):
+                await model.chat([message_to_dict(HumanMessage(content="检索"))], [TOOL])
+        finally:
+            await model.aclose()
+
+    asyncio.run(run())
 
 @pytest.mark.parametrize(
     "status,expected",
@@ -172,8 +260,8 @@ def test_native_refusal_stops_processing():
     async def run():
         client = httpx.AsyncClient(
             transport=httpx.MockTransport(
-                lambda _: httpx.Response(
-                    200, json=response({"role": "assistant", "content": "", "refusal": "拒绝"})
+                lambda _: stream_response(
+                    response({"role": "assistant", "content": "", "refusal": "拒绝"})
                 )
             )
         )
@@ -207,7 +295,7 @@ def test_incomplete_tool_arguments_are_not_delivered_as_business_submissions(tok
         body["usage"]["completion_tokens"] = tokens
         model = agent(
             httpx.AsyncClient(
-                transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body))
+                transport=httpx.MockTransport(lambda _: stream_response(body))
             )
         )
         try:
@@ -240,7 +328,7 @@ def test_malformed_tool_name_is_bounded_protocol_error_without_echoing_document(
         )
         model = agent(
             httpx.AsyncClient(
-                transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body))
+                transport=httpx.MockTransport(lambda _: stream_response(body))
             )
         )
         try:
@@ -257,7 +345,7 @@ def test_invalid_response_keeps_usage_for_budget_accounting():
     async def run():
         client = httpx.AsyncClient(
             transport=httpx.MockTransport(
-                lambda _: httpx.Response(200, json=response({"role": "assistant", "content": ""}))
+                lambda _: stream_response(response({"role": "assistant", "content": ""}))
             )
         )
         model = agent(client)

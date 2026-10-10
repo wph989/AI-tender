@@ -18,7 +18,13 @@ from tender.api.project_files import _role_is_parseable
 from tender.application.agent_runtime import limits_snapshot
 from tender.application.analysis_skills import MODULES, skill_snapshot, skill_version
 from tender.application.deep_analysis import CONTRACT, RUNTIME_VERSION, validate_project_claims
-from tender.application.knowledge import CATEGORIES, TOPICS
+from tender.application.knowledge import (
+    CATEGORIES,
+    TOPICS,
+    align_citation,
+    dedupe_citations,
+    merge_field_entries,
+)
 from tender.application.knowledge_retrieval import retrieve_chunks
 from tender.application.knowledge_store import (
     KnowledgeStore,
@@ -513,7 +519,11 @@ def visible_items(
     result = []
     for item in items:
         accessible = True
+        values: list[dict] = []
+        # 同一元素会被多个值引用，解析结果按元素复用，避免反复查库与重复解析正文。
+        resolved_elements: dict[tuple, dict] = {}
         for value in item.get("values", []):
+            refs: list[dict] = []
             for ref in value.get("citations", []):
                 try:
                     if (
@@ -521,12 +531,33 @@ def visible_items(
                         and ref["collection_id"] not in allowed_collections
                     ):
                         raise LookupError("已解除知识库关联")
-                    db.resolve(ref)
+                    element_key = (
+                        ref.get("version_id"),
+                        ref.get("parse_run_id"),
+                        ref.get("element_id"),
+                        ref.get("anchor"),
+                    )
+                    resolved = resolved_elements.get(element_key)
+                    if resolved is None:
+                        resolved = db.resolve(ref, with_content=True)
+                        resolved_elements[element_key] = resolved
                 except LookupError:
                     accessible = False
                     break
+                # 历史报告可能把同块其它事实当摘录；展示前按值回查元素原文收敛定位，
+                # 只在原文里确定性找到该值时改写，找不到就保留原引用，不伪造位置。
+                refs.append(
+                    align_citation(
+                        {str(ref.get("block_id")): resolved},
+                        ref,
+                        str(value.get("value") or ""),
+                    )
+                )
             if not accessible:
                 break
+            values.append({**value, "citations": dedupe_citations(refs)})
+        if accessible and values:
+            item = {**item, "values": values}
         result.append(
             item
             if accessible
@@ -553,19 +584,39 @@ def get_report(report_id: int, request: Request) -> dict:
     )
     allowed = db.collections_for_project(report["project_id"])
     for module in modules:
-        module["items"] = visible_items(db, module["items"], allowed)
         # 工具日志只供服务端重放，不在产品界面暴露整段中间提示词。
         module.pop("trace", None)
     runs = db.rows(
         """SELECT a.id,a.module_id,a.attempt,a.thread_id,a.status,a.started_at,
         a.deadline_at,a.finished_at,a.lease_until,a.model_calls,a.tool_calls,
-        a.prompt_tokens,a.completion_tokens,a.limits,a.error_message
+        a.prompt_tokens,a.completion_tokens,a.limits,a.error_message,
+        CASE WHEN a.state->'staged_items_verified'='true'::jsonb
+             THEN a.state->'staged_items' ELSE '[]'::jsonb END AS saved_items
         FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
         WHERE m.report_id=:id AND a.company_id=:company_id ORDER BY a.attempt""",
         {"id": report_id},
     )
     for module in modules:
         module["runs"] = [r for r in runs if r["module_id"] == module["id"]]
+        latest = module["runs"][-1] if module["runs"] else {}
+        merged = {item["id"]: item for item in module["items"]}
+        # 已有报告的合格暂存字段也可直接展示，无需补跑模型或重写历史运行账。
+        if module["status"] != "completed":
+            merged.update({
+                item["id"]: item for item in latest.get("saved_items") or []
+                if item.get("verification") == "supported"
+            })
+        # 同一字段的多版本在这里并成一行，历史报告也不再出现重复行与重复定位。
+        module["items"] = visible_items(
+            db,
+            merge_field_entries(
+                list(merged.values()),
+                is_outline=module["module_key"] == "bid_format_outline_parsing",
+            ),
+            allowed,
+        )
+    for run in runs:
+        run.pop("saved_items", None)
     report["summary"] = visible_items(db, report["summary"], allowed)
     current = analysis_status(report["project_id"], request)
     # 旧运行时报告只读展示：前端据此隐藏补跑入口，服务端补跑也会拒绝。
@@ -635,19 +686,23 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
     # 旧固定字段流程已下线：历史报告只读展示，补跑必须先重新发起分析。
     if report["runtime_version"] != RUNTIME_VERSION:
         raise ApiProblem(409, "runtime_retired", "该报告由已下线的解析流程生成，请重新发起分析")
-    if report["status"] not in {"partial", "failed", "canceled"}:
-        raise ApiProblem(409, "report_not_retryable", "只有失败、部分完成或已取消的报告可以补跑")
+    # 补跑限制只看“是否正在执行”：失败/部分完成/已取消按原语义补跑未完成模块，
+    # 显式指定模块时已完成的模块也可以重新解析；排队或执行中的报告必须拒绝，
+    # 否则会与正在运行的 attempt 争抢同一模块。
+    if report["status"] in {"waiting", "pending", "running"}:
+        raise ApiProblem(409, "report_running", "报告正在排队或执行，请等待完成或先取消再补跑")
     keys = payload.module_keys or list(MODULES)
     if set(keys) - MODULES.keys():
         raise ApiProblem(400, "invalid_module", "未知解析模块")
+    explicit = bool(payload.module_keys)
     with engine(request).begin() as connection:
         connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": report["project_id"]})
         # 并发点击补跑只能有一个请求创建新 attempt，不能重复重置预算。
         current_status = connection.execute(
             text("SELECT status FROM analysis_report WHERE id=:id FOR UPDATE"), {"id": report_id}
         ).scalar_one()
-        if current_status not in {"partial", "failed", "canceled"}:
-            raise ApiProblem(409, "report_not_retryable", "任务已进入执行，请勿重复补跑")
+        if current_status in {"waiting", "pending", "running"}:
+            raise ApiProblem(409, "report_running", "报告已进入执行，请勿重复补跑")
         other = connection.execute(
             text("""SELECT id FROM analysis_report WHERE project_id=:project
             AND id<>:id AND status IN ('waiting','pending','running')"""),
@@ -655,15 +710,33 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
         ).first()
         if other:
             raise ApiProblem(409, "analysis_in_flight", "项目已有其它分析任务")
-        retried = (
+        # 未指定模块时只补跑失败/已取消模块，保留已完成成果；显式指定时连已完成模块
+        # 一起重跑，否则“重新解析本专题”会被静默忽略。
+        scope = "" if explicit else " AND status IN ('failed','canceled')"
+        rows = (
             connection.execute(
-                text("""UPDATE analysis_module SET status='pending',error_message=NULL
-            WHERE report_id=:id AND module_key=ANY(:keys) AND status IN ('failed','canceled')
-            RETURNING id"""),
+                text(
+                    "SELECT id,status FROM analysis_module WHERE report_id=:id"
+                    " AND module_key=ANY(:keys)" + scope + " FOR UPDATE"
+                ),
                 {"id": report_id, "keys": keys},
             )
-            .scalars()
+            .mappings()
             .all()
+        )
+        if not rows:
+            raise ApiProblem(
+                409, "nothing_to_retry", "没有需要补跑的模块；重新解析已完成模块请显式指定模块"
+            )
+        # 已完成的模块重新解析时必须从零开始，否则继承的旧草稿会让新图直接收尾（等于没重跑）。
+        restarted = {row["id"] for row in rows if row["status"] == "completed"}
+        retried = [row["id"] for row in rows]
+        connection.execute(
+            text(
+                "UPDATE analysis_module SET status='pending',error_message=NULL"
+                " WHERE id=ANY(:ids)"
+            ),
+            {"ids": retried},
         )
         # 限值取配置中心当前值：用户调整预算后补跑必须生效，不能被创建时的旧快照锁死。
         limits = limits_snapshot(store(request))
@@ -687,21 +760,32 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
                 ).scalar_one_or_none()
                 or {}
             )
-            # 已通过结构/引文校验的草稿可接着做支持性验证，避免预算末尾失败后重复检索。
-            # 补跑只针对失败/已取消模块；携带的暂存结果在新 attempt 内重新校验，不继承旧验证标签。
+            # 报告保持同一资料快照，访问权限会在恢复时重新检查；已核实字段无需再次调用模型。
             carry = (
                 previous_state
-                if previous_state.get("draft") or previous_state.get("staged_items")
+                if module_id not in restarted
+                and (previous_state.get("draft") or previous_state.get("staged_items"))
                 else {}
             )
             if carry:
-                carry.pop("staged_items_verified", None)
+                # draft 会让新图直接结束，必须转成暂存后继续补齐未完成内容。
+                draft = carry.pop("draft", None)
+                if draft:
+                    carry["staged_items"] = draft["fields"]
+                    carry["staged_relations"] = draft.get("relations", [])
+                    carry["staged_items_verified"] = all(
+                        item.get("verification") == "supported" for item in draft["fields"]
+                    )
                 # 新attempt保留成果和证据，但不能继承旧调用ID缓存与纠错次数。
                 carry.pop("tool_results", None)
                 carry.pop("invalid_submissions", None)
                 carry.pop("consecutive_invalid_submissions", None)
                 carry.pop("consecutive_unsubmitted_responses", None)
                 carry.pop("last_unsubmitted_message_id", None)
+                carry.pop("field_failures", None)
+                carry.pop("unavailable_submissions", None)
+                # 旧校验失败可能遗留收尾意图；新 attempt 必须允许补读并重新确认完成。
+                carry.pop("pending_final", None)
                 try:
                     validate_project_claims(
                         carry.get("draft", {}).get("fields", carry.get("staged_items", [])),

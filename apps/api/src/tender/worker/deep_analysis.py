@@ -244,6 +244,7 @@ async def execute_module(
             f"analysis:{report['id']}:{module['module_key']}:{module['attempt']}",
             before_request=reserve_model,
             output_limit=limits.max_output_tokens,
+            extra_retries_limit=2,
             on_call=runtime.record_call,
             remaining_seconds=lambda: max(
                 0, (runtime.run["deadline_at"] - datetime.now(UTC)).total_seconds()
@@ -254,21 +255,12 @@ async def execute_module(
             async def verification_evidence(items):
                 return await expand_evidence(items, seen=research.seen, sources=sources, read=read)
 
-            async def validate_support(items):
+            async def review_support(items):
                 # 校验需要同块原文与邻近块才能判断章节归属，不能只看摘录文本。
+                # 结论（supported / verification_issues）由 verify_items 写在条目上，
+                # 由 Agent 图的校验节点按条目归因到字段纠正次数；整批抛错会让同批字段反复重审。
                 evidence = await verification_evidence(items)
                 await verify_items(model, items, explain=True, evidence=evidence)
-                # 关系条目按支持性过滤而非终止模块；只有字段结论未获支持才回退重提。
-                unsupported = [
-                    item["field"] + "：" + "；".join(item.get("verification_issues", []))
-                    for item in items
-                    if item.get("kind") != "relation" and item["verification"] != "supported"
-                ]
-                if unsupported:
-                    raise ValueError(
-                        "以下字段包含引用未支持的断言，请删除推断、补齐双方引文或移入检索缺口："
-                        + "；".join(unsupported)
-                    )
 
             async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn()) as saver:
                 graph, files = build_module_agent(
@@ -281,11 +273,15 @@ async def execute_module(
                     reserve_tool=reserve_tool,
                     save=save,
                     budget_status=lambda: {
+                        "seconds_remaining": max(
+                            0, int((runtime.run["deadline_at"] - datetime.now(UTC)).total_seconds())
+                        ),
+                        "finish_reserve_seconds": min(300, int(limits.timeout_seconds * 0.25)),
                         "model_calls_remaining": limits.max_model_calls
                         - runtime.run["model_calls"],
                         "tool_calls_remaining": limits.max_tool_calls - runtime.run["tool_calls"],
                     },
-                    validate_support=validate_support,
+                    review_support=review_support,
                 )
                 await invoke_module(
                     graph,

@@ -49,11 +49,11 @@ CREATE INDEX ix_agent_module_run_active ON agent_module_run (company_id, status,
 CREATE INDEX ix_agent_run_event_run ON agent_run_event (run_id, id);""",
     """INSERT INTO config_item (key,layer,value_type,default_value,description,requires_gate) VALUES
 ('analysis.max_inflight', 'L1', 'int', '2'::jsonb, '同公司所有报告共享的 DeepAgents 子代理并发上限', false),
-('analysis.max_model_calls', 'L1', 'int', '32'::jsonb, '每模块每次运行的实际模型请求上限，含重试和摘要', false),
+        ('analysis.max_model_calls', 'L1', 'int', '40'::jsonb, '每模块每次运行的实际模型请求上限，含重试和摘要', false),
 ('analysis.max_tool_calls', 'L1', 'int', '48'::jsonb, '每模块每次运行的工具调用上限', false),
-('analysis.timeout_seconds', 'L1', 'int', '900'::jsonb, '模块从首次执行开始的总时限，恢复不重置', false),
+('analysis.timeout_seconds', 'L1', 'int', '1800'::jsonb, '单个模块的总时限（非单次请求），恢复不重置', false),
 ('analysis.context_tokens', 'L1', 'int', '24000'::jsonb, '模块上下文预算，达到百分之八十时压缩', false),
-('analysis.max_output_tokens', 'L1', 'int', '4096'::jsonb, '模块单次模型输出上限', false);""",
+        ('analysis.max_output_tokens', 'L1', 'int', '8192'::jsonb, '模块单次模型输出上限', false);""",
 )
 
 

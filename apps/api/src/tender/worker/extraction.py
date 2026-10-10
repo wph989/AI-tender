@@ -255,11 +255,17 @@ def _routing_model(
     output_limit: int | None = None,
     on_call=None,
     remaining_seconds=None,
+    extra_retries_limit: int | None = None,
 ) -> RoutingModel:
     from tender.application.provider_cooldown import ProviderCooldown
 
     cooldown = ProviderCooldown(_engine)
     candidates = _load_candidates(feature_key, purpose)
+    if extra_retries_limit is not None:
+        candidates = [
+            replace(candidate, extra_retries=min(candidate.extra_retries, extra_retries_limit))
+            for candidate in candidates
+        ]
     with _engine.connect() as c:
         policy = (
             c.execute(text("SELECT * FROM llm_feature WHERE key=:key"), {"key": feature_key})

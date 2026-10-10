@@ -11,7 +11,8 @@ from langchain_core.messages import AIMessage, message_to_dict
 from sqlalchemy import create_engine, text
 
 from tender.api import knowledge, projects
-from tender.application.knowledge import validate_items
+from tender.application.analysis_outline import outline_result
+from tender.application.knowledge import fingerprint, validate_items
 from tender.application.knowledge_store import KnowledgeStore, sync_sources
 from tender.core import settings
 from tender.ports.llm import Completion
@@ -257,6 +258,162 @@ def test_report_items_survive_reparse_and_show_unavailable_when_deleted(environm
         knowledge.get_report(report["id"], request)["modules"][0]["items"][0]["verification"]
         == "unavailable"
     )
+
+
+def test_unfinished_module_shows_verified_items_saved_in_run_state(environment):
+    """未完成模块也展示已核实成果：运行状态里暂存的合格字段合并进结果，失败不白跑。"""
+    request, conn, pid = environment
+    add_source(conn, pid, "要求甲级资质。")
+    configure(request, pid)
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    store = KnowledgeStore(request.app.state.components.engine, 1)
+    collection = knowledge.project_knowledge(pid, request)["collection_id"]
+    block = store.readable_chunks(store.sources([collection])[0])[0]
+    item = validate_items(
+        [
+            {
+                "field": "资质",
+                "group": "",
+                "sort_order": 0,
+                "values": [
+                    {
+                        "value": block["content"],
+                        "citations": [{"block_id": block["block_id"], "quote": block["content"]}],
+                    }
+                ],
+                "note": "",
+            }
+        ],
+        {block["block_id"]: block},
+    )[0]
+    item["verification"] = "supported"
+    module_id = conn.execute(
+        text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
+        VALUES (:report,'project_basic_info_parsing','项目概况','running','[]'::jsonb)
+        RETURNING id"""),
+        {"report": report["id"]},
+    ).scalar_one()
+    conn.execute(
+        text("""INSERT INTO agent_module_run
+        (module_id,company_id,attempt,thread_id,status,limits,state)
+        VALUES (:module,1,1,:thread,'failed','{}'::jsonb,CAST(:state AS JSONB))"""),
+        {
+            "module": module_id,
+            "thread": f"analysis:{report['id']}:{module_id}:1",
+            "state": json.dumps(
+                {"staged_items": [item], "staged_items_verified": True}, ensure_ascii=False
+            ),
+        },
+    )
+    module = next(
+        entry
+        for entry in knowledge.get_report(report["id"], request)["modules"]
+        if entry["id"] == module_id
+    )
+    assert module["status"] == "running"
+    assert [entry["field"] for entry in module["items"]] == ["资质"]
+    assert module["items"][0]["verification"] == "supported"
+
+
+def test_report_merges_same_field_versions_and_dedupes_locations(environment):
+    """同一字段的多版本在展示时合成一行：值取并集去重、定位去重，历史报告也不重复铺行。"""
+    request, conn, pid = environment
+    add_source(conn, pid, "质保三年。质保五年。")
+    configure(request, pid)
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    store = KnowledgeStore(request.app.state.components.engine, 1)
+    collection = knowledge.project_knowledge(pid, request)["collection_id"]
+    block = store.readable_chunks(store.sources([collection])[0])[0]
+    items = validate_items(
+        [
+            {
+                "field": "质保期",
+                "group": "质保",
+                "sort_order": 2,
+                "values": [
+                    {
+                        "value": "质保三年",
+                        "citations": [{"block_id": block["block_id"], "quote": "质保三年"}],
+                    }
+                ],
+                "note": "",
+            },
+            {
+                "field": "质保期",
+                "group": "质保",
+                "sort_order": 2,
+                "values": [
+                    {
+                        "value": "质保三年",
+                        "citations": [{"block_id": block["block_id"], "quote": "质保三年"}],
+                    },
+                    {
+                        "value": "质保五年",
+                        "citations": [{"block_id": block["block_id"], "quote": "质保五年"}],
+                    },
+                ],
+                "note": "",
+            },
+        ],
+        {block["block_id"]: block},
+    )
+    for entry in items:
+        entry["verification"] = "supported"
+    # 模拟改造前的历史记录：值“质保五年”借用了同一元素里“质保三年”的摘录。
+    items[1]["values"][1]["citations"][0]["quote"] = "质保三年"
+    conn.execute(
+        text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
+        VALUES (:report,'project_basic_info_parsing','项目概况','completed',CAST(:items AS JSONB))"""),
+        {"report": report["id"], "items": json.dumps(items, ensure_ascii=False)},
+    )
+    module = knowledge.get_report(report["id"], request)["modules"][0]
+    assert [entry["field"] for entry in module["items"]] == ["质保期"]
+    assert [value["value"] for value in module["items"][0]["values"]] == ["质保三年", "质保五年"]
+    assert len(module["items"][0]["values"][0]["citations"]) == 1
+    # 展示时按值回查元素原文：错位的历史摘录收敛到值真正出现的位置。
+    located = module["items"][0]["values"][1]["citations"][0]["quote"]
+    assert "质保五年" in located
+
+
+@pytest.mark.parametrize("legacy_ids", [False, True])
+def test_report_preserves_outline_nodes_with_different_parent_paths(environment, legacy_ids):
+    """新报告和旧报告展示都不能把同名材料跨父级合并，避免编制要求失去归属。"""
+    request, conn, pid = environment
+    content = "商务标。甲标段营业执照须盖章。乙标段营业执照须签字。"
+    add_source(conn, pid, content)
+    configure(request, pid)
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    store = KnowledgeStore(request.app.state.components.engine, 1)
+    collection = knowledge.project_knowledge(pid, request)["collection_id"]
+    block = store.readable_chunks(store.sources([collection])[0])[0]
+    nodes = [{
+        "id": node_id, "name": name, "parent_id": parent, "node_type": kind,
+        "requirements": requirements,
+        "citations": [{"block_id": block["block_id"], "quote": content}],
+    } for node_id, name, parent, kind, requirements in [
+        ("root", "商务标", None, "group", []),
+        ("lot-a", "甲标段", "root", "section", []),
+        ("license-a", "营业执照", "lot-a", "section", ["须盖章"]),
+        ("lot-b", "乙标段", "root", "section", []),
+        ("license-b", "营业执照", "lot-b", "section", ["须签字"]),
+    ]]
+    items, _ = outline_result({"outline_nodes": nodes}, {block["block_id"]: block})
+    for item in items:
+        item["verification"] = "supported"
+        if legacy_ids:
+            item["id"] = fingerprint([item["field"], item["values"]])[:20]
+    conn.execute(
+        text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
+        VALUES (:report,'bid_format_outline_parsing','格式大纲','completed',CAST(:items AS JSONB))"""),
+        {"report": report["id"], "items": json.dumps(items, ensure_ascii=False)},
+    )
+    displayed = knowledge.get_report(report["id"], request)["modules"][0]["items"]
+    assert len(displayed) == 5
+    licenses = [item for item in displayed if item["field"] == "营业执照"]
+    assert [item["note"].split("上级路径：")[1] for item in licenses] == [
+        "商务标 / 甲标段", "商务标 / 乙标段"
+    ]
+    assert [item["values"][0]["value"] for item in licenses] == ["须盖章", "须签字"]
 
 
 def test_retired_runtime_report_cannot_run_or_retry(environment):

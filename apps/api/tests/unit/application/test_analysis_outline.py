@@ -83,7 +83,9 @@ def test_node_name_requirement_and_parent_must_have_read_evidence():
     child = node("b", "营业执照", "a")
     child["citations"] = [{"block_id": "b1", "quote": "营业执照须盖章"}]
     items, relations = outline_result({"outline_nodes": [node("a", "资格材料"), child]}, SEEN)
-    assert [ref["quote"] for ref in items[1]["values"][0]["citations"]] == ["营业执照须盖章", TEXT]
+    # 子节点窄摘录与父节点整块摘录来自同一元素，是同一处原文：只显示更完整的一条，
+    # 避免同一位置出现多个定位按钮（同一元素里被包含的窄摘录不会给出新信息）。
+    assert [ref["quote"] for ref in items[1]["values"][0]["citations"]] == [TEXT]
     # 关系引文必须复用校验后的引文行，携带块身份元数据，前端才能定位和高亮。
     assert relations[0]["citations"] == items[1]["values"][0]["citations"]
     # 汇集到的祖先引文只是值的证据，程序不会把模型判断升级成事实。
