@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+import { AntdRegistry } from "@ant-design/nextjs-registry";
+import { AntdProvider } from "@/components/AntdProvider";
 
 import "./globals.css";
 
@@ -16,7 +18,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
        * 不加 min-h-screen：工作台要求 h-screen 撑满，外层再撑一次会多出一条滚动。
        */}
       <body className="bg-slate-50 font-sans text-[14px] leading-[22px] text-slate-800 antialiased">
-        {children}
+        <AntdRegistry>
+          <AntdProvider>{children}</AntdProvider>
+        </AntdRegistry>
       </body>
     </html>
   );

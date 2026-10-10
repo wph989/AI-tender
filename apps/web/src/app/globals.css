@@ -1,6 +1,30 @@
 /* 仅扫描前端源码，避免 PDF 静态资源复制时触发文件锁与无关重编译。 */
 @import "tailwindcss" source("../");
 
+/* 仅约束业务容器尺寸，控件的焦点、禁用和弹层状态由 Ant Design 管理。 */
+.ant-app, .ant-tabs, .ant-tabs-content-holder, .ant-tabs-tabpane { min-width: 0; }
+.ant-select { min-width: 130px; max-width: 100%; }
+.ant-form-item .ant-select { width: 100%; }
+.ant-checkbox-group { gap: 10px 16px; }
+.ant-drawer-content-wrapper { max-width: 100vw; }
+.ant-table-wrapper { min-width: 0; max-width: 100%; }
+.editor-modal .ant-modal-body { max-height: calc(100dvh - 210px); overflow-y: auto; padding: 4px 8px 4px 0; }
+.editor-modal .ant-modal-footer { padding-top: 12px; border-top: 1px solid #e7e8f0; }
+.sticky-actions { position: sticky; bottom: 0; z-index: 2; padding: 16px 0; border-top: 1px solid #e7e8f0; background: white; }
+.settings-panel { background: white; border: 1px solid #e7e8f0; border-radius: 12px; }
+.ui-panel.settings-panel { overflow: visible; }
+.analysis-command-bar > .ant-segmented { padding: 0; }
+.module-markdown-body pre { max-width: 100%; overflow: auto; padding: 12px; background: #f7f8fc; }
+.module-markdown-body table { min-width: 280px; }
+.ant-upload-wrapper .ant-upload-drag .upload-icon { margin: 0 auto 16px; }
+@media (max-width: 600px) {
+  .editor-modal .ant-modal-body { max-height: calc(100dvh - 190px); }
+  .ant-modal { max-width: calc(100vw - 24px); }
+  .ant-pagination { flex-wrap: wrap; row-gap: 8px; }
+  .ant-table-cell { overflow-wrap: anywhere; }
+  .sticky-actions { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+}
+
 /* 新增分析沿用现有紫色定位与白色纸面；覆盖条带表达实际文件状态。 */
 .analysis-main { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 22px 18px; }
 .analysis-command-bar { display: flex; align-items: center; gap: 14px; padding: 10px 0; flex-shrink: 0; }

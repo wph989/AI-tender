@@ -1,4 +1,5 @@
 "use client";
+import { Button, Tabs } from "antd";
 
 /**
  * 模型管理页容器：一次取齐供应商、模型、功能绑定三份数据（设计文档 12 第 8 节）。
@@ -10,10 +11,9 @@
  * 各写一套页头迟早会分叉成"看起来像两个产品"。
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { PageShell } from "@/components/PageShell";
-import { BUTTON_CLASS } from "@/components/ui";
 import {
   getLlmSettings,
   listFeatures,
@@ -43,8 +43,10 @@ export function ModelSettings() {
   const [settings, setSettings] = useState<LlmSettings | null>(null);
   const [state, setState] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
+  const loadSequence = useRef(0);
 
   const reload = useCallback(async () => {
+    const sequence = ++loadSequence.current;
     const [nextProviders, nextModels, nextFeatures, nextSettings] =
       await Promise.all([
         listProviders(),
@@ -52,6 +54,8 @@ export function ModelSettings() {
         listFeatures(),
         getLlmSettings(),
       ]);
+    // 测试轮询与保存后的刷新可能重叠，旧快照不能覆盖刚保存的状态。
+    if (sequence !== loadSequence.current) return;
     setProviders(nextProviders);
     setModels(nextModels);
     setFeatures(nextFeatures);
@@ -104,9 +108,9 @@ export function ModelSettings() {
       title="模型管理"
       description="配置模型能力、调用顺序与预算，查看抽取、综合分析和知识检索的调用记录。"
       actions={
-        <button type="button" className={BUTTON_CLASS} onClick={refresh}>
+        <Button htmlType="button" onClick={refresh}>
           刷新
-        </button>
+        </Button>
       }
     >
       {state === "loading" && (
@@ -119,13 +123,9 @@ export function ModelSettings() {
           <p className="mt-1 text-[13px] text-rose-600">
             暂时无法获取模型配置，请确认服务可用后重试。
           </p>
-          <button
-            type="button"
-            className={BUTTON_CLASS + " mt-2"}
-            onClick={retry}
-          >
+          <Button htmlType="button" className={" mt-2"} onClick={retry}>
             重试
-          </button>
+          </Button>
         </div>
       )}
 
@@ -136,94 +136,63 @@ export function ModelSettings() {
       )}
 
       {state === "ready" && settings && (
-        <div className="settings-layout">
-          <nav className="settings-nav" aria-label="模型设置分类">
-            {[
-              {
-                key: "providers",
-                step: "1",
-                label: "连接供应商",
-                hint: "服务地址与访问密钥",
-                count: providers.length,
-              },
-              {
-                key: "models",
-                step: "2",
-                label: "管理模型",
-                hint: "模型能力与调用参数",
-                count: models.length,
-              },
-              {
-                key: "bindings",
-                step: "3",
-                label: "分配功能",
-                hint: "为抽取任务选择模型",
-                count: features.length,
-              },
-              {
-                key: "calls",
-                step: "4",
-                label: "调用记录",
-                hint: "请求状态、重试与用量",
-                count: null,
-              },
-            ].map((item) => (
-              <button
-                type="button"
-                key={item.key}
-                aria-pressed={section === item.key}
-                onClick={() => setSection(item.key)}
-              >
-                <span className="nav-step">{item.step}</span>
-                <span>
-                  <strong>
-                    {item.label}{" "}
-                    <span className="ml-1 text-[11px] text-slate-400">
-                      {item.count}
-                    </span>
-                  </strong>
-                  <small>{item.hint}</small>
-                </span>
-              </button>
-            ))}
-            <p className="settings-help">
-              按顺序完成连接、添加模型与功能分配。修改后可使用测试按钮检查连接。
-            </p>
-          </nav>
-          {/* 保留面板挂载，切换分类时不丢失未保存的表单。 */}
-          <div className="settings-main">
-            <div hidden={section !== "providers"}>
-              <ProvidersPanel
-                providers={providers}
-                profiles={settings.adapter_profiles}
-                secretReady={settings.secret_key_ready}
-                onChanged={reload}
-              />
-            </div>
-            <div hidden={section !== "models"}>
-              <ModelsPanel
-                providers={providers}
-                models={models}
-                profiles={settings.adapter_profiles}
-                onChanged={reload}
-              />
-            </div>
-            <div hidden={section !== "bindings"}>
-              <FeatureBindingsPanel
-                features={features}
-                models={models}
-                onChanged={reload}
-              />
-            </div>
-            <div hidden={section !== "calls"}>
-              <CallLogsPanel
-                active={section === "calls"}
-                features={features}
-                models={models}
-              />
-            </div>
-          </div>
-        </div>
+        <Tabs
+          activeKey={section}
+          onChange={setSection}
+          destroyOnHidden={false}
+          items={[
+            {
+              key: "providers",
+              label: `连接供应商 (${providers.length})`,
+              forceRender: true,
+              children: (
+                <ProvidersPanel
+                  providers={providers}
+                  profiles={settings.adapter_profiles}
+                  secretReady={settings.secret_key_ready}
+                  onChanged={reload}
+                />
+              ),
+            },
+            {
+              key: "models",
+              label: `管理模型 (${models.length})`,
+              forceRender: true,
+              children: (
+                <ModelsPanel
+                  providers={providers}
+                  models={models}
+                  profiles={settings.adapter_profiles}
+                  onChanged={reload}
+                />
+              ),
+            },
+            {
+              key: "bindings",
+              label: "分配功能",
+              forceRender: true,
+              children: (
+                <FeatureBindingsPanel
+                  features={features}
+                  models={models}
+                  onChanged={reload}
+                />
+              ),
+            },
+            {
+              key: "calls",
+              label: "调用记录",
+              forceRender: true,
+              children: (
+                <CallLogsPanel
+                  active={section === "calls"}
+                  features={features}
+                  models={models}
+                />
+              ),
+            },
+          ]}
+        />
       )}
     </PageShell>
   );

@@ -58,7 +58,10 @@ export function blockerLabel(code: string): string {
   return BLOCKER_LABELS[code] ?? SOFT_BREACH_LABELS[code] ?? code;
 }
 
-export function itemsOfLayer(items: ConfigItem[], layer: ConfigLayer): ConfigItem[] {
+export function itemsOfLayer(
+  items: ConfigItem[],
+  layer: ConfigLayer,
+): ConfigItem[] {
   return items.filter((item) => item.layer === layer);
 }
 
@@ -74,9 +77,18 @@ interface ParseResult {
   error?: string;
 }
 
-function parseValue(key: string, valueType: ConfigValueType, raw: string): ParseResult {
+function parseValue(
+  key: string,
+  valueType: ConfigValueType,
+  raw: string,
+): ParseResult {
+  // Number("") 会变成 0；清空数值输入时应提示补填，不能静默发布零并发/零超时。
+  if ((valueType === "int" || valueType === "number") && raw.trim() === "") {
+    return { error: key + " 不能为空" };
+  }
   if (valueType === "bool") {
-    if (raw !== "true" && raw !== "false") return { error: key + " 只能是 true / false" };
+    if (raw !== "true" && raw !== "false")
+      return { error: key + " 只能是 true / false" };
     return { value: raw === "true" };
   }
   if (valueType === "int") {
@@ -114,12 +126,19 @@ export interface PatchResult {
  * "没改的不提交"不是优化，而是正确性要求：L2/L3 的补丁只要带上一个 key
  * 就会把该版本送进门禁流程，噪声会让影响清单里出现没人真正改过的条目。
  */
-export function buildPatch(items: ConfigItem[], drafts: Record<string, string>): PatchResult {
+export function buildPatch(
+  items: ConfigItem[],
+  drafts: Record<string, string>,
+): PatchResult {
   const patch: Record<string, unknown> = {};
   const errors: string[] = [];
   for (const item of items) {
     if (!(item.key in drafts)) continue;
-    const parsed = parseValue(item.key, item.value_type, drafts[item.key] ?? "");
+    const parsed = parseValue(
+      item.key,
+      item.value_type,
+      drafts[item.key] ?? "",
+    );
     if (parsed.error !== undefined) {
       errors.push(parsed.error);
       continue;
@@ -131,7 +150,9 @@ export function buildPatch(items: ConfigItem[], drafts: Record<string, string>):
 }
 
 /** 服务端 diff 的展示顺序：按 key 排序，页面刷新前后不跳动。 */
-export function diffRows(changed: Record<string, { old: unknown; new: unknown }>) {
+export function diffRows(
+  changed: Record<string, { old: unknown; new: unknown }>,
+) {
   return Object.entries(changed)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, value]) => ({ key, old: value.old, new: value.new }));

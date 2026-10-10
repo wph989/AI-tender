@@ -1,4 +1,7 @@
 "use client";
+import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
+import { useFeedback } from "@/hooks/useFeedback";
+import { Button, Input, Select } from "antd";
 
 /**
  * 单层配置编辑器：本地草稿 → 补丁 → 创建版本（设计文档 08 第 2 节）。
@@ -9,9 +12,13 @@
 
 import { useState } from "react";
 
-import { BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS, SELECT_CLASS } from "@/components/ui";
 import { createRelease } from "@/lib/api/config";
-import { LAYER_HINTS, LAYER_LABELS, buildPatch, formatValue } from "@/lib/config/draft";
+import {
+  LAYER_HINTS,
+  LAYER_LABELS,
+  buildPatch,
+  formatValue,
+} from "@/lib/config/draft";
 import { message } from "@/lib/errors";
 import type { ConfigItem, ConfigLayer } from "@/types/config";
 
@@ -26,15 +33,20 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useFeedback(error);
 
-  if (items.length === 0) return null;
   const writable = items.every((item) => item.writable);
 
   const draftCount = items.filter(
-    (item) => item.key in drafts && drafts[item.key] !== formatValue(item.value),
+    (item) =>
+      item.key in drafts && drafts[item.key] !== formatValue(item.value),
   ).length;
 
+  useUnsavedChanges(draftCount > 0, busy);
+  if (items.length === 0) return null;
+
   const save = async () => {
+    if (busy) return;
     const { patch, errors } = buildPatch(items, drafts);
     if (errors.length > 0) {
       setError(errors.join("；"));
@@ -47,14 +59,21 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const result = await createRelease({ values: patch, note: note || undefined });
+      const result = await createRelease({
+        values: patch,
+        note: note || undefined,
+      });
       setDrafts({});
       setNote("");
-      await onSaved(
-        result.status === "active"
-          ? "已保存并立即生效（L1 不需要回归门禁）"
-          : "已生成草稿 v" + result.version_no + "，请到「版本与发布」逐条确认影响后激活",
-      );
+      await Promise.resolve(
+        onSaved(
+          result.status === "active"
+            ? "已保存并立即生效（L1 不需要回归门禁）"
+            : "已生成草稿 v" +
+                result.version_no +
+                "，请到「版本与发布」逐条确认影响后激活",
+        ),
+      ).catch(() => setError("配置已保存，但刷新失败，请刷新页面查看版本。"));
     } catch (caught) {
       setError(message(caught, "保存配置失败"));
     } finally {
@@ -66,8 +85,12 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
     <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">{LAYER_LABELS[layer]}</h2>
-          <p className="mt-1 text-[13px] leading-5 text-slate-500">{LAYER_HINTS[layer]}</p>
+          <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">
+            {LAYER_LABELS[layer]}
+          </h2>
+          <p className="mt-1 text-[13px] leading-5 text-slate-500">
+            {LAYER_HINTS[layer]}
+          </p>
         </div>
         <span className="text-[13px] text-slate-400">{items.length} 项</span>
       </div>
@@ -98,34 +121,46 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                     </span>
                   )}
                 </div>
-                <p className="mt-0.5 text-[13px] text-slate-500">{item.description}</p>
+                <p className="mt-0.5 text-[13px] text-slate-500">
+                  {item.description}
+                </p>
               </div>
               {item.value_type === "bool" ? (
-                <select
+                <Select<string>
                   aria-label={item.description || item.key}
-                  className={SELECT_CLASS + " w-full"}
-                  value={value}
-                  disabled={!writable}
-                  onChange={(event) =>
-                    setDrafts((current) => ({ ...current, [item.key]: event.target.value }))
+                  className={" w-full"}
+                  value={String(value)}
+                  disabled={!writable || busy}
+                  onChange={(selectedValue) =>
+                    setDrafts((current) => ({
+                      ...current,
+                      [item.key]: selectedValue,
+                    }))
                   }
                 >
-                  <option value="true">true</option>
-                  <option value="false">false</option>
-                </select>
+                  <Select.Option value="true">true</Select.Option>
+                  <Select.Option value="false">false</Select.Option>
+                </Select>
               ) : (
-                <input
+                <Input
                   className={
-                    INPUT_CLASS + " w-full" + (item.value_type === "secret" ? " font-mono" : "")
+                    "" +
+                    " w-full" +
+                    (item.value_type === "secret" ? " font-mono" : "")
                   }
                   aria-label={item.description || item.key}
                   type={
-                    item.value_type === "int" || item.value_type === "number" ? "number" : "text"
+                    item.value_type === "int" || item.value_type === "number"
+                      ? "number"
+                      : "text"
                   }
                   value={value}
-                  disabled={!writable}
+                  disabled={!writable || busy}
                   onChange={(event) =>
-                    setDrafts((current) => ({ ...current, [item.key]: event.target.value }))
+                    setDrafts((current) => ({
+                      ...current,
+                      [item.key]: event.target.value,
+                    }))
                   }
                 />
               )}
@@ -143,33 +178,40 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
         </p>
       )}
 
-      <div className="mt-3 flex flex-wrap items-center gap-2">
-        <input
+      <div className="sticky-actions mt-3 flex flex-wrap items-center gap-2">
+        <Input
           aria-label="配置变更说明"
-          className={INPUT_CLASS + " min-w-0 flex-1"}
+          className={" min-w-0 flex-1"}
           placeholder="变更说明（会写进审计，例如：调整保证金字段提示词）"
+          disabled={busy}
           value={note}
           onChange={(event) => setNote(event.target.value)}
         />
-        <button
-          type="button"
-          className={PRIMARY_BUTTON_CLASS}
+        <Button
+          type="primary"
+          htmlType="button"
+
           disabled={!writable || busy || draftCount === 0}
           onClick={() => void save()}
         >
-          {layer === "L1" ? "保存并立即生效" : "保存为草稿"}
-        </button>
-        <button
-          type="button"
-          className={BUTTON_CLASS}
+          {busy
+            ? "正在保存…"
+            : layer === "L1"
+              ? "保存并立即生效"
+              : "保存为草稿"}
+        </Button>
+        <Button
+          htmlType="button"
+
           disabled={busy || draftCount === 0}
           onClick={() => {
             setDrafts({});
+            setNote("");
             setError(null);
           }}
         >
           放弃修改
-        </button>
+        </Button>
       </div>
     </section>
   );

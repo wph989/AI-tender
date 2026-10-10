@@ -1,4 +1,5 @@
 "use client";
+import { Alert, App, Button, Drawer, Input, Spin, Table } from "antd";
 
 /**
  * 配置版本面板：版本列表 + 详情（diff / 影响清单逐条确认 / 门禁 / 审计）。
@@ -9,7 +10,6 @@
 
 import { useState } from "react";
 
-import { BUTTON_CLASS, DANGER_BUTTON_CLASS, INPUT_CLASS, PRIMARY_BUTTON_CLASS } from "@/components/ui";
 import {
   blockerLabel,
   diffRows,
@@ -18,9 +18,15 @@ import {
   releaseStatusLabel,
 } from "@/lib/config/draft";
 import { formatTime } from "@/lib/llm/format";
-import type { ConfigRelease, ConfigReleaseDetail, ImpactEntry } from "@/types/config";
+import type {
+  ConfigRelease,
+  ConfigReleaseDetail,
+  ImpactEntry,
+} from "@/types/config";
 
 interface Props {
+  error: string | null;
+  onRetry: () => void;
   releases: ConfigRelease[];
   detail: ConfigReleaseDetail | null;
   busy: boolean;
@@ -47,6 +53,8 @@ const STATUS_TEXT_CLASS: Record<string, string> = {
 };
 
 export function ReleasePanel({
+  error,
+  onRetry,
   releases,
   detail,
   busy,
@@ -55,6 +63,8 @@ export function ReleasePanel({
   onActivate,
   onRollback,
 }: Props) {
+  const { modal } = App.useApp();
+  const [open, setOpen] = useState(false);
   const [comment, setComment] = useState("");
   const [reason, setReason] = useState("");
 
@@ -66,217 +76,324 @@ export function ReleasePanel({
   return (
     <div className="flex flex-col gap-4">
       <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
-        <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">配置版本</h2>
+        <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">
+          配置版本
+        </h2>
         <p className="mt-1 text-[13px] leading-5 text-slate-500">
           回滚是把历史版本直接置回生效，不重建配置（避免遗漏）。
         </p>
-        <ul className="mt-3 flex flex-col divide-y divide-slate-100">
-          {releases.map((release) => (
-            <li key={release.id}>
-              <button
-                type="button"
-                className={
-                  "flex w-full flex-wrap items-center gap-2 py-2 text-left hover:bg-slate-50 " +
-                  (detail?.id === release.id ? "bg-slate-50" : "")
-                }
-                onClick={() => onSelect(release.id)}
-              >
-                <span className="w-12 text-[13px] text-slate-500">v{release.version_no}</span>
-                <span
-                  className={
-                    "inline-flex items-center gap-1.5 text-[13px] " +
-                    (STATUS_TEXT_CLASS[release.status] ?? "text-slate-500")
-                  }
+        <Table<ConfigRelease>
+          className="mt-4"
+          rowKey="id"
+          dataSource={releases}
+          size="middle"
+          scroll={{ x: 580 }}
+          pagination={{
+            defaultPageSize: 10,
+            showSizeChanger: true,
+            showTotal: (total) => `共 ${total} 个版本`,
+          }}
+          columns={[
+            {
+              title: "版本",
+              key: "version",
+              width: 100,
+              render: (_, release) => `v${release.version_no}`,
+            },
+            {
+              title: "状态",
+              key: "status",
+              width: 100,
+              render: (_, release) => releaseStatusLabel(release.status),
+            },
+            {
+              title: "变更说明",
+              dataIndex: "note",
+              render: (value: string | null) => value || "—",
+            },
+            {
+              title: "创建时间",
+              dataIndex: "created_at",
+              width: 180,
+              render: (value: string) => formatTime(value),
+            },
+            {
+              title: "操作",
+              key: "actions",
+              width: 120,
+              render: (_, release) => (
+                <Button
+                  size="small"
+                  disabled={busy}
+                  onClick={() => {
+                    setComment("");
+                    setReason("");
+                    setOpen(true);
+                    onSelect(release.id);
+                  }}
                 >
-                  <span
-                    aria-hidden
-                    className={
-                      "h-1.5 w-1.5 rounded-full " +
-                      (STATUS_DOT_CLASS[release.status] ?? "bg-slate-400")
-                    }
-                  />
-                  {releaseStatusLabel(release.status)}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-[13px] text-slate-600">
-                  {release.note ?? "—"}
-                </span>
-                <span className="text-[11px] text-slate-400">
-                  {release.created_by} · {formatTime(release.created_at)}
-                </span>
-              </button>
-            </li>
-          ))}
-          {releases.length === 0 && <li className="py-2 text-[13px] text-slate-500">还没有配置版本。</li>}
-        </ul>
+                  查看详情
+                </Button>
+              ),
+            },
+          ]}
+        />
       </section>
 
-      {detail !== null && (
-        <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">v{detail.version_no} 详情</h2>
-            <span
-              className={
-                "inline-flex items-center gap-1.5 text-[13px] " +
-                (STATUS_TEXT_CLASS[detail.status] ?? "text-slate-500")
-              }
-            >
+      <Drawer
+        title={detail ? `配置版本 v${detail.version_no}` : "配置版本详情"}
+        open={open}
+        size={880}
+        destroyOnHidden
+        mask={{ closable: !busy }}
+        keyboard={!busy}
+        closable={!busy}
+        onClose={() => setOpen(false)}
+      >
+        {error && (
+          <Alert
+            className="mb-4"
+            type="error"
+            showIcon
+            title={error}
+            action={
+              <Button size="small" disabled={busy} onClick={onRetry}>
+                重试
+              </Button>
+            }
+          />
+        )}
+        {busy && !detail && (
+          <Spin tip="正在读取版本详情">
+            <div className="h-32" />
+          </Spin>
+        )}
+        {detail !== null && (
+          <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">
+                v{detail.version_no} 详情
+              </h2>
               <span
-                aria-hidden
                 className={
-                  "h-1.5 w-1.5 rounded-full " + (STATUS_DOT_CLASS[detail.status] ?? "bg-slate-400")
+                  "inline-flex items-center gap-1.5 text-[13px] " +
+                  (STATUS_TEXT_CLASS[detail.status] ?? "text-slate-500")
                 }
-              />
-              {releaseStatusLabel(detail.status)}
-            </span>
-            {detail.based_on !== null && (
-              <span className="text-[11px] text-slate-400">基于版本 #{detail.based_on}</span>
-            )}
-            {isDraft && unacked > 0 && (
-              <span className="text-[11px] text-amber-700">还有 {unacked} 条影响未确认</span>
-            )}
-          </div>
-
-          <h3 className="mt-3 font-display font-semibold text-[14px] text-slate-800">与当前生效版本的差异</h3>
-          {rows.length === 0 ? (
-            <p className="mt-1 text-[13px] leading-5 text-slate-500">没有差异。</p>
-          ) : (
-            <table className="mt-1 w-full text-[13px]">
-              <thead>
-                <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
-                  <th className="border-b border-slate-200 py-2">配置项</th>
-                  <th className="border-b border-slate-200 py-2">原值</th>
-                  <th className="border-b border-slate-200 py-2">新值</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row) => (
-                  <tr key={row.key} className="border-t border-slate-100">
-                    <td className="border-b border-slate-100 py-1 pr-2">
-                      <code>{row.key}</code>
-                    </td>
-                    <td className="py-1 pr-2 text-slate-500">{formatValue(row.old)}</td>
-                    <td className="py-1 text-slate-800">{formatValue(row.new)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-
-          <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">变更影响清单</h3>
-          <p className="mt-1 text-[13px] leading-5 text-slate-500">
-            必须逐条确认"已知悉"，每条单独落一行确认记录（谁、何时、确认了哪一条）。
-          </p>
-          <ul className="mt-2 flex flex-col gap-1">
-            {detail.impact.map((entry) => (
-              <li
-                key={entry.kind + "|" + entry.ref}
-                className="flex flex-wrap items-center gap-2 border border-slate-200 px-2 py-1"
               >
-                <span className="w-24 text-[11px] text-slate-500">
-                  {impactKindLabel(entry.kind)}
+                <span
+                  aria-hidden
+                  className={
+                    "h-1.5 w-1.5 rounded-full " +
+                    (STATUS_DOT_CLASS[detail.status] ?? "bg-slate-400")
+                  }
+                />
+                {releaseStatusLabel(detail.status)}
+              </span>
+              {detail.based_on !== null && (
+                <span className="text-[11px] text-slate-400">
+                  基于版本 #{detail.based_on}
                 </span>
-                <code className="min-w-0 flex-1 truncate text-[13px]">{entry.ref}</code>
-                {entry.acked ? (
-                  <span className="text-[11px] text-emerald-700">已确认</span>
-                ) : (
-                  <button
-                    type="button"
-                    className={BUTTON_CLASS}
-                    disabled={busy || !isDraft}
-                    onClick={() => void onAcknowledge(entry, comment)}
-                  >
-                    确认已知悉
-                  </button>
-                )}
-              </li>
-            ))}
-            {detail.impact.length === 0 && (
-              <li className="text-[13px] text-slate-500">本次变更没有影响条目。</li>
+              )}
+              {isDraft && unacked > 0 && (
+                <span className="text-[11px] text-amber-700">
+                  还有 {unacked} 条影响未确认
+                </span>
+              )}
+            </div>
+
+            <h3 className="mt-3 font-display font-semibold text-[14px] text-slate-800">
+              与当前生效版本的差异
+            </h3>
+            {rows.length === 0 ? (
+              <p className="mt-1 text-[13px] leading-5 text-slate-500">
+                没有差异。
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="mt-1 w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
+                      <th className="border-b border-slate-200 py-2">配置项</th>
+                      <th className="border-b border-slate-200 py-2">原值</th>
+                      <th className="border-b border-slate-200 py-2">新值</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((row) => (
+                      <tr key={row.key} className="border-t border-slate-100">
+                        <td className="border-b border-slate-100 py-1 pr-2">
+                          <code>{row.key}</code>
+                        </td>
+                        <td className="py-1 pr-2 text-slate-500">
+                          {formatValue(row.old)}
+                        </td>
+                        <td className="py-1 text-slate-800">
+                          {formatValue(row.new)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
-          </ul>
-          {detail.impact.length > 0 && (
-            <input
-              className={INPUT_CLASS + " mt-2 w-full"}
-              placeholder="确认备注（可选，会写进审计）"
-              value={comment}
-              onChange={(event) => setComment(event.target.value)}
-            />
-          )}
 
-          <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">门禁</h3>
-          {detail.gate.passed ? (
-            <p className="mt-1 text-[13px] text-emerald-700">当前满足激活条件。</p>
-          ) : (
-            <ul className="mt-1 flex flex-col gap-0.5 text-[13px]">
-              {detail.gate.blockers.map((code) => (
-                <li key={code} className="text-rose-700">
-                  阻断：{blockerLabel(code)}
+            <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">
+              变更影响清单
+            </h3>
+            <p className="mt-1 text-[13px] leading-5 text-slate-500">
+              必须逐条确认"已知悉"，每条单独落一行确认记录（谁、何时、确认了哪一条）。
+            </p>
+            <ul className="mt-2 flex flex-col gap-1">
+              {detail.impact.map((entry) => (
+                <li
+                  key={entry.kind + "|" + entry.ref}
+                  className="flex flex-wrap items-center gap-2 border border-slate-200 px-2 py-1"
+                >
+                  <span className="w-24 text-[11px] text-slate-500">
+                    {impactKindLabel(entry.kind)}
+                  </span>
+                  <code className="min-w-0 flex-1 truncate text-[13px]">
+                    {entry.ref}
+                  </code>
+                  {entry.acked ? (
+                    <span className="text-[11px] text-emerald-700">已确认</span>
+                  ) : (
+                    <Button
+                      htmlType="button"
+
+                      disabled={busy || !isDraft}
+                      onClick={() => void onAcknowledge(entry, comment)}
+                    >
+                      确认已知悉
+                    </Button>
+                  )}
                 </li>
               ))}
-              {softBreaches.map((code) => (
-                <li key={code} className="text-amber-700">
-                  需二次确认：{blockerLabel(code)}
+              {detail.impact.length === 0 && (
+                <li className="text-[13px] text-slate-500">
+                  本次变更没有影响条目。
                 </li>
-              ))}
+              )}
             </ul>
-          )}
-
-          {isDraft && (
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <input
-                className={INPUT_CLASS + " min-w-64 flex-1"}
-                placeholder={
-                  softBreaches.length > 0 ? "强制激活必须填写理由" : "激活理由（可选）"
-                }
-                value={reason}
-                onChange={(event) => setReason(event.target.value)}
+            {detail.impact.length > 0 && (
+              <Input
+                className={" mt-2 w-full"}
+                aria-label="确认备注"
+                placeholder="确认备注（可选，会写进审计）"
+                value={comment}
+                onChange={(event) => setComment(event.target.value)}
               />
-              <button
-                type="button"
-                className={PRIMARY_BUTTON_CLASS}
-                disabled={
-                  busy ||
-                  detail.gate.blockers.length > 0 ||
-                  (softBreaches.length > 0 && reason.trim() === "")
-                }
-                onClick={() => void onActivate(softBreaches.length > 0, reason)}
-              >
-                {softBreaches.length > 0 ? "强制激活" : "激活"}
-              </button>
-            </div>
-          )}
+            )}
 
-          {detail.status !== "draft" && detail.status !== "active" && (
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <input
-                className={INPUT_CLASS + " min-w-64 flex-1"}
-                placeholder="回滚理由（可选）"
-                value={reason}
-                onChange={(event) => setReason(event.target.value)}
-              />
-              <button
-                type="button"
-                className={DANGER_BUTTON_CLASS}
-                disabled={busy}
-                onClick={() => void onRollback(reason)}
-              >
-                回滚到该版本
-              </button>
-            </div>
-          )}
+            <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">
+              门禁
+            </h3>
+            {detail.gate.passed ? (
+              <p className="mt-1 text-[13px] text-emerald-700">
+                当前满足激活条件。
+              </p>
+            ) : (
+              <ul className="mt-1 flex flex-col gap-0.5 text-[13px]">
+                {detail.gate.blockers.map((code) => (
+                  <li key={code} className="text-rose-700">
+                    阻断：{blockerLabel(code)}
+                  </li>
+                ))}
+                {softBreaches.map((code) => (
+                  <li key={code} className="text-amber-700">
+                    需二次确认：{blockerLabel(code)}
+                  </li>
+                ))}
+              </ul>
+            )}
 
-          <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">审计</h3>
-          <ul className="mt-1 flex flex-col gap-0.5 text-[13px] text-slate-600">
-            {detail.audit.map((entry) => (
-              <li key={entry.id}>
-                {formatTime(entry.created_at)} · {entry.actor} · {entry.action}
-                {entry.reason !== null && entry.reason !== "" ? " · " + entry.reason : ""}
-              </li>
-            ))}
-            {detail.audit.length === 0 && <li className="text-slate-500">暂无审计记录。</li>}
-          </ul>
-        </section>
-      )}
+            {isDraft && (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Input
+                  className={" min-w-0 flex-1"}
+                  aria-label="激活理由"
+                  placeholder={
+                    softBreaches.length > 0
+                      ? "强制激活必须填写理由"
+                      : "激活理由（可选）"
+                  }
+                  value={reason}
+                  onChange={(event) => setReason(event.target.value)}
+                />
+                <Button
+                  type="primary"
+                  htmlType="button"
+
+                  disabled={
+                    busy ||
+                    detail.gate.blockers.length > 0 ||
+                    (softBreaches.length > 0 && reason.trim() === "")
+                  }
+                  onClick={() =>
+                    modal.confirm({
+                      title: softBreaches.length
+                        ? "确认强制激活？"
+                        : "确认激活该版本？",
+                      content: "生效后，新任务将使用本次配置。",
+                      okText: "确认激活",
+                      onOk: () => onActivate(softBreaches.length > 0, reason),
+                    })
+                  }
+                >
+                  {softBreaches.length > 0 ? "强制激活" : "激活"}
+                </Button>
+              </div>
+            )}
+
+            {detail.status !== "draft" && detail.status !== "active" && (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Input
+                  className={" min-w-0 flex-1"}
+                  aria-label="回滚理由"
+                  placeholder="回滚理由（可选）"
+                  value={reason}
+                  onChange={(event) => setReason(event.target.value)}
+                />
+                <Button
+                  danger
+                  htmlType="button"
+
+                  disabled={busy}
+                  onClick={() =>
+                    modal.confirm({
+                      title: "确认回滚到该版本？",
+                      content: "当前生效配置将被这个历史版本替换。",
+                      okText: "确认回滚",
+                      okButtonProps: { danger: true },
+                      onOk: () => onRollback(reason),
+                    })
+                  }
+                >
+                  回滚到该版本
+                </Button>
+              </div>
+            )}
+
+            <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">
+              审计
+            </h3>
+            <ul className="mt-1 flex flex-col gap-0.5 text-[13px] text-slate-600">
+              {detail.audit.map((entry) => (
+                <li key={entry.id}>
+                  {formatTime(entry.created_at)} · {entry.actor} ·{" "}
+                  {entry.action}
+                  {entry.reason !== null && entry.reason !== ""
+                    ? " · " + entry.reason
+                    : ""}
+                </li>
+              ))}
+              {detail.audit.length === 0 && (
+                <li className="text-slate-500">暂无审计记录。</li>
+              )}
+            </ul>
+          </section>
+        )}
+      </Drawer>
     </div>
   );
 }

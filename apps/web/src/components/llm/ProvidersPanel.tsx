@@ -1,19 +1,22 @@
 "use client";
 
-/**
- * 供应商面板：连接信息、连通性测试与远端模型导入（设计文档 12 第 7、8 节）。
- *
- * 密钥只写不回显：编辑时输入框永远从空开始，"留空"表示不动，清除必须显式勾选
- * （后端用空串表达清除、用不传表达保持原值，见 api/llm.py 的 _store_key）。
- */
-
-import { Fragment, useState } from "react";
+import { useState } from "react";
 import {
-  ModelConfigurationFields,
-  defaultConfiguration,
-  type ModelConfiguration,
-} from "./ModelConfigurationFields";
-
+  Alert,
+  App,
+  Button,
+  Checkbox,
+  Empty,
+  Form,
+  Input,
+  Modal,
+  Select,
+  Space,
+  Spin,
+  Switch,
+  Table,
+  Tag,
+} from "antd";
 import {
   createProvider,
   deleteProvider,
@@ -31,20 +34,16 @@ import {
 import type {
   AdapterProfile,
   LlmProvider,
-  LlmTestResult,
   ProviderInput,
   ProviderPatchInput,
 } from "@/types/llm";
-
+import { useFeedback } from "@/hooks/useFeedback";
+import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
 import {
-  BUTTON_CLASS,
-  DANGER_BUTTON_CLASS,
-  FORM_LABEL_CLASS,
-  FORM_ROW_CLASS,
-  INPUT_CLASS,
-  PRIMARY_BUTTON_CLASS,
-  SELECT_CLASS,
-} from "./ui";
+  ModelConfigurationFields,
+  defaultConfiguration,
+  type ModelConfiguration,
+} from "./ModelConfigurationFields";
 
 interface Props {
   providers: LlmProvider[];
@@ -59,466 +58,435 @@ export function ProvidersPanel({
   secretReady,
   onChanged,
 }: Props) {
-  const [editing, setEditing] = useState<number | "new" | null>(null);
+  const { modal, message: toast } = App.useApp();
+  const [editing, setEditing] = useState<LlmProvider | "new" | null>(null);
   const [busy, setBusy] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [results, setResults] = useState<Record<number, LlmTestResult>>({});
-  const [importingId, setImportingId] = useState<number | null>(null);
+  const [importing, setImporting] = useState<LlmProvider | null>(null);
   const [remote, setRemote] = useState<string[] | null>(null);
   const [importMode, setImportMode] = useState("");
-  const [importConfiguration, setImportConfiguration] =
-    useState<ModelConfiguration | null>(null);
-  const importProfile = profiles.find(
+  const [configuration, setConfiguration] = useState<ModelConfiguration | null>(
+    null,
+  );
+  const [selected, setSelected] = useState<string[]>([]);
+  const [search, setSearch] = useState("");
+  const closeEditor = useUnsavedChanges(dirty, busy);
+  useFeedback(error);
+  const profile = profiles.find(
     (p) =>
-      p.protocol ===
-        providers.find((provider) => provider.id === importingId)?.protocol &&
+      p.protocol === importing?.protocol &&
       (!importMode || p.api_mode === importMode),
   );
-  const [checked, setChecked] = useState<Record<string, boolean>>({});
 
-  const run = async (fallback: string, task: () => Promise<void>) => {
+  const refresh = async () => {
+    // 写入和刷新分开报告，避免写入成功后误导用户重复创建。
+    await onChanged().catch(() =>
+      setError("操作已完成，列表刷新失败，请点击刷新。"),
+    );
+  };
+  const run = async (task: () => Promise<void>) => {
+    if (busy) return;
     setBusy(true);
     setError(null);
-    setNotice(null);
     try {
       await task();
-    } catch (caught) {
-      setError(message(caught, fallback));
+    } catch (e) {
+      setError(message(e, "操作失败"));
     } finally {
       setBusy(false);
     }
   };
-
-  const save = (
-    provider: LlmProvider | null,
-    input: ProviderInput | ProviderPatchInput,
-  ) =>
-    void run(
-      provider === null ? "新建供应商失败" : "保存供应商失败",
-      async () => {
-        if (provider === null) await createProvider(input as ProviderInput);
-        else await updateProvider(provider.id, input);
-        setEditing(null);
-        await onChanged();
-      },
-    );
-
-  const remove = (provider: LlmProvider) => {
-    if (
-      !window.confirm(
-        "删除供应商「" + provider.name + "」？其模型仍被功能绑定时会被拒绝。",
-      )
-    ) {
-      return;
-    }
-    void run("删除供应商失败", async () => {
-      await deleteProvider(provider.id);
-      await onChanged();
-    });
+  const edit = (provider: LlmProvider | "new") => {
+    setDirty(false);
+    setError(null);
+    setEditing(provider);
   };
-
-  const test = (provider: LlmProvider) =>
-    void run("测试供应商失败", async () => {
-      const result = await testProvider(provider.id);
-      setResults((previous) => ({ ...previous, [provider.id]: result }));
-      await onChanged();
+  const save = (input: ProviderInput | ProviderPatchInput) =>
+    void run(async () => {
+      if (editing === "new") await createProvider(input as ProviderInput);
+      else if (editing) await updateProvider(editing.id, input);
+      setDirty(false);
+      setEditing(null);
+      void toast.success("供应商已保存");
+      await refresh();
     });
-
   const openRemote = (provider: LlmProvider) =>
-    void run("拉取远端模型失败", async () => {
-      setImportingId(provider.id);
-      setImportMode("");
-      setImportConfiguration(null);
+    void run(async () => {
+      setImporting(provider);
       setRemote(null);
-      setChecked({});
-      try {
-        setRemote(await listRemoteModels(provider.id));
-      } catch (e) {
-        setImportingId(null);
-        throw e;
-      }
+      setSelected([]);
+      setSearch("");
+      setImportMode("");
+      setConfiguration(null);
+      setRemote(await listRemoteModels(provider.id));
     });
-
-  const closeRemote = () => {
-    setImportingId(null);
-    setRemote(null);
-    setChecked({});
-  };
-
-  const selectedIds = Object.keys(checked).filter(
-    (key) => checked[key] === true,
-  );
-
   const importSelected = () =>
-    void run("导入模型失败", async () => {
-      if (importingId === null) return;
-      const protocol = providers.find((p) => p.id === importingId)?.protocol;
-      const compatible = profiles.filter((p) => p.protocol === protocol);
-      const profile =
-        compatible.find((p) => p.api_mode === importMode) ?? compatible[0];
-      if (!profile) throw new Error("该协议暂无可导入的模型能力");
-      const configuration =
-        importConfiguration ?? defaultConfiguration(profile);
-      const created = await importModels(importingId, selectedIds, profile, {
-        capabilities: configuration.capabilities,
-        supported_parameters: configuration.supported,
+    void run(async () => {
+      if (!importing || !profile) return;
+      const config = configuration ?? defaultConfiguration(profile);
+      const count = await importModels(importing.id, selected, profile, {
+        capabilities: config.capabilities,
+        supported_parameters: config.supported,
         parameters: Object.fromEntries(
-          Object.entries(configuration.values).filter(
+          Object.entries(config.values).filter(
             ([key]) => !["temperature", "max_tokens"].includes(key),
           ),
         ),
         temperature:
-          configuration.values.temperature == null
+          config.values.temperature == null
             ? null
-            : Number(configuration.values.temperature),
+            : Number(config.values.temperature),
         max_tokens:
-          configuration.values.max_tokens == null
+          config.values.max_tokens == null
             ? null
-            : Number(configuration.values.max_tokens),
+            : Number(config.values.max_tokens),
       });
-      setNotice(
-        `已导入 ${created} 个模型，跳过 ${selectedIds.length - created} 个已有模型。新模型默认停用。`,
+      void toast.success(
+        `已导入 ${count} 个模型，跳过 ${selected.length - count} 个已有模型。新模型默认停用。`,
       );
-      closeRemote();
-      await onChanged();
+      setImporting(null);
+      await refresh();
     });
 
   return (
-    <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
-      <div className="flex items-start justify-between gap-4">
+    <section className="ui-panel settings-panel p-6">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">
-            供应商
-          </h2>
-          <p className="mt-1 text-[13px] leading-5 text-slate-500">
-            目录测试仅验证连接与目录协议；模型能力需要在模型页单独测试。
+          <h2 className="text-lg font-semibold">供应商</h2>
+          <p className="mt-1 text-sm text-slate-500">
+            配置服务连接；模型的具体能力在「管理模型」中测试。
           </p>
         </div>
-        <button
-          type="button"
-          className={PRIMARY_BUTTON_CLASS}
-          disabled={busy || editing !== null}
-          onClick={() => setEditing("new")}
-        >
+        <Button type="primary" disabled={busy} onClick={() => edit("new")}>
           新增供应商
-        </button>
+        </Button>
       </div>
-
       {!secretReady && (
-        <p className="mt-3 text-sm text-amber-700">
-          部署尚未配置有效的
-          LLM_SECRET_KEYS，当前可保存元数据与匿名服务，暂不能新增或替换密钥。
-        </p>
+        <Alert
+          className="mb-4"
+          type="warning"
+          showIcon
+          title="密钥存储尚未配置，可保存连接信息或使用匿名服务。"
+        />
       )}
-      {notice && (
-        <p role="status" className="mt-3 text-sm text-emerald-700">
-          {notice}
-        </p>
+      {error && !editing && !importing && (
+        <Alert className="mb-4" type="error" showIcon title={error} />
       )}
-      {error !== null && (
-        <p className="mt-3 border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">
-          {error}
-        </p>
-      )}
-
-      {providers.length === 0 && editing !== "new" && (
-        <p className="mt-3 text-[14px] leading-6 text-slate-500">
-          添加供应商并在功能页绑定模型后才能调用。模型与密钥均来自此处配置。
-        </p>
-      )}
-
-      {providers.length > 0 && (
-        <div
-          className="settings-table-scroll"
-          role="region"
-          aria-label="配置列表"
-          tabIndex={0}
-        >
-          <table className="w-full border-collapse text-[13px]">
-            <thead>
-              <tr className="border-b border-slate-200 text-left text-[13px] text-slate-400">
-                <th className="border-b border-slate-200 py-2 pr-3 font-normal">
-                  名称
-                </th>
-                <th className="border-b border-slate-200 py-2 pr-3 font-normal">
-                  Base URL
-                </th>
-                <th className="border-b border-slate-200 py-2 pr-3 font-normal">
-                  密钥
-                </th>
-                <th className="border-b border-slate-200 py-2 pr-3 font-normal">
-                  状态
-                </th>
-                <th className="border-b border-slate-200 py-2 pr-3 font-normal">
-                  最近测试
-                </th>
-                <th className="border-b border-slate-200 py-2 text-right font-normal">
-                  操作
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {providers.map((provider) => {
-                const result = results[provider.id];
-                return (
-                  <Fragment key={provider.id}>
-                    <tr className="border-t border-slate-100 align-top">
-                      <td className="py-2 pr-3 font-medium text-slate-800">
-                        {provider.name}
-                        <div className="text-xs text-slate-500">
-                          {provider.protocol}
-                        </div>
-                      </td>
-                      <td className="max-w-xs break-all py-2 pr-3 text-[13px] text-slate-600">
-                        {provider.base_url}
-                      </td>
-                      <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
-                        {provider.auth_mode === "none"
-                          ? "匿名"
-                          : provider.has_api_key
-                            ? (provider.api_key_hint ?? "已配置")
-                            : "未配置"}
-                      </td>
-                      <td className="border-b border-slate-100 py-2 pr-3 text-[13px]">
-                        <span
-                          className={
-                            "inline-flex items-center gap-1.5 " +
-                            (provider.enabled
-                              ? "text-emerald-700"
-                              : "text-slate-500")
-                          }
-                        >
-                          <span
-                            aria-hidden
-                            className={
-                              "h-1.5 w-1.5 shrink-0 rounded-full " +
-                              (provider.enabled
-                                ? "bg-emerald-500"
-                                : "bg-slate-400")
-                            }
-                          />
-                          {provider.enabled ? "启用" : "停用"}
-                        </span>
-                      </td>
-                      <td className="border-b border-slate-100 py-2 pr-3 text-[13px] text-slate-600">
-                        {validityLabel(provider.test_validity)}
-                        {result !== undefined && (
-                          <span className="ml-1 text-slate-400">
-                            {result.latency_ms}ms
-                          </span>
-                        )}
-                        <div className="text-slate-400">
-                          {formatTime(provider.last_test_at)}
-                        </div>
-                      </td>
-                      <td className="border-b border-slate-100 py-2 text-right whitespace-nowrap">
-                        <button
-                          type="button"
-                          className={BUTTON_CLASS + " mr-1"}
-                          disabled={busy}
-                          onClick={() => test(provider)}
-                        >
-                          测试
-                        </button>
-                        <button
-                          type="button"
-                          className={BUTTON_CLASS + " mr-1"}
-                          disabled={busy}
-                          onClick={() => openRemote(provider)}
-                        >
-                          拉取模型
-                        </button>
-                        <button
-                          type="button"
-                          className={BUTTON_CLASS + " mr-1"}
-                          disabled={busy || editing !== null}
-                          onClick={() => setEditing(provider.id)}
-                        >
-                          编辑
-                        </button>
-                        <button
-                          type="button"
-                          className={DANGER_BUTTON_CLASS}
-                          disabled={busy}
-                          onClick={() => remove(provider)}
-                        >
-                          删除
-                        </button>
-                      </td>
-                    </tr>
-
-                    {provider.last_test_error !== null && (
-                      <tr>
-                        <td
-                          colSpan={6}
-                          className="pb-2 text-[13px] text-rose-600"
-                        >
-                          {provider.last_test_error}
-                        </td>
-                      </tr>
-                    )}
-
-                    {editing === provider.id && (
-                      <tr>
-                        <td colSpan={6} className="pb-3">
-                          <ProviderForm
-                            provider={provider}
-                            profiles={profiles}
-                            secretReady={secretReady}
-                            busy={busy}
-                            onSubmit={(input) => save(provider, input)}
-                            onCancel={() => setEditing(null)}
-                          />
-                        </td>
-                      </tr>
-                    )}
-
-                    {importingId === provider.id && (
-                      <tr>
-                        <td colSpan={6} className="pb-3">
-                          <div className="border border-slate-200 bg-slate-50 px-4 py-3.5">
-                            {remote === null ? (
-                              <p className="text-[13px] text-slate-500">
-                                正在拉取远端模型…
-                              </p>
-                            ) : remote.length === 0 ? (
-                              <p className="text-[13px] text-slate-500">
-                                远端没有返回模型（部分兼容网关不实现
-                                /v1/models）。
-                              </p>
-                            ) : (
-                              <>
-                                <p className="text-[13px] text-slate-500">
-                                  勾选并确认能力。已有模型跳过；新模型默认停用，确认参数后再启用。目录不证明模型能力。
-                                </p>
-                                <select
-                                  aria-label="导入模型能力"
-                                  className={SELECT_CLASS}
-                                  value={
-                                    importMode ||
-                                    profiles.find(
-                                      (p) => p.protocol === provider.protocol,
-                                    )?.api_mode ||
-                                    ""
-                                  }
-                                  onChange={(e) => {
-                                    setImportMode(e.target.value);
-                                    setImportConfiguration(
-                                      defaultConfiguration(
-                                        profiles.find(
-                                          (profile) =>
-                                            profile.protocol ===
-                                              provider.protocol &&
-                                            profile.api_mode === e.target.value,
-                                        ),
-                                      ),
-                                    );
-                                  }}
-                                >
-                                  {profiles
-                                    .filter(
-                                      (p) => p.protocol === provider.protocol,
-                                    )
-                                    .map((p) => (
-                                      <option
-                                        key={p.api_mode}
-                                        value={p.api_mode}
-                                      >
-                                        {kindLabel[p.kind]} · {p.api_mode}
-                                      </option>
-                                    ))}
-                                </select>
-                                {importProfile && (
-                                  <div className="my-4">
-                                    <ModelConfigurationFields
-                                      profile={importProfile}
-                                      value={
-                                        importConfiguration ??
-                                        defaultConfiguration(importProfile)
-                                      }
-                                      onChange={setImportConfiguration}
-                                    />
-                                  </div>
-                                )}
-                                <div className="mt-2 grid max-h-56 grid-cols-2 gap-1 overflow-auto">
-                                  {remote.map((modelId) => (
-                                    <label
-                                      key={modelId}
-                                      className="flex items-center gap-2 text-[13px] text-slate-700"
-                                    >
-                                      <input
-                                        type="checkbox"
-                                        checked={checked[modelId] === true}
-                                        onChange={(event) =>
-                                          setChecked((previous) => ({
-                                            ...previous,
-                                            [modelId]: event.target.checked,
-                                          }))
-                                        }
-                                      />
-                                      {modelId}
-                                    </label>
-                                  ))}
-                                </div>
-                                <div className="mt-2 flex gap-2">
-                                  <button
-                                    type="button"
-                                    className={PRIMARY_BUTTON_CLASS}
-                                    disabled={
-                                      busy ||
-                                      selectedIds.length === 0 ||
-                                      selectedIds.length > 100
-                                    }
-                                    onClick={importSelected}
-                                  >
-                                    导入选中的 {selectedIds.length} 个
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className={BUTTON_CLASS}
-                                    onClick={closeRemote}
-                                  >
-                                    取消
-                                  </button>
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {editing === "new" && (
-        <div className="mt-3">
+      <Table<LlmProvider>
+        rowKey="id"
+        dataSource={providers}
+        size="middle"
+        scroll={{ x: 900 }}
+        pagination={{
+          defaultPageSize: 10,
+          showSizeChanger: true,
+          showTotal: (total) => `共 ${total} 个供应商`,
+        }}
+        locale={{
+          emptyText: <Empty description="暂无供应商，点击新增供应商配置连接" />,
+        }}
+        columns={[
+          {
+            title: "名称",
+            key: "name",
+            width: 180,
+            render: (_, p) => (
+              <>
+                <strong>{p.name}</strong>
+                <div className="text-xs text-slate-500">{p.protocol}</div>
+              </>
+            ),
+          },
+          {
+            title: "服务地址",
+            dataIndex: "base_url",
+            width: 230,
+            render: (value: string) => (
+              <span className="break-all">{value}</span>
+            ),
+          },
+          {
+            title: "密钥",
+            key: "key",
+            width: 110,
+            render: (_, p) =>
+              p.auth_mode === "none"
+                ? "匿名"
+                : p.has_api_key
+                  ? (p.api_key_hint ?? "已配置")
+                  : "未配置",
+          },
+          {
+            title: "状态",
+            key: "state",
+            width: 90,
+            render: (_, p) => (
+              <Tag color={p.enabled ? "success" : "default"}>
+                {p.enabled ? "启用" : "停用"}
+              </Tag>
+            ),
+          },
+          {
+            title: "最近测试",
+            key: "test",
+            width: 200,
+            render: (_, p) => (
+              <>
+                {validityLabel(p.test_validity)}
+                <div className="text-xs text-slate-500">
+                  {formatTime(p.last_test_at)}
+                </div>
+                {p.last_test_error && (
+                  <p className="break-all text-xs text-rose-700">
+                    {p.last_test_error}
+                  </p>
+                )}
+              </>
+            ),
+          },
+          {
+            title: "操作",
+            key: "actions",
+            width: 260,
+            render: (_, p) => (
+              <Space wrap>
+                <Button
+                  size="small"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(async () => {
+                      const result = await testProvider(p.id);
+                      if (result.status === "ok")
+                        void toast.success("连接测试成功");
+                      else setError(result.error ?? "连接测试未通过");
+                      await refresh();
+                    })
+                  }
+                >
+                  测试
+                </Button>
+                <Button
+                  size="small"
+                  disabled={busy}
+                  onClick={() => openRemote(p)}
+                >
+                  拉取模型
+                </Button>
+                <Button size="small" disabled={busy} onClick={() => edit(p)}>
+                  编辑
+                </Button>
+                <Button
+                  size="small"
+                  danger
+                  disabled={busy}
+                  onClick={() =>
+                    modal.confirm({
+                      title: `删除供应商「${p.name}」？`,
+                      content: "仍被功能绑定的模型会阻止删除。",
+                      okText: "删除",
+                      okButtonProps: { danger: true },
+                      onOk: async () => {
+                        try {
+                          await deleteProvider(p.id);
+                          void toast.success("供应商已删除");
+                          await refresh();
+                        } catch (e) {
+                          setError(message(e, "删除失败"));
+                          throw e;
+                        }
+                      },
+                    })
+                  }
+                >
+                  删除
+                </Button>
+              </Space>
+            ),
+          },
+        ]}
+      />
+      {/* 弹层挂载到 body，分页、表格滚动及页头位置都不会遮住编辑入口。 */}
+      <Modal
+        title={
+          editing === "new"
+            ? "新增供应商"
+            : `编辑供应商 · ${editing?.name ?? ""}`
+        }
+        open={editing !== null}
+        width={600}
+        centered
+        destroyOnHidden
+        mask={{ closable: false }}
+        keyboard={!busy}
+        closable={!busy}
+        onCancel={() => closeEditor(() => { setEditing(null); setDirty(false); setError(null); })}
+        className="editor-modal"
+        footer={
+          <Space>
+            <Button
+              disabled={busy}
+              onClick={() => closeEditor(() => { setEditing(null); setDirty(false); setError(null); })}
+            >
+              取消
+            </Button>
+            <Button
+              type="primary"
+              htmlType="submit"
+              form="provider-form"
+              loading={busy}
+            >
+              保存
+            </Button>
+          </Space>
+        }
+      >
+        {error && (
+          <Alert className="mb-4" type="error" showIcon title={error} />
+        )}
+        {editing !== null && (
           <ProviderForm
-            provider={null}
+            key={editing === "new" ? "new" : editing.id}
+            provider={editing === "new" ? null : editing}
             profiles={profiles}
             secretReady={secretReady}
             busy={busy}
-            onSubmit={(input) => save(null, input)}
-            onCancel={() => setEditing(null)}
+            onSubmit={save}
+            onDirty={() => setDirty(true)}
           />
-        </div>
-      )}
+        )}
+      </Modal>
+      <Modal
+        title={`导入模型 · ${importing?.name ?? ""}`}
+        open={importing !== null}
+        width={760}
+        centered
+        className="editor-modal"
+        destroyOnHidden
+        mask={{ closable: false }}
+        keyboard={!busy}
+        closable={!busy}
+        onCancel={() => setImporting(null)}
+        footer={
+          <Space>
+            <Button disabled={busy} onClick={() => setImporting(null)}>
+              取消
+            </Button>
+            <Button
+              type="primary"
+              htmlType="submit"
+              form="import-models"
+              loading={busy}
+              disabled={!selected.length || !profile}
+            >
+              导入 {selected.length} 个模型
+            </Button>
+          </Space>
+        }
+      >
+        {error && (
+          <Alert
+            className="mb-4"
+            type="error"
+            showIcon
+            title={error}
+            action={
+              <Button
+                size="small"
+                disabled={busy}
+                onClick={() => importing && openRemote(importing)}
+              >
+                重新拉取
+              </Button>
+            }
+          />
+        )}
+        {remote === null ? (
+          busy && (
+            <Spin tip="正在拉取模型">
+              <div className="h-24" />
+            </Spin>
+          )
+        ) : (
+          <Form
+            id="import-models"
+            layout="vertical"
+            disabled={busy}
+            onFinish={importSelected}
+          >
+            <p className="mb-4 text-sm text-slate-500">
+              选择模型并核对能力。已有模型会跳过，新模型默认停用。
+            </p>
+            <Form.Item label="导入模型能力">
+              <Select
+                value={profile?.api_mode}
+                onChange={(mode) => {
+                  setImportMode(mode);
+                  setConfiguration(null);
+                }}
+                options={profiles
+                  .filter((p) => p.protocol === importing?.protocol)
+                  .map((p) => ({
+                    value: p.api_mode,
+                    label: `${kindLabel[p.kind]} · ${p.api_mode}`,
+                  }))}
+              />
+            </Form.Item>
+            {profile && (
+              <ModelConfigurationFields
+                profile={profile}
+                value={configuration ?? defaultConfiguration(profile)}
+                onChange={setConfiguration}
+                disabled={busy}
+              />
+            )}
+            <Input.Search
+              className="my-4"
+              aria-label="搜索远端模型"
+              placeholder="搜索远端模型"
+              allowClear
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+            <Table<{ id: string }>
+              size="small"
+              rowKey="id"
+              dataSource={remote
+                .filter((id) => id.toLowerCase().includes(search.toLowerCase()))
+                .map((id) => ({ id }))}
+              columns={[
+                {
+                  title: "模型 ID",
+                  dataIndex: "id",
+                  render: (id: string) => (
+                    <span className="break-all">{id}</span>
+                  ),
+                },
+              ]}
+              rowSelection={{
+                selectedRowKeys: selected,
+                preserveSelectedRowKeys: true,
+                onChange: (keys) => setSelected(keys as string[]),
+                getCheckboxProps: () => ({ disabled: busy }),
+              }}
+              pagination={{ defaultPageSize: 8, showSizeChanger: false }}
+              locale={{ emptyText: "没有匹配的远端模型" }}
+            />
+          </Form>
+        )}
+      </Modal>
     </section>
   );
 }
 
-interface FormProps {
-  profiles: AdapterProfile[];
-  secretReady: boolean;
-  provider: LlmProvider | null;
-  busy: boolean;
-  onSubmit: (input: ProviderInput | ProviderPatchInput) => void;
-  onCancel: () => void;
+interface ProviderValues {
+  name: string;
+  protocol: string;
+  base_url: string;
+  auth_mode: "api_key" | "none";
+  api_key?: string;
+  clear_api_key?: boolean;
+  enabled: boolean;
 }
 
 function ProviderForm({
@@ -527,161 +495,127 @@ function ProviderForm({
   secretReady,
   busy,
   onSubmit,
-  onCancel,
-}: FormProps) {
-  const [revision] = useState(provider?.revision);
-  const [protocol, setProtocol] = useState(
-    provider?.protocol ?? "openai_compatible",
-  );
-  const [authMode, setAuthMode] = useState<"api_key" | "none">(
-    provider?.auth_mode ?? "api_key",
-  );
-  const [name, setName] = useState(provider?.name ?? "");
-  const [baseUrl, setBaseUrl] = useState(provider?.base_url ?? "");
-  const [apiKey, setApiKey] = useState("");
-  const [enabled, setEnabled] = useState(provider?.enabled ?? true);
-  const [clearKey, setClearKey] = useState(false);
-
-  const submit = () => {
-    const common = {
-      name: name.trim(),
-      base_url: baseUrl.trim(),
-      enabled,
-      auth_mode: authMode,
-    };
-    if (provider === null) {
-      onSubmit(
-        apiKey === ""
-          ? { ...common, protocol }
-          : { ...common, protocol, api_key: apiKey },
-      );
-      return;
-    }
-    const patch: ProviderPatchInput = { ...common, revision };
-    if (clearKey) patch.clear_api_key = true;
-    else if (apiKey !== "") patch.api_key = apiKey;
-    onSubmit(patch);
-  };
-
+  onDirty,
+}: {
+  provider: LlmProvider | null;
+  profiles: AdapterProfile[];
+  secretReady: boolean;
+  busy: boolean;
+  onSubmit: (input: ProviderInput | ProviderPatchInput) => void;
+  onDirty: () => void;
+}) {
+  const [form] = Form.useForm<ProviderValues>();
+  const auth = Form.useWatch("auth_mode", form);
+  const clearKey = Form.useWatch("clear_api_key", form);
   return (
-    <fieldset
+    <Form
+      form={form}
+      id="provider-form"
+      layout="vertical"
       disabled={busy}
-      className="min-w-0 flex flex-col gap-3 border border-slate-200 bg-slate-50 px-5 py-4"
+      onValuesChange={onDirty}
+      scrollToFirstError={{ focus: true }}
+      initialValues={{
+        name: provider?.name ?? "",
+        protocol:
+          provider?.protocol ?? profiles[0]?.protocol ?? "openai_compatible",
+        base_url: provider?.base_url ?? "",
+        auth_mode: provider?.auth_mode ?? "api_key",
+        enabled: provider?.enabled ?? true,
+      }}
+      onFinish={(values) => {
+        const common = {
+          name: values.name.trim(),
+          base_url: values.base_url.trim(),
+          auth_mode: values.auth_mode,
+          enabled: values.enabled,
+        };
+        // 密钥只写不读：空白保持原值，清除由独立复选项明确表达。
+        const key = values.clear_api_key
+          ? { clear_api_key: true }
+          : values.api_key && values.auth_mode !== "none"
+            ? { api_key: values.api_key }
+            : {};
+        onSubmit(
+          provider
+            ? { ...common, ...key, revision: provider.revision }
+            : { ...common, ...key, protocol: values.protocol },
+        );
+      }}
     >
-      <label className={FORM_ROW_CLASS}>
-        <span className={FORM_LABEL_CLASS}>名称</span>
-        <input
-          className={INPUT_CLASS}
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-          placeholder="如 内网网关"
+      <Form.Item
+        name="name"
+        label="名称"
+        rules={[
+          { required: true, whitespace: true, message: "请输入供应商名称" },
+          { max: 200, message: "名称最多 200 字" },
+        ]}
+      >
+        <Input autoFocus placeholder="例如：内网网关" maxLength={200} />
+      </Form.Item>
+      <Form.Item
+        name="protocol"
+        label="协议"
+        rules={[{ required: true, message: "请选择协议" }]}
+      >
+        <Select
+          disabled={busy || provider !== null}
+          options={Array.from(new Set(profiles.map((p) => p.protocol))).map(
+            (value) => ({ value, label: value }),
+          )}
         />
-      </label>
-      <label className={FORM_ROW_CLASS}>
-        <span className={FORM_LABEL_CLASS}>协议</span>
-        <select
-          className={SELECT_CLASS}
-          value={protocol}
-          disabled={provider !== null}
-          onChange={(e) => setProtocol(e.target.value)}
-        >
-          {Array.from(new Set(profiles.map((p) => p.protocol))).map((p) => (
-            <option key={p} value={p}>
-              {p}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className={FORM_ROW_CLASS}>
-        <span className={FORM_LABEL_CLASS}>认证</span>
-        <select
-          className={SELECT_CLASS}
-          value={authMode}
-          onChange={(e) => setAuthMode(e.target.value as "api_key" | "none")}
-        >
-          <option value="api_key">API Key</option>
-          <option value="none">匿名服务（无需密钥）</option>
-        </select>
-      </label>
-      <label className={FORM_ROW_CLASS}>
-        <span className={FORM_LABEL_CLASS}>Base URL</span>
-        <input
-          className={INPUT_CLASS}
-          value={baseUrl}
-          onChange={(event) => setBaseUrl(event.target.value)}
-          placeholder="https://gateway.example/v1"
+      </Form.Item>
+      <Form.Item name="auth_mode" label="认证">
+        <Select
+          options={[
+            { value: "api_key", label: "API Key" },
+            { value: "none", label: "匿名服务（无需密钥）" },
+          ]}
         />
-      </label>
-      <label className={FORM_ROW_CLASS}>
-        <span className={FORM_LABEL_CLASS}>API Key</span>
-        <input
-          type="password"
+      </Form.Item>
+      <Form.Item
+        name="base_url"
+        label="服务地址（Base URL）"
+        rules={[
+          { required: true, whitespace: true, message: "请输入服务地址" },
+          {
+            validator: (_, value: string) => {
+              try {
+                const url = new URL(value.trim());
+                if (["http:", "https:"].includes(url.protocol))
+                  return Promise.resolve();
+              } catch {}
+              return Promise.reject(
+                new Error("请输入完整的 http:// 或 https:// 地址"),
+              );
+            },
+          },
+        ]}
+      >
+        <Input placeholder="https://gateway.example/v1" />
+      </Form.Item>
+      <Form.Item
+        name="api_key"
+        label="API Key"
+        extra={
+          provider
+            ? "留空保持现有密钥；已保存的密钥不会回显。"
+            : "也可稍后填写，调用前需完成配置。"
+        }
+      >
+        <Input.Password
           autoComplete="new-password"
-          disabled={!secretReady || clearKey || authMode === "none"}
-          className={INPUT_CLASS}
-          value={apiKey}
-          onChange={(event) => setApiKey(event.target.value)}
-          placeholder={
-            provider === null
-              ? "稍后填写也可保存，调用前需配置"
-              : "留空保持不变"
-          }
+          disabled={busy || !secretReady || clearKey || auth === "none"}
         />
-      </label>
-      <label className={FORM_ROW_CLASS}>
-        <span className={FORM_LABEL_CLASS}>启用</span>
-        <input
-          type="checkbox"
-          className="justify-self-start"
-          checked={enabled}
-          onChange={(event) => setEnabled(event.target.checked)}
-        />
-      </label>
-      {provider !== null && (
-        <label className={FORM_ROW_CLASS}>
-          <span className={FORM_LABEL_CLASS}>清除已存密钥</span>
-          <input
-            type="checkbox"
-            className="justify-self-start"
-            checked={clearKey}
-            onChange={(event) => setClearKey(event.target.checked)}
-          />
-        </label>
+      </Form.Item>
+      <Form.Item name="enabled" label="启用供应商" valuePropName="checked">
+        <Switch />
+      </Form.Item>
+      {provider && (
+        <Form.Item name="clear_api_key" valuePropName="checked">
+          <Checkbox>清除已保存的密钥</Checkbox>
+        </Form.Item>
       )}
-      <div className={FORM_ROW_CLASS}>
-        <span />
-        <div className="flex gap-2">
-          <button
-            type="button"
-            className={PRIMARY_BUTTON_CLASS}
-            disabled={busy || name.trim() === "" || baseUrl.trim() === ""}
-            onClick={submit}
-          >
-            保存
-          </button>
-          <button
-            type="button"
-            className={BUTTON_CLASS}
-            disabled={busy}
-            onClick={onCancel}
-          >
-            取消
-          </button>
-        </div>
-      </div>
-      {provider !== null && (
-        <div className={FORM_ROW_CLASS}>
-          <span className={FORM_LABEL_CLASS}>当前密钥</span>
-          <span className="text-[13px] leading-5 text-slate-500">
-            {provider.auth_mode === "none"
-              ? "匿名"
-              : provider.has_api_key
-                ? (provider.api_key_hint ?? "已配置")
-                : "未配置"}
-            ；保存后写入加密密文，页面不再回显。
-          </span>
-        </div>
-      )}
-    </fieldset>
+    </Form>
   );
 }

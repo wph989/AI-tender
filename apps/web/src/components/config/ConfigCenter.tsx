@@ -1,4 +1,6 @@
 "use client";
+import { Button, Tabs } from "antd";
+import { useFeedback } from "@/hooks/useFeedback";
 
 /**
  * 配置中心页容器（设计文档 08 第 2、5、6 节）。
@@ -11,7 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { PageShell } from "@/components/PageShell";
-import { BUTTON_CLASS, DATA_CLASS } from "@/components/ui";
+import { DATA_CLASS } from "@/components/ui";
 import {
   acknowledgeRelease,
   activateRelease,
@@ -22,7 +24,12 @@ import {
 } from "@/lib/api/config";
 import { LAYERS, itemsOfLayer } from "@/lib/config/draft";
 import { message } from "@/lib/errors";
-import type { ConfigItem, ConfigRelease, ConfigReleaseDetail, ImpactEntry } from "@/types/config";
+import type {
+  ConfigItem,
+  ConfigRelease,
+  ConfigReleaseDetail,
+  ImpactEntry,
+} from "@/types/config";
 
 import { LayerEditor } from "./LayerEditor";
 import { ReleasePanel } from "./ReleasePanel";
@@ -33,17 +40,27 @@ export function ConfigCenter() {
   const [section, setSection] = useState("L1");
   const [items, setItems] = useState<ConfigItem[]>([]);
   const [role, setRole] = useState("");
-  const [active, setActive] = useState<{ release_id: number; version_no: number } | null>(null);
+  const [active, setActive] = useState<{
+    release_id: number;
+    version_no: number;
+  } | null>(null);
   const [releases, setReleases] = useState<ConfigRelease[]>([]);
   const [detail, setDetail] = useState<ConfigReleaseDetail | null>(null);
   const [state, setState] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  useFeedback(error, info);
   const selectedId = useRef<number | null>(null);
+  const loadSequence = useRef(0);
 
   const reload = useCallback(async () => {
-    const [itemsResponse, releaseList] = await Promise.all([listConfigItems(), listReleases()]);
+    const sequence = ++loadSequence.current;
+    const [itemsResponse, releaseList] = await Promise.all([
+      listConfigItems(),
+      listReleases(),
+    ]);
+    if (sequence !== loadSequence.current) return;
     setItems(itemsResponse.items);
     setRole(itemsResponse.role);
     setActive(itemsResponse.active);
@@ -53,7 +70,8 @@ export function ConfigCenter() {
       releaseList.find((release) => release.status === "draft") ??
       releaseList[0];
     selectedId.current = fallback?.id ?? null;
-    setDetail(fallback === undefined ? null : await getRelease(fallback.id));
+    const nextDetail = fallback === undefined ? null : await getRelease(fallback.id);
+    if (sequence === loadSequence.current && selectedId.current === (fallback?.id ?? null)) setDetail(nextDetail);
   }, []);
 
   useEffect(() => {
@@ -79,7 +97,7 @@ export function ConfigCenter() {
     setError(null);
     try {
       await task();
-      await reload();
+      await reload().catch(() => setError("操作已完成，刷新配置失败，请点击刷新。"));
     } catch (caught) {
       setError(message(caught, fallback));
     } finally {
@@ -87,11 +105,24 @@ export function ConfigCenter() {
     }
   };
 
-  const selectRelease = (id: number) =>
-    void run("加载版本详情失败", async () => {
-      selectedId.current = id;
-      setDetail(await getRelease(id));
-    });
+  const selectRelease = (id: number) => {
+    selectedId.current = id;
+    setDetail(null);
+    setBusy(true);
+    setError(null);
+    // 详情读取与发布分开，快速切换版本时只接纳最后一次请求。
+    void getRelease(id)
+      .then((next) => {
+        if (selectedId.current === id) setDetail(next);
+      })
+      .catch((caught) => {
+        if (selectedId.current === id)
+          setError(message(caught, "加载版本详情失败"));
+      })
+      .finally(() => {
+        if (selectedId.current === id) setBusy(false);
+      });
+  };
 
   const retry = () => {
     setState("loading");
@@ -106,14 +137,20 @@ export function ConfigCenter() {
 
   return (
     <PageShell
-      breadcrumb={[<span>设置</span>, <span className="text-slate-600">配置中心</span>]}
+      breadcrumb={[
+        <span>设置</span>,
+        <span className="text-slate-600">配置中心</span>,
+      ]}
       eyebrow="设置 · 配置"
       title="配置中心"
       description="管理运行、解析与抽取规则，查看每一次配置发布的影响。"
       actions={
         <>
           <span className="text-[13px] text-slate-500">
-            角色 <span className={DATA_CLASS + " text-slate-700"}>{role === "" ? "—" : role}</span>
+            角色{" "}
+            <span className={DATA_CLASS + " text-slate-700"}>
+              {role === "" ? "—" : role}
+            </span>
           </span>
           <span className="text-[13px] text-slate-500">
             生效版本{" "}
@@ -121,9 +158,9 @@ export function ConfigCenter() {
               {active === null ? "—" : "v" + active.version_no}
             </span>
           </span>
-          <button
-            type="button"
-            className={BUTTON_CLASS}
+          <Button
+            htmlType="button"
+
             disabled={busy}
             onClick={() =>
               void run("刷新失败", async () => {
@@ -132,11 +169,13 @@ export function ConfigCenter() {
             }
           >
             刷新
-          </button>
+          </Button>
         </>
       }
     >
-      {state === "loading" && <p className="text-[14px] text-slate-500">正在加载配置…</p>}
+      {state === "loading" && (
+        <p className="text-[14px] text-slate-500">正在加载配置…</p>
+      )}
 
       {state === "error" && (
         <div className="border border-rose-200 bg-rose-50 px-4 py-3 text-[14px] text-rose-700">
@@ -144,9 +183,9 @@ export function ConfigCenter() {
           <p className="mt-1 text-[13px] text-rose-600">
             暂时无法获取配置，请确认服务可用后重试。
           </p>
-          <button type="button" className={BUTTON_CLASS + " mt-2"} onClick={retry}>
+          <Button htmlType="button" className={" mt-2"} onClick={retry}>
             重试
-          </button>
+          </Button>
         </div>
       )}
 
@@ -163,54 +202,80 @@ export function ConfigCenter() {
       )}
 
       {state === "ready" && (
-        <div className="settings-layout">
-          <nav className="settings-nav" aria-label="配置分类">
-            {[
-              { key: "L1", label: "运行参数", hint: "并发与超时 · 立即生效" },
-              { key: "L2", label: "解析配置", hint: "文档解析 · 发布后生效" },
-              { key: "L3", label: "抽取配置", hint: "信息抽取 · 发布后生效" },
-              { key: "releases", label: "版本与发布", hint: "变更确认、发布与回滚" },
-            ].map((item) => <button key={item.key} type="button" aria-pressed={section === item.key} onClick={() => setSection(item.key)}>
-              <span className="nav-step">{item.key === "releases" ? "↗" : item.key}</span>
-              <span><strong>{item.label}</strong><small>{item.hint}</small></span>
-            </button>)}
-            <p className="settings-help">解析与抽取配置先保存为草稿。确认影响并通过检查后，在「版本与发布」中生效。</p>
-          </nav>
-          <div className="settings-main">
-            {LAYERS.map((layer) => <div key={layer} hidden={section !== layer}>
-              <LayerEditor layer={layer} items={itemsOfLayer(items, layer)} onSaved={async (text) => { setInfo(text); await reload(); }} />
-            </div>)}
-            <div hidden={section !== "releases"}>
-          <ReleasePanel
-            releases={releases}
-            detail={detail}
-            busy={busy}
-            onSelect={selectRelease}
-            onAcknowledge={(entry: ImpactEntry, comment: string) =>
-              run("确认失败", async () => {
-                if (detail === null) return;
-                await acknowledgeRelease(detail.id, [entry], comment || undefined);
-                setInfo("已记录确认：" + entry.ref);
-              })
-            }
-            onActivate={(force: boolean, reason: string) =>
-              run("激活失败", async () => {
-                if (detail === null) return;
-                await activateRelease(detail.id, { force, reason: reason || undefined });
-                setInfo("版本 v" + detail.version_no + " 已生效");
-              })
-            }
-            onRollback={(reason: string) =>
-              run("回滚失败", async () => {
-                if (detail === null) return;
-                await rollbackRelease(detail.id, reason || undefined);
-                setInfo("已回滚到版本 v" + detail.version_no);
-              })
-            }
-          />
-            </div>
-          </div>
-        </div>
+        <Tabs
+          activeKey={section}
+          onChange={setSection}
+          destroyOnHidden={false}
+          items={[
+            ...LAYERS.map((layer) => ({
+              key: layer,
+              label:
+                layer === "L1"
+                  ? "运行参数"
+                  : layer === "L2"
+                    ? "解析配置"
+                    : "抽取配置",
+              forceRender: true,
+              children: (
+                <LayerEditor
+                  layer={layer}
+                  items={itemsOfLayer(items, layer)}
+                  onSaved={async (text) => {
+                    setInfo(text);
+                    await reload();
+                    if (layer !== "L1") setSection("releases");
+                  }}
+                />
+              ),
+            })),
+            {
+              key: "releases",
+              label: "版本与发布",
+              forceRender: true,
+              children: (
+                <ReleasePanel
+                  releases={releases}
+                  error={error}
+                  onRetry={() =>
+                    selectedId.current !== null &&
+                    selectRelease(selectedId.current)
+                  }
+                  detail={detail}
+                  busy={busy}
+                  onSelect={selectRelease}
+                  onAcknowledge={(entry: ImpactEntry, comment: string) =>
+                    run("确认失败", async () => {
+                      if (detail === null) return;
+                      await acknowledgeRelease(
+                        detail.id,
+                        [entry],
+                        comment || undefined,
+                      );
+                      setInfo("已记录确认：" + entry.ref);
+                    })
+                  }
+                  onActivate={(force: boolean, reason: string) =>
+                    run("激活失败", async () => {
+                      if (detail === null) return;
+                      await activateRelease(detail.id, {
+                        force,
+                        reason: reason || undefined,
+                      });
+                      setInfo("版本 v" + detail.version_no + " 已生效");
+                    })
+                  }
+                  onRollback={(reason: string) =>
+                    run("回滚失败", async () => {
+                      if (detail === null) return;
+                      await rollbackRelease(detail.id, reason || undefined);
+                      setInfo("已回滚到版本 v" + detail.version_no);
+                    })
+                  }
+                />
+              ),
+            },
+          ]}
+        />
       )}
     </PageShell>
   );

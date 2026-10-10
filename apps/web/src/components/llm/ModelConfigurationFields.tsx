@@ -1,13 +1,8 @@
 "use client";
 
+import { Checkbox, Collapse, Form, Input, Select } from "antd";
 import { capabilityLabel } from "@/lib/llm/format";
 import type { AdapterProfile, ModelParameterValue } from "@/types/llm";
-import {
-  FORM_LABEL_CLASS,
-  FORM_ROW_CLASS,
-  INPUT_CLASS,
-  SELECT_CLASS,
-} from "./ui";
 
 export interface ModelConfiguration {
   capabilities: string[];
@@ -25,15 +20,17 @@ export function defaultConfiguration(
   };
 }
 
-/** 新建、编辑和目录导入共用受控字段，避免三个入口对能力作不同的假设。 */
+/** 三个入口共用后端能力规则，防止导入和手动创建采用不同的参数边界。 */
 export function ModelConfigurationFields({
   profile,
   value,
   onChange,
+  disabled = false,
 }: {
   profile: AdapterProfile;
   value: ModelConfiguration;
   onChange: (next: ModelConfiguration) => void;
+  disabled?: boolean;
 }) {
   const update = (key: string, next: ModelParameterValue | undefined) => {
     const values = { ...value.values };
@@ -42,77 +39,61 @@ export function ModelConfigurationFields({
     onChange({ ...value, values });
   };
   return (
-    <div className="min-w-0 space-y-4">
-      <div className={FORM_ROW_CLASS}>
-        <span className={FORM_LABEL_CLASS}>允许能力</span>
-        <div className="space-y-2">
-          <div className="flex flex-wrap gap-3">
-            {profile.capabilities.map((capability) => (
-              <label
-                key={capability}
-                className="flex items-center gap-2 text-sm"
-              >
-                <input
-                  type="checkbox"
-                  checked={value.capabilities.includes(capability)}
-                  disabled={profile.required_capabilities.includes(capability)}
-                  onChange={(e) =>
+    <div className="min-w-0">
+      <Form.Item label="允许能力">
+        <Checkbox.Group
+          value={value.capabilities}
+          disabled={disabled}
+          options={profile.capabilities.map((cap) => ({
+            value: cap,
+            label: capabilityLabel[cap] ?? cap,
+            disabled: disabled || profile.required_capabilities.includes(cap),
+          }))}
+          onChange={(capabilities) => onChange({ ...value, capabilities })}
+        />
+        {profile.kind === "embedding" && (
+          <p className="mt-2 text-xs text-slate-500">
+            {value.capabilities.includes("image_input")
+              ? "文本＋图片多模态嵌入；图文能力需单独测试。"
+              : "纯文本嵌入；文本测试不能证明图片嵌入能力。"}
+          </p>
+        )}
+      </Form.Item>
+      <Collapse
+        className="mb-4"
+        items={[
+          {
+            key: "parameters",
+            label: `本模型支持的参数（${value.supported.length} 项）`,
+            children: (
+              <>
+                <p className="mb-3 text-xs text-slate-500">
+                  取消模型不接受的参数。可选值留空时使用服务默认值。
+                </p>
+                <Checkbox.Group
+                  value={value.supported}
+                  disabled={disabled}
+                  options={profile.parameters.map((key) => ({
+                    value: key,
+                    label: profile.parameter_schema[key]?.label ?? key,
+                  }))}
+                  onChange={(supported) =>
                     onChange({
                       ...value,
-                      capabilities: e.target.checked
-                        ? [...value.capabilities, capability]
-                        : value.capabilities.filter((c) => c !== capability),
+                      supported,
+                      values: Object.fromEntries(
+                        Object.entries(value.values).filter(([key]) =>
+                          supported.includes(key),
+                        ),
+                      ),
                     })
                   }
                 />
-                {capabilityLabel[capability] ?? capability}
-              </label>
-            ))}
-          </div>
-          {profile.kind === "embedding" && (
-            <p className="text-xs text-slate-500">
-              {value.capabilities.includes("image_input")
-                ? "文本＋图片多模态嵌入；图文能力需要单独测试。"
-                : "纯文本嵌入；文本测试不能证明图片嵌入能力。"}
-              {!profile.capabilities.includes("image_input") &&
-                " 此接口尚不支持图片嵌入。"}
-            </p>
-          )}
-          <p className="text-xs text-slate-500">
-            按模型实际能力确认，目录和模型名称不构成能力证明。
-          </p>
-        </div>
-      </div>
-      <details className="rounded-lg border border-slate-200 bg-white p-3">
-        <summary className="cursor-pointer text-sm font-medium">
-          本模型支持的参数（{value.supported.length} 项）
-        </summary>
-        <p className="my-2 text-xs text-slate-500">
-          取消模型不接受的参数。留空使用服务默认值，保存时不会发送未填写的可选参数。
-        </p>
-        <div className="flex flex-wrap gap-x-4 gap-y-2">
-          {profile.parameters.map((key) => (
-            <label key={key} className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={value.supported.includes(key)}
-                onChange={(e) => {
-                  const values = { ...value.values };
-                  if (!e.target.checked) delete values[key];
-                  onChange({
-                    ...value,
-                    values,
-                    supported: e.target.checked
-                      ? [...value.supported, key]
-                      : value.supported.filter((k) => k !== key),
-                  });
-                }}
-              />
-              {profile.parameter_schema[key]?.label ?? key}
-            </label>
-          ))}
-        </div>
-      </details>
+              </>
+            ),
+          },
+        ]}
+      />
       {profile.parameters
         .filter((key) => value.supported.includes(key))
         .map((key) => {
@@ -120,24 +101,25 @@ export function ModelConfigurationFields({
           if (!rule) return null;
           const current = value.values[key];
           return (
-            <label className={FORM_ROW_CLASS} key={key}>
-              <span className={FORM_LABEL_CLASS}>{rule.label}</span>
+            <Form.Item label={rule.label} key={key}>
               {rule.type === "enum" ? (
-                <select
-                  className={SELECT_CLASS}
+                <Select
+                  aria-label={rule.label}
+                  disabled={disabled}
                   value={String(current ?? "")}
-                  onChange={(e) => update(key, e.target.value || undefined)}
-                >
-                  <option value="">服务默认</option>
-                  {rule.values?.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(next) => update(key, next || undefined)}
+                  options={[
+                    { value: "", label: "服务默认" },
+                    ...(rule.values ?? []).map((option) => ({
+                      value: option,
+                      label: option,
+                    })),
+                  ]}
+                />
               ) : rule.type === "string_array" ? (
-                <textarea
-                  className={INPUT_CLASS}
+                <Input.TextArea
+                  aria-label={rule.label}
+                  disabled={disabled}
                   rows={2}
                   value={Array.isArray(current) ? current.join("\n") : ""}
                   placeholder="留空不发送停止词"
@@ -149,8 +131,9 @@ export function ModelConfigurationFields({
                   }
                 />
               ) : (
-                <input
-                  className={INPUT_CLASS}
+                <Input
+                  aria-label={rule.label}
+                  disabled={disabled}
                   type="number"
                   min={rule.min}
                   max={rule.max}
@@ -167,7 +150,7 @@ export function ModelConfigurationFields({
                   }
                 />
               )}
-            </label>
+            </Form.Item>
           );
         })}
     </div>

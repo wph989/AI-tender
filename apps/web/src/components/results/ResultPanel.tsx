@@ -1,4 +1,6 @@
 "use client";
+import type { InputRef } from "antd";
+import { Input } from "antd";
 
 /**
  * 结果面板：分组标签页 + 当前分组的字段卡片（见 docs/设计/06 第 2.1 节）。
@@ -19,21 +21,31 @@
 import type { KeyboardEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { DATA_CLASS, EYEBROW_CLASS, INPUT_CLASS, RESULT_PANEL_WIDTH } from "@/components/ui";
+import { DATA_CLASS, EYEBROW_CLASS, RESULT_PANEL_WIDTH } from "@/components/ui";
 import type { ReviewInput } from "@/lib/api/client";
-import { buildResultTabs, selectBatchConfirmable } from "@/lib/results/grouping";
+import {
+  buildResultTabs,
+  selectBatchConfirmable,
+} from "@/lib/results/grouping";
 import { needsActionCount, orderForReview } from "@/lib/results/reviewQueue";
 import { rerunMode, type RerunButtonMode } from "@/lib/results/rerun";
 import { useViewerStore } from "@/lib/store/viewerStore";
 import type { EvidenceIndex, EvidenceTarget } from "@/lib/viewer/evidenceIndex";
-import type { WireAttempt, WireConflict, WireExtraction } from "@/types/workbench";
+import type {
+  WireAttempt,
+  WireConflict,
+  WireExtraction,
+} from "@/types/workbench";
 
 import { ConflictsPanel } from "./ConflictsPanel";
 import { ResultCard } from "./ResultCard";
 import { ResultGroupTabs } from "./ResultGroupTabs";
 
 const NO_TARGETS: readonly EvidenceTarget[] = [];
-const NO_CONFLICTS: ReadonlyMap<string, WireConflict> = new Map<string, WireConflict>();
+const NO_CONFLICTS: ReadonlyMap<string, WireConflict> = new Map<
+  string,
+  WireConflict
+>();
 
 interface Props {
   extractions: readonly WireExtraction[];
@@ -49,8 +61,14 @@ interface Props {
   /** 字段 key → 该项目该字段的未裁定冲突。由工作台统一取一次，避免每张卡各查一遍。 */
   conflictsByField?: ReadonlyMap<string, WireConflict>;
   onLocate: (target: EvidenceTarget) => void;
-  onReview: (extraction: WireExtraction, input: ReviewInput) => Promise<boolean>;
-  onRerun: (extraction: WireExtraction, hint: string | null) => Promise<boolean>;
+  onReview: (
+    extraction: WireExtraction,
+    input: ReviewInput,
+  ) => Promise<boolean>;
+  onRerun: (
+    extraction: WireExtraction,
+    hint: string | null,
+  ) => Promise<boolean>;
   onResolveConflict?: (conflictId: number, resolvedId: number) => Promise<void>;
   onBatchConfirm: (extractions: readonly WireExtraction[]) => Promise<void>;
   onRefresh: () => Promise<void>;
@@ -111,16 +129,20 @@ export function ResultPanel({
   // 键盘游标：j/k 在「当前显示顺序」里移动，Enter 处理。它是「正在读的那一条」，
   // 与 activeEvidence（原文高亮）不同——但两者互为镜像，见下面的反向联动。
   const [cursorId, setCursorId] = useState<number | null>(null);
-  const [rerunSignal, setRerunSignal] = useState<{ id: number; token: number }>({
-    id: 0,
-    token: 0,
-  });
+  const [rerunSignal, setRerunSignal] = useState<{ id: number; token: number }>(
+    {
+      id: 0,
+      token: 0,
+    },
+  );
   const [keyword, setKeyword] = useState("");
-  const searchRef = useRef<HTMLInputElement | null>(null);
+  const searchRef = useRef<InputRef | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
   const lastLocatedRef = useRef<number | null>(null);
 
-  const locatedId = useViewerStore((state) => state.activeEvidence?.extractionId ?? null);
+  const locatedId = useViewerStore(
+    (state) => state.activeEvidence?.extractionId ?? null,
+  );
 
   // 原文角标 → 结果卡的反向联动。只在「定位目标真的换了」时执行：
   // 每次数据刷新都重跑会把用户手动切过去的分组又拽回来。
@@ -128,7 +150,9 @@ export function ResultPanel({
     if (locatedId === null || locatedId === lastLocatedRef.current) return;
     lastLocatedRef.current = locatedId;
     // 章节树跳转也写 activeEvidence，但用的是哨兵 id（-1）；只接管真属于本版本的结果
-    const owner = tabs.find((tab) => tab.items.some((item) => item.id === locatedId));
+    const owner = tabs.find((tab) =>
+      tab.items.some((item) => item.id === locatedId),
+    );
     if (owner === undefined) return;
     setCursorId(locatedId);
     setActiveKey(owner.key);
@@ -150,15 +174,22 @@ export function ResultPanel({
   }, [active, keyword, reviewOnly]);
 
   const pending = needsActionCount(extractions);
-  const notFound = extractions.filter((item) => item.status === "not_found").length;
-  const batchable = active === undefined ? [] : selectBatchConfirmable(active.items);
+  const notFound = extractions.filter(
+    (item) => item.status === "not_found",
+  ).length;
+  const batchable =
+    active === undefined ? [] : selectBatchConfirmable(active.items);
 
   const moveCursor = (delta: number) => {
     if (visibleItems.length === 0) return;
     const current = visibleItems.findIndex((item) => item.id === cursorId);
     // 光标还没落下来时：按 j 从第一条开始，按 k 从最后一条开始。
-    const base = current === -1 ? (delta > 0 ? -1 : visibleItems.length) : current;
-    const next = visibleItems[Math.min(Math.max(base + delta, 0), visibleItems.length - 1)];
+    const base =
+      current === -1 ? (delta > 0 ? -1 : visibleItems.length) : current;
+    const next =
+      visibleItems[
+        Math.min(Math.max(base + delta, 0), visibleItems.length - 1)
+      ];
     if (next === undefined) return;
     setCursorId(next.id);
     // 焦点收回面板：光标移动后 j/k 必须继续在当前面板生效，而不是留在刚点过的按钮上
@@ -168,7 +199,9 @@ export function ResultPanel({
   const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const target = event.target as HTMLElement;
     const editable =
-      target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
+      target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.isContentEditable;
 
     if (editable) {
       // 在输入框里 Esc 只做「退出输入」，不要把整个高亮清掉
@@ -206,7 +239,11 @@ export function ResultPanel({
       setRerunSignal((prev) => ({ id: item.id, token: prev.token + 1 }));
       return;
     }
-    void onReview(item, { attempt_id: item.id, action: "confirm", review_mode: "item" });
+    void onReview(item, {
+      attempt_id: item.id,
+      action: "confirm",
+      review_mode: "item",
+    });
   };
 
   return (
@@ -214,17 +251,26 @@ export function ResultPanel({
       ref={panelRef}
       tabIndex={-1}
       onKeyDown={handleKeyDown}
-      className={RESULT_PANEL_WIDTH + " flex shrink-0 flex-col border-l border-slate-200 focus:outline-none"}
+      className={
+        RESULT_PANEL_WIDTH +
+        " flex shrink-0 flex-col border-l border-slate-200 focus:outline-none"
+      }
     >
       <div className="result-panel-heading border-b border-slate-200 bg-white px-4 pt-3.5 pb-3">
         <div className="flex items-baseline justify-between gap-3">
-          <p className={EYEBROW_CLASS}>{reviewOnly ? "复核队列" : "解析结果"}</p>
+          <p className={EYEBROW_CLASS}>
+            {reviewOnly ? "复核队列" : "解析结果"}
+          </p>
           <span className={DATA_CLASS + " text-[13px] text-slate-400"}>
             共 {extractions.length} 项
           </span>
         </div>
 
-        <div className="mt-2 flex items-center gap-1" role="tablist" aria-label="结果视图">
+        <div
+          className="mt-2 flex items-center gap-1"
+          role="tablist"
+          aria-label="结果视图"
+        >
           <ModeButton
             active={reviewOnly}
             label="复核队列"
@@ -243,7 +289,9 @@ export function ResultPanel({
             <span
               className={
                 DATA_CLASS +
-                (pending > 0 ? " mark-ink ml-0.5 px-1 text-slate-900" : " ml-0.5 text-slate-400")
+                (pending > 0
+                  ? " mark-ink ml-0.5 px-1 text-slate-900"
+                  : " ml-0.5 text-slate-400")
               }
             >
               {pending}
@@ -256,7 +304,9 @@ export function ResultPanel({
             未找到{" "}
             <span
               className={
-                DATA_CLASS + " ml-0.5 " + (notFound > 0 ? "text-slate-700" : "text-slate-400")
+                DATA_CLASS +
+                " ml-0.5 " +
+                (notFound > 0 ? "text-slate-700" : "text-slate-400")
               }
             >
               {notFound}
@@ -267,16 +317,20 @@ export function ResultPanel({
           </span>
         </p>
 
-        <input
+        <Input
           ref={searchRef}
           value={keyword}
           onChange={(event) => setKeyword(event.target.value)}
           placeholder="筛选字段名或值（/ 聚焦）"
           aria-label="筛选字段"
-          className={INPUT_CLASS + " mt-2 w-full py-1"}
+          className={" mt-2 w-full py-1"}
         />
 
-        <ConflictsPanel projectId={projectId} onNotice={onNotice} onResolved={onRefresh} />
+        <ConflictsPanel
+          projectId={projectId}
+          onNotice={onNotice}
+          onResolved={onRefresh}
+        />
       </div>
 
       {active === undefined ? (
@@ -285,7 +339,11 @@ export function ResultPanel({
         </div>
       ) : (
         <>
-          <ResultGroupTabs tabs={tabs} activeKey={active.key} onSelect={setActiveKey} />
+          <ResultGroupTabs
+            tabs={tabs}
+            activeKey={active.key}
+            onSelect={setActiveKey}
+          />
           <div
             key={active.key}
             role="tabpanel"
@@ -295,8 +353,13 @@ export function ResultPanel({
           >
             {!reviewOnly && batchable.length > 0 && (
               <div className="relative mb-3 flex items-center gap-2 border border-emerald-200 bg-emerald-50 py-1.5 pr-2 pl-3 text-[13px] text-emerald-800">
-                <span aria-hidden className="absolute inset-y-0 left-0 w-[4px] bg-emerald-500" />
-                <span className="flex-1">{batchable.length} 项自动抽取无需逐条查看</span>
+                <span
+                  aria-hidden
+                  className="absolute inset-y-0 left-0 w-[4px] bg-emerald-500"
+                />
+                <span className="flex-1">
+                  {batchable.length} 项自动抽取无需逐条查看
+                </span>
                 <button
                   type="button"
                   onClick={() => void onBatchConfirm(batchable)}
@@ -320,12 +383,14 @@ export function ResultPanel({
                     extraction={item}
                     targets={index.byExtraction.get(item.id) ?? NO_TARGETS}
                     rerunButton={rerunMode(rerunModes, item.field_key)}
-                    busy={busyExtractionId === item.id}
+                    busy={busyExtractionId !== null}
                     highlighted={item.id === cursorId}
                     forceOpen={reviewOnly && item.status === "conflict"}
                     conflict={conflictsByField.get(item.field_key) ?? null}
                     onResolveConflict={onResolveConflict}
-                    openRerunToken={rerunSignal.id === item.id ? rerunSignal.token : 0}
+                    openRerunToken={
+                      rerunSignal.id === item.id ? rerunSignal.token : 0
+                    }
                     onLocate={onLocate}
                     onReview={(input) => onReview(item, input)}
                     onRerun={(hint) => onRerun(item, hint)}

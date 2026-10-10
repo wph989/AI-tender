@@ -1,4 +1,6 @@
 "use client";
+import { App, Button, Modal, Select } from "antd";
+import { useFeedback } from "@/hooks/useFeedback";
 
 /** 文件管理保留上传、重跑与角色变更接口，用文件卡片承载处理进度和操作。 */
 
@@ -8,15 +10,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { PageShell } from "@/components/PageShell";
 import { FilePipeline, SPINE_CLASS } from "@/components/projects/FilePipeline";
-import { UploadPanel, type UploadOptionsState } from "@/components/projects/UploadPanel";
 import {
-  BUTTON_CLASS,
+  UploadPanel,
+  type UploadOptionsState,
+} from "@/components/projects/UploadPanel";
+import {
   DATA_CLASS,
-  DANGER_GHOST_BUTTON_CLASS,
-  GHOST_BUTTON_CLASS,
   PRIMARY_BUTTON_CLASS,
   SECTION_TITLE_CLASS,
-  SELECT_CLASS,
 } from "@/components/ui";
 import {
   deleteProjectFile,
@@ -28,7 +29,11 @@ import {
   waitForJob,
 } from "@/lib/api/client";
 import { formatBytes, formatTime } from "@/lib/format";
-import { derivePipeline, needsExtractRerun, needsReparse } from "@/lib/projects/pipeline";
+import {
+  derivePipeline,
+  needsExtractRerun,
+  needsReparse,
+} from "@/lib/projects/pipeline";
 import {
   FILE_ROLE_LABELS,
   type FileRole,
@@ -70,12 +75,16 @@ interface Props {
 }
 
 export function ProjectFiles({ projectId }: Props) {
+  const { modal, message: toast } = App.useApp();
   const [project, setProject] = useState<WireProjectDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [busyFileId, setBusyFileId] = useState<number | null>(null);
-  const [reparseTarget, setReparseTarget] = useState<ReparseTarget | null>(null);
+  const [reparseTarget, setReparseTarget] = useState<ReparseTarget | null>(
+    null,
+  );
+  useFeedback(error, notice);
   const timer = useRef<number | null>(null);
 
   const reload = useCallback(async () => {
@@ -88,7 +97,8 @@ export function ProjectFiles({ projectId }: Props) {
   useEffect(() => {
     let alive = true;
     reload().catch((caught: unknown) => {
-      if (alive) setError(caught instanceof Error ? caught.message : "加载项目失败");
+      if (alive)
+        setError(caught instanceof Error ? caught.message : "加载项目失败");
     });
     return () => {
       alive = false;
@@ -96,7 +106,9 @@ export function ProjectFiles({ projectId }: Props) {
   }, [reload]);
 
   // 只有在跑的文件才值得轮询；全部落定后要立刻停表，否则页面永远在悄悄请求。
-  const inFlight = (project?.files ?? []).some((file) => derivePipeline(file).inFlight);
+  const inFlight = (project?.files ?? []).some(
+    (file) => derivePipeline(file).inFlight,
+  );
   useEffect(() => {
     if (!inFlight) return;
     timer.current = window.setInterval(() => {
@@ -136,12 +148,16 @@ export function ProjectFiles({ projectId }: Props) {
         onProgress,
       );
       setNotice(
-        result.jobs.length === 0 ? `已归档 ${result.added.length} 个文件，无需解析` : options.autoParse
-          ? `已入库 ${result.added.length} 个文件，正在转换与解析…`
-          : `已入库 ${result.added.length} 个文件（未自动解析）`,
+        result.jobs.length === 0
+          ? `已归档 ${result.added.length} 个文件，无需解析`
+          : options.autoParse
+            ? `已入库 ${result.added.length} 个文件，正在转换与解析…`
+            : `已入库 ${result.added.length} 个文件（未自动解析）`,
       );
       // 入库已成功：后续列表刷新失败不能把上传回执变成失败，导致用户重复上传。
-      await reload().catch(() => setError("文件已上传，但列表刷新失败，请点击刷新查看。"));
+      await reload().catch(() =>
+        setError("文件已上传，但列表刷新失败，请点击刷新查看。"),
+      );
       return result;
     } catch (caught: unknown) {
       setError(caught instanceof Error ? caught.message : "上传失败");
@@ -164,11 +180,20 @@ export function ProjectFiles({ projectId }: Props) {
   };
 
   const handleDelete = async (fileId: number, name: string) => {
-    if (!window.confirm(`删除「${name}」？已抽取的结果会一并从清单中移除。`)) return;
+    const confirmed = await modal.confirm({
+      title: `删除「${name}」？`,
+      content: "已抽取的结果会一并从清单中移除。",
+      okText: "删除",
+      okButtonProps: { danger: true },
+    });
+    if (!confirmed) return;
     setBusyFileId(fileId);
     try {
       await deleteProjectFile(projectId, fileId);
-      await reload();
+      void toast.success("文件已删除");
+      await reload().catch(() =>
+        setError("文件已删除，刷新列表失败，请点击刷新。"),
+      );
     } catch (caught: unknown) {
       setError(caught instanceof Error ? caught.message : "删除失败");
     } finally {
@@ -255,13 +280,13 @@ export function ProjectFiles({ projectId }: Props) {
       description="集中管理主文件、补遗与澄清材料，跟进每份文件的分析进度。"
       actions={
         <>
-          <button
-            type="button"
-            className={BUTTON_CLASS}
+          <Button
+            htmlType="button"
+
             onClick={() => void reload().catch(() => setError("刷新失败"))}
           >
             刷新
-          </button>
+          </Button>
           {/* 默认页已改为综合分析，项目级入口需显式带 view=fields 才能进入字段工作台。 */}
           <Link
             href={"/projects/" + projectId + "?view=fields"}
@@ -275,7 +300,11 @@ export function ProjectFiles({ projectId }: Props) {
       {error !== null && (
         <div className="flex items-start gap-3 border border-rose-200 bg-rose-50 px-3 py-2 text-[14px] text-rose-700">
           <span className="flex-1">{error}</span>
-          <button type="button" className="text-[13px] text-rose-700" onClick={() => setError(null)}>
+          <button
+            type="button"
+            className="text-[13px] text-rose-700"
+            onClick={() => setError(null)}
+          >
             关闭
           </button>
         </div>
@@ -294,51 +323,50 @@ export function ProjectFiles({ projectId }: Props) {
         </div>
       )}
 
-      {/* 后果横幅：重新解析的代价必须先说清楚，再让用户按下去（见 docs/质量/09 第 5.2 节） */}
-      {reparseTarget !== null && (
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border border-rose-200 bg-rose-50 py-2 pr-3 pl-4">
-          <span aria-hidden className="h-4 w-[4px] shrink-0 bg-rose-500" />
-          <p className="text-[13px] text-rose-800">
-            「{reparseTarget.fileName}」将重建全部锚点（页码与 block 编号都可能变），此前{" "}
-            <span className={DATA_CLASS + " font-medium"}>{reparseTarget.confirmed}</span>{" "}
-            条已确认结果需要重新复核。
-          </p>
-          <div className="ml-auto flex items-center gap-2">
-            <button
-              type="button"
-              className={PRIMARY_BUTTON_CLASS}
-              disabled={busyFileId !== null}
-              onClick={() => void handleReparse()}
-            >
-              确认重新解析
-            </button>
-            <button
-              type="button"
-              className={BUTTON_CLASS}
-              disabled={busyFileId !== null}
-              onClick={() => setReparseTarget(null)}
-            >
-              取消
-            </button>
-          </div>
-        </div>
-      )}
+      <Modal
+        title="确认重新解析"
+        open={reparseTarget !== null}
+        centered
+        mask={{ closable: false }}
+        onCancel={() => setReparseTarget(null)}
+        okText="确认重新解析"
+        okButtonProps={{ danger: true, disabled: busyFileId !== null }}
+        onOk={() => void handleReparse()}
+      >
+        <p>
+          「{reparseTarget?.fileName}」将重新生成原文位置，原有{" "}
+          {reparseTarget?.confirmed ?? 0} 条已确认结果需要重新复核。
+        </p>
+      </Modal>
 
       <div className="file-overview" aria-label="文件概览">
-        <span><Icon name="file" size={15} />文件 <strong>{project === null ? "—" : files.length}</strong></span>
-        <span><Icon name="scan" size={15} />处理中 <strong>{project === null ? "—" : running}</strong></span>
-        <span><Icon name="clock" size={15} />待复核 <strong>{project === null ? "—" : reviewers}</strong></span>
+        <span>
+          <Icon name="file" size={15} />
+          文件 <strong>{project === null ? "—" : files.length}</strong>
+        </span>
+        <span>
+          <Icon name="scan" size={15} />
+          处理中 <strong>{project === null ? "—" : running}</strong>
+        </span>
+        <span>
+          <Icon name="clock" size={15} />
+          待复核 <strong>{project === null ? "—" : reviewers}</strong>
+        </span>
       </div>
       <UploadPanel busy={busy} onUpload={handleUpload} />
 
       {/* 被拒文件的原因由交件台的逐行结果承接（见 UploadPanel）：同一份信息不写两处，
           否则两边的名单迟早对不上。 */}
 
-      {project === null && <p className="text-[14px] text-slate-500">正在加载文件清单…</p>}
+      {project === null && !error && (
+        <p className="text-[14px] text-slate-500">正在加载文件清单…</p>
+      )}
 
       {project !== null && files.length === 0 && (
         <div className="empty-state">
-          <p className="font-display font-semibold text-[19px] text-slate-900">这个项目还没有文件</p>
+          <p className="font-display font-semibold text-[19px] text-slate-900">
+            这个项目还没有文件
+          </p>
           <p className="mx-auto mt-2 max-w-md text-[14px] leading-6 text-slate-500">
             在上方选择或拖入招标文件，上传后即可在这里查看进度。
           </p>
@@ -351,7 +379,9 @@ export function ProjectFiles({ projectId }: Props) {
             <div>
               <h2 className={SECTION_TITLE_CLASS + " mt-1"}>文件清单</h2>
             </div>
-            <span className={DATA_CLASS + " pb-0.5 text-[13px] text-slate-400"}>{files.length} 个</span>
+            <span className={DATA_CLASS + " pb-0.5 text-[13px] text-slate-400"}>
+              {files.length} 个
+            </span>
             {/* 图例放在流水线旁边，而不是页脚：读者看到色块的那一刻就能查到它什么意思 */}
             <ul className="ml-auto flex items-center gap-3 pb-0.5 text-[13px] text-slate-400">
               {(
@@ -363,7 +393,10 @@ export function ProjectFiles({ projectId }: Props) {
                 ] as const
               ).map(([state, label]) => (
                 <li key={state} className="flex items-center gap-1.5">
-                  <span aria-hidden className={"h-[7px] w-[7px] " + SPINE_CLASS[state]} />
+                  <span
+                    aria-hidden
+                    className={"h-[7px] w-[7px] " + SPINE_CLASS[state]}
+                  />
                   {label}
                 </li>
               ))}
@@ -372,9 +405,7 @@ export function ProjectFiles({ projectId }: Props) {
 
           <ul>
             {files.map((file) => {
-              const pipeline = derivePipeline(file);
-              const fileBusy =
-                busyFileId !== null;
+              const fileBusy = busyFileId !== null;
               return (
                 <li
                   key={file.project_file_id}
@@ -382,95 +413,129 @@ export function ProjectFiles({ projectId }: Props) {
                 >
                   <div className="file-entry">
                     <div className="file-entry-name">
-                      <span className="file-type-icon"><Icon name="file" size={22} /></span>
+                      <span className="file-type-icon">
+                        <Icon name="file" size={22} />
+                      </span>
                       <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span
-                          className="min-w-0 break-all font-display font-semibold text-[14px] leading-6 text-slate-900"
-                          title={file.display_name}
-                        >
-                          {file.display_name}
-                        </span>
-                        {/* 文档种类：扫清单时先看它是主文件还是补遗/澄清，比读下拉框快 */}
-                        <span className="shrink-0 border border-slate-300 px-1 py-px text-[11px] text-slate-600">
-                          {FILE_ROLE_LABELS[file.role as FileRole] ?? file.role}
-                        </span>
-                        {file.replaced_by_id !== null && (
-                          <span className="shrink-0 border border-slate-200 px-1 py-px text-[11px] text-slate-500">
-                            已换版
-                          </span>
-                        )}
-                        {!file.is_parseable && (
-                          <span className="shrink-0 border border-slate-200 px-1 py-px text-[11px] text-slate-500">
-                            仅归档
-                          </span>
-                        )}
-                      </div>
-                      <div
-                        className={
-                          DATA_CLASS +
-                          " mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-slate-400"
-                        }
-                        title={"SHA-256 " + file.sha256}
-                      >
-                        <span>{formatBytes(file.size_bytes)}</span>
-                        <span>{file.page_count ?? "—"} 页</span>
-
-                        <span>{formatTime(file.created_at)}</span>
-                        <label className="flex items-center gap-1.5 text-slate-400">
-                          <span className="font-sans">角色</span>
-                          <select
-                            value={file.role}
-                            disabled={fileBusy}
-                            aria-label={"「" + file.display_name + "」的角色"}
-                            onChange={(event) =>
-                              void handleRole(file.project_file_id, event.target.value as FileRole)
-                            }
-                            className={
-                              SELECT_CLASS + " py-0.5 pl-1.5 text-[13px] font-sans text-slate-600"
-                            }
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span
+                            className="min-w-0 break-all font-display font-semibold text-[14px] leading-6 text-slate-900"
+                            title={file.display_name}
                           >
-                            {(Object.keys(FILE_ROLE_LABELS) as FileRole[]).map((role) => (
-                              <option key={role} value={role}>
-                                {FILE_ROLE_LABELS[role]}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      </div>
-                    </div>
+                            {file.display_name}
+                          </span>
+                          {/* 文档种类：扫清单时先看它是主文件还是补遗/澄清，比读下拉框快 */}
+                          <span className="shrink-0 border border-slate-300 px-1 py-px text-[11px] text-slate-600">
+                            {FILE_ROLE_LABELS[file.role as FileRole] ??
+                              file.role}
+                          </span>
+                          {file.replaced_by_id !== null && (
+                            <span className="shrink-0 border border-slate-200 px-1 py-px text-[11px] text-slate-500">
+                              已换版
+                            </span>
+                          )}
+                          {!file.is_parseable && (
+                            <span className="shrink-0 border border-slate-200 px-1 py-px text-[11px] text-slate-500">
+                              仅归档
+                            </span>
+                          )}
+                        </div>
+                        <div
+                          className={
+                            DATA_CLASS +
+                            " mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-slate-400"
+                          }
+                          title={"SHA-256 " + file.sha256}
+                        >
+                          <span>{formatBytes(file.size_bytes)}</span>
+                          <span>{file.page_count ?? "—"} 页</span>
 
+                          <span>{formatTime(file.created_at)}</span>
+                          <label className="flex items-center gap-1.5 text-slate-400">
+                            <span className="font-sans">角色</span>
+                            <Select<string>
+                              value={String(file.role)}
+                              disabled={fileBusy}
+                              aria-label={"「" + file.display_name + "」的角色"}
+                              onChange={(selectedValue) =>
+                                void handleRole(
+                                  file.project_file_id,
+                                  selectedValue as FileRole,
+                                )
+                              }
+                              className={
+                                "" +
+                                " py-0.5 pl-1.5 text-[13px] font-sans text-slate-600"
+                              }
+                            >
+                              {(
+                                Object.keys(FILE_ROLE_LABELS) as FileRole[]
+                              ).map((role) => (
+                                <Select.Option key={role} value={String(role)}>
+                                  {FILE_ROLE_LABELS[role]}
+                                </Select.Option>
+                              ))}
+                            </Select>
+                          </label>
+                        </div>
+                      </div>
                     </div>
                     <div>
                       {file.is_parseable ? (
                         <FilePipeline file={file} />
                       ) : (
-                        <span className="text-[13px] text-slate-400">不参与文本解析</span>
+                        <span className="text-[13px] text-slate-400">
+                          不参与文本解析
+                        </span>
                       )}
-                      {file.latest_job && ["failed", "canceled"].includes(file.latest_job.status) && (
-                        <p className="mt-2 max-w-sm break-words text-[12px] text-rose-700" role="alert">
-                          {file.latest_job.error_message ?? file.latest_job.error_code ?? "任务未完成，请检查服务后重试。"}
-                        </p>
-                      )}
+                      {file.latest_job &&
+                        ["failed", "canceled"].includes(
+                          file.latest_job.status,
+                        ) && (
+                          <p
+                            className="mt-2 max-w-sm break-words text-[12px] text-rose-700"
+                            role="alert"
+                          >
+                            {file.latest_job.error_message ??
+                              file.latest_job.error_code ??
+                              "任务未完成，请检查服务后重试。"}
+                          </p>
+                        )}
                     </div>
 
                     <div className="file-entry-review text-right">
                       <p className="mb-1 text-[10px] text-slate-400">待复核</p>
                       {file.review_count > 0 ? (
-                        <span className={DATA_CLASS + " mark-ink px-1 text-[14px] text-slate-900"}>
+                        <span
+                          className={
+                            DATA_CLASS +
+                            " mark-ink px-1 text-[14px] text-slate-900"
+                          }
+                        >
                           {file.review_count}
                         </span>
                       ) : (
-                        <span className={DATA_CLASS + " text-[14px] text-slate-300"}>—</span>
+                        <span
+                          className={DATA_CLASS + " text-[14px] text-slate-300"}
+                        >
+                          —
+                        </span>
                       )}
                     </div>
 
                     <div className="file-entry-actions">
                       {file.version_id === null ? (
-                        <span className="text-[13px] text-slate-400">{file.is_parseable ? "暂无预览" : "仅归档"}</span>
+                        <span className="text-[13px] text-slate-400">
+                          {file.is_parseable ? "暂无预览" : "仅归档"}
+                        </span>
                       ) : (
                         <Link
-                          href={"/projects/" + projectId + "?file=" + file.project_file_id}
+                          href={
+                            "/projects/" +
+                            projectId +
+                            "?file=" +
+                            file.project_file_id
+                          }
                           className="whitespace-nowrap rounded-lg px-1.5 py-0.5 text-[13px] text-sky-700 hover:bg-sky-50 hover:underline"
                         >
                           打开工作台
@@ -482,19 +547,30 @@ export function ProjectFiles({ projectId }: Props) {
                            * 两种重跑的代价差一个量级（见 docs/设计/05 第 3.11 节），所以是两个按钮：
                            * 抽取没产出时把「重跑抽取」升为主操作——重新解析会白付一次重建锚点的代价。
                            */}
-                          <button
-                            type="button"
-                            className={
-                              needsExtractRerun(file) ? PRIMARY_BUTTON_CLASS : GHOST_BUTTON_CLASS
+                          <Button
+                            type="primary"
+                            htmlType="button"
+                            className={needsExtractRerun(file) ? "" : ""}
+                            disabled={
+                              fileBusy ||
+                              derivePipeline(file).inFlight ||
+                              !["completed", "partial"].includes(
+                                file.parse_status ?? "",
+                              )
                             }
-                            disabled={fileBusy || derivePipeline(file).inFlight || !["completed", "partial"].includes(file.parse_status ?? "")}
-                            onClick={() => void handleExtractRerun(file.version_id as number, file.project_file_id)}
+                            onClick={() =>
+                              void handleExtractRerun(
+                                file.version_id as number,
+                                file.project_file_id,
+                              )
+                            }
                           >
                             重跑抽取
-                          </button>
-                          <button
-                            type="button"
-                            className={needsReparse(file) ? PRIMARY_BUTTON_CLASS : GHOST_BUTTON_CLASS}
+                          </Button>
+                          <Button
+                            type="primary"
+                            htmlType="button"
+                            className={needsReparse(file) ? "" : ""}
                             disabled={fileBusy || derivePipeline(file).inFlight}
                             onClick={() =>
                               setReparseTarget({
@@ -508,17 +584,24 @@ export function ProjectFiles({ projectId }: Props) {
                             }
                           >
                             重新解析
-                          </button>
+                          </Button>
                         </>
                       )}
-                      <button
-                        type="button"
-                        className={DANGER_GHOST_BUTTON_CLASS}
+                      <Button
+                        danger
+                        type="text"
+                        htmlType="button"
+
                         disabled={fileBusy}
-                        onClick={() => void handleDelete(file.project_file_id, file.display_name)}
+                        onClick={() =>
+                          void handleDelete(
+                            file.project_file_id,
+                            file.display_name,
+                          )
+                        }
                       >
                         删除
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 </li>

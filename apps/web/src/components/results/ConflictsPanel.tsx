@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "antd";
 
 /**
  * 跨文件冲突裁定：同一字段在不同文件里抽出了不同的值，必须由人选一个。
@@ -13,7 +14,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import { BUTTON_CLASS, DATA_CLASS } from "@/components/ui";
+import { DATA_CLASS } from "@/components/ui";
 import { loadConflicts, resolveConflict } from "@/lib/api/client";
 import type { WireConflict } from "@/types/workbench";
 
@@ -79,19 +80,26 @@ export function ConflictsPanel({ projectId, onNotice, onResolved }: Props) {
         }
       >
         {openCount > 0 && (
-          <span aria-hidden className="absolute inset-y-0 left-0 w-[4px] bg-rose-500" />
+          <span
+            aria-hidden
+            className="absolute inset-y-0 left-0 w-[4px] bg-rose-500"
+          />
         )}
         <span className="font-medium">跨文件冲突</span>
         <span className={DATA_CLASS + " text-[13px]"}>
           {openCount > 0 ? openCount + " 项待裁定" : "无待裁定"}
         </span>
-        <span className="ml-auto text-[13px] text-slate-400">{open ? "收起" : "展开"}</span>
+        <span className="ml-auto text-[13px] text-slate-400">
+          {open ? "收起" : "展开"}
+        </span>
       </button>
 
       {open && (
         <div className="mt-2 flex flex-col gap-2">
           {conflicts.length === 0 && (
-            <p className="text-[13px] text-slate-500">当前项目没有跨文件冲突。</p>
+            <p className="text-[13px] text-slate-500">
+              当前项目没有跨文件冲突。
+            </p>
           )}
           {conflicts.map((conflict) => (
             <div key={conflict.id} className="border border-slate-200 bg-white">
@@ -113,22 +121,31 @@ export function ConflictsPanel({ projectId, onNotice, onResolved }: Props) {
                         className="flex items-start justify-between gap-3 bg-slate-50 px-2 py-1.5"
                       >
                         <span className="min-w-0 flex-1">
-                          <span className={DATA_CLASS + " block text-[14px] break-words text-slate-900"}>
+                          <span
+                            className={
+                              DATA_CLASS +
+                              " block text-[14px] break-words text-slate-900"
+                            }
+                          >
                             {candidate.value_text || "（空值）"}
                           </span>
                           <span className="mt-0.5 block truncate text-[13px] text-slate-500">
                             {candidate.display_name}
-                            {candidate.page_no !== null ? ` · 第 ${candidate.page_no} 页` : ""}
+                            {candidate.page_no !== null
+                              ? ` · 第 ${candidate.page_no} 页`
+                              : ""}
                           </span>
                         </span>
-                        <button
-                          type="button"
+                        <Button
+                          htmlType="button"
                           disabled={busyId === conflict.id}
-                          onClick={() => void decide(conflict, "resolve", candidate.id)}
-                          className={BUTTON_CLASS + " shrink-0"}
+                          onClick={() =>
+                            void decide(conflict, "resolve", candidate.id)
+                          }
+                          className={" shrink-0"}
                         >
                           采用这条
-                        </button>
+                        </Button>
                       </li>
                     ))}
                   </ul>
@@ -144,8 +161,9 @@ export function ConflictsPanel({ projectId, onNotice, onResolved }: Props) {
               ) : (
                 <p className="px-2.5 py-2 text-[13px] text-slate-500">
                   已裁定：
-                  {conflict.candidates.find((item) => item.id === conflict.resolved_id)
-                    ?.value_text ?? "忽略"}
+                  {conflict.candidates.find(
+                    (item) => item.id === conflict.resolved_id,
+                  )?.value_text ?? "忽略"}
                 </p>
               )}
             </div>

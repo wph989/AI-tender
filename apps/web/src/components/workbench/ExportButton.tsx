@@ -1,4 +1,5 @@
 "use client";
+import { Button } from "antd";
 
 /**
  * 项目导出入口：小项目直接下文件，大项目先排队再下载。
@@ -9,8 +10,13 @@
 
 import { useState } from "react";
 
-import { BUTTON_CLASS, DATA_CLASS } from "@/components/ui";
-import { downloadExportJob, exportProject, saveBlob, waitForJob } from "@/lib/api/client";
+import { DATA_CLASS } from "@/components/ui";
+import {
+  downloadExportJob,
+  exportProject,
+  saveBlob,
+  waitForJob,
+} from "@/lib/api/client";
 
 interface Props {
   projectId: number | null;
@@ -46,17 +52,21 @@ export function ExportButton({ projectId, onNotice }: Props) {
   };
 
   return (
-    <button
-      type="button"
+    <Button
+      htmlType="button"
       onClick={() => void handleClick()}
       disabled={projectId === null || busy}
-      title={projectId === null ? "没有项目，导出不可用" : "导出当前项目的抽取结果（Excel）"}
-      className={BUTTON_CLASS + " py-1"}
+      title={
+        projectId === null
+          ? "没有项目，导出不可用"
+          : "导出当前项目的抽取结果（Excel）"
+      }
+      className={" py-1"}
     >
       <span aria-hidden className={DATA_CLASS + " text-[13px]"}>
         ↓
       </span>
       {busy ? "导出中…" : "导出 Excel"}
-    </button>
+    </Button>
   );
 }

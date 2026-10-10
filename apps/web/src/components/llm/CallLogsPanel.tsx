@@ -1,10 +1,10 @@
 "use client";
+import { Alert, Button, Drawer, Select, Spin, Table, Tag } from "antd";
 
 import { useEffect, useRef, useState } from "react";
 import { listCalls } from "@/lib/api/llm";
 import { formatTime, message } from "@/lib/llm/format";
 import type { LlmCall, LlmFeature, LlmModel } from "@/types/llm";
-import { BUTTON_CLASS, SELECT_CLASS } from "./ui";
 
 const statusNames: Record<string, string> = {
   ok: "成功",
@@ -38,6 +38,7 @@ export function CallLogsPanel({
   const [chain, setChain] = useState<{ id: string; items: LlmCall[] } | null>(
     null,
   );
+  const [chainError, setChainError] = useState<string | null>(null);
   const [chainBusy, setChainBusy] = useState(false);
   const chainRequest = useRef(0);
 
@@ -47,7 +48,7 @@ export function CallLogsPanel({
     let canceled = false;
     setBusy(true);
     setError(null);
-    setData(null);
+
     void listCalls(filters)
       .then((set) => {
         if (!canceled) setData(set);
@@ -67,14 +68,24 @@ export function CallLogsPanel({
     const request = ++chainRequest.current;
     setChain({ id, items: [] });
     setChainBusy(true);
-    setError(null);
+    setChainError(null);
     try {
-      const result = await listCalls({ invocation_id: id, offset: 0 });
-      if (request === chainRequest.current)
-        setChain({ id, items: result.items });
+      // 后端单页最多 25 条；调用链需继续取完，不能把第一页误称为完整记录。
+      const items: LlmCall[] = [];
+      let total = 1;
+      while (items.length < total && request === chainRequest.current) {
+        const result = await listCalls({
+          invocation_id: id,
+          offset: items.length,
+        });
+        total = result.total;
+        if (!result.items.length) break;
+        items.push(...result.items);
+      }
+      if (request === chainRequest.current) setChain({ id, items });
     } catch (e) {
       if (request === chainRequest.current)
-        setError(message(e, "加载调用链失败"));
+        setChainError(message(e, "加载调用链失败"));
     } finally {
       if (request === chainRequest.current) setChainBusy(false);
     }
@@ -89,145 +100,207 @@ export function CallLogsPanel({
             查看实际请求与失败链。未返回的用量显示为“—”，不保存提示词和响应正文。
           </p>
         </div>
-        <button
-          className={BUTTON_CLASS}
+        <Button
+          htmlType="submit"
+
           disabled={busy}
           onClick={() => setRefresh((value) => value + 1)}
         >
           刷新记录
-        </button>
+        </Button>
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
-        <select
+        <Select<string>
           aria-label="按调用功能筛选"
-          className={SELECT_CLASS}
-          value={filters.feature_key}
-          onChange={(e) =>
-            setFilters({ ...filters, feature_key: e.target.value, offset: 0 })
+
+          value={String(filters.feature_key)}
+          onChange={(selectedValue) =>
+            setFilters({ ...filters, feature_key: selectedValue, offset: 0 })
           }
         >
-          <option value="">全部功能（含测试）</option>
+          <Select.Option value="">全部功能（含测试）</Select.Option>
           {features.map((f) => (
-            <option key={f.key} value={f.key}>
+            <Select.Option key={f.key} value={String(f.key)}>
               {f.name}
-            </option>
+            </Select.Option>
           ))}
-        </select>
-        <select
+        </Select>
+        <Select<string>
           aria-label="按调用模型筛选"
-          className={SELECT_CLASS}
-          value={filters.model_id}
-          onChange={(e) =>
-            setFilters({ ...filters, model_id: e.target.value, offset: 0 })
+
+          value={String(filters.model_id)}
+          onChange={(selectedValue) =>
+            setFilters({ ...filters, model_id: selectedValue, offset: 0 })
           }
         >
-          <option value="">全部模型（含已删除）</option>
+          <Select.Option value="">全部模型（含已删除）</Select.Option>
           {models.map((m) => (
-            <option key={m.id} value={m.id}>
+            <Select.Option key={m.id} value={String(m.id)}>
               {m.display_name}
-            </option>
+            </Select.Option>
           ))}
-        </select>
-        <select
+        </Select>
+        <Select<string>
           aria-label="按调用状态筛选"
-          className={SELECT_CLASS}
-          value={filters.status}
-          onChange={(e) =>
-            setFilters({ ...filters, status: e.target.value, offset: 0 })
+
+          value={String(filters.status)}
+          onChange={(selectedValue) =>
+            setFilters({ ...filters, status: selectedValue, offset: 0 })
           }
         >
-          <option value="">全部状态</option>
+          <Select.Option value="">全部状态</Select.Option>
           {Object.entries(statusNames).map(([key, label]) => (
-            <option key={key} value={key}>
+            <Select.Option key={key} value={String(key)}>
               {label}
-            </option>
+            </Select.Option>
           ))}
-        </select>
+        </Select>
       </div>
       {error && (
-        <p role="alert" className="mt-3 text-sm text-rose-700">
-          {error}
-        </p>
+        <Alert
+          className="my-4"
+          type="error"
+          showIcon
+          title={error}
+          action={
+            <Button size="small" onClick={() => setRefresh((n) => n + 1)}>
+              重试
+            </Button>
+          }
+        />
       )}
-      {busy && (
-        <p role="status" className="mt-4 text-sm text-slate-500">
-          正在加载调用记录…
-        </p>
-      )}
-      {data && (
-        <>
-          <div className="mt-4 space-y-3">
-            {data.items.map((call) => (
-              <CallItem
-                key={call.id}
-                call={call}
-                feature={features.find((f) => f.key === call.feature_key)?.name}
-                onChain={showChain}
-              />
+      <Table<LlmCall>
+        className="mt-4"
+        rowKey="id"
+        dataSource={data?.items ?? []}
+        loading={busy}
+        size="middle"
+        scroll={{ x: 860 }}
+        pagination={{
+          current: Math.floor(filters.offset / 25) + 1,
+          pageSize: 25,
+          total: data?.total ?? 0,
+          showSizeChanger: false,
+          showTotal: (total) => `共 ${total} 条记录`,
+          onChange: (page) =>
+            setFilters({ ...filters, offset: (page - 1) * 25 }),
+        }}
+        expandable={{
+          expandedRowRender: (call) => <CallItem call={call} />,
+          columnTitle: "详情",
+          columnWidth: 55,
+        }}
+        columns={[
+          {
+            title: "时间",
+            dataIndex: "created_at",
+            width: 180,
+            render: (value: string) => formatTime(value),
+          },
+          {
+            title: "模型 / 供应商",
+            key: "model",
+            width: 230,
+            render: (_, call) => (
+              <>
+                <strong>{call.display_name ?? "供应商目录"}</strong>
+                <p className="text-xs text-slate-500">
+                  {call.provider_name ?? "未知供应商"}
+                </p>
+              </>
+            ),
+          },
+          {
+            title: "功能",
+            key: "feature",
+            width: 140,
+            render: (_, call) =>
+              features.find((f) => f.key === call.feature_key)?.name ??
+              call.feature_key ??
+              "管理测试",
+          },
+          {
+            title: "状态",
+            dataIndex: "status",
+            width: 100,
+            render: (value: string) => (
+              <Tag
+                color={
+                  value === "ok"
+                    ? "success"
+                    : value === "error"
+                      ? "error"
+                      : "default"
+                }
+              >
+                {statusNames[value] ?? value}
+              </Tag>
+            ),
+          },
+          {
+            title: "耗时",
+            dataIndex: "latency_ms",
+            width: 100,
+            render: (value: number | null) =>
+              value == null ? "—" : `${(value / 1000).toFixed(1)} 秒`,
+          },
+          {
+            title: "操作",
+            key: "actions",
+            width: 125,
+            render: (_, call) =>
+              call.invocation_id ? (
+                <Button
+                  size="small"
+                  onClick={() => void showChain(call.invocation_id!)}
+                >
+                  查看调用链
+                </Button>
+              ) : (
+                "—"
+              ),
+          },
+        ]}
+      />
+      <Drawer
+        title="完整调用链"
+        open={chain !== null}
+        size={720}
+        onClose={() => {
+          ++chainRequest.current;
+          setChain(null);
+          setChainBusy(false);
+        }}
+        destroyOnHidden
+      >
+        <p className="mb-4 break-all text-xs text-slate-500">{chain?.id}</p>
+        {chainError && (
+          <Alert
+            type="error"
+            showIcon
+            title={chainError}
+            action={
+              <Button
+                size="small"
+                onClick={() => chain && void showChain(chain.id)}
+              >
+                重试
+              </Button>
+            }
+          />
+        )}
+        {chainBusy ? (
+          <Spin tip="正在加载请求顺序">
+            <div className="h-24" />
+          </Spin>
+        ) : (
+          <div className="space-y-3">
+            {chain?.items.map((call) => (
+              <CallItem key={call.id} call={call} />
             ))}
           </div>
-          {!data.items.length && (
-            <p className="mt-4 text-sm text-slate-500">
-              暂无符合条件的调用记录。
-            </p>
-          )}
-          <div className="mt-4 flex flex-wrap items-center justify-end gap-3 text-sm">
-            <span>
-              共 {data.total} 条 · 第 {Math.floor(filters.offset / 25) + 1} 页
-            </span>
-            <button
-              className={BUTTON_CLASS}
-              disabled={busy || filters.offset === 0}
-              onClick={() =>
-                setFilters({
-                  ...filters,
-                  offset: Math.max(0, filters.offset - 25),
-                })
-              }
-            >
-              上一页
-            </button>
-            <button
-              className={BUTTON_CLASS}
-              disabled={busy || filters.offset + 25 >= data.total}
-              onClick={() =>
-                setFilters({ ...filters, offset: filters.offset + 25 })
-              }
-            >
-              下一页
-            </button>
-          </div>
-        </>
-      )}
-      {chain && (
-        <div
-          className="mt-5 rounded-xl border border-violet-200 bg-violet-50/30 p-4"
-          aria-label="完整调用链"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 className="font-semibold">请求顺序</h3>
-            <button
-              className={BUTTON_CLASS}
-              onClick={() => {
-                ++chainRequest.current;
-                setChain(null);
-              }}
-            >
-              关闭调用链
-            </button>
-          </div>
-          <p className="mt-1 break-all text-xs text-slate-500">{chain.id}</p>
-          {chainBusy ? (
-            <p className="mt-3 text-sm">正在加载…</p>
-          ) : (
-            <div className="mt-3 space-y-3">
-              {chain.items.map((call) => (
-                <CallItem key={call.id} call={call} />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+        )}
+      </Drawer>
     </section>
   );
 }
@@ -276,12 +349,13 @@ function CallItem({
         <p className="mt-2 break-words text-rose-700">{call.error_message}</p>
       )}
       {onChain && call.invocation_id && (
-        <button
-          className={BUTTON_CLASS + " mt-3"}
+        <Button
+          htmlType="submit"
+          className={" mt-3"}
           onClick={() => onChain(call.invocation_id!)}
         >
           查看调用链
-        </button>
+        </Button>
       )}
     </article>
   );

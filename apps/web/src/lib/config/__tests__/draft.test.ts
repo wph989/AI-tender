@@ -34,15 +34,30 @@ function item(overrides: Partial<ConfigItem> & { key: string }): ConfigItem {
 
 const ITEMS: ConfigItem[] = [
   item({ key: "convert.max_inflight", value: 4 }),
-  item({ key: "mineru.tier", layer: "L2", value_type: "string", value: "standard" }),
-  item({ key: "llm_aided.title_leveling", layer: "L2", value_type: "bool", value: true }),
+  item({
+    key: "mineru.tier",
+    layer: "L2",
+    value_type: "string",
+    value: "standard",
+  }),
+  item({
+    key: "llm_aided.title_leveling",
+    layer: "L2",
+    value_type: "bool",
+    value: true,
+  }),
   item({
     key: "mineru.output_formats",
     layer: "L2",
     value_type: "json",
     value: ["middle_json", "zip"],
   }),
-  item({ key: "extract.rerun.hide_threshold", layer: "L3", value_type: "number", value: 0.1 }),
+  item({
+    key: "extract.rerun.hide_threshold",
+    layer: "L3",
+    value_type: "number",
+    value: 0.1,
+  }),
 ];
 
 describe("itemsOfLayer", () => {
@@ -65,6 +80,17 @@ describe("formatValue", () => {
 });
 
 describe("buildPatch", () => {
+  it("清空数值不能变成零并发或零阈值", () => {
+    const result = buildPatch(ITEMS, {
+      "convert.max_inflight": "",
+      "extract.rerun.hide_threshold": "   ",
+    });
+    expect(result.patch).toEqual({});
+    expect(result.errors).toEqual([
+      "convert.max_inflight 不能为空",
+      "extract.rerun.hide_threshold 不能为空",
+    ]);
+  });
   it("没改的项不进补丁", () => {
     const result = buildPatch(ITEMS, { "mineru.tier": "standard" });
     expect(result).toEqual({ patch: {}, errors: [] });
@@ -99,7 +125,9 @@ describe("buildPatch", () => {
   });
 
   it("整数值相同但文本不同（4 与 4.0）不算变更", () => {
-    expect(buildPatch(ITEMS, { "convert.max_inflight": "4.0" }).patch).toEqual({});
+    expect(buildPatch(ITEMS, { "convert.max_inflight": "4.0" }).patch).toEqual(
+      {},
+    );
   });
 });
 
@@ -111,8 +139,12 @@ describe("文案口径", () => {
   });
 
   it("门禁阻断码覆盖硬门槛与软门槛", () => {
-    expect(blockerLabel("impact_not_acknowledged")).toBe("变更影响清单还有未确认项");
-    expect(blockerLabel("first_pass_rate_drop_over_2pp")).toContain("2 个百分点");
+    expect(blockerLabel("impact_not_acknowledged")).toBe(
+      "变更影响清单还有未确认项",
+    );
+    expect(blockerLabel("first_pass_rate_drop_over_2pp")).toContain(
+      "2 个百分点",
+    );
     expect(blockerLabel("unknown_code")).toBe("unknown_code");
   });
 });
@@ -123,6 +155,9 @@ describe("diffRows", () => {
       "mineru.tier": { old: "standard", new: "basic" },
       "convert.max_inflight": { old: 4, new: 6 },
     });
-    expect(rows.map((row) => row.key)).toEqual(["convert.max_inflight", "mineru.tier"]);
+    expect(rows.map((row) => row.key)).toEqual([
+      "convert.max_inflight",
+      "mineru.tier",
+    ]);
   });
 });

@@ -11,6 +11,8 @@ apps/web/public/pdfjs/
 apps/web/next-env.d.ts
 # E2E 临时截图（人工验收用，不进版本库）
 apps/web/.e2e-*.png
+apps/web/test-results/
+apps/web/playwright-report/
 
 # Python
 __pycache__/

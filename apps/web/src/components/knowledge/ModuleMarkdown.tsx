@@ -1,6 +1,8 @@
 "use client";
 
-import { Fragment, useMemo, type ReactElement, type ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Icon } from "@/components/Icon";
 import type { AnalysisField, Citation, FieldValue } from "@/types/knowledge";
 
@@ -10,7 +12,7 @@ import type { AnalysisField, Citation, FieldValue } from "@/types/knowledge";
  * - 定位图标跟在取值后面（不单独占一列）：图标紧贴它要证明的那个值，一眼能看出值得位置。
  *   同一个值里重复的同一处原文按“资料 + 元素 + 页 + 摘录”去重，只留一个图标。
  * - 每个值仍绑定自己的引用（经校验的真实依据），重复值提醒与未支持提示保持原样。
- * - 正文按轻量 Markdown 渲染（段落、列表、加粗），只生成 React 元素，绝不执行模型返回的 HTML。
+ * - 正文由 react-markdown 与 GFM 插件渲染，支持标准列表和表格，忽略模型返回的 HTML。
  */
 export function ModuleMarkdown({
   items,
@@ -33,7 +35,9 @@ export function ModuleMarkdown({
             {conflicts.map((item) => (
               <li key={item.id}>
                 {item.field}
-                {item.values.length > 1 ? "：" + item.values.map((value) => value.value).join(" ／ ") : ""}
+                {item.values.length > 1
+                  ? "：" + item.values.map((value) => value.value).join(" ／ ")
+                  : ""}
               </li>
             ))}
           </ul>
@@ -41,7 +45,9 @@ export function ModuleMarkdown({
       )}
       {[...groups.entries()].map(([group, fields]) => (
         <section key={group} className="module-group">
-          {group !== "未分类" && <h4 className="module-group-title">{group}</h4>}
+          {group !== "未分类" && (
+            <h4 className="module-group-title">{group}</h4>
+          )}
           <table className="module-table">
             <thead>
               <tr>
@@ -58,30 +64,48 @@ export function ModuleMarkdown({
                   className={activeId === item.id ? "report-item-active" : ""}
                 >
                   <th scope="row">
-                    <span className="module-field-name">{renderInline(item.field)}</span>
+                    <span className="module-field-name">
+                      {renderInline(item.field)}
+                    </span>
                     {/* 只在综合字段里标注跨专题来源；模块视图每行本来就属于同一专题。 */}
                     {(item.module_keys?.length ?? 0) > 1 && (
-                      <span className="module-keys">{item.module_keys?.length} 个专题</span>
+                      <span className="module-keys">
+                        {item.module_keys?.length} 个专题
+                      </span>
                     )}
                   </th>
                   <td>
                     <ul className="field-values">
                       {item.values.map((value, index) => (
                         // 沿用正文样式类：轻量 Markdown 的段落/列表间距对取值同样适用。
-                        <li key={index} className="field-value module-markdown-body">
+                        <li
+                          key={index}
+                          className="field-value module-markdown-body"
+                        >
                           {renderMarkdown(
                             value.value,
-                            <ValueLocates refs={valueCitations(value)} onLocate={onLocate} />,
+                            <ValueLocates
+                              refs={valueCitations(value)}
+                              onLocate={onLocate}
+                            />,
                           )}
                         </li>
                       ))}
                     </ul>
-                    {!!item.note && <p className="field-note">{renderMarkdown(item.note)}</p>}
+                    {!!item.note && (
+                      <div className="field-note">
+                        {renderMarkdown(item.note)}
+                      </div>
+                    )}
                     {item.verification === "unsupported" && (
-                      <p className="field-warning">引用尚不足以支持这条结论，请核对原文。</p>
+                      <p className="field-warning">
+                        引用尚不足以支持这条结论，请核对原文。
+                      </p>
                     )}
                     {item.verification === "unavailable" && (
-                      <p className="field-note">{item.note || "来源已不可用。"}</p>
+                      <p className="field-note">
+                        {item.note || "来源已不可用。"}
+                      </p>
                     )}
                   </td>
                 </tr>
@@ -101,12 +125,19 @@ function groupFields(items: AnalysisField[]): Map<string, AnalysisField[]> {
     const key = item.group?.trim() || "未分类";
     groups.set(key, [...(groups.get(key) ?? []), item]);
   }
-  for (const fields of groups.values()) fields.sort((a, b) => a.sort_order - b.sort_order);
+  for (const fields of groups.values())
+    fields.sort((a, b) => a.sort_order - b.sort_order);
   return groups;
 }
 
 /** 取值后面紧跟的定位图标：没有引用时不渲染，避免出现点不开的空图标。 */
-function ValueLocates({ refs, onLocate }: { refs: Citation[]; onLocate: (ref: Citation) => void }) {
+function ValueLocates({
+  refs,
+  onLocate,
+}: {
+  refs: Citation[];
+  onLocate: (ref: Citation) => void;
+}) {
   if (!refs.length) return null;
   return (
     <span className="value-locates">
@@ -132,7 +163,9 @@ function valueCitations(value: FieldValue): Citation[] {
   const seen = new Set<string>();
   const result: Citation[] = [];
   for (const ref of value.citations ?? []) {
-    const key = [ref.source_id, ref.element_id, ref.page_no, ref.quote].join("\u0000");
+    const key = [ref.source_id, ref.element_id, ref.page_no, ref.quote].join(
+      "\u0000",
+    );
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(ref);
@@ -141,67 +174,76 @@ function valueCitations(value: FieldValue): Citation[] {
 }
 
 function locateTitle(ref: Citation): string {
-  const where = (ref.file_name ?? "原文") + (ref.page_no ? " 第 " + ref.page_no + " 页" : "");
+  const where =
+    (ref.file_name ?? "原文") +
+    (ref.page_no ? " 第 " + ref.page_no + " 页" : "");
   const quote = (ref.quote ?? "").replace(/\s+/g, " ").trim();
   return quote ? where + "：" + quote.slice(0, 42) : where;
 }
 
 /** 一个字段出现多个不同值，或引用未获支持时，属于需要用户核对的信息。 */
 function needsReview(item: AnalysisField): boolean {
-  if (item.verification === "unsupported" || item.verification === "unavailable") return true;
+  if (
+    item.verification === "unsupported" ||
+    item.verification === "unavailable"
+  )
+    return true;
   const distinct = new Set(item.values.map((value) => value.value.trim()));
   return distinct.size > 1;
 }
 
-/**
- * 轻量 Markdown 块级渲染：段落、无序列表（-/•）、有序列表（1./1、），空行分段。
- * trailing 是取值末尾的定位图标：单段值直接接在同一行，列表等块结构接在最后一块之后。
- */
-function renderMarkdown(text: string, trailing?: ReactNode): ReactNode {
-  const blocks: ReactNode[] = [];
-  let list: { ordered: boolean; entries: string[] } | null = null;
-  const flush = () => {
-    if (!list) return;
-    const entries = list.entries.map((entry, i) => <li key={i}>{renderInline(entry)}</li>);
-    blocks.push(list.ordered ? <ol key={blocks.length}>{entries}</ol> : <ul key={blocks.length}>{entries}</ul>);
-    list = null;
+/** 只扩展值末尾的业务定位入口，Markdown 语法由成熟解析器处理。 */
+interface MarkdownNode {
+  type: string;
+  children?: MarkdownNode[];
+  data?: { hName: string; hProperties?: Record<string, string> };
+}
+function appendCitations() {
+  return (tree: MarkdownNode) => {
+    const marker: MarkdownNode = {
+      type: "citationAnchor",
+      data: { hName: "span", hProperties: { className: "citation-anchor" } },
+    };
+    const last = tree.children?.at(-1);
+    // 普通取值的图标接在最后一段行内，列表/表格则在最后一个块之后，保持既有定位语义。
+    if (last?.type === "paragraph") last.children?.push(marker);
+    else tree.children?.push({ type: "paragraph", children: [marker] });
   };
-  for (const line of text.split(/\n/)) {
-    const bullet = line.match(/^\s*[-•]\s+(.*)$/);
-    const numbered = line.match(/^\s*\d+[.、)]\s+(.*)$/);
-    if (bullet) {
-      if (!list || list.ordered) { flush(); list = { ordered: false, entries: [] }; }
-      list.entries.push(bullet[1] ?? "");
-    } else if (numbered) {
-      if (!list || !list.ordered) { flush(); list = { ordered: true, entries: [] }; }
-      list.entries.push(numbered[1] ?? "");
-    } else {
-      flush();
-      if (line.trim()) blocks.push(<p key={blocks.length}>{renderInline(line)}</p>);
-    }
-  }
-  flush();
-  if (trailing) {
-    const last = blocks[blocks.length - 1] as ReactElement<{ children?: ReactNode }> | undefined;
-    if (last?.type === "p") {
-      blocks[blocks.length - 1] = (
-        <p key={last.key ?? undefined}>
-          {last.props.children}
-          {trailing}
-        </p>
-      );
-    } else {
-      blocks.push(<Fragment key={"locates-" + blocks.length}>{trailing}</Fragment>);
-    }
-  }
-  return blocks;
 }
 
-/** 行内渲染：只支持加粗，其余保持原文本；不解析任何 HTML。 */
-function renderInline(text: string): ReactNode[] {
-  if (!text.includes("**")) return [text];
-  return text.split(/(\*\*[^*]+\*\*)/g).map((part, index) =>
-    part.startsWith("**") && part.endsWith("**") && part.length > 4
-      ? <strong key={index}>{part.slice(2, -2)}</strong>
-      : <Fragment key={index}>{part}</Fragment>);
+function renderMarkdown(text: string, trailing?: ReactNode): ReactNode {
+  return (
+    <Markdown
+      skipHtml
+      remarkPlugins={trailing ? [remarkGfm, appendCitations] : [remarkGfm]}
+      components={{
+        span: ({ className, children }) =>
+          className === "citation-anchor" ? (
+            trailing
+          ) : (
+            <span className={className}>{children}</span>
+          ),
+        table: ({ children }) => (
+          <div className="overflow-x-auto">
+            <table>{children}</table>
+          </div>
+        ),
+        // 模型返回的图片只展示说明，避免报告正文自行向第三方发起图片请求。
+        img: ({ alt }) => <span>{alt}</span>,
+      }}
+    >
+      {text}
+    </Markdown>
+  );
+}
+
+function renderInline(text: string): ReactNode {
+  return (
+    <Markdown
+      skipHtml
+      components={{ p: "span", img: ({ alt }) => <span>{alt}</span> }}
+    >
+      {text}
+    </Markdown>
+  );
 }

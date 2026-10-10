@@ -1,4 +1,7 @@
 "use client";
+import type { InputRef } from "antd";
+import { Button, Input, Modal, Space } from "antd";
+import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
 
 /**
  * 单条字段结果卡：值、证据定位和复核操作。
@@ -12,14 +15,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import {
-  BUTTON_CLASS,
-  DATA_CLASS,
-  DANGER_GHOST_BUTTON_CLASS,
-  GHOST_BUTTON_CLASS,
-  INPUT_CLASS,
-  PRIMARY_BUTTON_CLASS,
-} from "@/components/ui";
+import { DATA_CLASS } from "@/components/ui";
 import type { ReviewEvidenceInput, ReviewInput } from "@/lib/api/client";
 import {
   statusDotClass,
@@ -29,7 +25,11 @@ import {
 import type { RerunButtonMode } from "@/lib/results/rerun";
 import { useViewerStore } from "@/lib/store/viewerStore";
 import type { EvidenceTarget } from "@/lib/viewer/evidenceIndex";
-import type { WireAttempt, WireConflict, WireExtraction } from "@/types/workbench";
+import type {
+  WireAttempt,
+  WireConflict,
+  WireExtraction,
+} from "@/types/workbench";
 
 import { AttemptHistory } from "./AttemptHistory";
 import { EvidenceList } from "./EvidenceList";
@@ -74,6 +74,8 @@ export function ResultCard({
 }: Props) {
   const label = statusLabel(extraction.status);
   const isNotFound = extraction.status === "not_found";
+  const [dirty, setDirty] = useState(false);
+  const closeEditor = useUnsavedChanges(dirty, busy);
   const [editMode, setEditMode] = useState<EditMode>(null);
   const [draftValue, setDraftValue] = useState(extraction.value_text);
   const [draftAnchor, setDraftAnchor] = useState(targets[0]?.anchor ?? "");
@@ -85,13 +87,14 @@ export function ResultCard({
   const [attemptsLoading, setAttemptsLoading] = useState(false);
   const [attemptsError, setAttemptsError] = useState<string | null>(null);
   const activeAnchor = useViewerStore((state) =>
-    state.activeEvidence !== null && state.activeEvidence.extractionId === extraction.id
+    state.activeEvidence !== null &&
+    state.activeEvidence.extractionId === extraction.id
       ? state.activeEvidence.anchor
       : null,
   );
   const onlyTarget = targets.length === 1 ? targets[0] : undefined;
   const rootRef = useRef<HTMLElement | null>(null);
-  const rerunInputRef = useRef<HTMLInputElement | null>(null);
+  const rerunInputRef = useRef<InputRef | null>(null);
   const [conflictBusy, setConflictBusy] = useState(false);
 
   // Shift+Enter：展开重跑面板并把光标送进提示输入框，用户接着打字即可。
@@ -122,6 +125,7 @@ export function ResultCard({
 
   const beginEdit = (mode: EditMode) => {
     setEditMode(mode);
+    setDirty(false);
     setDraftValue(isNotFound ? "" : extraction.value_text);
     setDraftAnchor(targets[0]?.anchor ?? "");
     setDraftQuote(targets[0]?.quote ?? "");
@@ -131,7 +135,9 @@ export function ResultCard({
     const value = draftValue.trim();
     const anchor = draftAnchor.trim();
     if (!value || !anchor) return;
-    const evidence: ReviewEvidenceInput[] = [{ anchor, quote: draftQuote.trim() || undefined }];
+    const evidence: ReviewEvidenceInput[] = [
+      { anchor, quote: draftQuote.trim() || undefined },
+    ];
     const succeeded = await onReview({
       attempt_id: extraction.id,
       action: editMode === "supplement" ? "supplement" : "correct",
@@ -139,7 +145,10 @@ export function ResultCard({
       new_value: value,
       evidence,
     });
-    if (succeeded) setEditMode(null);
+    if (succeeded) {
+      setEditMode(null);
+      setDirty(false);
+    }
   };
 
   const submitConfirm = async () => {
@@ -179,13 +188,16 @@ export function ResultCard({
     void onLoadAttempts(extraction.id)
       .then((items) => setAttempts(items))
       .catch((error: unknown) => {
-        setAttemptsError(error instanceof Error ? error.message : "尝试链加载失败");
+        setAttemptsError(
+          error instanceof Error ? error.message : "尝试链加载失败",
+        );
       })
       .finally(() => setAttemptsLoading(false));
   };
 
   const attemptNote =
-    extraction.machine_attempt_no === null || extraction.machine_attempt_no === undefined
+    extraction.machine_attempt_no === null ||
+    extraction.machine_attempt_no === undefined
       ? extraction.trigger === "manual_edit"
         ? "人工"
         : null
@@ -212,7 +224,9 @@ export function ResultCard({
           <span className="flex shrink-0 items-center gap-1.5 text-[13px]">
             <span
               aria-hidden
-              className={"h-1.5 w-1.5 rounded-full " + statusDotClass(extraction.status)}
+              className={
+                "h-1.5 w-1.5 rounded-full " + statusDotClass(extraction.status)
+              }
             />
             <span className={statusTextClass(extraction.status)}>{label}</span>
           </span>
@@ -233,7 +247,9 @@ export function ResultCard({
 
         <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] text-slate-400">
           {!isNotFound && (
-            <span className={DATA_CLASS}>置信度 {(extraction.confidence * 100).toFixed(0)}%</span>
+            <span className={DATA_CLASS}>
+              置信度 {(extraction.confidence * 100).toFixed(0)}%
+            </span>
           )}
           {attemptNote !== null && (
             <>
@@ -270,7 +286,11 @@ export function ResultCard({
 
       {(targets.length > 1 || (forceOpen && targets.length > 0)) && (
         <div className="px-3.5 pb-2">
-          <EvidenceList targets={targets} activeAnchor={activeAnchor} onLocate={onLocate} />
+          <EvidenceList
+            targets={targets}
+            activeAnchor={activeAnchor}
+            onLocate={onLocate}
+          />
         </div>
       )}
 
@@ -291,22 +311,29 @@ export function ResultCard({
                 className="flex items-start justify-between gap-3 border border-rose-100 bg-white px-2 py-1.5"
               >
                 <span className="min-w-0 flex-1">
-                  <span className={DATA_CLASS + " block text-[16px] leading-6 break-words text-slate-900"}>
+                  <span
+                    className={
+                      DATA_CLASS +
+                      " block text-[16px] leading-6 break-words text-slate-900"
+                    }
+                  >
                     {candidate.value_text || "（空值）"}
                   </span>
                   <span className="mt-0.5 block truncate text-[13px] text-slate-500">
                     {candidate.display_name}
-                    {candidate.page_no !== null ? " · 第 " + candidate.page_no + " 页" : ""}
+                    {candidate.page_no !== null
+                      ? " · 第 " + candidate.page_no + " 页"
+                      : ""}
                   </span>
                 </span>
-                <button
-                  type="button"
+                <Button
+                  htmlType="button"
                   disabled={busy || conflictBusy}
                   onClick={() => void decideConflict(candidate.id)}
-                  className={BUTTON_CLASS + " shrink-0"}
+                  className={" shrink-0"}
                 >
                   采用这条
-                </button>
+                </Button>
               </li>
             ))}
           </ul>
@@ -327,44 +354,60 @@ export function ResultCard({
       <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-100 px-3.5 py-2">
         {isNotFound ? (
           <>
-            <button type="button" className={PRIMARY_BUTTON_CLASS} disabled={busy} onClick={submitConfirm}>
+            <Button
+              type="primary"
+              htmlType="button"
+              disabled={busy}
+              onClick={submitConfirm}
+            >
               确认没有
-            </button>
-            <button
-              type="button"
-              className={BUTTON_CLASS}
+            </Button>
+            <Button
+              htmlType="button"
+
               disabled={busy}
               onClick={() => beginEdit("supplement")}
             >
               人工补充
-            </button>
+            </Button>
           </>
         ) : (
           <>
-            <button type="button" className={PRIMARY_BUTTON_CLASS} disabled={busy} onClick={submitConfirm}>
+            <Button
+              type="primary"
+              htmlType="button"
+              disabled={busy}
+              onClick={submitConfirm}
+            >
               确认
-            </button>
-            <button
-              type="button"
-              className={BUTTON_CLASS}
+            </Button>
+            <Button
+              htmlType="button"
+
               disabled={busy}
               onClick={() => beginEdit("correct")}
             >
               修正
-            </button>
+            </Button>
             {rerunButton !== "hide" && (
-              <button
-                type="button"
-                className={BUTTON_CLASS}
+              <Button
+                htmlType="button"
+
                 disabled={busy}
                 onClick={() => setRerunOpen((open) => !open)}
               >
                 重跑
-              </button>
+              </Button>
             )}
-            <button type="button" className={DANGER_GHOST_BUTTON_CLASS} disabled={busy} onClick={submitReject}>
+            <Button
+              danger
+              type="text"
+              htmlType="button"
+              disabled={busy}
+              onClick={submitReject}
+            >
               驳回
-            </button>
+            </Button>
           </>
         )}
       </div>
@@ -392,82 +435,117 @@ export function ResultCard({
             <span className="text-[13px] text-slate-500">
               重跑时给模型的提示（可留空，留空即普通重跑）
             </span>
-            <input
+            <Input
               ref={rerunInputRef}
               value={rerunHint}
               onChange={(event) => setRerunHint(event.target.value)}
               placeholder="例如：该值可能在「投标人须知前附表」或「评标办法」章节"
-              className={INPUT_CLASS}
             />
           </label>
           <div className="flex gap-1.5">
-            <button type="button" className={PRIMARY_BUTTON_CLASS} disabled={busy} onClick={() => void submitRerun()}>
+            <Button
+              type="primary"
+              htmlType="button"
+              disabled={busy}
+              onClick={() => void submitRerun()}
+            >
               提交重跑
-            </button>
-            <button
-              type="button"
-              className={BUTTON_CLASS}
+            </Button>
+            <Button
+              htmlType="button"
+
               disabled={busy}
               onClick={() => setRerunOpen(false)}
             >
               取消
-            </button>
+            </Button>
           </div>
         </div>
       )}
 
-      {editMode !== null && (
-        <div className="flex flex-col gap-2.5 border-t border-sky-200 bg-sky-50 px-3.5 py-2.5">
+      <Modal
+        open={editMode !== null}
+        title={editMode === "supplement" ? "补充字段结果" : "修正字段结果"}
+        centered
+        destroyOnHidden
+        className="editor-modal"
+        mask={{ closable: false }}
+        keyboard={!busy}
+        closable={!busy}
+        onCancel={() =>
+          closeEditor(() => {
+            setEditMode(null);
+            setDirty(false);
+          })
+        }
+        footer={
+          <Space>
+            <Button
+              disabled={busy}
+              onClick={() =>
+                closeEditor(() => {
+                  setEditMode(null);
+                  setDirty(false);
+                })
+              }
+            >
+              取消
+            </Button>
+            <Button
+              type="primary"
+              loading={busy}
+              disabled={!draftValue.trim() || !draftAnchor.trim()}
+              onClick={() => void submitEdit()}
+            >
+              提交{editMode === "supplement" ? "补充" : "修正"}
+            </Button>
+          </Space>
+        }
+      >
+        <fieldset disabled={busy} className="space-y-4">
           <label className="flex flex-col gap-1.5">
             <span className="text-[13px] text-slate-500">
               {editMode === "supplement" ? "补充的值" : "修正后的值"}
             </span>
-            <input
+            <Input
               autoFocus
               value={draftValue}
-              onChange={(event) => setDraftValue(event.target.value)}
+              onChange={(event) => {
+                setDraftValue(event.target.value);
+                setDirty(true);
+              }}
               placeholder="填写修正后的值"
-              className={INPUT_CLASS}
             />
           </label>
           <label className="flex flex-col gap-1.5">
-            <span className="text-[13px] text-slate-500">原文位置（锚点，已按当前证据预填）</span>
-            <input
+            <span className="text-[13px] text-slate-500">
+              原文位置（锚点，已按当前证据预填）
+            </span>
+            <Input
               value={draftAnchor}
-              onChange={(event) => setDraftAnchor(event.target.value)}
+              onChange={(event) => {
+                setDraftAnchor(event.target.value);
+                setDirty(true);
+              }}
               placeholder="例如 p12b5"
-              className={INPUT_CLASS + " " + DATA_CLASS}
+              className={" " + DATA_CLASS}
             />
           </label>
           <label className="flex flex-col gap-1.5">
-            <span className="text-[13px] text-slate-500">该位置的原文片段（选填，便于复核时比对）</span>
-            <textarea
+            <span className="text-[13px] text-slate-500">
+              该位置的原文片段（选填，便于复核时比对）
+            </span>
+            <Input.TextArea
               value={draftQuote}
-              onChange={(event) => setDraftQuote(event.target.value)}
+              onChange={(event) => {
+                setDraftQuote(event.target.value);
+                setDirty(true);
+              }}
               rows={2}
-              className={INPUT_CLASS}
             />
           </label>
-          <div className="flex gap-1.5">
-            <button
-              type="button"
-              className={PRIMARY_BUTTON_CLASS}
-              disabled={busy || !draftValue.trim() || !draftAnchor.trim()}
-              onClick={() => void submitEdit()}
-            >
-              提交{editMode === "supplement" ? "补充" : "修正"}
-            </button>
-            <button
-              type="button"
-              className={GHOST_BUTTON_CLASS}
-              disabled={busy}
-              onClick={() => setEditMode(null)}
-            >
-              取消
-            </button>
-          </div>
-        </div>
-      )}
+        </fieldset>
+      </Modal>
     </article>
   );
 }
