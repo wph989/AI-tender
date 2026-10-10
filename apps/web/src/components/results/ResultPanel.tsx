@@ -54,7 +54,10 @@ interface Props {
   projectId: number | null;
   /** 服务端下发的重跑按钮口径（09 第 8 节）；没有统计的字段回落 show。 */
   rerunModes: Record<string, RerunButtonMode>;
+  /** 单条操作（复核/重跑）正在提交：只锁对应的那张卡，别锁整个面板。 */
   busyExtractionId: number | null;
+  /** 批量确认在跑：整面板都要锁，避免边确认边刷新。 */
+  batchBusy: boolean;
   /** 复核队列：冲突/待复核排最前，冲突项就地展开两侧取值（见 06 第 11 节）。 */
   reviewOnly: boolean;
   onReviewModeChange: (next: boolean) => void;
@@ -109,6 +112,7 @@ export function ResultPanel({
   projectId,
   rerunModes,
   busyExtractionId,
+  batchBusy,
   reviewOnly,
   onReviewModeChange,
   conflictsByField = NO_CONFLICTS,
@@ -363,7 +367,7 @@ export function ResultPanel({
                 <button
                   type="button"
                   onClick={() => void onBatchConfirm(batchable)}
-                  disabled={busyExtractionId !== null}
+                  disabled={batchBusy || busyExtractionId !== null}
                   className="border border-emerald-300 bg-white px-2 py-0.5 hover:bg-emerald-100 disabled:opacity-40"
                 >
                   批量确认
@@ -383,7 +387,7 @@ export function ResultPanel({
                     extraction={item}
                     targets={index.byExtraction.get(item.id) ?? NO_TARGETS}
                     rerunButton={rerunMode(rerunModes, item.field_key)}
-                    busy={busyExtractionId !== null}
+                    busy={batchBusy || busyExtractionId === item.id}
                     highlighted={item.id === cursorId}
                     forceOpen={reviewOnly && item.status === "conflict"}
                     conflict={conflictsByField.get(item.field_key) ?? null}

@@ -118,6 +118,9 @@ export function DocumentWorkbench({
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyExtractionId, setBusyExtractionId] = useState<number | null>(null);
+  // 批量确认是整面板动作，与单条操作的「只锁自己那张卡」分开记：混用一个状态时，
+  // 要么锁不住其它卡片，要么让单条重跑的整个等待期把所有卡片都冻住。
+  const [batchBusy, setBatchBusy] = useState(false);
   const [rerunModes, setRerunModes] = useState<Record<string, RerunButtonMode>>(
     {},
   );
@@ -444,7 +447,7 @@ export function DocumentWorkbench({
     async (items: readonly WireExtraction[]): Promise<void> => {
       if (batchLock.current) return;
       batchLock.current = true;
-      setBusyExtractionId(-1);
+      setBatchBusy(true);
       setNotice(`正在批量确认 ${items.length} 项…`);
       let failed = 0;
       for (const item of items) {
@@ -469,7 +472,7 @@ export function DocumentWorkbench({
         setNotice(errorMessage(error, "确认已提交，刷新失败"));
       } finally {
         batchLock.current = false;
-        setBusyExtractionId(null);
+        setBatchBusy(false);
       }
     },
     [settle, setNotice],
@@ -625,6 +628,7 @@ export function DocumentWorkbench({
                 rerunModes={rerunModes}
                 projectId={data.projectId}
                 busyExtractionId={busyExtractionId}
+                batchBusy={batchBusy}
                 reviewOnly={reviewOnly}
                 onReviewModeChange={setReviewOnly}
                 conflictsByField={conflictsByField}

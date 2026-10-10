@@ -1401,9 +1401,15 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 
 #### 2026-10-10 提交后的代码审查与待修复项
 
-用户要求先提交当前前端改造，再修改审查发现的问题。代码审查确认两处本次引入的行为缺陷，均待修复（尚未改动）：
+用户要求先提交当前前端改造，再修改审查发现的问题。前端改造已提交（提交 `fee563d`），审查确认的两处行为缺陷已修复但尚未提交：
 
 - `apps/web/src/components/llm/ProvidersPanel.tsx`：新加的「搜索远端模型」输入框（约 443 行）位于 `Form id=import-models`（`onFinish={importSelected}`）内部，footer 的「导入 N 个模型」是 `htmlType=submit` 的默认提交按钮。已勾选模型后，在搜索框按 Enter 会触发隐式提交，直接发出导入（创建模型）的写请求。修法：把搜索框移到表单之外，或在搜索框上拦截 Enter 的默认行为。
 - `apps/web/src/components/results/ResultPanel.tsx`：结果卡的 `busy` 由 `busyExtractionId === item.id` 改为 `busyExtractionId !== null`（约 386 行）。`busyExtractionId` 会一直持有到 `waitForJob` 返回，单字段重跑期间其它卡片的确认/修正/重跑/驳回全部被禁用。修法：卡片只在自己被提交时禁用，另用独立标记挡住并发写请求。
 
 另需注意：仓库根目录存在未跟踪的 `pelican-bicycle.html`（与本项目无关的演示文件），提交时刻意未纳入版本库，勿误加。
+
+修复方式与验证：
+
+- 两处修复：导入弹窗在表单层拦截 Enter 的默认行为（表单只提供 Form 上下文，唯一提交入口仍是页脚按钮）；结果面板恢复「单条操作只锁自己那张卡」，批量确认改用独立的 `batchBusy` 做整面板加锁。
+- `pnpm --dir apps/web typecheck` 通过；`pnpm --dir apps/web test` → 12 个文件 / 77 项通过。这两条路径都未被现有 e2e 覆盖，未重跑 Playwright。
+- `pelican-bicycle.html` 已不在工作区（勿再补回）。

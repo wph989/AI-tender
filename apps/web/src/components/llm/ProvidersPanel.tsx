@@ -408,10 +408,16 @@ export function ProvidersPanel({
             </Spin>
           )
         ) : (
+          /* 这个表单只为下方能力与参数字段提供 Form 上下文，唯一的提交入口是页脚的
+             「导入 N 个模型」按钮。不在表单层拦 Enter 的话，在搜索框或参数输入框里回车
+             会触发浏览器的隐式提交，直接把已勾选的模型导入（一次创建模型的写请求）。 */
           <Form
             id="import-models"
             layout="vertical"
             disabled={busy}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.preventDefault();
+            }}
             onFinish={importSelected}
           >
             <p className="mb-4 text-sm text-slate-500">
