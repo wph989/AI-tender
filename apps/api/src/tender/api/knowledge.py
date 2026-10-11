@@ -784,6 +784,13 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
                 carry.pop("last_unsubmitted_message_id", None)
                 carry.pop("field_failures", None)
                 carry.pop("unavailable_submissions", None)
+                for key in (
+                    "loaded_skill", "correction_failures", "tool_failures",
+                    "consecutive_tool_failures", "identical_tool_calls", "read_tool_cache",
+                    "progress_message_id", "progress_signature", "no_progress_rounds",
+                    "finish_only", "subagent_retries",
+                ):
+                    carry.pop(key, None)
                 # 旧校验失败可能遗留收尾意图；新 attempt 必须允许补读并重新确认完成。
                 carry.pop("pending_final", None)
                 try:

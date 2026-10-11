@@ -1,4 +1,4 @@
-﻿"""用真实 DeepAgents 图验证权限、工具执行、纠正与 checkpoint 恢复。"""
+"""用真实 DeepAgents 图验证权限、工具执行、纠正与 checkpoint 恢复。"""
 
 import asyncio
 import copy
@@ -25,7 +25,7 @@ from tender.ports.llm import Completion
 KEY = "project_basic_info_parsing"
 SKILL = {
     KEY
-    + "/SKILL.md": "---\nname: project_basic_info_parsing\ndescription: 分析概况\n---\n检索项目概况"
+    + "/SKILL.md": "---\nname: project-basic-info-parsing\ndescription: 分析概况\n---\n检索项目概况"
 }
 
 
@@ -140,7 +140,7 @@ def test_graph_uses_native_tools_and_resumes_completed_checkpoint_without_model_
         research = session([block()])
         router = ScriptedRouter(
             [
-                call("read_file", {"file_path": f"/skills/{KEY}/SKILL.md"}, 1),
+                call("read_file", {"file_path": "/skills/project-basic-info-parsing/SKILL.md"}, 1),
                 call("search_document", {"query": "质保要求"}, 2),
                 call(
                     "submit_analysis",
@@ -192,7 +192,7 @@ def test_graph_uses_native_tools_and_resumes_completed_checkpoint_without_model_
             "submit_analysis",
         }
         assert state["draft"]["fields"][0]["values"][0]["citations"][0]["quote"] == "质保三年"
-        assert len(reserved) == 4
+        assert len(reserved) == 5  # 运行时强制加载Skill也占用一次工具预算。
         assert saved[-2]["staged_items"][0]["values"][0]["value"] == "质保三年"
         assert "draft" not in saved[-2]
         assert saved[-1]["research"]["seen"]
@@ -268,7 +268,8 @@ def test_tool_result_replays_after_crash_without_duplicate_retrieval():
 
         async def crash_save(value):
             persisted.update(copy.deepcopy(value))
-            raise ConnectionError("模拟工具持久化后、图提交前崩溃")
+            if value.get("tool_results"):
+                raise ConnectionError("模拟工具持久化后、图提交前崩溃")
 
         async def noop(*args):
             pass
@@ -329,7 +330,7 @@ def test_context_compaction_preserves_original_evidence_and_only_writes_history(
         router = SummaryRouter(
             [
                 call("search_document", {"query": "质保"}, 1),
-                call("read_document", {"source_id": 1, "offset": 0, "limit": 1}, 2),
+                call("read_document", {"block_id": "s1r1c0", "before": 0, "after": 0}, 2),
                 call("search_document", {"query": "质量保证"}, 3),
                 call(
                     "submit_analysis",
@@ -361,7 +362,7 @@ def test_context_compaction_preserves_original_evidence_and_only_writes_history(
         assert research.seen[original["block_id"]]["content"] == original["content"]
         created = set(result["files"]) - set(files)
         assert created and all(path.startswith("/conversation_history/") for path in created)
-        assert result["files"][f"/skills/{KEY}/SKILL.md"] == files[f"/skills/{KEY}/SKILL.md"]
+        assert result["files"]["/skills/project-basic-info-parsing/SKILL.md"] == files["/skills/project-basic-info-parsing/SKILL.md"]
 
     asyncio.run(run())
 
@@ -530,7 +531,7 @@ def test_scope_and_schema_errors_are_bounded_feedback_without_leaking_bad_draft(
         research = session([block()], limits=AgentLimits(context_tokens=128000))
         router = ScriptedRouter(
             [
-                call("read_document", {"source_id": 99, "offset": 0}, 1),
+                call("read_document", {"block_id": "unknown"}, 1),
                 call("search_document", {"query": "质保"}, 2),
                 call(
                     "submit_analysis",
@@ -659,7 +660,7 @@ def test_out_of_range_read_arguments_return_error_message_and_keep_module_alive(
         research = session([block()])
         router = ScriptedRouter(
             [
-                call("read_document", {"source_id": 1, "offset": -1, "limit": 6}, 1),
+                call("read_document", {"block_id": "s1r1c0", "before": -1}, 1),
                 call("search_document", {"query": "质保"}, 2),
                 call(
                     "submit_analysis",
@@ -690,7 +691,7 @@ def test_out_of_range_read_arguments_return_error_message_and_keep_module_alive(
         await invoke_module(graph, files, thread_id="bad-read-args", task="分析")
         # 越界参数只回传错误提示，模型可改用正确参数继续，模块不因此失败。
         assert state["tool_results"]["call_1"]["data"]["status"] == "error"
-        assert "1到12块" in state["tool_results"]["call_1"]["data"]["content"]
+        assert "最多12块" in state["tool_results"]["call_1"]["data"]["content"]
         assert state["draft"]["fields"] == []
 
     asyncio.run(run())
@@ -702,7 +703,7 @@ def test_evidence_budget_feedback_keeps_module_alive():
         router = ScriptedRouter(
             [
                 call("search_document", {"query": "质保"}, 1),
-                call("read_document", {"source_id": 2, "offset": 0}, 2),
+                call("search_knowledge", {"query": "质保"}, 2),
                 call(
                     "submit_analysis",
                     {
@@ -1159,7 +1160,7 @@ def test_failed_final_review_requires_a_new_final_submission(failure):
                 "fields": [submitted_field("质保", "质保五年")],
                 "relations": [], "research_summary": "首次提交",
             }, 2),
-            call("read_document", {"source_id": 1, "offset": 0, "limit": 1}, 3),
+            call("read_document", {"block_id": "s1r1c0", "before": 0, "after": 0}, 3),
             call("submit_analysis", {
                 "fields": [submitted_field("质保", "质保三年")],
                 "relations": [], "research_summary": "已纠正，继续核对", "final": False,

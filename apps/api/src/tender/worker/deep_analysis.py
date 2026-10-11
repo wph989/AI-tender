@@ -1,4 +1,4 @@
-﻿"""确定性调度全部模块，模块内部的阅读与检索由独立 DeepAgents 子图决定。"""
+"""确定性调度全部模块，模块内部的阅读与检索由独立 DeepAgents 子图决定。"""
 
 from __future__ import annotations
 
@@ -260,7 +260,23 @@ async def execute_module(
                 # 结论（supported / verification_issues）由 verify_items 写在条目上，
                 # 由 Agent 图的校验节点按条目归因到字段纠正次数；整批抛错会让同批字段反复重审。
                 evidence = await verification_evidence(items)
-                await verify_items(model, items, explain=True, evidence=evidence)
+                await verify_items(
+                    model, items, explain=True, evidence=evidence, select_evidence=True
+                )
+                # 只对最终被选中且通过支持性校验的ID解析位置，模型不能提供或修改定位字段。
+                await authorize()
+                resolved = {}
+                for item in items:
+                    if item.get("verification") != "supported":
+                        continue
+                    for value in item["values"]:
+                        for ref in value["citations"]:
+                            key = str(ref["block_id"])
+                            if key not in resolved:
+                                resolved[key] = await asyncio.to_thread(db.resolve, ref)
+                            ref.update(
+                                {k: resolved[key][k] for k in ("page_no", "file_name", "bbox")}
+                            )
 
             async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn()) as saver:
                 graph, files = build_module_agent(
@@ -287,6 +303,9 @@ async def execute_module(
                     graph,
                     files,
                     thread_id=runtime.run["thread_id"],
+                    state=state,
+                    save=save,
+                    max_retries=limits.max_subagent_retries,
                     task=(
                         f"分析模块：{MODULES[module['module_key']]}。项目设置："
                         + encode(
@@ -296,7 +315,7 @@ async def execute_module(
                                 "lots": report["lot_settings"],
                             }
                         )
-                        + "。先列出资料与按需读取 Skill，自主检索本模块条件并核对补充文件。"
+                        + "。运行时已加载当前Skill，先列出资料，自主检索本模块条件并核对补充文件。"
                     ),
                 )
             await authorize()

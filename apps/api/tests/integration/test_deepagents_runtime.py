@@ -242,6 +242,128 @@ class NativeRouter:
         pass
 
 
+def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypatch):
+    """真实图、检查点和元素表串联，证明模型看不到位置且只解析最终选中的证据。"""
+    row = report(env)
+    with env.engine.begin() as conn:
+        conn.execute(
+            text("""INSERT INTO element
+            (version_id,run_id,page_no,order_no,anchor,type,text,bbox_x0,bbox_y0,bbox_x1,bbox_y1)
+            SELECT version_id,run_id,1,2,'p1b2','text',text,0.2,0.3,0.9,0.4
+            FROM element LIMIT 1""")
+        )
+    row, sources = worker.prepare_report(env.db, row)
+    run = env.db.rows("""SELECT a.*,m.module_key FROM agent_module_run a
+        JOIN analysis_module m ON m.id=a.module_id ORDER BY a.id LIMIT 1""")[0]
+    selected, resolved_ids = [], []
+    original_resolve = env.db.resolve
+
+    def resolve(ref, **kwargs):
+        resolved_ids.append(ref["block_id"])
+        return original_resolve(ref, **kwargs)
+
+    class EvidenceRouter(NativeRouter):
+        async def chat(self, messages, tools):
+            if self.calls == 0:
+                return await super().chat(messages, tools)
+            await self.reserve()
+            self.calls += 1
+            result = next(
+                json.loads(m["data"]["content"])
+                for m in messages
+                if m["type"] == "tool" and m["data"].get("name") == "search_document"
+            )
+            assert "retrieval" not in result
+            assert all(set(b) == {"id", "text"} for b in result["blocks"])
+            args = {
+                "fields": [
+                    {
+                        "field": "质保",
+                        "group": "",
+                        "sort_order": 0,
+                        "note": "",
+                        "values": [
+                            {
+                                "value": "质保三年",
+                                "citations": [
+                                    {"block_id": b["id"], "quote": "质保三年"}
+                                    for b in result["blocks"]
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                "relations": [],
+                "research_summary": "已核对质保",
+                "final": True,
+            }
+            return Completion(
+                content="",
+                model="fixture",
+                agent_message=message_to_dict(
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"name": "submit_analysis", "args": args, "id": "submit"}],
+                    )
+                ),
+            )
+
+        async def complete(self, prompt):
+            await self.reserve()
+            items = json.loads(prompt.rsplit("\n", 1)[-1])
+            refs = items[0]["values"][0]["citations"]
+            assert len(refs) == 2 and all(set(r) == {"id", "text"} for r in refs)
+            selected.append(refs[-1]["id"])
+            return Completion(
+                content=json.dumps(
+                    {
+                        "reviews": [
+                            {
+                                "supported": True,
+                                "unsupported_claims": [],
+                                "evidence_ids": [[selected[-1]]],
+                            }
+                        ]
+                    }
+                ),
+                model="fixture",
+            )
+
+    async def retrieve(db, selected_sources, query, *args, **kwargs):
+        return db.readable_chunks(selected_sources[0]), {"mode": "keyword"}
+
+    monkeypatch.setattr(
+        worker, "_routing_model", lambda feature, purpose, **kw: EvidenceRouter(**kw)
+    )
+    monkeypatch.setattr(worker, "retrieve_chunks", retrieve)
+    monkeypatch.setattr(env.db, "resolve", resolve)
+    run_async(worker.execute_module(env.db, row, run, sources))
+    module = env.db.rows("SELECT * FROM analysis_module WHERE id=:id", {"id": run["module_id"]})[0]
+    assert module["status"] == "completed", module["error_message"]
+    assert resolved_ids == selected and len(selected) == 1
+    refs = module["items"][0]["values"][0]["citations"]
+    assert len(refs) == 1 and refs[0]["block_id"] == selected[0]
+    assert refs[0]["bbox"] == [0.2, 0.3, 0.9, 0.4]
+
+
+def test_guard_migration_seeds_isolated_config_catalog(env):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "alembic/versions/0010_analysis_guards.py"
+    spec = importlib.util.spec_from_file_location("guard_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with env.engine.begin() as conn:
+        # search_path首先命中测试schema；不给业务配置定义或活动发布写入任何内容。
+        conn.execute(text("CREATE TABLE config_item (LIKE public.config_item INCLUDING ALL)"))
+        for statement in migration._STATEMENTS:
+            conn.execute(text(statement))
+        rows = conn.execute(text("SELECT key,default_value FROM config_item")).all()
+    assert len(rows) == 5
+    assert dict(rows)["analysis.max_subagent_retries"] == 2
+
+
 def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, monkeypatch):
     row = report(env)
     routers = []
@@ -275,6 +397,8 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     assert len({r["thread_id"] for r in runs}) == 13
     assert all(r["status"] == "completed" and r["model_calls"] == 2 for r in runs)
     assert all(r["state"]["research"]["seen"] for r in runs)
+    assert all(r["state"]["loaded_skill"]["sha256"] for r in runs)
+    assert len(env.db.rows("SELECT id FROM agent_run_event WHERE kind='skill_loaded'")) == 13
     assert result["coverage"]["mode"] == "agent_research"
     assert "scanned_blocks" not in result["coverage"]
     assert len(env.db.rows("SELECT id FROM agent_run_event WHERE kind='client_close_failed'")) == 13
@@ -484,13 +608,16 @@ def test_explicit_retry_reparses_completed_module_from_scratch(env):
     runtime.release()
     report_id = runtime.report["id"]
     module_id = runtime.run["module_id"]
-    key = env.db.rows(
-        "SELECT module_key FROM analysis_module WHERE id=:id", {"id": module_id}
-    )[0]["module_key"]
+    key = env.db.rows("SELECT module_key FROM analysis_module WHERE id=:id", {"id": module_id})[0][
+        "module_key"
+    ]
     env.db.execute("UPDATE analysis_report SET status='completed' WHERE id=:id", {"id": report_id})
-    assert knowledge.retry_report(report_id, knowledge.RetryInput(module_keys=[key]), env.request)[
-        "status"
-    ] == "pending"
+    assert (
+        knowledge.retry_report(report_id, knowledge.RetryInput(module_keys=[key]), env.request)[
+            "status"
+        ]
+        == "pending"
+    )
     rows = env.db.rows(
         "SELECT attempt,state FROM agent_module_run WHERE module_id=:id ORDER BY attempt",
         {"id": module_id},
@@ -538,9 +665,7 @@ def test_dynamic_reference_revocation_stops_tool_and_hides_existing_result(env):
             "field": "历史参考",
             "group": "",
             "sort_order": 0,
-            "values": [
-                {"value": "五年", "citations": [{"collection_id": cid}]}
-            ],
+            "values": [{"value": "五年", "citations": [{"collection_id": cid}]}],
             "note": "",
         }
         shown = knowledge.visible_items(
@@ -581,6 +706,9 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
     # 未在配置中心显式调整的键回落默认值，同样不沿用旧快照。
     assert runs[-1]["limits"]["max_tool_calls"] == 48
     # 报告创建时的快照保持原值，只作为历史记录，不被补跑改写。
-    assert knowledge.report_row(env.request, runtime.report["id"])["runtime_settings"][
-        "max_model_calls"
-    ] == 40
+    assert (
+        knowledge.report_row(env.request, runtime.report["id"])["runtime_settings"][
+            "max_model_calls"
+        ]
+        == 40
+    )

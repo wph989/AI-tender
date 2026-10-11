@@ -1,12 +1,12 @@
 ---
-name: biz_standard_parsing
+name: biz-standard-parsing
 description: "商务标准解析专家。从招标文件中提取付款、交付、验收、质保、违约、担保、知识产权、争议解决及合同变更终止等合同履约条款。"
 ---
 
 # 商务标准解析 Skill
 
 ## 适用场景
-- 触发：主 Agent 委派商务标准解析任务时调用。
+- 触发：项目控制器启动当前专题商务标准解析任务时调用。
 - 输入：授权资料清单与按需检索得到的原文块，不预先灌入全文。
 - 输出：submit_analysis 原生工具提交的字段（field/group/sort_order/values/note），每个值附已读取原文块的引用。
 
@@ -45,13 +45,21 @@ description: "商务标准解析专家。从招标文件中提取付款、交付
 
 ## 工具与证据
 
-- `list_documents()`：获取本项目及关联知识库的授权资料清单。
-- `search_document(query, source_id?)`：自主检索项目条款，可限定清单中的某个来源。
-- `search_knowledge(query, source_id?)`：检索关联参考库，历史依据不能证明本次满足要求。
-- `read_document(source_id, offset, limit)`：按命中位置扩展原文，每次最多12块；压缩后也可补读。
-- `read_file(file_path)`：只读 `/skills/biz_standard_parsing/SKILL.md` 及其 references，或会话压缩历史。
-- `submit_analysis`：提交本模块综合结果和检索总结。相同命中先去重，再分析条件、例外与修订。
-不进行全文顺序扫描；基于本专题问题选择检索角度，核对各份相关补充文件。
+- 运行时先调用 `load_skill` 加载本文件及 `references/output_format.md`，无需重复读取；其余细则按需读取。
+- `list_documents()`：返回授权资料的 id 和说明文本；资料 id 可填入检索的 source_id。
+- `search_document(query, source_id?)`：检索本项目；`search_knowledge(query, source_id?)`：检索关联参考库。
+- 检索证据只含 `id`、`text`。把证据 id 填入引用的 `block_id`；quote 必须是该 text 的连续原文。
+- `read_document(block_id, before=2, after=2)`：围绕已读证据补读；before/after 合计最多11，均为0时只补读本块。不得猜测ID或扫描全文。
+- `read_file(file_path)`：只读 `/skills/biz-standard-parsing/references/` 下当前任务需要的细则，或压缩历史；不能读取招标文件磁盘路径。
+- `submit_analysis`：结构化提交，普通字段每批最多3条，大纲每批最多6节点；`final=false` 暂存，明确核对完成后 `final=true`。
+
+## 证据选择与纠错
+
+1. 先按本专题的问题检索，再核对主体、标段、表头、脚注、条件和补充文件。上下文不足时按证据ID补读；不能用关键词命中代替事实判断。
+2. 同一事实在相同适用范围内重复出现，选最直接、完整的一处。跨块条件、不同标段、修订前后和未决冲突所需的证据分别保留；检索相似度和自报置信分数不作为可信度。
+3. 引用只提交ID和连续摘录，不生成页码、坐标、文件路径或来源元数据。服务端校验实际读取记录、资料权限和版本后，按保留的ID补齐定位。
+4. 工具返回结构化错误时，按 `message` 和 `remaining_attempts` 修正；只补交未通过部分，不重交已保存事实。更换字段名或重复相同请求不会获得新额度。
+5. 收到收尾提示就停止扩展检索，提交已有可靠结果并在 `research_summary` 记录缺口；不得声称缺口是文件未约定。不得再委派子Agent，服务故障与重试由运行时处理。
 
 ## 注意
 - 商务验收只提取流程、期限、主体和付款关联，不展开具体技术指标

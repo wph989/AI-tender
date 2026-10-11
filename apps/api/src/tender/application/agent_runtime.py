@@ -282,6 +282,12 @@ class AgentRuntime:
                 text("UPDATE agent_module_run SET state=CAST(:state AS JSONB) WHERE id=:id"),
                 params | {"state": encode(state)},
             )
+            if state.get("loaded_skill") and not previous.get("loaded_skill"):
+                conn.execute(
+                    text("""INSERT INTO agent_run_event(run_id,kind,detail)
+                    VALUES (:id,'skill_loaded',CAST(:detail AS JSONB))"""),
+                    {"id": self.run["id"], "detail": encode(state["loaded_skill"])},
+                )
             if state.get("staged_items_verified"):
                 # 运行状态与成果分开：未完成/失败仍可展示已核实字段，且与检查点同事务保存。
                 conn.execute(

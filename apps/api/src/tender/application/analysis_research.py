@@ -36,6 +36,11 @@ class AgentLimits:
     timeout_seconds: int = 1800
     context_tokens: int = 24000
     max_output_tokens: int = 8192
+    max_tool_failures: int = 3
+    max_no_progress_rounds: int = 3
+    max_identical_tool_calls: int = 3
+    max_validation_failures: int = 3
+    max_subagent_retries: int = 2
 
 
 @dataclass
@@ -50,6 +55,8 @@ class ResearchSession:
     events: list[dict] = field(default_factory=list)
     tool_calls: int = 0
     expand: Expand | None = None
+    # 问答保留原协议；专题解析在构图时开启，避免把位置和检索分数交给分析模型。
+    compact_results: bool = False
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def _begin(self, action: str, arguments: dict) -> None:
@@ -104,7 +111,9 @@ class ResearchSession:
                 continue
             remembered[key] = dict(row)
             blocks.append(
-                {
+                {"id": key, "text": row["content"]}
+                if self.compact_results
+                else {
                     k: row[k]
                     for k in (
                         "block_id",
@@ -133,6 +142,18 @@ class ResearchSession:
 
     async def documents(self) -> list[dict]:
         await self._begin("list_documents", {})
+        if self.compact_results:
+            return [
+                {
+                    "id": str(s["source_id"]),
+                    "text": ("本项目资料" if s["project_id"] == self.project_id else "参考资料")
+                    + "："
+                    + s["file_name"]
+                    + "；用途："
+                    + s["purpose"],
+                }
+                for s in self.sources
+            ]
         return [
             {
                 k: s[k]
@@ -159,6 +180,9 @@ class ResearchSession:
         if self.expand:
             # 扩展必须处于同一次检索工具内，让 Agent 真正读到关联原文；范围仍是本次所选资料。
             rows, relations = await self.expand(sources, rows)
+        selected_sources = {s["source_id"] for s in sources}
+        if any(r["source_id"] not in selected_sources for r in rows):
+            raise PermissionError("检索返回了所选范围以外的资料，不能将参考资料混入本项目")
         # 查询等待期间可能撤销关联，结果进入模型上下文前再次检查。
         await self.authorize()
         async with self._lock:
@@ -170,18 +194,45 @@ class ResearchSession:
                 if link.get("citations")
                 and all(str(ref.get("block_id")) in self.seen for ref in link["citations"])
             ]
-        if self.expand:
+        if self.expand and not self.compact_results:
             result["relations"] = relations
         self.events.append(
             {
                 "action": "search_result",
                 "scope": scope,
-                "block_ids": [b["block_id"] for b in result["blocks"]],
+                "block_ids": [
+                    b["id" if self.compact_results else "block_id"] for b in result["blocks"]
+                ],
                 **info,
                 "relations": relations,
             }
         )
-        return result | {"retrieval": info}
+        return result if self.compact_results else result | {"retrieval": info}
+
+    async def read_evidence(self, block_id: str, before: int = 2, after: int = 2) -> dict:
+        """只允许围绕已读 ID 补读，服务端解析位置，防止模型猜测偏移或跨版本读取。"""
+        if any(type(n) is not int or n < 0 for n in (before, after)) or before + after > 11:
+            raise ToolArgumentError("before/after 必须为非负整数，连同当前块每次最多12块")
+        row = self.seen.get(block_id)
+        if row is None:
+            raise ToolArgumentError("证据ID尚未读取，请先检索；不得猜测其他资料的ID")
+        sources = [s for s in self.sources if s["source_id"] == row["source_id"]]
+        if len(sources) != 1:
+            raise SourceNotAllowed("证据所属资料不在授权范围")
+        await self._begin("read_evidence", {"block_id": block_id, "before": before, "after": after})
+        rows = await self.read(sources[0])
+        await self.authorize()
+        if any(r["source_id"] != row["source_id"] for r in rows):
+            raise PermissionError("补读返回了其它来源的资料")
+        # 依赖原文 offset 而不是列表下标，过滤缺块窗口时也不会错读其它条款。
+        selected = sorted(
+            (r for r in rows if row["offset"] - before <= r["offset"] <= row["offset"] + after),
+            key=lambda r: r["offset"],
+        )
+        if not any(str(r["block_id"]) == block_id for r in selected):
+            raise PermissionError("证据已失效，请基于最新资料重新分析")
+        async with self._lock:
+            return self._remember(selected, deduplicate=False)
 
     async def read_source(self, source_id: int, offset: int, limit: int = 6) -> dict:
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 12:

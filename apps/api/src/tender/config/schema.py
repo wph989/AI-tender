@@ -57,6 +57,13 @@ ITEMS: tuple[ConfigItem, ...] = (
         "analysis.max_model_calls", L1, "int", 40, "每模块每次运行的实际模型请求上限，含重试和摘要"
     ),
     _item("analysis.max_tool_calls", L1, "int", 48, "每模块每次运行的工具调用上限"),
+    _item("analysis.max_tool_failures", L1, "int", 3, "工具连续失败上限，按工具及全局分别计数"),
+    _item(
+        "analysis.max_no_progress_rounds", L1, "int", 3, "无新增证据或有效成果的轮数，达到后收尾"
+    ),
+    _item("analysis.max_identical_tool_calls", L1, "int", 3, "同一工具与参数的累计调用上限"),
+    _item("analysis.max_validation_failures", L1, "int", 3, "同一事实校验失败上限，含首次失败"),
+    _item("analysis.max_subagent_retries", L1, "int", 2, "子Agent本地执行故障的自动恢复上限"),
     _item(
         "analysis.timeout_seconds", L1, "int", 1800, "单个模块的总时限（非单次请求），恢复不重置"
     ),
@@ -189,6 +196,11 @@ def validate_value(key: str, value: Any) -> str | None:
             "analysis.max_inflight": (1, 32),
             "analysis.max_model_calls": (4, 256),
             "analysis.max_tool_calls": (4, 512),
+            "analysis.max_tool_failures": (1, 5),
+            "analysis.max_no_progress_rounds": (1, 8),
+            "analysis.max_identical_tool_calls": (1, 5),
+            "analysis.max_validation_failures": (1, 5),
+            "analysis.max_subagent_retries": (0, 2),
             "analysis.timeout_seconds": (60, 7200),
             "analysis.context_tokens": (4096, None),
             "analysis.max_output_tokens": (512, 16384),
