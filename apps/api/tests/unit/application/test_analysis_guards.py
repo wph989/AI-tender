@@ -319,7 +319,10 @@ class Selector:
             content=json.dumps(
                 {
                     "reviews": [
-                        {"supported": True, "unsupported_claims": [], "evidence_ids": [self.ids]}
+                        {
+                            "supported": True, "unsupported_claims": [],
+                            "unresolved_references": [], "evidence_ids": [self.ids],
+                        }
                     ]
                 }
             ),

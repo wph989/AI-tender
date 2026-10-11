@@ -437,6 +437,17 @@ async def verify_items(
         )
         if select_evidence:
             output_rule += (
+                '每条review还必须包含"unresolved_references":["值序号及尚待展开的具体文件/章节/条款"],'
+                "无待展开指向时为[]。这项单独检查内容是否完成解析，不能用supported代替。"
+                "原文真实存在的转引句也可能supported=true，但仍须列出unresolved_references。"
+                "只有原文支持且没有待展开指向，才是可发布的解析要求。"
+                "结果若只是‘详见第三章’‘评分细则载于附件’‘按前附表执行’，"
+                "或只列分值却把评分档次、公式或适用条件留给另处，都须列出待展开指向。"
+                "即使引文已给出细则，value仍只写索引也不能通过；要把具体要求写进value。"
+                "按字段实际含义判断：已完整写出的条件后附章节出处、明确的标准号、"
+                "‘须按附件格式提交投标函并盖章’这类材料义务、明确的修订关系，"
+                "不是仅有索引，不因出现文件名或‘见’字就拒绝，也不要求展开外部标准全文。"
+                "明确写出的评标方法、单独的分值构成可作为独立事实，不得冒充完整评分细则。"
                 '每条review还必须包含"evidence_ids":[["证据ID"],...]，与本字段values一一对应。'
                 "每个值优先选择直接、完整支撑全部事实的最佳一处，等价重复引用不保留；"
                 "跨块条件、不同主体或标段、冲突和修订双方的必要证据必须保留。"
@@ -469,6 +480,14 @@ async def verify_items(
                             "字符串数组 unsupported_claims（无问题时为[]）"
                         )
                     if select_evidence:
+                        gaps = review.get("unresolved_references")
+                        if not isinstance(gaps, list) or any(
+                            not isinstance(gap, str) or not gap.strip() for gap in gaps
+                        ):
+                            raise InvalidModelOutput(
+                                "unresolved_references 必须是非空字符串组成的数组，"
+                                "无待展开指向时为[]"
+                            )
                         _validate_evidence_selection(review, batch[index])
             else:
                 flags = verdict.get("supported")
@@ -545,7 +564,13 @@ async def verify_items(
         )
         reviews = verdict.get("reviews") if explain else None
         if explain:
-            flags = [r["supported"] and not r["unsupported_claims"] for r in reviews]
+            # 摘录真实不等于解析完成；独立检查的未展开指向即使supported=true也必须退回。
+            # 仅专题解析启用此检查，问答仍可回答“条款位于哪里”这类定位问题。
+            flags = [
+                r["supported"] and not r["unsupported_claims"]
+                and (not select_evidence or not r["unresolved_references"])
+                for r in reviews
+            ]
         else:
             flags = verdict.get("supported")
         if (
@@ -557,7 +582,14 @@ async def verify_items(
         for index, (item, flag) in enumerate(zip(batch, flags, strict=True)):
             item["verification"] = "supported" if flag else "unsupported"
             if explain:
-                item["verification_issues"] = reviews[index]["unsupported_claims"]
+                item["verification_issues"] = list(reviews[index]["unsupported_claims"])
+                if select_evidence:
+                    item["verification_issues"].extend(
+                        "待展开原文：" + target + "。请用search_document按该指向检索实际条款，"
+                        "跨文件先list_documents核对资料，命中后read_document补读条件并引用正文；"
+                        "已读细则须写入value，确实找不到则仅在research_summary记录缺口。"
+                        for target in reviews[index]["unresolved_references"]
+                    )
             if flag and select_evidence:
                 for value, chosen in zip(
                     item["values"], reviews[index]["evidence_ids"], strict=True

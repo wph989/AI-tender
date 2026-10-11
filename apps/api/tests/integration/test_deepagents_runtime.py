@@ -321,6 +321,7 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
                             {
                                 "supported": True,
                                 "unsupported_claims": [],
+                                "unresolved_references": [],
                                 "evidence_ids": [[selected[-1]]],
                             }
                         ]
