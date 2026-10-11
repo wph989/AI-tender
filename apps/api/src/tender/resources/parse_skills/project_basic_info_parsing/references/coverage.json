@@ -1,0 +1,22 @@
+[
+  {
+    "key": "identity",
+    "title": "项目与采购人"
+  },
+  {
+    "key": "scope",
+    "title": "采购范围"
+  },
+  {
+    "key": "budget",
+    "title": "预算与限价"
+  },
+  {
+    "key": "dates",
+    "title": "关键日期"
+  },
+  {
+    "key": "lots",
+    "title": "标段划分"
+  }
+]

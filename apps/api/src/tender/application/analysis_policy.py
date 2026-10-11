@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 
+from tender.application.analysis_data import semantic_payload
 from tender.application.knowledge import fingerprint, normalized
 
 
@@ -21,6 +22,9 @@ def load_module_skill(snapshot: dict, key: str) -> dict:
     instructions = content
     if output_path in resources:
         instructions += "\n\n" + resources[output_path]
+    coverage_path = key + "/references/coverage.json"
+    if coverage_path in resources:
+        instructions += "\n\n必须登记状态的主题（coverage.json）：\n" + resources[coverage_path]
     return {
         "path": "/skills/" + key.replace("_", "-") + "/SKILL.md",
         "sha256": digest.hexdigest(),
@@ -28,10 +32,19 @@ def load_module_skill(snapshot: dict, key: str) -> dict:
     }
 
 
+def business_claim(entry: dict) -> dict | None:
+    """纠错和进展关注业务语义，改展示名称或重新分配 key 不算新事实。"""
+    if not entry.get("business"):
+        return None
+    return {k: v for k, v in semantic_payload(entry["business"]).items() if k != "title"}
+
+
 def correction_count(state: dict, entry: dict) -> int:
     """同时按字段和证据事实记账，避免只改展示名称就获得新的纠错额度。"""
     label = str(entry.get("group", "")) + ":" + str(entry.get("field", "未知字段"))
-    keys = ["field:" + label]
+    claim = business_claim(entry)
+    # 业务记录同名很常见；使用服务端身份，避免不同标段或起算点的要求串账。
+    keys = ["record:" + entry["id"]] if claim is not None else ["field:" + label]
     for value in entry.get("values", []):
         refs = sorted(
             (str(r.get("block_id")), normalized(str(r.get("quote", ""))))
@@ -46,6 +59,8 @@ def correction_count(state: dict, entry: dict) -> int:
                 normalized(str(entry.get("note", ""))),
                 refs,
             ]
+            if claim is not None:
+                fact.append(claim)
             keys.append("fact:" + fingerprint(fact))
     ledger = state.setdefault("correction_failures", {})
     count = max((ledger.get(k, 0) for k in keys), default=0) + 1
@@ -60,7 +75,7 @@ def progress_signature(seen: dict, state: dict, *, verified_only: bool = True) -
     """只有新增原文或通过校验的新事实算进展；改名、工具成功、草稿暂存都不算。"""
     facts = sorted(
         {
-            fingerprint([value.get("value"), value.get("citations")])
+            fingerprint([value.get("value"), value.get("citations"), business_claim(entry)])
             for entry in state.get("staged_items", [])
             if not verified_only or entry.get("verification") == "supported"
             for value in entry.get("values", [])
@@ -102,6 +117,9 @@ def select_verified_repeats(entries: list[dict]) -> None:
     chosen: dict[tuple, list[dict]] = {}
     for entry in entries:
         if entry.get("verification") != "supported":
+            continue
+        if entry.get("business"):
+            # 相同文字可能具有不同条件与标段，业务记录不能套用展示字段的证据替换键。
             continue
         for value in entry["values"]:
             refs = value["citations"]

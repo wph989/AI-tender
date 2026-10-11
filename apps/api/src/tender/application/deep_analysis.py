@@ -36,6 +36,16 @@ from psycopg import OperationalError
 from pydantic import Field
 from typing_extensions import TypedDict
 
+from tender.application.analysis_data import (
+    DATA_VERSION,
+    BusinessRecord,
+    CoverageInput,
+    GapInput,
+    format_tree_issues,
+    module_data,
+    prepare_coverage,
+    prepare_records,
+)
 from tender.application.analysis_outline import outline_result
 from tender.application.analysis_policy import (
     correction_count,
@@ -60,7 +70,26 @@ from tender.domain.errors import (
     ModelOutputTruncated,
 )
 
-RUNTIME_VERSION = "deepagents-0.7.22-v2"
+RUNTIME_VERSION = "deepagents-0.7.22-v3"
+
+DATA_CONTRACT = """本任务采用业务数据协议，以本段和工具schema为准。
+submit_analysis 提交 records、coverage、gaps、research_summary，不提交 fields 或 outline_nodes。
+每条记录以 key 标识，纠正同一条记录时沿用 key；kind 为 fact/requirement/lot/format_node/relation。
+title 是名称，text 直接写完整原文要求。scope 区分 common/lots/unknown；
+lots 填 lot_refs 原文编号或名称，不能把未知当公共。conditions 保留原表达式、比较项、
+单位、起算点和例外；mixed 表示混合且/或，不得改成单一逻辑。materials 写明证明材料；
+scoring 保留满分、公式、各档次和扣分。不能可靠结构化用 structuring=partial，不能推测未知值。
+lot 仅由项目概况模块提交，code/aliases/title均需原文依据；其他模块直接声明标段原文指向。
+format_node 由格式模块提交，node_type为group/section，parent_key唯一且先父后子，不限制原文层数。
+relation 先提交端点，再引用 subject_key/object_key；supersedes 表示 subject 替代 object，
+修订和冲突必须引用双方并保留适用范围，不得凭上传时间推断。
+coverage.topic 来自已加载的 coverage.json，extracted 关联已提交 record_keys；
+searched_not_found 仅表示此次检索未找到，not_applicable 必须引用明确原文。
+结构化缺口进入 gaps，不得把缺口伪装成业务事实；原文文本和全部业务属性一并接受校验。
+final=false时gaps按key累积；final=true时必须提交全部剩余缺口，校验通过后替换旧清单。
+全部缺口已解决时最终提交gaps=[]；最终校验失败不会清除已有缺口。
+普通模块每批最多3条，格式模块最多6条；final=false暂存，最后显式final=true。
+"""
 
 
 CONTRACT = """你是当前解析模块的独立子 Agent。使用原生工具调用完成任务。
@@ -375,9 +404,25 @@ class ResearchMiddleware(AgentMiddleware):
             for entry in self.state.get("staged_items", [])
             if entry["id"] not in pending_ids or entry.get("verification") == "supported"
         ]
+        for item_id in pending_ids:
+            previous = self.state.get("business_previous", {}).get(item_id)
+            if previous and not any(i["id"] == item_id for i in self.state["staged_items"]):
+                self.state["staged_items"].append(previous)
 
-    def build_draft(self, request: dict, fields: list[dict]) -> None:
+    def build_draft(self, request: dict, fields: list[dict]) -> dict | None:
         """校验全部通过后才由运行时生成 draft；缺口只进检索总结。"""
+        if self.state.get("business_protocol"):
+            issues = format_tree_issues([
+                entry["business"] for entry in fields if entry.get("business")
+            ])
+            if issues:
+                self.state.pop("pending_final", None)
+                return self.feedback("；".join(
+                    f"{key}：{detail}" for key, (_, detail) in issues.items()
+                ))
+            if "business_gaps" in request:
+                # 最终清单只在原文校验及累计结构校验通过后生效，失败提交不能清除缺口。
+                self.state["business_gaps"] = request["business_gaps"]
         summary = request.get("research_summary", "")
         notes = self.state.get("gap_notes", [])
         if notes:
@@ -388,7 +433,10 @@ class ResearchMiddleware(AgentMiddleware):
             "relations": self.state.get("staged_relations", []),
             "research_summary": summary,
         }
+        if self.state.get("business_protocol"):
+            self.state["draft"]["business_data"] = module_data(self.state)
         self.state.pop("pending_final", None)
+        return None
 
     async def run_review_step(self) -> dict | None:
         """Agent 图的校验节点：本批待校验条目一次送审，结论写回条目并反馈给主 Agent。
@@ -399,9 +447,10 @@ class ResearchMiddleware(AgentMiddleware):
         if self.review_support is None:
             # 未配置校验器（降级/旧路径）时按登记结果收尾，行为与内联校验前一致。
             if final_request := self.state.get("pending_final"):
-                self.build_draft(final_request, self.state.get("staged_items", []))
+                feedback = self.build_draft(final_request, self.state.get("staged_items", []))
                 self.state["research"] = self.research.checkpoint()
                 await self.save(self.state)
+                return feedback
             return None
         pending = [
             entry
@@ -418,9 +467,10 @@ class ResearchMiddleware(AgentMiddleware):
         )
         if not pending and not units:
             if final_request:
-                self.build_draft(final_request, self.state.get("staged_items", []))
+                feedback = self.build_draft(final_request, self.state.get("staged_items", []))
                 self.state["research"] = self.research.checkpoint()
                 await self.save(self.state)
+                return feedback
             return None
         pending_ids = {entry["id"] for entry in pending}
         try:
@@ -463,7 +513,11 @@ class ResearchMiddleware(AgentMiddleware):
                 continue
             if entry.get("verification") == "supported":
                 kept.append(entry)
+                self.state.get("business_previous", {}).pop(entry["id"], None)
                 continue
+            previous = self.state.get("business_previous", {}).get(entry["id"])
+            if previous:
+                kept.append(previous)
             issues = "；".join(entry.get("verification_issues") or []) or "引用未支持该字段的断言"
             label = field_label(entry)
             failures = correction_count(self.state, entry)
@@ -498,8 +552,9 @@ class ResearchMiddleware(AgentMiddleware):
                     + message
                 )
             return self.feedback(message, remaining=remaining)
+        feedback = None
         if final_request:
-            self.build_draft(
+            feedback = self.build_draft(
                 final_request,
                 [
                     entry
@@ -509,7 +564,7 @@ class ResearchMiddleware(AgentMiddleware):
             )
         self.state["research"] = self.research.checkpoint()
         await self.save(self.state)
-        return None
+        return feedback
 
     @hook_config(can_jump_to=["end"])
     async def abefore_model(self, state, runtime):
@@ -702,6 +757,10 @@ def build_module_agent(
     if key not in MODULES:
         raise ValueError("未注册的分析模块")
     skill = load_module_skill(snapshot, key)
+    business_protocol = snapshot.get("__analysis_data_version__") == DATA_VERSION
+    if business_protocol:
+        state["business_protocol"] = True
+        state["business_topics"] = json.loads(snapshot.get(key + "/references/coverage.json", "[]"))
     research.compact_results = True
     # 数据库模块键保持兼容，虚拟Skill名称遵循Agent Skills的连字符规范。
     skill_name = key.replace("_", "-")
@@ -736,6 +795,8 @@ def build_module_agent(
         research_summary: str,
         outline_nodes: list[OutlineInput] | None = None,
         final: bool = True,
+        business_items: list[dict] | None = None,
+        business_gaps: list[dict] | None = None,
     ) -> dict:
         """登记本批结果：结构与引用归属在此确定性判定，支持性校验由 Agent 图的校验步骤完成。
 
@@ -749,7 +810,7 @@ def build_module_agent(
                 raise ValueError("请先检索相关证据再提交分析")
             is_outline = key == "bid_format_outline_parsing"
             nodes = []
-            if is_outline:
+            if is_outline and business_items is None:
                 if outline_nodes is None:
                     raise ValueError("格式模块必须提供outline_nodes")
                 ids = {node["id"] for node in outline_nodes}
@@ -768,7 +829,9 @@ def build_module_agent(
                 exhausted |= failures >= research.limits.max_validation_failures
                 errors.append(f"{label}（第{failures}次）：{error}")
 
-            if is_outline:
+            if business_items is not None:
+                checked, links = business_items, []
+            elif is_outline:
                 checked, links = outline_result({"outline_nodes": nodes}, research.seen)
                 state["staged_outline_nodes"] = nodes
             else:
@@ -781,10 +844,10 @@ def build_module_agent(
                     except ValueError as exc:
                         rejected(raw, exc)
             gaps: list[dict] = []
-            if not is_outline:
+            if not is_outline and business_items is None:
                 checked, gaps = split_absence_claims(checked, research.project_id)
             previous = {entry["id"]: entry for entry in state.get("staged_items", [])}
-            if not is_outline:
+            if not is_outline or business_items is not None:
                 combined = previous | {entry["id"]: entry for entry in checked}
                 checked = list(combined.values())
             checked = [dict(entry) for entry in checked]
@@ -794,15 +857,21 @@ def build_module_agent(
                     validate_project_claims([entry], research.project_id)
                 except ValueError as exc:
                     rejected(entry, exc)
+                    # 修正版本的来源校验失败时，仍保留同一身份上已核实的上一版。
+                    old = previous.get(entry["id"])
+                    if entry.get("business") and old and old.get("verification") == "supported":
+                        staged.append(old)
                     continue
                 old = previous.get(entry["id"], {})
+                if entry.get("business") and old.get("verification") == "supported":
+                    state.setdefault("business_previous", {})[entry["id"]] = old
                 # 同一资料快照中未改变的已核实字段不再重复送审；模型不能自行提供验证标记。
                 # 条目级标记让部分暂存的成果在下一批提交时不再重审，避免同一批字段
                 # 每轮提交都烧一遍校验请求（跨 attempt 继承由 staged_items_verified 兜底）。
                 if old.get("verification") == "supported" and all(
                     entry.get(k) == old.get(k)
                     for k in ("field", "group", "sort_order", "values", "note")
-                ):
+                ) and old.get("business") == entry.get("business"):
                     entry["verification"] = "supported"
                 else:
                     entry["verification"] = "pending"
@@ -828,11 +897,13 @@ def build_module_agent(
                     link for link in links if link not in state.get("staged_relations", [])
                 ]
             state["staged_relations"] = links
-            if is_outline:
+            if is_outline and business_items is None:
                 state["staged_outline_nodes"] = nodes
             if final:
                 # draft 只在校验通过后由 Agent 图生成；这里先登记收尾意图与检索总结。
                 state["pending_final"] = {"research_summary": research_summary.strip()}
+                if business_gaps is not None:
+                    state["pending_final"]["business_gaps"] = business_gaps
             state["research"] = research.checkpoint()
             await save(state)
             return {
@@ -863,10 +934,46 @@ def build_module_agent(
         """每批最多6个格式节点，先父后子、默认暂存；全部节点提交后显式final=true结束。"""
         return await submit_analysis([], [], research_summary, outline_nodes, final)
 
+    async def submit_business(
+        records: Annotated[list[BusinessRecord], Field(max_length=6)],
+        coverage: Annotated[list[CoverageInput], Field(max_length=20)],
+        gaps: Annotated[list[GapInput], Field(max_length=20)],
+        research_summary: str,
+        final: bool = False,
+    ) -> dict:
+        """提交有稳定key的业务记录和覆盖状态；范围未知不能当成公共要求。"""
+        try:
+            maximum = 6 if key == "bid_format_outline_parsing" else 3
+            if len(records) > maximum:
+                raise ValueError(f"当前模块每批最多{maximum}条业务记录")
+            prepared = prepare_records(records, state, research.seen, key)
+            checked_coverage, reviews = prepare_coverage(
+                coverage, state, research.seen, state["business_topics"], key,
+            )
+            coverage_by_key = {
+                (v["topic"], json.dumps(v["scope"], sort_keys=True)): v
+                for v in state.get("business_coverage", [])
+            }
+            for value in checked_coverage:
+                identity = (value["topic"], json.dumps(value["scope"], sort_keys=True))
+                coverage_by_key[identity] = value
+            state["business_coverage"] = list(coverage_by_key.values())
+            gap_by_key = {v["key"]: v for v in state.get("business_gaps", [])}
+            for gap in gaps:
+                gap_by_key[gap.key] = gap.model_dump()
+            state["business_gaps"] = list(gap_by_key.values())
+            return await submit_analysis(
+                [], [], research_summary, final=final, business_items=prepared + reviews,
+                business_gaps=[gap.model_dump() for gap in gaps],
+            )
+        except ValueError as exc:
+            raise ToolException(str(exc)) from exc
+
     def validation_feedback(error):
         # 默认错误包含完整kwargs，会把整份坏草稿重复塞回上下文并浪费摘要/纠正预算。
         fields = ", ".join(".".join(map(str, e["loc"])) for e in error.errors())[:400]
         required = (
+            "records、coverage、gaps" if business_protocol else
             "outline_nodes（每批最多6个，先父后子）"
             if key == "bid_format_outline_parsing"
             else "fields和relations（每批各最多3条）"
@@ -885,7 +992,8 @@ def build_module_agent(
     tools.append(
         StructuredTool.from_function(
             name="submit_analysis",
-            coroutine=submit_outline if key == "bid_format_outline_parsing" else submit_items,
+            coroutine=(submit_business if business_protocol else
+                       submit_outline if key == "bid_format_outline_parsing" else submit_items),
             handle_tool_error=True,
             handle_validation_error=validation_feedback,
         )
@@ -899,8 +1007,10 @@ def build_module_agent(
         checkpointer=checkpointer,
         skills=["/skills/"],
         permissions=permissions,
-        system_prompt=CONTRACT
-        + ("\n" + OUTLINE_INSTRUCTIONS if key == "bid_format_outline_parsing" else ""),
+        system_prompt=(
+            CONTRACT + "\n" + DATA_CONTRACT if business_protocol else CONTRACT
+            + ("\n" + OUTLINE_INSTRUCTIONS if key == "bid_format_outline_parsing" else "")
+        ),
         middleware=[
             FilesystemMiddleware(
                 backend=backend,

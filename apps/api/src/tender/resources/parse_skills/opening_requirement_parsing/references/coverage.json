@@ -1,0 +1,14 @@
+[
+  {
+    "key": "time_place",
+    "title": "开标时间地点"
+  },
+  {
+    "key": "procedure",
+    "title": "开标流程"
+  },
+  {
+    "key": "materials",
+    "title": "到场或解密材料"
+  }
+]

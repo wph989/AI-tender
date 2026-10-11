@@ -58,6 +58,7 @@ class _MigrationSpec:
 
 
 _MIGRATIONS: tuple[_MigrationSpec, ...] = (
+    _MigrationSpec("0011_analysis_data.py", (("设计/14-知识库与综合分析实现.md", 1),)),
     _MigrationSpec(
         "0009_provider_cooldown.py",
         (("设计/16-DeepAgents标书分析运行时.md", 1),),

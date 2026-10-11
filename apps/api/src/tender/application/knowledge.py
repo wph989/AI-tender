@@ -312,6 +312,10 @@ def merge_field_entries(entries: Sequence[dict], *, is_outline: bool = False) ->
     merged: dict[str, dict] = {}
     others: list[dict] = []
     for entry in entries:
+        if entry.get("business") or entry.get("record_id"):
+            # 同名展示字段不代表同一业务要求，必须保留各自的身份、条件与适用范围。
+            others.append(entry)
+            continue
         if entry.get("verification") != "supported":
             others.append(entry)
             continue

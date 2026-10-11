@@ -661,6 +661,8 @@ data: {"status":"completed","version_id":2048}
 | `PUT` | `/api/v1/projects/{project_id}/analysis/settings` | 知识库与项目综合分析，见设计/14 |
 | `POST` | `/api/v1/projects/{project_id}/analysis` | 知识库与项目综合分析，见设计/14 |
 | `GET` | `/api/v1/analysis/reports/{report_id}` | 知识库与项目综合分析，见设计/14 |
+| `GET` | `/api/v1/analysis/reports/{report_id}/data` | 读取最新或指定的业务数据快照，按实时资料权限过滤 |
+| `POST` | `/api/v1/analysis/reports/{report_id}/context` | 按单个标段获取大纲、正文或检查的编制依据 |
 | `POST` | `/api/v1/analysis/reports/{report_id}/cancel` | 知识库与项目综合分析，见设计/14 |
 | `POST` | `/api/v1/analysis/reports/{report_id}/retry` | 知识库与项目综合分析，见设计/14 |
 | `POST` | `/api/v1/knowledge/collections/{collection_id}/ask` | 知识库与项目综合分析，见设计/14 |
@@ -691,6 +693,57 @@ DeepAgents 报告补跑可选 `max_output_tokens`（512–16384）和 `timeout_s
 模型路由收到非法 JSON 时，在换候选前最多追加两次格式纠正提示，计入既有总请求/时间预算；该行为不放宽引用校验，也不把连接、配置、权限或明确拒绝错误当作格式问题重试。
 结论的支持性检查最多反馈两次供 Agent 补读或修正，仍受模块总步数限制；最终不支持的条目明确标记 `insufficient` / `unsupported`。
 
+
+### 业务快照与编制上下文
+
+`GET /analysis/reports/{report_id}/data?snapshot_id=...` 返回
+`report_id / snapshot_id / revision / schema_version / stale / data`。
+省略 `snapshot_id` 时读取最新正式快照；指定旧版本仍可查看，但 `stale=true`，不能作为新编制任务的依据。
+报告正在补跑、材料或分析设置变化时也标记过期。
+报告取消后若模块尚未退出或本轮正式快照尚未发布，旧快照也保持过期，`context` 返回409。
+`data` 的业务结构、引用和 DDL 见
+[14-知识库与综合分析实现](14-知识库与综合分析实现.md) 的“单标段编制的业务数据”。
+读取会按实时权限过滤，不直接把数据库中的历史 JSON 原样返回。
+
+`POST /analysis/reports/{report_id}/context` 只读取依据，不创建生成任务或调用正文生成模型：
+
+```json
+{
+  "snapshot_id": 123,
+  "purpose": "outline",
+  "lot_id": 7,
+  "requirement_ids": [],
+  "offset": 0,
+  "limit": 100
+}
+```
+
+| 字段/用途 | 契约 |
+| --- | --- |
+| `snapshot_id` | 必填，正整数；须属于该报告且为当前有效快照 |
+| `lot_id` | 单个正整数；多标段必填，单标段可省略并解析为唯一标段；无标段且没有未决分标线索时允许项目级编制 |
+| `purpose=outline` | 公共及所选标段的项目事实、适用要求、完整格式树、关系、覆盖和缺口 |
+| `purpose=content` | 必须提供本快照、所选标段下有效的 `requirement_ids`（最多500条）；额外检索已关联企业/历史库，片段单列 `references`，可能带 `reference_warning` |
+| `purpose=check` | 所选范围的完整要求清单及分批记录，不能用检索 top-k 代替完整检查输入 |
+| `offset / limit` | 要求列表分页；默认0/100，limit为1–200，事实与格式树不分页 |
+
+响应包含 `schema_version / snapshot_id / purpose / lot_id / facts / requirements / format_nodes /
+relations / coverage / gaps / unresolved / readiness / references`，另有完整 `requirement_manifest`
+（要求 ID 数组）、`total_requirements` 和 `next_offset`。应持续读取直到 `next_offset=null`，
+各页固定同一快照、用途和标段。正文用途的清单限定为本次显式选择的要求。
+`readiness` 为 usable、partial 或 unavailable；partial 会同时返回已核实可用数据及未决事项。
+
+| 状态 | 错误码与含义 |
+| --- | --- |
+| 400 | `invalid_argument`：字段类型或取值不满足 schema，例如传入标段数组 |
+| 404 | `not_found`：报告不存在或不属于当前公司 |
+| 409 | `data_reanalysis_required`：旧协议报告没有业务数据，需重新分析 |
+| 409 | `data_not_ready`：没有可读取的正式快照，或指定快照不属于该报告 |
+| 409 | `report_running`：报告尚未结束或正在补跑 |
+| 409 | `data_stale`：来源/设置变化，或指定的不是最新快照 |
+| 409 | `source_unavailable`：必要来源删除或撤销，含检索进行期间发生的撤销 |
+| 422 | `lot_selection_required / invalid_lot / lot_scope_unresolved`：标段未显式选择、不属于快照或分标线索未解决 |
+| 422 | `requirements_required / invalid_requirements`：正文未选要求，或要求来自其他范围、已失效、尚未确认 |
 
 ## AI 模型管理接口
 

@@ -1,0 +1,22 @@
+[
+  {
+    "key": "duration",
+    "title": "合同期限"
+  },
+  {
+    "key": "payment",
+    "title": "付款"
+  },
+  {
+    "key": "acceptance",
+    "title": "验收"
+  },
+  {
+    "key": "warranty",
+    "title": "质保"
+  },
+  {
+    "key": "liability",
+    "title": "责任与违约"
+  }
+]

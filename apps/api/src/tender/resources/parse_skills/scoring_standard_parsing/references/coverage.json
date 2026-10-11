@@ -1,0 +1,22 @@
+[
+  {
+    "key": "method",
+    "title": "评标方法"
+  },
+  {
+    "key": "composition",
+    "title": "总分构成"
+  },
+  {
+    "key": "criteria",
+    "title": "完整评分细则"
+  },
+  {
+    "key": "price",
+    "title": "价格评分公式"
+  },
+  {
+    "key": "deductions",
+    "title": "加扣分"
+  }
+]

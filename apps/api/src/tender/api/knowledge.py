@@ -16,6 +16,18 @@ from tender.api.errors import ApiProblem
 from tender.api.parsing import ParseRequest, _create_parse_job
 from tender.api.project_files import _role_is_parseable
 from tender.application.agent_runtime import limits_snapshot
+from tender.application.analysis_data import (
+    DATA_VERSION,
+    ContextError,
+    ContextInput,
+    build_context,
+    display_items,
+)
+from tender.application.analysis_data_store import (
+    accessible_data,
+    publish_data_snapshot,
+    snapshot_matches_report,
+)
 from tender.application.analysis_skills import MODULES, skill_snapshot, skill_version
 from tender.application.deep_analysis import CONTRACT, RUNTIME_VERSION, validate_project_claims
 from tender.application.knowledge import (
@@ -71,8 +83,8 @@ class AnalysisInput(StrictModel):
 
 class RetryInput(StrictModel):
     module_keys: list[str] = Field(default_factory=list, max_length=13)
-    max_output_tokens: int | None = Field(default=None, ge=512, le=16384)
-    timeout_seconds: int | None = Field(default=None, ge=300, le=3600)
+    max_output_tokens: int | None = Field(default=None, ge=512, )
+    timeout_seconds: int | None = Field(default=None, ge=0, le=3600)
 
 
 class AskInput(StrictModel):
@@ -455,6 +467,7 @@ def start_analysis(project_id: int, payload: AnalysisInput, request: Request) ->
                     raise
     rules = skill_snapshot()
     rules["__deep_contract__"] = CONTRACT
+    rules["__analysis_data_version__"] = DATA_VERSION
     db = store(request)
     references = [
         s
@@ -563,6 +576,7 @@ def visible_items(
             if accessible
             else {
                 "id": item["id"],
+                **({"record_id": item["record_id"]} if item.get("record_id") else {}),
                 "field": item.get("field", "来源已不可用"),
                 "group": item.get("group", ""),
                 "sort_order": item.get("sort_order", 0),
@@ -586,6 +600,7 @@ def get_report(report_id: int, request: Request) -> dict:
     for module in modules:
         # 工具日志只供服务端重放，不在产品界面暴露整段中间提示词。
         module.pop("trace", None)
+        module.pop("business_data", None)
     runs = db.rows(
         """SELECT a.id,a.module_id,a.attempt,a.thread_id,a.status,a.started_at,
         a.deadline_at,a.finished_at,a.lease_until,a.model_calls,a.tool_calls,
@@ -609,10 +624,10 @@ def get_report(report_id: int, request: Request) -> dict:
         # 同一字段的多版本在这里并成一行，历史报告也不再出现重复行与重复定位。
         module["items"] = visible_items(
             db,
-            merge_field_entries(
+            display_items(merge_field_entries(
                 list(merged.values()),
                 is_outline=module["module_key"] == "bid_format_outline_parsing",
-            ),
+            )),
             allowed,
         )
     for run in runs:
@@ -625,7 +640,11 @@ def get_report(report_id: int, request: Request) -> dict:
         source_signature(current["sources"]) != source_signature(report["source_snapshot"])
         or current["analysis_category"] != report["category"]
         or current["analysis_topics"] != report["topics"]
-        or current["lots"] != report["lot_settings"]
+        or [lot for lot in current["lots"] if not (
+            lot["id"] in report.get("derived_lot_ids", [])
+            and lot["id"] not in {old["id"] for old in report["lot_settings"]}
+            and lot["category"] is None and lot["topics"] is None
+        )] != report["lot_settings"]
         # 参考来源快照只有当前运行时才会记录；旧报告该列为空，比较会恒判为已变化。
         or (
             not retired
@@ -640,7 +659,106 @@ def get_report(report_id: int, request: Request) -> dict:
         "modules": modules,
         "stale": stale,
         "runtime_retired": retired,
+        "data_schema_version": None if retired else DATA_VERSION,
     }
+
+
+def data_snapshot(request: Request, report_id: int, snapshot_id: int | None = None) -> dict:
+    report = report_row(request, report_id)
+    if report["runtime_version"] != RUNTIME_VERSION:
+        raise ApiProblem(409, "data_reanalysis_required", "此报告没有业务数据，请重新发起分析")
+    rows = store(request).rows(
+        "SELECT * FROM analysis_data_snapshot WHERE report_id=:report"
+        + (" AND id=:snapshot" if snapshot_id is not None else "") + " ORDER BY id DESC LIMIT 1",
+        {"report": report_id, "snapshot": snapshot_id},
+    )
+    if not rows:
+        raise ApiProblem(409, "data_not_ready", "正式业务数据快照尚未就绪")
+    return rows[0]
+
+
+@router.get("/analysis/reports/{report_id}/data")
+def get_analysis_data(
+    report_id: int, request: Request, snapshot_id: int | None = Query(None, gt=0),
+) -> dict:
+    snapshot = data_snapshot(request, report_id, snapshot_id)
+    report = get_report(report_id, request)
+    db = store(request)
+    return {
+        "report_id": report_id, "snapshot_id": snapshot["id"], "revision": snapshot["revision"],
+        "schema_version": snapshot["schema_version"],
+        "stale": (
+            report["stale"] or report["status"] in {"waiting", "pending", "running"}
+            or data_snapshot(request, report_id)["id"] != snapshot["id"]
+            or not snapshot_matches_report(db, snapshot)
+        ),
+        "data": accessible_data(
+            db, snapshot["data"], db.collections_for_project(report["project_id"]),
+            sources=snapshot["input_snapshot"]["source_snapshot"]
+            + snapshot["input_snapshot"]["reference_snapshot"],
+        ),
+    }
+
+
+def context_data(request: Request, report_id: int, snapshot: dict) -> tuple[dict, dict]:
+    """取数前后共用有效性门禁，网络检索期间发生的撤销或补跑同样生效。"""
+    report = get_report(report_id, request)
+    if report["status"] in {"waiting", "pending", "running"}:
+        raise ApiProblem(409, "report_running", "报告正在更新，请在本轮分析结束后获取编制依据")
+    db = store(request)
+    allowed = db.collections_for_project(report["project_id"])
+    data = accessible_data(
+        db, snapshot["data"], allowed,
+        sources=snapshot["input_snapshot"]["source_snapshot"]
+        + snapshot["input_snapshot"]["reference_snapshot"],
+    )
+    if any(g["code"] == "source_unavailable" for g in data["gaps"]):
+        raise ApiProblem(409, "source_unavailable", "部分来源已删除或撤销访问，请更新分析")
+    if (
+        report["stale"] or data_snapshot(request, report_id)["id"] != snapshot["id"]
+        or not snapshot_matches_report(db, snapshot)
+    ):
+        raise ApiProblem(409, "data_stale", "依据已更新，请使用当前有效分析快照")
+    return report, data
+
+
+@router.post("/analysis/reports/{report_id}/context")
+async def get_analysis_context(report_id: int, payload: ContextInput, request: Request) -> dict:
+    snapshot = data_snapshot(request, report_id, payload.snapshot_id)
+    report, data = context_data(request, report_id, snapshot)
+    try:
+        context = build_context(data, payload)
+    except ContextError as exc:
+        raise ApiProblem(422, exc.code, str(exc)) from exc
+    if payload.purpose == "content":
+        sources = [s for s in report["reference_snapshot"]
+                   if s["purpose"] in {"company", "history"}]
+        if sources and context["requirements"]:
+            db = store(request)
+            rows, meta = await retrieve_chunks(
+                db, sources, "\n".join(r["text"] for r in context["requirements"]),
+                lambda: None, create_embedding_gateway, embedding_timeout=15,
+            )
+            # 不只重查参考片段；招标依据也可能在等待参考检索时被撤销或重跑。
+            context_data(request, report_id, snapshot)
+            live = db.collections_for_project(report["project_id"])
+            for row in rows[:12]:
+                if row["collection_id"] not in live:
+                    continue
+                try:
+                    citation = db.resolve({k: row[k] for k in (
+                        "source_id", "collection_id", "project_id", "project_file_id", "version_id",
+                        "parse_run_id", "element_id", "anchor", "page_no", "bbox", "file_name",
+                    )} | {"purpose": row["purpose"], "quote": row["content"]})
+                except LookupError as exc:
+                    raise ApiProblem(
+                        409, "source_unavailable", "参考来源已撤销，请更新分析",
+                    ) from exc
+                context["references"].append({
+                    "purpose": row["purpose"], "text": row["content"], "citation": citation,
+                })
+            context["reference_warning"] = meta.get("warning")
+    return context
 
 
 @router.post("/analysis/reports/{report_id}/cancel")
@@ -651,6 +769,7 @@ def cancel_report(report_id: int, request: Request) -> dict:
         WHERE id=:id AND company_id=:company_id AND status IN ('waiting','pending','running')""",
         {"id": report_id},
     )
+    publish_data_snapshot(store(request), report_id)
     return {"status": report_row(request, report_id)["status"]}
 
 
@@ -730,6 +849,9 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             )
         # 已完成的模块重新解析时必须从零开始，否则继承的旧草稿会让新图直接收尾（等于没重跑）。
         restarted = {row["id"] for row in rows if row["status"] == "completed"}
+        if restarted:
+            connection.execute(text("""UPDATE analysis_module SET items='[]'::jsonb,
+                business_data='{}'::jsonb WHERE id=ANY(:ids)"""), {"ids": sorted(restarted)})
         retried = [row["id"] for row in rows]
         connection.execute(
             text(

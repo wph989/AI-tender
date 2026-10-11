@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from data_schema import install_data_schema
 from langchain_core.messages import AIMessage, message_to_dict
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.conninfo import make_conninfo
@@ -92,6 +93,8 @@ def env(monkeypatch):
         {"options": f"-csearch_path={schema},public"}
     )
     engine = create_engine(url, pool_size=10, max_overflow=10)
+    with engine.begin() as connection:
+        install_data_schema(connection)
     db = KnowledgeStore(engine, 1)
     request = SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(components=SimpleNamespace(engine=engine))),
@@ -208,22 +211,11 @@ class NativeRouter:
         self.calls += 1
         if self.calls == 1:
             name, args = "search_document", {"query": "质保"}
-        elif self.outline:
-            # 格式模块的 submit_analysis 绑定 submit_outline，必须按 outline 协议提交。
-            name, args = (
-                "submit_analysis",
-                {
-                    "outline_nodes": [],
-                    "research_summary": "已检索质保，无格式层级新增",
-                    "final": True,
-                },
-            )
         else:
             name, args = (
                 "submit_analysis",
                 {
-                    "fields": [],
-                    "relations": [],
+                    "records": [], "coverage": [], "gaps": [],
                     "research_summary": "已检索质保，当前专题无新增事项",
                     "final": True,
                 },
@@ -276,24 +268,14 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
             assert "retrieval" not in result
             assert all(set(b) == {"id", "text"} for b in result["blocks"])
             args = {
-                "fields": [
-                    {
-                        "field": "质保",
-                        "group": "",
-                        "sort_order": 0,
-                        "note": "",
-                        "values": [
-                            {
-                                "value": "质保三年",
-                                "citations": [
-                                    {"block_id": b["id"], "quote": "质保三年"}
-                                    for b in result["blocks"]
-                                ],
-                            }
-                        ],
-                    }
-                ],
-                "relations": [],
+                "records": [{
+                    "key": "warranty", "kind": "requirement", "title": "质保", "text": "质保三年",
+                    "scope": {"kind": "common", "lot_refs": []},
+                    "citations": [
+                        {"block_id": b["id"], "quote": "质保三年"} for b in result["blocks"]
+                    ],
+                }],
+                "coverage": [], "gaps": [],
                 "research_summary": "已核对质保",
                 "final": True,
             }
@@ -313,6 +295,8 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
             items = json.loads(prompt.rsplit("\n", 1)[-1])
             refs = items[0]["values"][0]["citations"]
             assert len(refs) == 2 and all(set(r) == {"id", "text"} for r in refs)
+            # 校验请求包含业务属性，不能只核对展示文字后把标段范围直接落库。
+            assert items[0]["business"]["scope"] == {"kind": "common", "lot_refs": []}
             selected.append(refs[-1]["id"])
             return Completion(
                 content=json.dumps(
@@ -345,6 +329,10 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
     refs = module["items"][0]["values"][0]["citations"]
     assert len(refs) == 1 and refs[0]["block_id"] == selected[0]
     assert refs[0]["bbox"] == [0.2, 0.3, 0.9, 0.4]
+    business = module["business_data"]["records"][0]
+    assert business["id"] == module["items"][0]["record_id"]
+    assert business["verification"] == "supported"
+    assert business["citations"] == refs
 
 
 def test_guard_migration_seeds_isolated_config_catalog(env):
@@ -403,6 +391,12 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     assert result["coverage"]["mode"] == "agent_research"
     assert "scanned_blocks" not in result["coverage"]
     assert len(env.db.rows("SELECT id FROM agent_run_event WHERE kind='client_close_failed'")) == 13
+    snapshots = env.db.rows("SELECT * FROM analysis_data_snapshot WHERE report_id=:id",
+                            {"id": row["id"]})
+    assert len(snapshots) == 1 and snapshots[0]["schema_version"] == "1"
+    # 模型只提交空结果时，13 个模块执行完成也不能伪装成业务覆盖完整。
+    assert snapshots[0]["data"]["readiness"] == "unavailable"
+    assert snapshots[0]["data"]["coverage"]
     assert not env.db.rows(
         "SELECT objid FROM pg_locks WHERE locktype='advisory' AND classid=:ns"
         " AND objsubid=2 AND granted",

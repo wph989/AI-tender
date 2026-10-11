@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+from data_schema import install_data_schema
 from langchain_core.messages import AIMessage, message_to_dict
 from sqlalchemy import create_engine, text
 
@@ -68,6 +69,7 @@ def environment(monkeypatch):
                         f"SET DEFAULT nextval('test_{table}_id_seq')"
                     )
                 )
+        install_data_schema(connection, temporary=True)
         facade = SimpleNamespace(
             connect=lambda: nullcontext(connection), begin=lambda: nullcontext(connection)
         )
@@ -363,7 +365,8 @@ def test_report_merges_same_field_versions_and_dedupes_locations(environment):
     items[1]["values"][1]["citations"][0]["quote"] = "质保三年"
     conn.execute(
         text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
-        VALUES (:report,'project_basic_info_parsing','项目概况','completed',CAST(:items AS JSONB))"""),
+        VALUES (:report,'project_basic_info_parsing','项目概况','completed',
+                CAST(:items AS JSONB))"""),
         {"report": report["id"], "items": json.dumps(items, ensure_ascii=False)},
     )
     module = knowledge.get_report(report["id"], request)["modules"][0]
@@ -404,7 +407,8 @@ def test_report_preserves_outline_nodes_with_different_parent_paths(environment,
             item["id"] = fingerprint([item["field"], item["values"]])[:20]
     conn.execute(
         text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
-        VALUES (:report,'bid_format_outline_parsing','格式大纲','completed',CAST(:items AS JSONB))"""),
+        VALUES (:report,'bid_format_outline_parsing','格式大纲','completed',
+                CAST(:items AS JSONB))"""),
         {"report": report["id"], "items": json.dumps(items, ensure_ascii=False)},
     )
     displayed = knowledge.get_report(report["id"], request)["modules"][0]["items"]

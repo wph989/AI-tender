@@ -1,0 +1,14 @@
+[
+  {
+    "key": "qualification",
+    "title": "资格否决"
+  },
+  {
+    "key": "response",
+    "title": "响应否决"
+  },
+  {
+    "key": "procedure",
+    "title": "程序与形式否决"
+  }
+]

@@ -4,9 +4,9 @@
 
 工作目录：`G:\aicode\AI-tender`
 
-> **新会话先读**:最新改动见文件末尾「2026-10-11 提交转引追踪修复与数据库迁移文档」:转引追踪已修复并提交(校验新增 `unresolved_references` 必填项),新增 `docs/工程/17-数据库迁移.md`;提交前 529 passed / 7 skipped。业务库迁移 0009 → 0010 **已应用**且 checkpoint 四表已建,**但 API/worker 尚未重启**;未推送、未调用真实供应商。前端历史记录保留,继续操作前需重新确认服务现场。禁止自动提交。
+> **新会话先读**：最新实现见文件末尾「2026-10-11 修复代码审查发现的四处业务数据问题」，提交说明见随后「2026-10-11 按用户要求提交单标段业务数据改造」。四处问题已修复并新增11项回归，后端 **615 passed / 8 skipped**。前一轮前端类型检查、77项单测、生产构建和新增8项桌面/窄屏交互通过，本轮未改前端。**业务库此前确认仍为 `0010_analysis_guards`，本轮未执行业务库迁移、未启用API/worker，真实供应商与新业务报告尚未验收。** 本次按用户要求提交，未推送；现场迁移和服务启用按此前约定需单独确认，禁止自动提交后续改动。
 
-状态：前端重构、现有后端接口对接及审查问题修复已完成，构建、测试与浏览器验证通过；本次按用户要求提交相关代码、测试与文档。
+状态：此前前端重构和已提交事项保留作历史记录；当前单标段数据改造已完成代码与隔离验证，并按用户要求提交，尚待现场启用。以末尾最新记录为准。
 
 **接口对接见第 12 节，随后审查发现的两处问题及修复见第 13 节，提交说明见第 14 节。第 1—11 节保留此前重构与产品讨论的历史记录，其中“尚需最终验证”和旧服务状态已由后文更新。RAG、GraphRAG、动态报告和分类选择仍处于设计阶段。**
 
@@ -1477,3 +1477,133 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 - 提交前验证:`uv run pytest tests/unit tests/contract -q --tb=short` → **529 passed / 7 skipped**;新增测试单跑 16 passed。模型调用均为测试替身。
 - 现场已变:本轮之后用户已在业务库执行 `alembic upgrade head`,`alembic current` → `0010_analysis_guards (head)`,即 0009 → 0010 的迁移**已应用**;`agent_runtime` 下 checkpoint 四表已存在,无需补跑 `agent_checkpoints`。尚未重启 API/worker。
 - 部署与运行边界:**未重启服务**、未推送、未调用真实供应商、未重新解析业务报告。新 Skill 快照只对新发起的分析生效,已有报告不会自动改写。
+
+### 2026-10-11 面向单标段编制的解析数据与下游接口改造(进行中,未提交,未接完)
+
+本节是留给新会话的续接说明。**工作未完成,未经用户明确要求不要提交、不要重启服务、不要执行业务库迁移。**
+
+#### 目标与已确定原则
+
+用户要求把解析结果从"只给用户看"升级为"给后续生产流程用":解析阶段直接产出可复用的业务数据,并为大纲、正文、检查三种用途提供取数接口。真正的大纲生成、正文生成、投标文件检查留到后续实施,本轮只做数据契约、持久化、解析接入、标段治理、下游接口和页面接入。
+
+- 覆盖项目全部招标材料,保留公共要求和各标段要求;**每次编制只允许选择一个标段**。
+- 多标段必须由用户显式选择目标标段,服务端同样强制校验,不能默认取第一个。
+- 继续沿用现有 13 个 DeepAgents 解析模块、检索、证据校验与运行护栏。
+- Agent 直接提交业务数据,展示字段由程序生成,避免报告结束后再来一轮模型转换。
+- 缺口默认返回"适用且已核实的数据 + 明确未解决事项",不增加整份报告人工批准的发布环节。
+- 仅确定性合并内容、范围、条件都等价的记录;不同标段、主体、起算点和例外分别保留。
+
+#### 数据模型与持久化
+
+- 新增版本化 `AnalysisDataset`(数据版本 `DATA_VERSION = "1"`),包含 `lots / facts / requirements / format_nodes / relations / coverage / gaps`,业务结构定义在 `apps/api/src/tender/application/analysis_data.py`。
+- 现有 `field / values / citations` 保留为展示投影,页面只接收投影和记录身份(`display_items` 去掉 `business` 内部属性)。
+- 业务约定:范围分 `common / lots / unknown`,一条要求可适用多个标段但一次只取一个;条件保留比较符、数量、金额、单位、时间范围、起算点、且/或及例外,无法可靠拆解时保留原文并标 `structuring=partial`,不推测数值;评分项保留完整档次、分值、扣分和公式;原文支持性、结构化完整性、有效状态分开记录。
+- 编号由服务端按"命名空间 + 稳定 key"生成(`record_identity`),分批修正沿用同一编号,下游用 `snapshot_id + record_id` 固定依据。
+- 持久化沿用既有 PostgreSQL,新增迁移 `apps/api/alembic/versions/0011_analysis_data.py`:给 `analysis_module` 加 `business_data JSONB`、给 `analysis_report` 加 `derived_lot_ids BIGINT[]`,并新增不可变表 `analysis_data_snapshot`(report_id、revision、schema_version、manifest_hash、input_snapshot、data,唯一约束 report_id+revision 与 report_id+manifest_hash)。
+- 快照发布在 `apps/api/src/tender/application/analysis_data_store.py`:`publish_data_snapshot` 在报告终态后按 manifest 指纹幂等发布(相同指纹不重复建 revision),`accessible_data` 在读取时按实时资料权限过滤,依据被撤销时返回 `source_unavailable` 并降为 `unavailable`。
+
+#### 解析流程接入
+
+- `deep_analysis.py`:运行时版本提升为 `deepagents-0.7.22-v3`,新增 `DATA_CONTRACT`,`build_module_agent` 在快照带业务数据版本时启用 `submit_business` 工具(提交 `records / coverage / gaps / research_summary`),旧快照继续走 `fields / outline_nodes` 老协议。
+- `analysis_skills.py`:`skill_snapshot` 现在同时加载 `*.md` 和 `*.json`;支持性校验请求新增 `business` 语义载荷,要求标段、比较符、单位、分值、例外等结构化属性与展示文字一样被原文证据支持。
+- `analysis_policy.py`:`load_module_skill` 追加模块 `references/coverage.json` 主题清单;`select_verified_repeats` 对带 `business` 的条目不再做基于展示文字的重复证据替换。
+- `agent_runtime.py` 与 `knowledge.py`:模块落库同时写 `business_data`;暂存投影用 `display_items`;同名字段合并(普通字段与大纲)跳过带 `business` 的记录,避免不同标段/条件的要求被当成重复项。
+- 13 个解析 Skill 均已改造成业务数据协议,每个 Skill 新增 `references/coverage.json`,定义必检主题;格式 Skill 改为用 `parent_key` 表达完整父子层级(不再按展示做三级截断)。
+- 标段目录由项目概况模块提交(带证据),服务端在快照发布时创建或映射 `lot`,写入 `analysis_report.derived_lot_ids`;无法解析的指向进入 `unknown` 与缺口清单,不降级成公共要求。来源解析产生的标段目录不算"过期"触发条件(`get_report` 的 stale 判定已排除派生标段)。
+
+#### 下游接口(已写,尚未接完)
+
+- `GET /api/v1/analysis/reports/{report_id}/data`:返回最新或指定 `snapshot_id` 的正式数据快照(含标段目录、业务数据、覆盖与缺口、`readiness`),读取时执行实时权限过滤。
+- `POST /api/v1/analysis/reports/{report_id}/context`:入参 `snapshot_id`、`purpose`(`outline / content / check`)、单个 `lot_id`、正文用途的 `requirement_ids`、`offset / limit`;返回该用途的适用范围数据、完整 `requirement_manifest`、分页 `next_offset`、未决 `unresolved` 和缺口。校验包括:多标段缺 `lot_id` 报 422、标段不属于快照报 422、正文要求必须属于同一快照与所选范围、报告未终态报 409、快照不是当前有效版本报 409、来源撤销报 409。正文用途会额外检索已授权企业和历史库参考片段,并再次校验关联。
+- 前端:`AnalysisDataPanel.tsx` 已完成"编制依据与待核对事项"面板和"编制依据预览"抽屉(单选标段、实际调用 context 接口、分页加载),接入 `ProjectAnalysis.tsx`;`types/knowledge.ts` 已补数据类型。
+
+#### 当前验证状态(必须如实转述)
+
+- `apps/api` 下 `uv run pytest tests/unit/application/test_analysis_data.py -q` → **8 passed**(新增用例,覆盖多标段隔离、条件保真、完整清单分页、结构证据等)。
+- `uv run pytest tests/unit tests/contract -q --tb=short` → **2 failed / 535 passed / 7 skipped**。失败项:
+  1. `tests/unit/application/test_analysis_guards.py::test_project_skills_have_loadable_references_and_distinct_domain_rules`:断言格式 Skill 文本包含 `parent_id`,而改造后 Skill 已改用 `parent_key`(属测试与实现口径不一致,需确认是改测试还是补 Skill 说明)。
+  2. `tests/contract/test_api_routes_match_docs.py::test_implemented_routes_are_documented_or_explained`:新增的 `GET .../data` 与 `POST .../context` 未登记进 `docs/设计/05-后端API设计.md` 冻结清单,也未写入测试里的 `_UNDOCUMENTED`。
+- 迁移验证工具 `tests/integration/data_schema.py` 可在测试私有表上安装 0011(把 `ADD COLUMN` 改写为 `IF NOT EXISTS`、把建表改为 TEMP TABLE),不需要先升级业务库。
+- 隔离数据库集成测试、Ruff、import-linter、前端 typecheck/test/build 与桌面交互回归**本轮尚未执行**。
+
+#### 下一步(按建议顺序)
+
+1. 修掉上面 2 项测试失败:确认 `parent_id` 口径(改测试或补 Skill 说明),把两个新接口补进 `docs/设计/05-后端API设计.md` 清单(或写进 `_UNDOCUMENTED` 并注明原因)。
+2. 补跑 `tests/integration`(需要 `TENDER_RUN_DB_TESTS=1` 与隔离 schema)、`ruff check src/tender/`、`lint-imports`。
+3. 前端 `apps/web` 执行 pnpm 类型检查、测试、构建与交互回归,验证 `AnalysisDataPanel` 的标段单选、分页加载和原文定位。
+4. 补文档:API、DDL、运行说明与交接记录(至少 05、14、17 三处)。
+5. 业务库执行 `alembic upgrade head` 到 `0011_analysis_data`、重启 API/worker、新建分析报告验证真实链路。这一步属于现场变更,需用户明确同意后再做。
+6. 用人工核对样本检查解析质量:至少覆盖多标段、公共条款、补遗和证明材料;跨标段误混、无证据却标为已核实、转引占位通过都算验收失败。
+
+#### 未提交改动清单(本轮新增/修改)
+
+新增:`apps/api/alembic/versions/0011_analysis_data.py`、`apps/api/src/tender/application/analysis_data.py`、`apps/api/src/tender/application/analysis_data_store.py`、`apps/api/tests/integration/data_schema.py`、`apps/api/tests/unit/application/test_analysis_data.py`、`apps/web/src/components/knowledge/AnalysisDataPanel.tsx`、13 个 `references/coverage.json`。
+
+修改(主要):`api/knowledge.py`、`application/agent_runtime.py`、`application/analysis_policy.py`、`application/analysis_skills.py`、`application/deep_analysis.py`、`application/knowledge.py`、`worker/deep_analysis.py`、13 个 Skill 目录下的 SKILL/输出清单/示例,`tests/integration/test_deepagents_runtime.py`、`tests/integration/test_knowledge_flow.py`、`apps/web/src/components/knowledge/ProjectAnalysis.tsx`、`apps/web/src/types/knowledge.ts`。数量级为 63 个文件、约 +956/-377。
+
+#### 环境与服务现场
+
+- 业务库当前迁移版本为 `0010_analysis_guards`,checkpoint 四表已存在;`0011_analysis_data` **尚未在业务库执行**。
+- API/worker 未重启,仍运行已提交的旧代码;新 Skill 与业务数据协议只对新发起的分析生效,已有报告保持只读展示,不会自动回填业务数据。
+- 本轮只跑了单元/契约测试与 `test_analysis_data.py`,未调用真实供应商、未修改业务数据、未重启服务、未推送、未提交。
+
+### 2026-10-11 单标段数据改造续接：代码与隔离验证完成，待现场启用
+
+本节覆盖上节的“未接完、两项失败、前端未验证”状态。用户要求读取交接后继续，本轮使用
+`karpathy-guidelines`，没有启动子代理，没有提交或推送。仍只实现业务数据、持久化、标段治理和三种取数用途；
+真正的大纲生成、正文生成与投标文件检查不属于本阶段。
+
+#### 本轮接完与修复
+
+- 格式 Skill 的测试口径改为模型输入 `parent_key`，最终 `parent_id` 仍由服务端生成；两个新接口正式登记到 API 文档。
+- 展示投影携带 `record_id` 和适用范围说明，读报告时仍保留不同标段的同名要求；暂存条目中的内部 `business` 不泄露到页面。修正版本来源校验失败时保留上一版已核实成果。
+- 业务记录按稳定身份和业务语义计算纠错额度，不同标段不串账；已核实的范围/条件修正算作进展，仅改标题不算。
+- 主题覆盖按标段核对，A标段已提取不能代替B标段；具体标段的记录不能证明公共覆盖。不适用结论保存校验器最终证据并在读取时重新检查权限。
+- 修订关系不能作用到端点不适用的标段；关系端点文字变化、父节点未通过等情况保留缺口。范围未知不会混入适用要求。
+- 标段目录未核对完整、已有项目标段在解析目录中缺失，或存在未解决的分标指向时，不自动选择唯一已识别标段。普通“适用性待确认”仍与公共可用数据一起返回，避免所有缺口都阻断项目级草稿。
+- 正式快照读取同时检查输入来源，撤销来源即使只被缺口说明引用也会隐藏内容；正文参考检索结束后再次检查报告状态、快照与来源，防止等待期间的撤销绕过校验。
+- 指定历史快照仍可查看，但 `stale=true`；正在补跑的报告也不能提供新编制上下文。新增真实HTTP测试覆盖跨报告快照、分页清单、来源撤销和参考片段分离。
+- 前端补齐业务类型，预览显示项目事实、适用要求和未决事项；切换标段/报告丢弃旧请求。原文入口复用 `resolveCitation` 权限校验。
+- 把数据面板放入结果滚动区，修复展开长清单后窄屏原文区高度被挤为零的问题；保留桌面与移动端PDF定位。
+- 补齐 `docs/设计/05-后端API设计.md`、`docs/设计/14-知识库与综合分析实现.md`、`docs/工程/14-解析Skill与运行护栏.md`、`docs/工程/17-数据库迁移.md`，并把0011加入DDL契约映射。
+- 更正迁移文档的离线SQL说明：实际输出包含 `alembic_version` 更新；增量审阅可显式指定 `0010_analysis_guards:0011_analysis_data`。
+
+#### 最终验证结果
+
+- `apps/api`：`TENDER_RUN_DB_TESTS=1`、`PYTHONUTF8=1`，`uv run pytest tests/unit tests/contract tests/integration -q --tb=short` → **604 passed / 8 skipped**。数据库用隔离schema或临时表，模型为测试替身。
+- 新增 `tests/integration/test_analysis_data_flow.py`：8项真实PostgreSQL与HTTP验证；真实DeepAgents集成用例同时断言业务属性送审、精选证据落库和报告终态发布快照。
+- Ruff检查本轮源码、测试和0011迁移通过；`lint-imports` → **5 kept / 0 broken**；`git diff --check` 通过。
+- 前端 `pnpm --dir apps/web typecheck`、`pnpm --dir apps/web test`（**12文件 / 77项**）、`pnpm --dir apps/web build` 全部通过。最后一次生产构建包含本轮最终布局与类型变更。
+- 新增 `apps/web/e2e/analysis-data.spec.ts`：**8项全部通过**（1440px桌面和390px窄屏）。覆盖多标段显式单选、102项要求完整分页、旧请求丢弃、报告切换、过期快照、目录缺口、引用权限校验及PDF canvas显示。
+- 全部浏览器用例：一轮 **35 passed / 1 failed**，失败是既有模型保存重试用例的按钮等待超时；原样单独复跑 **1 passed**。不要写成“36项一次全绿”。该用例对应的产品代码未改。
+- 浏览器接口全部拦截，PDF使用仓库样本；没有执行真实新增、删除或模型请求。上述通过不等于真实模型解析质量通过。
+- 最终桌面/窄屏截图均已人工查看：`.tmp/analysis-data-browser/analysis-data-多标段必须显式单选，分页完整加载，原文入口先校验引用-desktop/analysis-preview.png` 及同名 `-mobile` 目录。
+- 离线SQL已渲染：`.tmp/analysis-data-migration.sql` 为整条链，`.tmp/analysis-data-0011.sql` 为0010→0011增量；两者都未执行到业务库。
+
+#### 现场与下一步
+
+- 只读检查 `alembic current` → **0010_analysis_guards**，`alembic heads` → **0011_analysis_data (head)**；业务库尚未应用0011。
+- 本轮没有启动或重启API/worker，没有调用真实供应商，没有新建真实分析报告。测试所用前端已关闭，服务端口应在下次操作前重新确认。
+- 首次Turbopack开发服务启动超过Playwright的120秒等待；验证改用 `pnpm exec next dev --webpack -p 4400`，默认项目配置未改。生产Turbopack构建通过。
+- 需要用户单独同意现场变更后，再按迁移文档备份、`alembic upgrade head`、启用API/worker，并新建报告验证真实链路。旧报告不回填、旧版本检查点不能手工改号恢复。
+- 真实质量验收尚待进行：至少核对多标段、公共条款、补遗、证明材料和评分档次；不能把模型替身测试替代人工核对。
+- 所有代码与文档仍未提交。后续如用户明确要求提交，提交信息使用中文，不添加作者，不自动推送。
+
+### 2026-10-11 修复代码审查发现的四处业务数据问题
+
+用户要求修复未提交变更的审查问题，本轮沿用 `karpathy-guidelines`，没有启动子代理。
+
+- **取消补跑后的旧快照**：发布和取数共用 `snapshot_manifest`，读取时核对当前运行账和模块业务数据。报告取消但模块尚未退出、或新快照尚未发布时，旧快照仍为 `stale=true`，编制取数返回409。最新 attempt 的 pending 也阻止发布；已被后续补跑替代的历史 pending 不永久堵住发布。
+- **格式树部分回退**：新增累计结构检查，校验循环、缺失祖先和已核实父路径是否变化；最终提交发现问题时反馈模型修正。失败/取消时仍保留节点，但无效节点及其后代降为效力未知，放入 `unresolved / gaps`，不混入下游可用格式树。
+- **多标段不适用证明**：证明 key 区分主题和范围，汇总按 `review_id` 查询证明；旧检查点中重复 key 的证明也都保留，各标段不会互相覆盖。
+- **缺口无法清除**：分批 `final=false` 按 key 累积缺口，`final=true` 提交完整剩余清单，原文和结构校验通过后替换；全部解决时用 `gaps=[]`，最终校验失败不会清空旧缺口。运行时契约、13个模块的SKILL和输出清单、API及设计/运行文档均已同步。
+- 新增11项回归，修复前新增的首批9项均失败复现；修复后全套 `PYTHONUTF8=1`、`TENDER_RUN_DB_TESTS=1`，`uv run pytest tests/unit tests/contract tests/integration -q --tb=short` → **615 passed / 8 skipped**。Ruff检查本轮源码与测试通过，`lint-imports` → **5 kept / 0 broken**，`git diff --check`通过。
+- 测试使用临时表/隔离schema和模型替身，未修改业务数据、未调用真实供应商。未改前端，本轮未重跑前端检查；前轮验证结果保留。
+- 未执行迁移、未启动或重启服务、未提交或推送。现场启用仍按上一节约定处理。
+
+### 2026-10-11 按用户要求提交单标段业务数据改造
+
+- 用户明确要求「提交代码」，本次提交包含当前业务数据契约、0011迁移、13个解析模块协议、快照发布与单标段取数接口、前端编制依据预览、测试及文档，以及上述四处审查问题修复。
+- 提交信息：`实现单标段编制业务数据与快照取数并修复审查问题`，不附加作者说明，不推送。
+- 使用上一轮已通过的验证结果：后端615 passed / 8 skipped，Ruff和5项依赖分层检查通过；提交前再次检查差异空白。
+- 此次提交不执行数据库迁移或启用服务；真实供应商、新业务报告与解析质量验收仍待现场阶段完成。

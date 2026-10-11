@@ -1,0 +1,18 @@
+[
+  {
+    "key": "ceilings",
+    "title": "各标段限价"
+  },
+  {
+    "key": "components",
+    "title": "报价构成"
+  },
+  {
+    "key": "format",
+    "title": "报价材料"
+  },
+  {
+    "key": "adjustment",
+    "title": "调整及漏项规则"
+  }
+]

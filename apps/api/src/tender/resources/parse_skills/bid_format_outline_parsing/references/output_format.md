@@ -1,23 +1,35 @@
-# 格式大纲节点协议
+# bid_format_outline_parsing 业务数据输出
 
-通过 submit_analysis 提交 outline_nodes，fields 留空，research_summary 说明检索范围和缺口。每节点恰好包含：
+## 输出协议
 
-- id：本次输出中唯一的短字符串，仅用于节点之间互相引用，不是PDF锚点。
-- name：材料或逻辑标的原文名称，必须是自身引文中的连续文字。
-- node_type：group（逻辑标容器）或 section（具体材料章节）。
-- parent_id：唯一父节点 id；逻辑标容器和无明确归属的独立材料用 null。
-- requirements：编制要求的原文片段字符串数组；逐字保留填写、签署、证明、响应、条件和单位，不另行概述父子归属。容器没有编制要求时用空数组。
-- citations：[{"block_id":"实际读到的块ID","quote":"连续原文"}]。引用来自格式正文，覆盖本节点名称和编制要求；程序汇集父路径各节点的引文，不必反复抄写祖先引文。父子归属须有明确正文依据，仅凭相邻位置不足以证明归属。
+通过原生工具 `submit_analysis(records, coverage, gaps, research_summary, final=false)` 分批提交。
+普通专题每批最多3条业务记录，格式专题最多6条。最后明确 `final=true`。
+记录字段由工具 schema 定义，`key` 是本模块内稳定短标识，同一记录纠正时沿用。
+`kind` 为 fact / requirement / lot / format_node / relation；`title` 为名称，`text` 直接写完整事实或要求。
+`scope.kind` 必须为 common / lots / unknown；lots 的 `lot_refs` 填原文标段编号或名称。
+不能因未写标段就认定所有标段适用。公共适用性同样需要原文或上下文依据。
+`citations` 使用 [{"block_id":"实际读取ID","quote":"连续原文"}]，覆盖文本和全部业务属性。
+`conditions` 保留 expression、logic(all/any/mixed/text)、terms(subject/operator/value/unit/time_basis)、exceptions。
+日期起算点和类似项目定义不明时保留未知，不用常识填值。`materials` 列出 name 与 requirement。
+`scoring` 保留 max_points、formula、tiers(condition/points)、deductions；评分项内部的全部档次属于同一项。
+`structuring` 为 complete 或 partial，无法可靠拆解时用 partial 并保留完整 text。
+仅项目概况模块提交 kind=lot，保留 code、title、aliases；其他模块直接填写标段原文指向。
+格式节点用 kind=format_node、node_type(group/section)、parent_key；先父后子，完整保留原文层级。
+修订/冲突用 kind=relation，predicate 为 supersedes/conflicts/requires/contains；端点先提交再填 subject_key/object_key。
+supersedes 表示 subject 替代 object，双方证据和适用范围均须明确，不能按上传时间判断。
 
-节点中不填写 fields、层级或父路径：程序会从唯一 parent_id 统一生成字段展示和关系，保证展示一致。
-group只能是根；材料章节最多三级，更深内容作为上级节点的编制要求保留。
-独立章节与逻辑标可以并存。“单独提交”的附件若没有明确所属标或父章节，使用 parent_id=null，不凭相邻位置补造归属。
-正文只有材料清单时仍可输出各材料节点；没有任何格式依据时返回 outline_nodes=[]。
+`references/coverage.json` 是运行时已加载的主题清单。每个主题登记覆盖状态：
+extracted（关联 record_keys）、searched_not_found（只表示本次没找到）、pending、not_applicable（必须有引用）。
+一个主题可按不同标段分别登记。未核对主题不会被当成完成，不为填满清单编造要求。
+缺口用 gaps 提交 key/topic/scope/code/detail；code 为 unresolved_reference、unknown_condition、scope_unknown、
+conflict、missing_source、incomplete_structure、search_exhausted。检索总结不能替代这些结构化状态。
+转引只是线索，须检索实际条款并完整写进 text；预算耗尽或目标缺失时记录缺口。
+缺口随 final=false 按 key 累积；final=true 须提交全部剩余 gaps，校验通过后替换旧清单。
+全部缺口已解决时最终提交 gaps=[]；最终校验失败仍保留已有缺口。
+来源、页码和坐标由服务端按校验保留的证据ID补齐，模型不生成定位。
 
-## 本项目提交约束
-
-- 运行时已加载本输出清单。字段只有在找到直接原文依据后才输出，清单不要求填满。
-- 工具结果为 `{id,text}`；引用为 `{"block_id":"该id","quote":"text中的连续原文"}`。定位不由模型生成。
-- 同一事实只提交最佳必要证据集合；同一来源的等价重复通常选一处，条件跨块、修订双方和冲突分别保留。
-- 每批暂存用 `final=false`，最后用 `final=true` 明确完成；自然语言或Markdown回复不能代替提交工具。
-- 校验失败只修正反馈指出的事实；无充分证据时删除推断、保留检索缺口，不反复改名重试。
+## 内容检查清单
+- 格式层级
+- 独立材料清单
+- 填写签署要求
+- 附件及补充格式

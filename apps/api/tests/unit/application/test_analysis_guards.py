@@ -137,7 +137,8 @@ def test_project_skills_have_loadable_references_and_distinct_domain_rules():
         modified = snapshot | {key + "/SKILL.md": text + "\n新的业务规则"}
         assert load_module_skill(modified, key)["sha256"] != loaded["sha256"]
     assert "参数表" in snapshot["tech_requirement_parsing/SKILL.md"]
-    assert "parent_id" in snapshot["bid_format_outline_parsing/SKILL.md"]
+    # 模型引用稳定 key，最终 parent_id 由服务端生成，避免模型编造记录身份。
+    assert "parent_key" in snapshot["bid_format_outline_parsing/SKILL.md"]
     with pytest.raises(ValueError, match="Skill"):
         load_module_skill({}, KEY)
 

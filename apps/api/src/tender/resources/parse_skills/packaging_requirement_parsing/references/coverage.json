@@ -1,0 +1,18 @@
+[
+  {
+    "key": "copies",
+    "title": "份数载体"
+  },
+  {
+    "key": "signing",
+    "title": "签字盖章"
+  },
+  {
+    "key": "sealing",
+    "title": "封装标识"
+  },
+  {
+    "key": "submission",
+    "title": "递交要求"
+  }
+]

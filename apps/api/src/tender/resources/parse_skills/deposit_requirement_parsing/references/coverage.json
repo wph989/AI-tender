@@ -1,0 +1,18 @@
+[
+  {
+    "key": "amount",
+    "title": "保证金金额"
+  },
+  {
+    "key": "form",
+    "title": "提交形式"
+  },
+  {
+    "key": "deadline",
+    "title": "提交期限"
+  },
+  {
+    "key": "refund",
+    "title": "退还及不退还条件"
+  }
+]

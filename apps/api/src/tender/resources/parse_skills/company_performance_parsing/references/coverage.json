@@ -1,0 +1,22 @@
+[
+  {
+    "key": "eligibility",
+    "title": "类似业绩定义"
+  },
+  {
+    "key": "time",
+    "title": "业绩时间范围"
+  },
+  {
+    "key": "quantity",
+    "title": "数量条件"
+  },
+  {
+    "key": "materials",
+    "title": "证明材料"
+  },
+  {
+    "key": "scoring",
+    "title": "业绩评分"
+  }
+]

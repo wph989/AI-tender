@@ -1,0 +1,18 @@
+[
+  {
+    "key": "amendments",
+    "title": "补遗修订"
+  },
+  {
+    "key": "conflicts",
+    "title": "跨文件冲突"
+  },
+  {
+    "key": "references",
+    "title": "转引追踪"
+  },
+  {
+    "key": "other",
+    "title": "其它重要要求"
+  }
+]

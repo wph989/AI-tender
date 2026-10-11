@@ -17,6 +17,7 @@ from tender.application.agent_runtime import (
     check_report_access,
     requeue_unlocked_runs,
 )
+from tender.application.analysis_data_store import publish_data_snapshot
 from tender.application.analysis_research import AgentLimits, ResearchSession
 from tender.application.analysis_skills import MODULES, verify_items
 from tender.application.deep_analysis import (
@@ -360,6 +361,7 @@ async def execute_module(
                     )
         if isinstance(exc, asyncio.CancelledError):
             raise
+
     finally:
         try:
             if model:
@@ -430,3 +432,6 @@ async def analyze_report(db: KnowledgeStore, report: dict) -> None:
         )
         if isinstance(exc, asyncio.CancelledError):
             raise
+    finally:
+        # 取消或失败时各模块已由上面的异常分支等待退出，再固定已核实成果。
+        await asyncio.to_thread(publish_data_snapshot, db, report["id"])

@@ -1,15 +1,32 @@
-# 企业业绩输出格式
+﻿# company_performance_parsing 业务数据输出
 
 ## 输出协议
 
-通过原生工具 submit_analysis 提交 fields、relations 和 research_summary，不在普通正文中模拟工具动作。
-每个字段包含 `field`、`group`、`sort_order`、`values`、`note`。
-`values` 是解析值数组，每个值形如 `{"value":"解析值原文表述","citations":[{"block_id":"实际读到的块ID","quote":"该块内的连续原文"}]}`，证据逐值绑定。
-`group` 是展示分类（可留空），`sort_order` 是非负整数展示顺序，`note` 是备注（可留空）。
-同一字段出现多个值（如不同文件或补充通知不一致）时，每个值各自成一条并带自己的引用，不合并成一段文字。
-保留且/或、例外、否定、金额单位及标段条件；一个值可有多条引用。
-没有相关依据返回 空 fields/relations，并填写说明检索缺口的 research_summary，不补造“未提及”记录。
-参考清单只定义要核对的内容，不是另一套输出格式。文件名、页码和坐标由服务端从引用补齐。
+通过原生工具 `submit_analysis(records, coverage, gaps, research_summary, final=false)` 分批提交。
+普通专题每批最多3条业务记录，格式专题最多6条。最后明确 `final=true`。
+记录字段由工具 schema 定义，`key` 是本模块内稳定短标识，同一记录纠正时沿用。
+`kind` 为 fact / requirement / lot / format_node / relation；`title` 为名称，`text` 直接写完整事实或要求。
+`scope.kind` 必须为 common / lots / unknown；lots 的 `lot_refs` 填原文标段编号或名称。
+不能因未写标段就认定所有标段适用。公共适用性同样需要原文或上下文依据。
+`citations` 使用 [{"block_id":"实际读取ID","quote":"连续原文"}]，覆盖文本和全部业务属性。
+`conditions` 保留 expression、logic(all/any/mixed/text)、terms(subject/operator/value/unit/time_basis)、exceptions。
+日期起算点和类似项目定义不明时保留未知，不用常识填值。`materials` 列出 name 与 requirement。
+`scoring` 保留 max_points、formula、tiers(condition/points)、deductions；评分项内部的全部档次属于同一项。
+`structuring` 为 complete 或 partial，无法可靠拆解时用 partial 并保留完整 text。
+仅项目概况模块提交 kind=lot，保留 code、title、aliases；其他模块直接填写标段原文指向。
+格式节点用 kind=format_node、node_type(group/section)、parent_key；先父后子，完整保留原文层级。
+修订/冲突用 kind=relation，predicate 为 supersedes/conflicts/requires/contains；端点先提交再填 subject_key/object_key。
+supersedes 表示 subject 替代 object，双方证据和适用范围均须明确，不能按上传时间判断。
+
+`references/coverage.json` 是运行时已加载的主题清单。每个主题登记覆盖状态：
+extracted（关联 record_keys）、searched_not_found（只表示本次没找到）、pending、not_applicable（必须有引用）。
+一个主题可按不同标段分别登记。未核对主题不会被当成完成，不为填满清单编造要求。
+缺口用 gaps 提交 key/topic/scope/code/detail；code 为 unresolved_reference、unknown_condition、scope_unknown、
+conflict、missing_source、incomplete_structure、search_exhausted。检索总结不能替代这些结构化状态。
+转引只是线索，须检索实际条款并完整写进 text；预算耗尽或目标缺失时记录缺口。
+缺口随 final=false 按 key 累积；final=true 须提交全部剩余 gaps，校验通过后替换旧清单。
+全部缺口已解决时最终提交 gaps=[]；最终校验失败仍保留已有缺口。
+来源、页码和坐标由服务端按校验保留的证据ID补齐，模型不生成定位。
 
 ## 内容检查清单
 以下主题和字段用于检查覆盖，不要求逐项填满；只有原文明示且有引用的内容才输出。
@@ -37,11 +54,3 @@
 - 业绩要求必须针对投标人企业历史项目经验；人员个人业绩不得写入本模块。
 - 合同金额、数量、年限、完成时间等必须保留原文口径，不得自行换算。
 - 业绩评分标准仅输出直接以企业业绩为评分对象的规则。
-
-## 本项目提交约束
-
-- 运行时已加载本输出清单。字段只有在找到直接原文依据后才输出，清单不要求填满。
-- 工具结果为 `{id,text}`；引用为 `{"block_id":"该id","quote":"text中的连续原文"}`。定位不由模型生成。
-- 同一事实只提交最佳必要证据集合；同一来源的等价重复通常选一处，条件跨块、修订双方和冲突分别保留。
-- 每批暂存用 `final=false`，最后用 `final=true` 明确完成；自然语言或Markdown回复不能代替提交工具。
-- 校验失败只修正反馈指出的事实；无充分证据时删除推断、保留检索缺口，不反复改名重试。

@@ -9,6 +9,7 @@ from uuid import uuid4
 from sqlalchemy import Connection, create_engine, text
 from sqlalchemy.pool import NullPool
 
+from tender.application.analysis_data import display_items, module_data
 from tender.application.analysis_research import AgentLimits
 from tender.application.knowledge_store import KnowledgeStore, encode
 from tender.config.registry import ConfigRegistry
@@ -291,13 +292,15 @@ class AgentRuntime:
             if state.get("staged_items_verified"):
                 # 运行状态与成果分开：未完成/失败仍可展示已核实字段，且与检查点同事务保存。
                 conn.execute(
-                    text("UPDATE analysis_module SET items=CAST(:items AS JSONB) WHERE id=:id"),
+                    text("""UPDATE analysis_module SET items=CAST(:items AS JSONB),
+                        business_data=CAST(:business AS JSONB) WHERE id=:id"""),
                     {
                         "id": self.run["module_id"],
-                        "items": encode([
+                        "business": encode(module_data(state)),
+                        "items": encode(display_items([
                             item for item in state.get("staged_items", [])
                             if item.get("verification") == "supported"
-                        ]),
+                        ])),
                     },
                 )
             for call_id in (
@@ -341,13 +344,16 @@ class AgentRuntime:
                 return
             conn.execute(
                 text("""UPDATE analysis_module SET status=:status,error_message=:error,
-                items=CASE WHEN :status='completed' THEN CAST(:items AS JSONB) ELSE items END
+                items=CASE WHEN :status='completed' THEN CAST(:items AS JSONB) ELSE items END,
+                business_data=CASE WHEN :status='completed' THEN CAST(:business AS JSONB)
+                                  ELSE business_data END
                 WHERE id=:id"""),
                 {
                     "id": self.run["module_id"],
                     "status": status,
                     "error": error,
-                    "items": encode((draft or {}).get("fields", [])),
+                    "items": encode(display_items((draft or {}).get("fields", []))),
+                    "business": encode((draft or {}).get("business_data", {})),
                 },
             )
             if draft is not None:

@@ -1,0 +1,26 @@
+[
+  {
+    "key": "roles",
+    "title": "岗位"
+  },
+  {
+    "key": "quantity",
+    "title": "人员数量"
+  },
+  {
+    "key": "qualification",
+    "title": "资格证书"
+  },
+  {
+    "key": "experience",
+    "title": "经验"
+  },
+  {
+    "key": "materials",
+    "title": "人员证明"
+  },
+  {
+    "key": "scoring",
+    "title": "人员评分"
+  }
+]

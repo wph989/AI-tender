@@ -94,6 +94,8 @@ export interface AnalysisReport {
   category: string;
   topics: string[];
   created_at: string;
+  finished_at?: string | null;
+  data_schema_version?: string | null;
   stale: boolean;
   runtime_retired?: boolean;
   error_message: string | null;
@@ -107,6 +109,109 @@ export interface AnalysisReport {
     total_blocks?: number;
     files?: { source_id: number; name: string; state: string }[];
   };
+}
+
+export interface AnalysisScope {
+  kind: "common" | "lots" | "unknown";
+  lot_ids: number[];
+  lot_refs: string[];
+}
+
+/** 正式业务记录与展示字段分离，编制任务固定快照和记录身份。 */
+export interface BusinessRecord {
+  id: string;
+  key: string;
+  kind: "fact" | "requirement" | "lot" | "format_node" | "relation";
+  title: string;
+  text: string;
+  scope: AnalysisScope;
+  structuring: "complete" | "partial";
+  citations: Citation[];
+  module_key: string;
+  verification: "supported";
+  group: string;
+  sort_order: number;
+  category: string;
+  parent_id?: string | null;
+  parent_key?: string | null;
+  parent_path?: string[];
+  node_type?: "group" | "section" | null;
+  requirement_ids?: string[];
+  requirement_keys?: string[];
+  conditions: {
+    expression: string;
+    logic: "all" | "any" | "mixed" | "text";
+    terms: {
+      subject: string;
+      operator: "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "text";
+      value: string;
+      unit: string | null;
+      time_basis: string | null;
+    }[];
+    exceptions: string[];
+  };
+  materials: { name: string; requirement: string }[];
+  scoring: {
+    max_points: string | null;
+    formula: string;
+    tiers: { condition: string; points: string }[];
+    deductions: string[];
+  } | null;
+  predicate?: "supersedes" | "conflicts" | "requires" | "contains" | null;
+  subject_id?: string;
+  object_id?: string;
+  effective_status?: "active" | "unknown";
+  superseded_in?: AnalysisScope[];
+  conflicts_in?: AnalysisScope[];
+}
+
+export interface AnalysisGap {
+  code: string;
+  detail: string;
+  scope: AnalysisScope;
+  record_id?: string;
+}
+
+export interface AnalysisCoverage {
+  topic: string;
+  title: string;
+  status: string;
+  scope: AnalysisScope;
+  detail: string;
+}
+
+export interface AnalysisDataset {
+  schema_version: string;
+  lots: (BusinessRecord & { lot_id: number; code: string; aliases: string[] })[];
+  facts: BusinessRecord[];
+  requirements: BusinessRecord[];
+  format_nodes: BusinessRecord[];
+  relations: BusinessRecord[];
+  coverage: AnalysisCoverage[];
+  gaps: AnalysisGap[];
+  readiness: "usable" | "partial" | "unavailable";
+}
+
+export interface AnalysisDataSnapshot {
+  report_id: number;
+  snapshot_id: number;
+  revision: number;
+  schema_version: string;
+  stale: boolean;
+  data: AnalysisDataset;
+}
+
+export interface AnalysisContext extends Omit<AnalysisDataset, "lots" | "schema_version"> {
+  schema_version: string;
+  snapshot_id: number;
+  purpose: "outline" | "content" | "check";
+  lot_id: number | null;
+  unresolved: BusinessRecord[];
+  requirement_manifest: string[];
+  total_requirements: number;
+  next_offset: number | null;
+  references: { purpose: "company" | "history"; text: string; citation: Citation }[];
+  reference_warning?: string | null;
 }
 
 export interface AnalysisStatus {

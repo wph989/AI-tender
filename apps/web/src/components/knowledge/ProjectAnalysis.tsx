@@ -19,6 +19,7 @@ import { STATE_LABELS } from "@/types/knowledge";
 import { CitationViewer } from "./CitationViewer";
 import { ModuleMarkdown } from "./ModuleMarkdown";
 import { QuestionPanel } from "./QuestionPanel";
+import { AnalysisDataPanel } from "./AnalysisDataPanel";
 
 export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const [name, setName] = useState("项目分析");
@@ -477,6 +478,8 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
               />
             </div>
             <div hidden={tab !== "report"}>
+              {/* 放进结果滚动区，展开长清单时仍为原文和窄屏定位保留可用高度。 */}
+              {report?.data_schema_version && <AnalysisDataPanel report={report} onLocate={(ref) => void locate(ref)} />}
               {!report ? (
                 <div className="empty-state">
                   <span className="empty-icon">

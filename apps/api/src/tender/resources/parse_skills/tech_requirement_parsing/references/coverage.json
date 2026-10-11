@@ -1,0 +1,22 @@
+[
+  {
+    "key": "scope",
+    "title": "技术范围"
+  },
+  {
+    "key": "parameters",
+    "title": "技术参数"
+  },
+  {
+    "key": "standards",
+    "title": "标准"
+  },
+  {
+    "key": "deliverables",
+    "title": "交付成果"
+  },
+  {
+    "key": "acceptance",
+    "title": "技术验收"
+  }
+]
