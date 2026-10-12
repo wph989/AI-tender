@@ -89,6 +89,7 @@ export interface AgentRun {
 }
 
 export interface AnalysisReport {
+  canceling?: boolean;
   id: number;
   status: string;
   category: string;

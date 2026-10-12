@@ -345,10 +345,19 @@ def test_image_model_binding_preview_history_and_cleanup(env, monkeypatch):
     assert "preview_data" not in test and test["result"]["preview_url"]
     assert llm.test_preview(result["test_id"], request).body == PROBE_IMAGE.data
     assert llm.list_calls(request, limit=25, offset=0)["items"][0]["image_count"] == 1
-    bound = llm.replace_bindings(
-        "image_generation", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request
+    # 模型显式测试可用，不应把尚无业务消费者的绑定伪装成有效设置。
+    with pytest.raises(ApiProblem) as unavailable:
+        llm.replace_bindings(
+            "image_generation", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request
+        )
+    assert unavailable.value.code == "feature_unavailable"
+    inactive = next(
+        f for f in llm.list_features(request)["items"] if f["key"] == "image_generation"
     )
-    assert bound["required_kind"] == "image_generation"
+    assert inactive["binding_available"] is False
+    assert llm.replace_bindings(
+        "image_generation", llm.BindingsRequest(model_ids=[], revision=1), request
+    )["bindings"] == []
     llm.update_model(
         m["id"], llm.ModelPatch(parameters={"quality": "medium"}, revision=m["revision"]), request
     )

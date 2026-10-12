@@ -61,12 +61,15 @@ export interface AdapterProfile {
   default_capabilities: string[];
   parameter_schema: Record<string, ParameterSchema>;
   adapter_version: string;
-  parameter_bounds: Record<string, { min: number; max: number }>;
+  parameter_bounds: Record<string, { min: number; max?: number }>;
 }
 export interface LlmSettings {
   secret_key_ready: boolean;
   adapter_profiles: AdapterProfile[];
   test_valid_seconds: number;
+  model_fields?: Record<string, ParameterSchema>;
+  feature_fields?: Record<string, ParameterSchema>;
+  max_bindings?: number;
 }
 export interface LlmCall extends LlmCallUsage {
   id: number;
@@ -146,6 +149,7 @@ export interface LlmBinding {
 }
 
 export interface LlmFeature {
+  binding_available?: boolean;
   revision: number;
   max_total_requests: number;
   deadline_seconds: number;

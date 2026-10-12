@@ -91,10 +91,11 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       locateAbort.current?.abort();
     };
   }, [projectId, reload]);
-  const running =
-    state?.reports.some((r) =>
+  const canceling = Boolean(report?.canceling);
+  const running = canceling ||
+    (state?.reports.some((r) =>
       ["waiting", "pending", "running"].includes(r.status),
-    ) ?? false;
+    ) ?? false);
   const processingFiles =
     state?.sources.some((source) => source.state === "processing") ?? false;
   useEffect(() => {
@@ -141,6 +142,8 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "操作失败");
+      // 取消可能已落库但后续响应失败，仍读取真实状态，避免界面永远停在执行中。
+      await reload().catch(() => undefined);
     } finally {
       setBusy(false);
     }
@@ -595,6 +598,14 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                         补跑未完成模块
                       </Button>
                     )}
+                  {canceling && (
+                    <Alert
+                      className="mb-3"
+                      type="info"
+                      showIcon
+                      title="正在停止任务，模块退出后即可重新解析。状态将自动刷新。"
+                    />
+                  )}
                   {["failed", "canceled"].includes(report.status) &&
                     !report.runtime_retired &&
                     !report.modules.length && (
@@ -739,7 +750,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                       </ul>
                                     </details>
                                   )}
-                                  {current.status === "failed" && (
+                                  {["failed", "canceled"].includes(current.status) && (
                                     <div className="notice">
                                       <span>{current.error_message}</span>
                                       {!report.runtime_retired && (

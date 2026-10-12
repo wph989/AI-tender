@@ -12,6 +12,7 @@ from sqlalchemy import text
 from tender.api.common import configs, engine, version_row
 from tender.api.errors import ApiProblem
 from tender.application.fields import FIELD_BY_KEY, FIELDS
+from tender.config.schema import parse_options
 from tender.core import settings
 
 router = APIRouter(prefix="/api/v1/versions", tags=["parsing"])
@@ -20,16 +21,16 @@ router = APIRouter(prefix="/api/v1/versions", tags=["parsing"])
 class ParseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tier: str = Field(default="standard")
-    ocr_mode: str = Field(default="auto")
+    tier: str | None = None
+    ocr_mode: str | None = None
     force: bool = False
     reason: str | None = Field(default=None, max_length=1000)
 
 
 def _validate(payload: ParseRequest) -> None:
-    if payload.tier not in {"flash", "basic", "standard", "advanced"}:
+    if payload.tier is not None and payload.tier not in {"flash", "basic", "standard", "advanced"}:
         raise ApiProblem(400, "invalid_argument", "tier 不受支持")
-    if payload.ocr_mode not in {"auto", "txt", "ocr"}:
+    if payload.ocr_mode is not None and payload.ocr_mode not in {"auto", "txt", "ocr"}:
         raise ApiProblem(400, "invalid_argument", "ocr_mode 不受支持")
     if payload.force and not (payload.reason and payload.reason.strip()):
         raise ApiProblem(400, "invalid_argument", "重新解析必须填写 reason")
@@ -47,6 +48,13 @@ def _create_parse_job(
     company = settings.company_id()
     # 先读活动配置（可能走 Redis 缓存）再开事务：不在事务里等网络。
     active_config = request.app.state.components.configs.active(company)
+    try:
+        options = parse_options(
+            active_config.resolved if active_config is not None else {},
+            payload.tier, payload.ocr_mode,
+        )
+    except ValueError as exc:
+        raise ApiProblem(400, "invalid_argument", str(exc)) from exc
     with db.begin() as connection:
         file_row = (
             connection.execute(
@@ -103,8 +111,7 @@ def _create_parse_job(
             )
         job_id = f"job_{uuid4().hex}"
         snapshot = {
-            "tier": payload.tier,
-            "ocr_mode": payload.ocr_mode,
+            **options,
             "auto_parse": True,
             "trigger": "reparse" if force else "first",
             "reason": payload.reason.strip() if payload.reason else None,

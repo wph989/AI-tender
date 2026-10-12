@@ -221,6 +221,26 @@ def test_version_failure_blocks_conversion(make_converter) -> None:
     assert convert_calls == 0, "版本读不到就不该把贵重的转换请求发出去"
 
 
+def test_version_retries_transient_failure(make_converter) -> None:
+    version_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal version_calls
+        if request.url.path == "/version":
+            version_calls += 1
+            if version_calls == 1:
+                return httpx.Response(503, text="models are still loading")
+            return version_response()
+        return pdf_response(request)
+
+    converter, sleeps = make_converter(handler)
+    result = run(converter.to_pdf(io.BytesIO(b"x"), filename="a.docx", trace_id="t"))
+
+    assert result.converter_version == "8.34.0"
+    assert version_calls == 2
+    assert sleeps == [0.5]
+
+
 def test_client_error_is_not_retried(make_converter) -> None:
     convert_calls = 0
 
@@ -282,6 +302,24 @@ def test_server_errors_exhaust_retries(make_converter) -> None:
     assert excinfo.value.retryable is True
     assert convert_calls == 3
     assert sleeps == [0.5, 1.0]
+
+
+def test_zero_extra_retries_sends_only_one_conversion_request(make_converter) -> None:
+    """0 表示不再请求，不能因默认重试或外层恢复把用户预算放大。"""
+    calls = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return version_response()
+        calls.append(request.url.path)
+        return httpx.Response(503, text="conversion timed out")
+
+    converter, sleeps = make_converter(handler, extra_retries=0)
+    with pytest.raises(ConversionUnavailable):
+        run(converter.to_pdf(io.BytesIO(b"x"), filename="a.docx", trace_id="t"))
+
+    assert len(calls) == 1
+    assert sleeps == []
 
 
 def test_trace_mismatch_is_retried_then_fails(make_converter) -> None:

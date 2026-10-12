@@ -683,13 +683,14 @@ data: {"status":"completed","version_id":2048}
 完整分析等待阶段如发现资料已失败、仅部分解析或格式不支持，报告转为 `failed`，错误列出文件。
 修复后可重试，或重新发起 `allow_partial=true` 的分析。从未固定检索批次的报告重试返回 `waiting`，
 等待资料可用；已经开始的报告重试返回 `pending` 并保留原资料批次。
-`retry` 接受 `failed`、`partial`、`canceled` 报告；`module_keys` 只将选中的失败、已取消模块置为待处理，
-未选中的失败模块和已完成模块保持原状态。不传 `module_keys` 时选择全部模块，仍只重置未完成项。
+`retry` 接受 `failed`、`partial`、`canceled`、`completed` 报告；显式 `module_keys` 可重跑已完成模块，
+已完成模块从零开始，其它模块保持原状态。不传 `module_keys` 时只补跑失败与已取消模块；
+取消时尚未创建任何模块的报告可以重新进入 `waiting`。
 恢复进程中断留下的 `running` 模块不受此限制。`runtime_version` 与当前运行时不一致的历史报告只读展示，
 补跑返回 409 `runtime_retired`。历史报告不比较参考来源快照：旧流程不记录该快照，否则库中只要有参考来源
 就会恒判为“材料已变化”。
 
-DeepAgents 报告补跑可选 `max_output_tokens`（512–16384）和 `timeout_seconds`（300–3600），只覆盖新 attempt 的对应字段；其余限值（模型/工具次数、证据块、上下文、时长）取配置中心当前值，用户调大预算后补跑立即生效。旧 attempt、报告创建时的快照和累计用量保留不回写，请求次数不随之扩大。
+DeepAgents 报告补跑可选 `max_output_tokens`（整数，最小值 1，无人工最大值）和 `timeout_seconds`（整数 ≥1，无人工最大值），只覆盖新 attempt 的对应字段；其余限值（模型/工具次数、证据块、上下文、时长）取配置中心当前值，用户调大预算后补跑立即生效。旧 attempt、报告创建时的快照和累计用量保留不回写，请求次数不随之扩大。输出仍受模型自身配置的 `max_tokens` 和供应商实际能力约束。各配置的实际限制与建议见 `docs/工程/18-配置限制清单.md`。
 模型路由收到非法 JSON 时，在换候选前最多追加两次格式纠正提示，计入既有总请求/时间预算；该行为不放宽引用校验，也不把连接、配置、权限或明确拒绝错误当作格式问题重试。
 结论的支持性检查最多反馈两次供 Agent 补读或修正，仍受模块总步数限制；最终不支持的条目明确标记 `insufficient` / `unsupported`。
 
@@ -788,5 +789,7 @@ relations / coverage / gaps / unresolved / readiness / references`，另有完�
 
 报告详情增加 runtime_version、runtime_settings、reference_snapshot、summary 及各模块 runs。
 新报告 coverage.mode=agent_research，界面显示13个专题的完成数，不使用 scanned_blocks/total_blocks。
-补跑为选中的失败、已取消模块创建新 attempt；原运行记录和已完成模块保留。取消停止后续模型与工具请求；
-已取消报告重新发起后只重跑未完成模块。
+补跑为所选模块创建新 attempt；原运行记录和未选中模块保留。取消接口与报告详情返回 `canceling`：
+取消先把报告置为 `canceled`，无执行者的排队/遗留运行立即终止，持有会话锁的模块由心跳取消并释放配额。
+`canceling=true` 时页面持续轮询并禁用补跑；旧控制器或模块仍持锁时，补跑返回409 `cancellation_pending`。
+重复取消幂等，不影响已完成模块。取消与领取任务通过报告行锁串行化，避免取消后又领取排队任务。

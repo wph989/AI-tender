@@ -1021,7 +1021,7 @@ def build_module_agent(
             SummarizationMiddleware(
                 model,
                 backend=backend,
-                trigger=("tokens", int(limits.context_tokens * 0.8)),
+                trigger=("tokens", max(1, limits.context_tokens * 4 // 5)),
                 keep=("messages", 4),
                 token_counter=context_size,
                 trim_tokens_to_summarize=limits.context_tokens,
@@ -1057,8 +1057,9 @@ async def invoke_module(
     state: dict | None = None,
     save: Callable[[dict], Awaitable[None]] | None = None,
     max_retries: int = 2,
+    recursion_limit: int = 256,
 ) -> dict:
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 256}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
     # 恢复整个图节点/工具调用状态，不能仅把历史messages重新塞给入口。
     with tracing_context(enabled=False):
         while True:

@@ -29,7 +29,8 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "pnpm exec next dev -p 4400",
+    // 与本地开发使用同一编译器，避免复用另一种编译器的开发缓存。
+    command: "pnpm exec next dev --webpack -p 4400",
     url: "http://localhost:4400/projects",
     reuseExistingServer: true,
     timeout: 120_000,

@@ -6,15 +6,19 @@ import math
 from decimal import Decimal
 from urllib.parse import urlsplit
 
-ADAPTER_VERSION = "2026-10-05.2"
+from tender.application.llm_registry import MAX_FAILOVER_LIMIT
+
+ADAPTER_VERSION = "2026-10-11.1"
 
 
-def number(label: str, minimum: float, maximum: float, *, integer: bool = False) -> dict:
+def number(
+    label: str, minimum: float, maximum: float | None = None, *, integer: bool = False
+) -> dict:
     return {
         "label": label,
         "type": "integer" if integer else "number",
         "min": minimum,
-        "max": maximum,
+        **({"max": maximum} if maximum is not None else {}),
     }
 
 
@@ -22,10 +26,27 @@ def choice(label: str, *values: str) -> dict:
     return {"label": label, "type": "enum", "values": list(values)}
 
 
+# 管理字段与协议参数一样由后端定义一次，API和页面读取同一份范围。
+MODEL_FIELDS = {
+    "timeout_seconds": number("超时（秒）", 1),
+    "extra_retries": number("失败后额外重试次数", 0, integer=True),
+}
+FEATURE_FIELDS = {
+    "failover_limit": number("故障转移级数", 1, MAX_FAILOVER_LIMIT, integer=True),
+    "max_total_requests": number("总请求上限", 1, integer=True),
+    "deadline_seconds": number("调用总时间", 1, integer=True),
+}
+
+
+def field_bounds(rule: dict) -> dict:
+    """把同一份数值范围用于请求模型；最大值缺省时不生成上限。"""
+    return {name: rule[key] for name, key in (("ge", "min"), ("le", "max")) if key in rule}
+
+
 # schema 同时用于服务端校验与表单渲染；不能允许任意 JSON 覆写 model/认证/请求路径。
 LANGUAGE = {
     "temperature": number("温度", 0, 2),
-    "max_tokens": number("最大输出 Token", 1, 100000, integer=True),
+    "max_tokens": number("最大输出 Token", 1, integer=True),
     "top_p": number("Top P", 0, 1),
     "stop": {"label": "停止词（每行一个，最多 4 个）", "type": "string_array", "max_items": 4},
 }
@@ -72,7 +93,8 @@ def profile(
         "parameters": list(schema),
         "parameter_schema": schema,
         "parameter_bounds": {
-            k: {"min": v["min"], "max": v["max"]} for k, v in schema.items() if "min" in v
+            k: {bound: v[bound] for bound in ("min", "max") if bound in v}
+            for k, v in schema.items() if "min" in v
         },
         "adapter_version": ADAPTER_VERSION,
     }
@@ -99,7 +121,7 @@ PROFILES = [
             ["json_output", "image_input"],
             {
                 "temperature": LANGUAGE["temperature"],
-                "max_tokens": number("最大输出 Token", 16, 100000, integer=True),
+                "max_tokens": number("最大输出 Token", 16, integer=True),
                 "top_p": LANGUAGE["top_p"],
                 "reasoning_effort": OPENAI_LANGUAGE["reasoning_effort"],
             },
@@ -115,7 +137,7 @@ PROFILES = [
         LANGUAGE
         | {
             "temperature": number("温度", 0, 1),
-            "top_k": number("Top K", 1, 500, integer=True),
+            "top_k": number("Top K", 1, integer=True),
         },
     ),
     profile(
@@ -126,7 +148,7 @@ PROFILES = [
         ["json_output", "image_input"],
         LANGUAGE
         | {
-            "top_k": number("Top K", 1, 500, integer=True),
+            "top_k": number("Top K", 1, integer=True),
             "seed": OPENAI_LANGUAGE["seed"],
         },
     ),
@@ -171,7 +193,7 @@ PROFILES = [
         ["text_input", "rerank"],
         [],
         {
-            "top_n": number("最多返回候选数", 1, 1000, integer=True),
+            "top_n": number("最多返回候选数", 1, integer=True),
         },
     ),
     *[
@@ -261,8 +283,9 @@ def validate_model(protocol: str, model: dict) -> dict:
             # NUMERIC 列经 psycopg 返回 Decimal，按数值统一转 float 再比较范围。
             valid = (
                 type(value) in ({int} if kind == "integer" else {int, float, Decimal})
-                and math.isfinite(float(value))
-                and rule["min"] <= float(value) <= rule["max"]
+                and (kind == "integer" or math.isfinite(float(value)))
+                and value >= rule["min"]
+                and ("max" not in rule or value <= rule["max"])
             )
         elif kind == "enum":
             valid = isinstance(value, str) and value in rule["values"]

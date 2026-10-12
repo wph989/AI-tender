@@ -14,6 +14,7 @@ import { Button, Tabs } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { PageShell } from "@/components/PageShell";
+import { ConfigWorkspace } from "@/components/config/ConfigCenter";
 import {
   getLlmSettings,
   listFeatures,
@@ -163,6 +164,7 @@ export function ModelSettings() {
                   providers={providers}
                   models={models}
                   profiles={settings.adapter_profiles}
+                  fields={settings.model_fields}
                   onChanged={reload}
                 />
               ),
@@ -175,9 +177,16 @@ export function ModelSettings() {
                 <FeatureBindingsPanel
                   features={features}
                   models={models}
+                  fields={settings.feature_fields}
+                  maximumBindings={settings.max_bindings}
                   onChanged={reload}
                 />
               ),
+            },
+            {
+              key: "runtime",
+              label: "分析参数",
+              children: <ConfigWorkspace scope="models" />,
             },
             {
               key: "calls",

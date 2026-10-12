@@ -18,11 +18,30 @@
 
 优先级与模型解耦是刻意的：同一个模型可以在不同功能里处于不同等级，运营商换模型时只动绑定层，不动模型行。
 
+### 当前功能与配置入口（2026-10-12）
+
+功能名称和说明由代码中的消费者清单返回，不再读取可能过期的数据库种子文案。
+
+| 功能键 | 实际调用范围 |
+| --- | --- |
+| `analysis` | 13个招标专题解析、证据校验、上下文压缩，以及模块补跑和指定专题重新解析 |
+| `knowledge_ask` | 项目问答、知识库问答与引用核对 |
+| `embedding` | 知识库向量索引、专题解析和问答中的向量检索；单模型 |
+| `rerank` | 专题解析与问答的检索候选重排；单模型 |
+| `extract` | 文件流水线和配置回归回放中的首次字段抽取 |
+| `retry` | 字段低置信复抽、人工重跑和带提示重跑，不用于专题补跑 |
+| `image_generation` | 尚未接入业务，`binding_available=false`；只允许清理历史绑定，模型列表仍可显式测试图片生成 |
+
+`analysis.*`、`llm_aided.*`、`extract.max_inflight`、`extract.strategy.*` 的编辑入口统一放在
+「模型管理 → 分析参数」，配置中心保留其它运行与文件处理规则。底层配置键、范围元数据和版本链不变，
+发布与回滚仍作用于整个版本。未接入的开关继续只读。向量与重排的路由预算不可编辑，因为当前消费者为单次调用。
+
 ## 3. 优先级规则
 
 - 取值范围 1–10，数字越小越优先；同一功能内唯一且连续（`1..N`）。
 - **整表提交**：客户端提交有序的 `model_ids`，服务端按数组位置写 `1..N`；不做单行改级接口，避免出现空洞与同级。
 - 页面上的"设为 N 级、其余自动降级"由前端计算后整表提交：把目标模型从原位置摘出，插入到第 N 位，原来的第 N 位及其后顺延一位。
+- 页面支持选择完整顺位、上移、下移、置顶、置底；顺位选择结束后再移动，避免输入两位数字时提前重排。切换功能保留独立草稿，保存仍使用原子整表提交及版本校验。
 - 新增第 11 个模型直接拒绝（`priority_limit_exceeded`），不静默挤掉最低级：静默丢模型会让线上配置无声变化。
 - 目标位置超出范围时夹到 `1..数量+1`，不保留空洞；空洞级别没有可解释语义。
 
@@ -31,7 +50,7 @@
 - 每个功能有 `failover_limit`（1–10，默认 3），实际生效值夹到该功能已绑定模型数量以内。
 - `failover_limit` 只计实际发送过请求的不同可用候选。语言模型暂时故障先按 `extra_retries` 退避；认证、参数或非法 JSON 不在原模型重复请求，模型明确拒绝与本地约束错误直接停止。
 - 模型返回了结果但置信度低**不算失败**：继续走既有的双轮复抽与规则投票。
-- 模型 `extra_retries` 为 0—10，默认 1；功能 `max_total_requests` 为 1—20，默认 6，`deadline_seconds` 默认 600。默认暂时故障顺序为 A/A/B/B/C/C，任何预算先到即停止。
+- 模型 `extra_retries` 为整数 ≥0，默认 1；功能 `max_total_requests` 为整数 ≥1，默认 6，`deadline_seconds` 为整数 ≥1，默认 600；这些预算无人工最大值。默认暂时故障顺序为 A/A/B/B/C/C，任何预算先到即停止。
 - 候选耗尽后，该字段落 `need_review` 并记录失败链；全部失败属于内部重试，不占机器解析序号。
 - 若所有候选的失败都是"暂时不可用"（网络、限流、5xx），向上抛 `ExtractionUnavailable`，让 worker 退避后整任务重试；只要有一个是明确拒绝（4xx、响应结构错误），就按字段失败处理。
 
@@ -317,4 +336,22 @@ ALTER TABLE llm_call_log ADD COLUMN image_count INT;
 INSERT INTO llm_feature(key,name,description) VALUES
         ('image_generation','图片生成','图片模型管理、功能绑定与显式测试；不自动生成业务素材')
         ON CONFLICT DO NOTHING;
+```
+
+
+## 12. 配置预算统一与迁移 0012（2026-10-11）
+
+模型管理字段范围由 `model_profiles.py` 的 MODEL_FIELDS/FEATURE_FIELDS 声明，API 请求校验及 `/llm/settings` 元数据共用；页面读取元数据，不再重复写上下限。模型 timeout_seconds 支持有限小数 ≥1，extra_retries ≥0，总请求次数与调用总时限 ≥1，均无人工最大值。max_tokens、top_k、top_n 移除统一人工上限；Responses 的 max_tokens 最小 16 等协议约束保留。
+
+候选绑定数量与 failover_limit 仍最多 10；嵌入/重排仍只绑定一个模型。预算只限制真实执行，不修改正在运行的分析 attempt。下面增量取代 0006 的三个旧 CHECK；历史 DDL 保留以便迁移审阅。新增证据块配置与运行预算默认值一致。
+
+```sql
+ALTER TABLE llm_model DROP CONSTRAINT llm_model_extra_retries_check,
+        ADD CONSTRAINT llm_model_extra_retries_check CHECK (extra_retries >= 0);
+ALTER TABLE llm_feature DROP CONSTRAINT llm_feature_max_total_requests_check,
+        DROP CONSTRAINT llm_feature_deadline_seconds_check,
+        ADD CONSTRAINT llm_feature_max_total_requests_check CHECK (max_total_requests >= 1),
+        ADD CONSTRAINT llm_feature_deadline_seconds_check CHECK (deadline_seconds >= 1);
+INSERT INTO config_item (key,layer,value_type,default_value,description,requires_gate) VALUES
+('analysis.max_evidence_blocks', 'L1', 'int', '160'::jsonb, '每模块保留的原文证据块上限', false);
 ```

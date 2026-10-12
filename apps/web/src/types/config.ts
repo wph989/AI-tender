@@ -14,6 +14,10 @@ export interface ConfigItem {
   value: unknown;
   overridden: boolean;
   writable: boolean;
+  readonly_reason?: string | null;
+  minimum?: number;
+  maximum?: number;
+  choices?: string[];
 }
 
 export interface ConfigItemsResponse {

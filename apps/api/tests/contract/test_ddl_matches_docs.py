@@ -58,6 +58,12 @@ class _MigrationSpec:
 
 
 _MIGRATIONS: tuple[_MigrationSpec, ...] = (
+    _MigrationSpec(
+        "0012_config_limits.py",
+        (("设计/12-LLM管理与模型路由.md", 3),),
+        require_tables=False,
+        require_indexes=False,
+    ),
     _MigrationSpec("0011_analysis_data.py", (("设计/14-知识库与综合分析实现.md", 1),)),
     _MigrationSpec(
         "0009_provider_cooldown.py",

@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { MAX_BINDINGS, moveToPriority } from "@/lib/llm/priority";
+import { moveToPriority } from "@/lib/llm/priority";
 
 describe("moveToPriority", () => {
   it("上移：目标模型插到第 N 位，原第 N 位及其后顺延", () => {
@@ -42,7 +42,6 @@ describe("moveToPriority", () => {
 
   it("满 10 个绑定时仍可重排（上限与后端一致）", () => {
     const ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-    expect(MAX_BINDINGS).toBe(10);
     expect(moveToPriority(ids, 10, 1)).toEqual([10, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
   });
 });

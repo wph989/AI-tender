@@ -88,6 +88,7 @@ class GotenbergConverter:
         transport: httpx.AsyncBaseTransport | None = None,
         timeout_seconds: float = 180.0,
         backoff_seconds: float = 0.5,
+        extra_retries: int = _MAX_ATTEMPTS - 1,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         # transport 只给测试注入：有了它，重试、串包、版本缓存这些分支不用起真服务就能覆盖
@@ -100,6 +101,7 @@ class GotenbergConverter:
             trust_env=False,
         )
         self._backoff_seconds = backoff_seconds
+        self._max_attempts = extra_retries + 1
         self._sleep = sleep
         self._version: str | None = None
 
@@ -108,6 +110,21 @@ class GotenbergConverter:
         await self._client.aclose()
 
     async def version(self) -> str:
+        """版本探测与转换共用重试预算:上游刚启动时 /version 可能短暂 503。"""
+        if self._version is not None:
+            return self._version
+        last_error: ConversionUnavailable | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                return await self._read_version()
+            except ConversionUnavailable as exc:
+                last_error = exc
+            if attempt < self._max_attempts:
+                await self._sleep(min(30, self._backoff_seconds * 2 ** min(attempt - 1, 10)))
+        assert last_error is not None  # 循环至少执行一次,所有失败路径都会赋值
+        raise last_error
+
+    async def _read_version(self) -> str:
         """Gotenberg 版本，进程内缓存。
 
         拿不到版本必须失败而不是降级成 "unknown"：converter_version 是溯源记录的一部分，
@@ -189,7 +206,7 @@ class GotenbergConverter:
         trace_id: str,
     ) -> httpx.Response:
         last_error: ConversionUnavailable | None = None
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
+        for attempt in range(1, self._max_attempts + 1):
             if attempt > 1:
                 _rewind(src)
             try:
@@ -223,8 +240,8 @@ class GotenbergConverter:
                         f"转换失败：HTTP {response.status_code} {_body_snippet(response)}"
                     )
 
-            if attempt < _MAX_ATTEMPTS:
-                await self._sleep(self._backoff_seconds * 2 ** (attempt - 1))
+            if attempt < self._max_attempts:
+                await self._sleep(min(30, self._backoff_seconds * 2 ** min(attempt - 1, 10)))
 
         assert last_error is not None  # 循环里每条失败路径都会赋值，这里只为类型收窄
         raise last_error

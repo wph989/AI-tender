@@ -34,7 +34,9 @@ def _load_migration() -> ModuleType:
 def _seed_rows() -> list[tuple[str, str, str, str, str, bool]]:
     module = _load_migration()
     sql = "\n".join(module._STATEMENTS)
-    for filename in ("0008_deepagents_runtime.py", "0010_analysis_guards.py"):
+    for filename in (
+        "0008_deepagents_runtime.py", "0010_analysis_guards.py", "0012_config_limits.py"
+    ):
         spec = importlib.util.spec_from_file_location(
             "_seed_extension", _MIGRATION.parent / filename
         )

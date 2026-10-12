@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import wraps
@@ -21,6 +21,7 @@ from tender.adapters.mineru import MinerUParser
 from tender.adapters.pdfium import InvalidPdfError, PdfInspection, inspect_pdf
 from tender.adapters.s3 import S3BlobStore
 from tender.application.middle_json import NormalizedElement, normalize_middle_json
+from tender.config.registry import ConfigRegistry
 from tender.core import settings
 from tender.domain.errors import (
     ConversionFailed,
@@ -119,6 +120,17 @@ def _serialize_job(function: Callable[..., None]) -> Callable[..., None]:
     return wrapped
 
 
+@asynccontextmanager
+async def _async_version_lock(lock_key: str) -> AsyncIterator[None]:
+    """转换等待同一版本锁时仍允许总时限取消，不能被同步阻塞查询绕过预算。"""
+    while True:
+        with _advisory_lock(lock_key, wait=False) as acquired:
+            if acquired:
+                yield
+                return
+        await asyncio.sleep(0.2)
+
+
 def _file_job(job_id: str) -> Mapping[str, Any] | None:
     with _engine.connect() as connection:
         row = (
@@ -200,7 +212,9 @@ def _verify_hash(content: bytes, expected: str, description: str) -> None:
         raise ValueError(f"{description}的 SHA-256 与数据库记录不一致")
 
 
-def _converter() -> GotenbergConverter:
+def _converter(
+    *, remaining_seconds: float | None = None, extra_retries: int = 2
+) -> GotenbergConverter:
     try:
         credentials = settings.gotenberg_credentials()
     except ValueError as exc:
@@ -209,14 +223,51 @@ def _converter() -> GotenbergConverter:
         timeout_seconds = settings.gotenberg_timeout_seconds()
     except ValueError as exc:
         raise ConversionFailed("Gotenberg 超时配置无效") from exc
-    # 客户端预算由部署参数给，不从构造函数默认值走：它必须跟着服务端的
-    # API_TIMEOUT 变，否则大文档的失败形态变成「服务端还在转、这边已放弃」
+    # 部署参数约束单次HTTP请求；任务剩余总时限更短时不能继续等待超过任务预算。
+    if remaining_seconds is not None:
+        timeout_seconds = min(timeout_seconds, remaining_seconds)
     return GotenbergConverter(
         settings.gotenberg_url(),
         username=credentials[0] if credentials else None,
         password=credentials[1] if credentials else None,
         timeout_seconds=timeout_seconds,
+        extra_retries=extra_retries,
     )
+
+
+def _runtime_values(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    return ConfigRegistry(_engine).resolved(int(row["company_id"]))
+
+
+def _execution_start(job_id: str, phase: str) -> datetime:
+    """阶段首启时间持久化，进程恢复和消息重试都不能重新获得完整总时限。"""
+    with _engine.begin() as connection:
+        value = connection.execute(
+            text("""UPDATE job SET progress=jsonb_set(progress, ARRAY[:key],
+                COALESCE(progress->:key, to_jsonb(now())), true)
+                WHERE id=:id RETURNING progress->>:key"""),
+            {"id": job_id, "key": phase + "_started_at"},
+        ).scalar_one()
+    return datetime.fromisoformat(value)
+
+
+def _remaining(started_at: datetime, minutes: int) -> float:
+    # 比较秒数而非构造可能溢出的远期datetime，不引入新的人工时长上限。
+    return minutes * 60 - (datetime.now(UTC) - started_at).total_seconds()
+
+
+async def _within(seconds: float, operation: Any) -> Any:
+    # 覆盖版本查询、读取和所有重试的累计等待，不能把总时限误当每次HTTP超时。
+    async with asyncio.timeout(seconds):
+        return await operation
+
+
+def _poll_delay(values: Mapping[str, Any], attempts: int) -> float:
+    initial = int(values["job.poll.initial_interval_ms"])
+    maximum = int(values["job.poll.max_interval_ms"])
+    # 达到最大间隔后不再计算巨大幂，次数预算调大也不会使退避计算溢出。
+    exponent = min(max(0, attempts), max(0, (maximum // initial).bit_length()))
+    return min(maximum, initial * 2 ** exponent) / 1000
 
 
 def _finish_file_version(
@@ -389,12 +440,27 @@ def _finish_file_version(
 
 
 async def _process_office_file(row: Mapping[str, Any], store: S3BlobStore) -> tuple[int, int, bool]:
+    values = _runtime_values(row)
+    started_at = _execution_start(str(row["id"]), "convert")
+    remaining = _remaining(started_at, int(values["job.timeout.convert_minutes"]))
+    if remaining <= 0:
+        raise TimeoutError("转换已达到任务总时限")
+    return await _within(
+        remaining, _convert_office_file(row, store, remaining, int(values["job.retry.convert_500"]))
+    )
+
+
+async def _convert_office_file(
+    row: Mapping[str, Any], store: S3BlobStore, remaining: float, extra_retries: int
+) -> tuple[int, int, bool]:
     source_sha256 = str(row["source_sha256"]).strip().lower()
-    converter_adapter = _converter()
+    converter_adapter = _converter(
+        remaining_seconds=remaining, extra_retries=extra_retries
+    )
     try:
         converter_version = await converter_adapter.version()
         lock_key = f"version:{row['project_company_id']}:{source_sha256}:{converter_version}"
-        with _advisory_lock(lock_key, wait=True):
+        async with _async_version_lock(lock_key):
             candidate = _version_candidate(
                 int(row["project_company_id"]), source_sha256, converter_version
             )
@@ -520,8 +586,12 @@ def process_file(self: Any, job_id: str) -> None:
             else:
                 _, _, should_parse = asyncio.run(_process_office_file(row, store))
         except ConversionUnavailable as exc:
-            _reset_file_job(job_id, stage, exc.code, str(exc))
-            raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
+            # 适配器已经消耗配置中的重试额度，外层不能再次无限倍增转换请求。
+            _set_job_failure(job_id, exc.code, str(exc))
+            return
+        except TimeoutError as exc:
+            _set_job_failure(job_id, "convert_timeout", str(exc))
+            return
         except BlobStoreError as exc:
             _reset_file_job(job_id, stage, "storage_unavailable", str(exc))
             raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
@@ -645,9 +715,20 @@ def submit_parse(self: Any, job_id: str) -> None:
     if not claimed:
         return
 
+    values = _runtime_values(row)
+    started_at = _execution_start(job_id, "parse")
+    if _remaining(started_at, int(values["job.timeout.parse_minutes"])) <= 0:
+        _set_job_failure(job_id, "parse_timeout", "解析已达到任务总时限")
+        return
     store = _store()
     try:
-        submission = asyncio.run(_submit(row, store))
+        submission = asyncio.run(_within(
+            _remaining(started_at, int(values["job.timeout.parse_minutes"])), _submit(row, store)
+        ))
+    except TimeoutError:
+        # 提交超时不能断言远端未受理，更不能自动重新提交同一任务。
+        _mark_submission_unknown(job_id, "解析提交达到任务总时限，远端受理状态未知")
+        return
     except ParseSubmissionUnknown as exc:
         _mark_submission_unknown(job_id, str(exc))
         return
@@ -712,7 +793,7 @@ def submit_parse(self: Any, job_id: str) -> None:
                 text(
                     """UPDATE job
                        SET run_id = :run_id, status = 'running', stage = 'parsing',
-                           progress = CAST(:progress AS JSONB), error_code = NULL,
+                           progress = progress || CAST(:progress AS JSONB), error_code = NULL,
                            error_message = NULL, updated_at = :now
                        WHERE id = :job_id AND status = 'submitting'"""
                 ),
@@ -728,7 +809,7 @@ def submit_parse(self: Any, job_id: str) -> None:
         _mark_submission_unknown(job_id, f"MinerU 已提交但任务记录写入失败：{exc}")
         return
 
-    poll_parse.apply_async(args=(job_id,), countdown=2)
+    poll_parse.apply_async(args=(job_id,), countdown=_poll_delay(values, 0))
 
 
 async def _poll(row: Mapping[str, Any], store: S3BlobStore) -> tuple[Any, Any | None]:
@@ -756,9 +837,27 @@ def poll_parse(self: Any, job_id: str) -> None:
         )
         return
 
+    values = _runtime_values(row)
+    started_at = _execution_start(job_id, "parse")
+    remaining = _remaining(started_at, int(values["job.timeout.parse_minutes"]))
+    attempts = int((row.get("progress") or {}).get("poll_attempts", 0))
+    if remaining <= 0 or attempts >= int(values["job.poll.max_attempts"]):
+        _set_job_failure(job_id, "parse_timeout", "解析已达到总时限或轮询次数上限")
+        return
+    # 每次真实轮询前记账；网络错误、服务重启与worker恢复不能重置次数。
+    with _engine.begin() as connection:
+        connection.execute(
+            text("""UPDATE job SET progress=jsonb_set(progress,'{poll_attempts}',
+                to_jsonb(CAST(:attempts AS bigint)),true) WHERE id=:id"""),
+            {"id": job_id, "attempts": attempts + 1},
+        )
+
     store = _store()
     try:
-        status, middle_json = asyncio.run(_poll(row, store))
+        status, middle_json = asyncio.run(_within(remaining, _poll(row, store)))
+    except TimeoutError:
+        _set_job_failure(job_id, "parse_timeout", "解析已达到任务总时限")
+        return
     except ServiceRestarted:
         with _engine.begin() as connection:
             claimed = connection.execute(
@@ -771,7 +870,13 @@ def poll_parse(self: Any, job_id: str) -> None:
         if not claimed:
             return
         try:
-            submission = asyncio.run(_submit(row, store))
+            submission = asyncio.run(_within(
+                _remaining(started_at, int(values["job.timeout.parse_minutes"])),
+                _submit(row, store),
+            ))
+        except TimeoutError:
+            _mark_submission_unknown(job_id, "重新提交达到任务总时限，远端受理状态未知")
+            return
         except ParseSubmissionUnknown as unknown:
             _mark_submission_unknown(job_id, str(unknown))
             return
@@ -789,7 +894,7 @@ def poll_parse(self: Any, job_id: str) -> None:
                 )
             raise self.retry(
                 exc=retryable,
-                countdown=_retry_delay(self.request.retries),
+                countdown=_poll_delay(values, attempts + 1),
             ) from retryable
 
         if submission.provider_version != row["provider_version"]:
@@ -814,15 +919,15 @@ def poll_parse(self: Any, job_id: str) -> None:
                 ),
                 {"job_id": job_id},
             )
-        poll_parse.apply_async(args=(job_id,), countdown=2)
+        poll_parse.apply_async(args=(job_id,), countdown=_poll_delay(values, attempts + 1))
         return
     except ParseUnavailable as exc:
-        raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
+        raise self.retry(exc=exc, countdown=_poll_delay(values, attempts + 1)) from exc
     except ParseFailed as exc:
         _set_job_failure(job_id, exc.code, str(exc))
         return
     except BlobStoreError as exc:
-        raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
+        raise self.retry(exc=exc, countdown=_poll_delay(values, attempts + 1)) from exc
 
     now = datetime.now(UTC)
     progress = asdict(status.progress) if status.progress is not None else {}
@@ -831,12 +936,12 @@ def poll_parse(self: Any, job_id: str) -> None:
             connection.execute(
                 text(
                     """UPDATE job
-                       SET progress = CAST(:progress AS JSONB), updated_at = :now
+                       SET progress = progress || CAST(:progress AS JSONB), updated_at = :now
                        WHERE id = :job_id"""
                 ),
                 {"job_id": job_id, "progress": json.dumps(progress), "now": now},
             )
-        poll_parse.apply_async(args=(job_id,), countdown=_retry_delay(self.request.retries))
+        poll_parse.apply_async(args=(job_id,), countdown=_poll_delay(values, attempts + 1))
         return
 
     terminal_status = status.status
@@ -850,7 +955,7 @@ def poll_parse(self: Any, job_id: str) -> None:
         try:
             store.put(raw_middle_key, middle_json.raw_bytes, content_type="application/json")
         except BlobStoreError as exc:
-            raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
+            raise self.retry(exc=exc, countdown=_poll_delay(values, attempts + 1)) from exc
         page_values = middle_json.payload.get("pages")
         page_count = len(page_values) if isinstance(page_values, list) else None
         backend = middle_json.backend

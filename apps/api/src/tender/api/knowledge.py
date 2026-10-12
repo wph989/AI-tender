@@ -15,7 +15,11 @@ from tender.api.common import engine, project_row
 from tender.api.errors import ApiProblem
 from tender.api.parsing import ParseRequest, _create_parse_job
 from tender.api.project_files import _role_is_parseable
-from tender.application.agent_runtime import limits_snapshot
+from tender.application.agent_runtime import (
+    cancel_unlocked_runs,
+    execution_active,
+    limits_snapshot,
+)
 from tender.application.analysis_data import (
     DATA_VERSION,
     ContextError,
@@ -44,6 +48,7 @@ from tender.application.knowledge_store import (
     source_signature,
     source_state,
 )
+from tender.config.schema import field_bounds
 from tender.core import settings
 from tender.core.di import create_embedding_gateway
 
@@ -83,8 +88,11 @@ class AnalysisInput(StrictModel):
 
 class RetryInput(StrictModel):
     module_keys: list[str] = Field(default_factory=list, max_length=13)
-    max_output_tokens: int | None = Field(default=None, ge=512, )
-    timeout_seconds: int | None = Field(default=None, ge=0, le=3600)
+    # 补跑与配置中心统一允许正整数，避免接口额外挡住较小或较大的输出预算。
+    max_output_tokens: int | None = Field(
+        default=None, **field_bounds("analysis.max_output_tokens")
+    )
+    timeout_seconds: int | None = Field(default=None, **field_bounds("analysis.timeout_seconds"))
 
 
 class AskInput(StrictModel):
@@ -654,8 +662,11 @@ def get_report(report_id: int, request: Request) -> dict:
             != source_signature(report["reference_snapshot"])
         )
     )
+    with engine(request).connect() as connection:
+        canceling = report["status"] == "canceled" and execution_active(connection, report_id)
     return {
         **report,
+        "canceling": canceling,
         "modules": modules,
         "stale": stale,
         "runtime_retired": retired,
@@ -764,13 +775,19 @@ async def get_analysis_context(report_id: int, payload: ContextInput, request: R
 @router.post("/analysis/reports/{report_id}/cancel")
 def cancel_report(report_id: int, request: Request) -> dict:
     report_row(request, report_id)
-    store(request).execute(
-        """UPDATE analysis_report SET status='canceled',finished_at=now(),lease_until=NULL
-        WHERE id=:id AND company_id=:company_id AND status IN ('waiting','pending','running')""",
-        {"id": report_id},
-    )
+    with engine(request).begin() as connection:
+        status = connection.execute(text("""SELECT status FROM analysis_report
+            WHERE id=:id AND company_id=:company FOR UPDATE"""),
+            {"id": report_id, "company": settings.company_id()}).scalar_one()
+        if status in {"waiting", "pending", "running", "canceled"}:
+            connection.execute(text("""UPDATE analysis_report SET status='canceled',
+                finished_at=COALESCE(finished_at,now()),lease_until=NULL WHERE id=:id"""),
+                {"id": report_id})
+            cancel_unlocked_runs(connection, report_id)
+            status = "canceled"
+        canceling = status == "canceled" and execution_active(connection, report_id)
     publish_data_snapshot(store(request), report_id)
-    return {"status": report_row(request, report_id)["status"]}
+    return {"status": status, "canceling": canceling}
 
 
 @router.get("/analysis/reports/{report_id}/runs/{run_id}/events")
@@ -822,6 +839,13 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
         ).scalar_one()
         if current_status in {"waiting", "pending", "running"}:
             raise ApiProblem(409, "report_running", "报告已进入执行，请勿重复补跑")
+        # 控制器持有整个执行周期的会话锁；旧 finally 完成前不可重置报告状态。
+        if execution_active(connection, report_id) or not connection.execute(text(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended(:key,0))"
+        ), {"key": f"analysis_report:{report_id}"}).scalar_one():
+            raise ApiProblem(409, "cancellation_pending", "任务正在停止，请等待模块退出后重新解析")
+        if current_status == "canceled":
+            cancel_unlocked_runs(connection, report_id)
         other = connection.execute(
             text("""SELECT id FROM analysis_report WHERE project_id=:project
             AND id<>:id AND status IN ('waiting','pending','running')"""),
@@ -843,7 +867,10 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             .mappings()
             .all()
         )
-        if not rows:
+        has_modules = connection.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM analysis_module WHERE report_id=:id)"
+        ), {"id": report_id}).scalar_one()
+        if not rows and (explicit or has_modules):
             raise ApiProblem(
                 409, "nothing_to_retry", "没有需要补跑的模块；重新解析已完成模块请显式指定模块"
             )
@@ -866,7 +893,13 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             limits["max_output_tokens"] = payload.max_output_tokens
         if payload.timeout_seconds is not None:
             limits["timeout_seconds"] = payload.timeout_seconds
-        # 显式参数只覆盖对应字段；报告创建时的旧快照与既有运行账均不回写。
+        if not has_modules:
+            connection.execute(
+                text("UPDATE analysis_report SET runtime_settings=CAST(:limits AS JSONB)"
+                     " WHERE id=:id"),
+                {"id": report_id, "limits": encode(limits)},
+            )
+        # 已有模块的运行账不因补跑改写；无模块的报告更新快照供延迟创建使用。
         for module_id in sorted(retried):
             attempt = connection.execute(
                 text("SELECT COALESCE(max(attempt),0)+1 FROM agent_module_run WHERE module_id=:id"),

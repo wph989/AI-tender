@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { mockApi, models } from "./fixtures";
+import { mockApi, models, profile } from "./fixtures";
 
 let pageErrors: string[];
 test.beforeEach(async ({ page }) => {
@@ -9,6 +9,188 @@ test.beforeEach(async ({ page }) => {
 });
 test.afterEach(() => {
   expect(pageErrors, "浏览器未捕获异常").toEqual([]);
+});
+
+test("配置范围由服务端下发，大预算可保存且未接入项只读", async ({ page }) => {
+  let saved: unknown;
+  await page.route("**/api/v1/config/items", (route) => route.fulfill({ json: {
+    active: { release_id: 1, version_no: 1 },
+    items: [
+      { key: "analysis.max_output_tokens", layer: "L1", value_type: "int",
+        description: "模块输出预算", default: 8192, value: 8192, writable: true,
+        minimum: 1, overridden: false, requires_gate: false },
+      { key: "preprocess.denoise", layer: "L2", value_type: "bool",
+        description: "扫描件去噪", default: true, value: true, writable: false,
+        readonly_reason: "当前执行流程尚未接入该配置", overridden: false, requires_gate: true },
+    ],
+  } }));
+  await page.route("**/api/v1/config/releases", async (route) => {
+    if (route.request().method() === "GET") return route.fallback();
+    saved = route.request().postDataJSON();
+    await route.fulfill({ json: { id: 2, version_no: 2, status: "active" } });
+  });
+  await page.goto("/settings/models");
+  // 窄屏标签会自动滚动；键盘激活避免在滚动过程中点击到旧坐标。
+  await page.getByRole("tab", { name: "分析参数", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  const budget = page.getByLabel("模块输出预算", { exact: true });
+  await expect(budget).toHaveAttribute("min", "1");
+  await expect(budget).not.toHaveAttribute("max");
+  await budget.fill("262144");
+  await page.getByRole("button", { name: "保存并立即生效", exact: true }).click();
+  await expect.poll(() => saved).toMatchObject({ values: { "analysis.max_output_tokens": 262144 } });
+  await page.goto("/settings/config");
+  await expect(page.getByLabel("模块输出预算", { exact: true })).toHaveCount(0);
+  await page.getByRole("tab", { name: "解析配置", exact: true }).click();
+  await expect(page.getByText("只读：当前执行流程尚未接入该配置")).toBeVisible();
+  await expect(page.getByLabel("扫描件去噪", { exact: true })).toBeDisabled();
+});
+
+test("模型超时允许小数并移除预算人工上限", async ({ page }) => {
+  let saved: unknown;
+  await page.route("**/api/v1/llm/settings", (route) => route.fulfill({ json: {
+    secret_key_ready: true, test_valid_seconds: 3600,
+    adapter_profiles: [{ ...profile, parameter_schema: {
+      ...profile.parameter_schema,
+      max_tokens: { label: "输出上限", type: "integer", min: 1 },
+    } }],
+    model_fields: {
+      timeout_seconds: { label: "超时", type: "number", min: 1 },
+      extra_retries: { label: "额外重试", type: "integer", min: 0 },
+    },
+  } }));
+  await page.route("**/api/v1/llm/models/1", async (route) => {
+    saved = route.request().postDataJSON();
+    await route.fulfill({ json: models[0] });
+  });
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: /管理模型/ }).click();
+  await page.getByRole("button", { name: "编辑", exact: true }).first().click();
+  const dialog = page.getByRole("dialog", { name: "编辑模型", exact: true });
+  const timeout = dialog.getByLabel("超时（秒）", { exact: true });
+  await expect(timeout).not.toHaveAttribute("max");
+  await timeout.fill("1200.5");
+  await dialog.getByLabel("失败后额外重试次数", { exact: true }).fill("99");
+  await dialog.getByLabel("输出上限", { exact: true }).fill("262144");
+  await dialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(saved).toMatchObject({ timeout_seconds: 1200.5, extra_retries: 99, max_tokens: 262144 });
+});
+
+test("功能大预算可保存，候选上限继续读取服务端规则", async ({ page }) => {
+  let saved: unknown;
+  await page.route("**/api/v1/llm/settings", (route) => route.fulfill({ json: {
+    secret_key_ready: true, test_valid_seconds: 3600, adapter_profiles: [profile],
+    max_bindings: 10,
+    feature_fields: {
+      failover_limit: { type: "integer", min: 1, max: 10 },
+      max_total_requests: { type: "integer", min: 1 },
+      deadline_seconds: { type: "integer", min: 1 },
+    },
+  } }));
+  await page.route("**/api/v1/llm/features/extract/models", async (route) => {
+    saved = route.request().postDataJSON();
+    await route.fulfill({ json: {} });
+  });
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: "分配功能", exact: true }).click();
+  const candidates = page.getByLabel("不同候选上限", { exact: true });
+  await expect(candidates).toHaveAttribute("max", "10");
+  await candidates.fill("11");
+  await expect(page.getByRole("button", { name: "保存", exact: true })).toBeDisabled();
+  await candidates.fill("10");
+  await page.getByLabel("总请求上限", { exact: true }).fill("1000");
+  await page.getByLabel("调用总时间", { exact: true }).fill("172800");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect.poll(() => saved).toMatchObject({
+    failover_limit: 10, max_total_requests: 1000, deadline_seconds: 172800,
+  });
+});
+
+test("功能顺序支持置顶、置底和直接选第10位，保存顺序与界面一致", async ({ page }) => {
+  let submitted: { model_ids: number[] } | undefined;
+  await page.route("**/api/v1/llm/features", (route) => route.fulfill({ json: { items: [{
+    key: "analysis", name: "招标专题解析", required_kind: "language", revision: 1,
+    description: "指定专题重新解析也使用此绑定。", failover_limit: 3,
+    max_total_requests: 6, deadline_seconds: 600,
+    bindings: models.slice(0, 10).map((model, index) => ({
+      model_row_id: model.id, priority: index + 1,
+    })),
+  }] } }));
+  await page.route("**/api/v1/llm/features/analysis/models", async (route) => {
+    submitted = route.request().postDataJSON();
+    await route.fulfill({ json: {} });
+  });
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: "分配功能", exact: true }).click();
+  await expect(page.getByText("指定专题重新解析也使用此绑定。", { exact: true })).toBeVisible();
+  const rows = page.getByRole("region", { name: "功能模型列表" }).locator("tbody tr");
+  await page.getByRole("button", { name: "测试模型 10置顶", exact: true }).click();
+  await expect(rows.first()).toContainText("model-10");
+  await page.getByRole("button", { name: "测试模型 10置底", exact: true }).click();
+  await expect(rows.last()).toContainText("model-10");
+  await page.getByRole("combobox", { name: "测试模型 1优先级", exact: true }).click();
+  await page.locator(".ant-select-dropdown:visible").getByTitle("10 · 备选", { exact: true }).click();
+  await expect(rows.last().locator(".font-medium")).toHaveText("测试模型 1");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect.poll(() => submitted?.model_ids).toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10, 1]);
+});
+
+test("执行中取消持续刷新，退出后只补跑选中的已取消模块", async ({ page }) => {
+  let phase = "running";
+  let retried: unknown;
+  await page.route("**/api/v1/projects/1/analysis", (route) => route.fulfill({ json: {
+    analysis_category: "goods", analysis_topics: [], lots: [], sources: [],
+    categories: { goods: "货物" }, topics: {},
+    reports: [{ id: 1, status: phase === "running" ? "running" : "canceled" }],
+  } }));
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: {
+    id: 1, status: phase === "running" ? "running" : "canceled",
+    canceling: phase === "stopping", category: "goods", topics: [], coverage: {},
+    modules: [
+      { id: 1, module_key: "project_basic_info_parsing", title: "项目概况",
+        status: phase === "stopped" ? "canceled" : "running", items: [] },
+      { id: 2, module_key: "deposit_requirement_parsing", title: "保证金要求",
+        status: phase === "running" ? "pending" : "canceled", items: [] },
+    ],
+  } }));
+  await page.route("**/api/v1/analysis/reports/1/cancel", async (route) => {
+    phase = "stopping";
+    await route.fulfill({ json: { status: "canceled", canceling: true } });
+  });
+  await page.route("**/api/v1/analysis/reports/1/retry", async (route) => {
+    retried = route.request().postDataJSON();
+    await route.fulfill({ json: { id: 1, status: "pending" } });
+  });
+  await page.goto("/projects/1");
+  await page.getByRole("button", { name: "取消任务", exact: true }).click();
+  await expect(page.getByText("正在停止任务，模块退出后即可重新解析。状态将自动刷新。")).toBeVisible();
+  await page.getByRole("tab", { name: /保证金要求/ }).click();
+  const retry = page.getByRole("button", { name: "补跑本模块", exact: true });
+  await expect(retry).toBeDisabled();
+  phase = "stopped";
+  await expect(retry).toBeEnabled({ timeout: 10000 });
+  await retry.click();
+  await expect.poll(() => retried).toEqual({ module_keys: ["deposit_requirement_parsing"] });
+});
+
+test("上传默认省略解析参数，让配置中心决定任务默认值", async ({ page }) => {
+  let multipart = "";
+  await page.route("**/api/v1/projects/1/files", async (route) => {
+    if (route.request().method() === "GET") return route.fallback();
+    multipart = route.request().postData() ?? "";
+    await route.fulfill({ json: { added: [], jobs: [], skipped: [] } });
+  });
+  await page.goto("/projects/1/files");
+  await page.getByText("解析选项与上传限制", { exact: false }).click();
+  await expect(page.getByLabel("解析档位", { exact: true }).locator("xpath=..")).toContainText("使用配置中心默认值");
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "预算测试.pdf", mimeType: "application/pdf", buffer: Buffer.from("%PDF-fixture"),
+  });
+  await page.getByRole("button", { name: "上传 1 个文件", exact: true }).click();
+  await expect.poll(() => multipart).toContain('name="files"');
+  expect(multipart).not.toContain('name="tier"');
+  expect(multipart).not.toContain('name="ocr_mode"');
 });
 
 test("长列表底部编辑模型，弹窗和保存按钮可见，关闭后返回原操作", async ({

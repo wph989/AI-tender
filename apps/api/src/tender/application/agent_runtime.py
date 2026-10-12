@@ -79,6 +79,38 @@ def requeue_unlocked_runs(conn: Connection, report_id: int) -> None:
         )
 
 
+def execution_active(conn: Connection, report_id: int) -> bool:
+    """取消后仍须等待旧控制器和模块释放锁，才能让新 attempt 接管同一报告。"""
+    return bool(conn.execute(text("""SELECT EXISTS (
+        SELECT 1 FROM pg_locks l WHERE l.locktype='advisory' AND l.granted
+        AND l.pid <> pg_backend_pid()
+        AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND (
+            (l.objsubid=1
+             AND l.classid=((hashtextextended(:key,0) >> 32) & 4294967295)::oid
+             AND l.objid=(hashtextextended(:key,0) & 4294967295)::oid)
+            OR (l.objsubid=2 AND l.classid=:ns AND l.objid IN (
+                SELECT a.id FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
+                WHERE m.report_id=:id
+            ))))"""), {
+        "id": report_id, "ns": QUOTA_NAMESPACE, "key": f"analysis_report:{report_id}",
+    }).scalar_one())
+
+
+def cancel_unlocked_runs(conn: Connection, report_id: int) -> None:
+    """调用方先锁报告；无执行者的排队/遗留运行立即终止，有锁的运行由心跳退出。"""
+    conn.execute(text("""UPDATE agent_module_run a SET status='canceled',
+        error_message='用户取消任务',finished_at=now(),lease_until=NULL,owner=NULL
+        FROM analysis_module m WHERE a.module_id=m.id AND m.report_id=:id
+        AND a.status IN ('pending','running') AND NOT EXISTS (
+            SELECT 1 FROM pg_locks l WHERE l.locktype='advisory' AND l.classid=:ns
+            AND l.objid=a.id AND l.objsubid=2 AND l.granted
+        )"""), {"id": report_id, "ns": QUOTA_NAMESPACE})
+    conn.execute(text("""UPDATE analysis_module m SET status='canceled',
+        error_message='用户取消任务' WHERE report_id=:id AND status IN ('pending','running')
+        AND NOT EXISTS (SELECT 1 FROM agent_module_run a
+            WHERE a.module_id=m.id AND a.status='running')"""), {"id": report_id})
+
+
 class AgentRuntime:
     def __init__(self, db: KnowledgeStore, report: dict, run: dict, sources: list[dict]):
         self.db, self.report, self.run, self.sources = db, report, run, sources
@@ -103,6 +135,12 @@ class AgentRuntime:
             with conn.begin():
                 # 所有 worker 先串行检查总占用再取槽；降低配置后先排空旧占用才接新任务。
                 conn.execute(text("SELECT pg_advisory_xact_lock(:ns, 0)"), {"ns": QUOTA_NAMESPACE})
+                # 与取消串行化：取消落库后，已排队的协程不能重新领取任务。
+                status = conn.execute(text(
+                    "SELECT status FROM analysis_report WHERE id=:id FOR UPDATE"
+                ), {"id": self.report["id"]}).scalar_one()
+                if status not in {"waiting", "pending", "running"}:
+                    raise InterruptedError("报告已取消或不再执行")
                 values = ConfigRegistry(self.db.engine).resolved(self.db.company_id)
                 occupied = conn.execute(
                     text("""SELECT count(*) FROM pg_locks l

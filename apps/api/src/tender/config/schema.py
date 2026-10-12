@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 L1 = "L1"
@@ -57,6 +58,7 @@ ITEMS: tuple[ConfigItem, ...] = (
         "analysis.max_model_calls", L1, "int", 40, "每模块每次运行的实际模型请求上限，含重试和摘要"
     ),
     _item("analysis.max_tool_calls", L1, "int", 48, "每模块每次运行的工具调用上限"),
+    _item("analysis.max_evidence_blocks", L1, "int", 160, "每模块保留的原文证据块上限"),
     _item("analysis.max_tool_failures", L1, "int", 3, "工具连续失败上限，按工具及全局分别计数"),
     _item(
         "analysis.max_no_progress_rounds", L1, "int", 3, "无新增证据或有效成果的轮数，达到后收尾"
@@ -146,6 +148,48 @@ ITEMS: tuple[ConfigItem, ...] = (
 
 ITEMS_BY_KEY: dict[str, ConfigItem] = {entry.key: entry for entry in ITEMS}
 
+# 未接入的能力不能伪装成生效开关；保留登记项以便查看历史版本和后续接入。
+READONLY_REASONS: dict[str, str] = {
+    "queue.priority.batch": "当前队列未接入动态批次优先级",
+    "mineru.output_formats": "当前解析协议固定使用 middle_json 和 zip",
+    "mineru.page_range": "当前章节与坐标契约要求解析全部页码 all",
+    **dict.fromkeys(
+        ("render.crop_dpi", "llm_aided.title_leveling", "llm_aided.cross_page_table_cell_merge",
+         "preprocess.deskew", "preprocess.denoise", "preprocess.min_dpi",
+         "extract.strategy.dual_route", "extract.strategy.second_pass",
+         "extract.strategy.multimodal", "extract.scope.per_lot"),
+        "当前执行流程尚未接入该配置",
+    ),
+}
+
+
+def value_rules(key: str) -> dict[str, Any]:
+    """让页面与写入校验共享约束；无 maximum 就表示没有人工最大值。"""
+    entry = item(key)
+    if key in READONLY_REASONS:
+        return {}
+    if key == "mineru.tier":
+        return {"choices": ["flash", "basic", "standard", "advanced"]}
+    if key == "mineru.ocr_mode":
+        return {"choices": ["auto", "txt", "ocr"]}
+    if key == "extract.rerun.hide_threshold":
+        return {"minimum": 0, "maximum": 1}
+    if entry.value_type == "int":
+        nonnegative = {
+            "analysis.max_subagent_retries", "convert.max_inflight", "parse.max_inflight",
+            "extract.max_inflight", "job.retry.convert_500",
+        }
+        return {"minimum": 0 if key in nonnegative else 1}
+    return {}
+
+
+def field_bounds(key: str) -> dict[str, Any]:
+    """补跑入口复用配置中心范围，避免同一个预算再出现另一套上下限。"""
+    rules = value_rules(key)
+    return {name: rules[source] for name, source in (
+        ("ge", "minimum"), ("le", "maximum")
+    ) if source in rules}
+
 
 class UnknownConfigKey(ValueError):
     """写入未登记 key：配置中心只认登记过的项，防止页面/脚本塞进无审计的值。"""
@@ -190,29 +234,39 @@ def validate_value(key: str, value: Any) -> str | None:
         ok = True  # json 接受任意可序列化值，序列化失败由写入侧兜底
     if not ok:
         return f"{key} 期望 {entry.value_type}，收到 {type(value).__name__}"
-    if key.startswith("analysis."):
-        # 上限只是防止误配的护栏；上下文预算不设上限，可用范围由所绑定模型的实际窗口决定。
-        bounds: dict[str, tuple[int, int | None]] = {
-            "analysis.max_inflight": (1, 32),
-            "analysis.max_model_calls": (4, 256),
-            "analysis.max_tool_calls": (4, 512),
-            "analysis.max_tool_failures": (1, 5),
-            "analysis.max_no_progress_rounds": (1, 8),
-            "analysis.max_identical_tool_calls": (1, 5),
-            "analysis.max_validation_failures": (1, 5),
-            "analysis.max_subagent_retries": (0, 2),
-            "analysis.timeout_seconds": (60, 7200),
-            "analysis.context_tokens": (4096, None),
-            "analysis.max_output_tokens": (512, 16384),
-        }
-        low, high = bounds[key]
-        if value < low or (high is not None and value > high):
-            return (
-                f"{key} 必须在 {low} 到 {high} 之间"
-                if high is not None
-                else f"{key} 不能小于 {low}"
-            )
+    if entry.value_type == "number" and not isfinite(value):
+        return f"{key} 必须是有限数值"
+    rules = value_rules(key)
+    if "minimum" in rules and value < rules["minimum"]:
+        return f"{key} 不能小于 {rules['minimum']}"
+    if "maximum" in rules and value > rules["maximum"]:
+        return f"{key} 不能大于 {rules['maximum']}"
+    if "choices" in rules and value not in rules["choices"]:
+        return f"{key} 仅支持 {' / '.join(rules['choices'])}"
     return None
+
+
+def validate_values(values: Mapping[str, Any]) -> str | None:
+    """在合并完整草稿后检查字段关系，单字段补丁也不能绕过轮询间隔的顺序。"""
+    if values["job.poll.max_interval_ms"] < values["job.poll.initial_interval_ms"]:
+        return "轮询最大间隔不能小于初始间隔"
+    return None
+
+
+def parse_options(
+    values: Mapping[str, Any], tier: str | None = None, ocr_mode: str | None = None
+) -> dict[str, str]:
+    """仅显式传入的任务选项覆盖配置中心，默认选择不再被界面的固定值遮住。"""
+    resolved = resolve_values(values)
+    options = {
+        "tier": tier if tier is not None else resolved["mineru.tier"],
+        "ocr_mode": ocr_mode if ocr_mode is not None else resolved["mineru.ocr_mode"],
+    }
+    for key, value in options.items():
+        message = validate_value("mineru." + key, value)
+        if message is not None:
+            raise ValueError(message)
+    return options
 
 
 def diff_values(
@@ -237,6 +291,9 @@ def write_denial(role: str, keys: object) -> str | None:
     """角色能否写这些 key：返回拒绝说明；None 表示允许。"""
     if role not in READERS:
         return f"未知角色：{role}"
+    readonly = [str(key) for key in keys if str(key) in READONLY_REASONS]
+    if readonly:
+        return f"配置项暂为只读：{'、'.join(readonly)}"
     denied = [layer for layer in sorted(layers_of(keys)) if role not in WRITERS[layer]]
     if denied:
         return f"角色 {role} 无权修改 {'/'.join(denied)} 配置"

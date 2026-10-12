@@ -219,7 +219,10 @@ def list_items(request: Request) -> dict[str, Any]:
                 "default": _mask(entry, entry.default),
                 "value": _mask(entry, current),
                 "overridden": entry.key in overrides,
-                "writable": role in schema.WRITERS[entry.layer],
+                "writable": role in schema.WRITERS[entry.layer]
+                and entry.key not in schema.READONLY_REASONS,
+                "readonly_reason": schema.READONLY_REASONS.get(entry.key),
+                **schema.value_rules(entry.key),
             }
         )
     return {
@@ -287,6 +290,9 @@ def create_release(payload: ReleaseCreate, request: Request) -> dict[str, Any]:
             base_row = _active_row(connection, company_id)
         base_values = dict(base_row["values"]) if base_row is not None else {}
         resolved = schema.resolve_values({**base_values, **payload.values})
+        message = schema.validate_values(resolved)
+        if message is not None:
+            raise ApiProblem(400, "invalid_argument", message)
         changed = schema.diff_values(schema.resolve_values(base_values), resolved)
         gated = schema.gated_keys(changed.keys())
         version_no = int(

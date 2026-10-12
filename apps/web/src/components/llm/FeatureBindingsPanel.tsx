@@ -13,13 +13,15 @@ import { App, Button, ConfigProvider, Input, Select, Tabs } from "antd";
 import { useState } from "react";
 
 import { replaceBindings } from "@/lib/api/llm";
-import { message } from "@/lib/llm/format";
-import { MAX_BINDINGS, moveToPriority } from "@/lib/llm/priority";
-import type { LlmFeature, LlmModel } from "@/types/llm";
+import { message, withinNumericRule } from "@/lib/llm/format";
+import { moveToPriority } from "@/lib/llm/priority";
+import type { LlmFeature, LlmModel, ParameterSchema } from "@/types/llm";
 
 interface Props {
   features: LlmFeature[];
   models: LlmModel[];
+  fields?: Record<string, ParameterSchema>;
+  maximumBindings?: number;
   onChanged: () => Promise<void>;
 }
 
@@ -32,7 +34,7 @@ interface Draft {
   revision: number;
 }
 
-export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
+export function FeatureBindingsPanel({ features, models, fields = {}, maximumBindings, onChanged }: Props) {
   const { message: toast } = App.useApp();
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
@@ -130,15 +132,19 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
   const modelById = new Map(models.map((model) => [model.id, model]));
   const unbound = models.filter(
     (model) =>
-      !ids.includes(model.id) &&
+      active.binding_available !== false && !ids.includes(model.id) &&
       model.kind === active.required_kind &&
       (active.required_kind !== "language" ||
         model.capabilities.includes("json_output")),
   );
   const singleModel = ["embedding", "rerank"].includes(active.required_kind);
-  const maxBindings = singleModel ? 1 : MAX_BINDINGS;
+  const languageRouting = active.required_kind === "language";
+  const maxBindings = singleModel ? 1 : (maximumBindings ?? models.length);
   const effective =
-    ids.length === 0 ? 0 : Math.max(1, Math.min(limit, ids.length));
+    Math.min(limit, ids.filter((id) => {
+      const model = modelById.get(id);
+      return model?.enabled && model.provider_enabled;
+    }).length);
 
   const setPriority = (modelRowId: number, target: number) => {
     update(moveToPriority(ids, modelRowId, target));
@@ -162,22 +168,24 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
     <section className="ui-panel settings-panel rounded-2xl border border-slate-200 bg-white p-6">
       <ConfigProvider componentDisabled={busy}>
         <fieldset disabled={busy} className="min-w-0">
-          <div className="flex items-start justify-between gap-4">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <h2 className="font-display font-semibold text-[19px] leading-[28px] text-slate-900">
                 功能绑定
               </h2>
               <p className="mt-1 text-[13px] leading-5 text-slate-500">
                 暂时故障按模型的额外次数重试，再尝试后续候选；请求总量与时间预算始终优先。
+                图片生成目前仅支持在模型列表中测试，尚未接入业务功能绑定。
               </p>
             </div>
-            <div className="flex items-center gap-2 text-[13px] text-slate-600">
+            <div className="flex shrink-0 items-center gap-2 whitespace-nowrap text-[13px] text-slate-600">
               不同候选上限
               <Input
                 aria-label="不同候选上限"
+                disabled={!languageRouting}
                 type="number"
-                min={1}
-                max={10}
+                min={fields.failover_limit?.min}
+                max={fields.failover_limit?.max}
                 className={" w-20"}
                 value={limit}
                 onChange={(event) => update(ids, Number(event.target.value))}
@@ -191,9 +199,10 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
               总请求上限{" "}
               <Input
                 aria-label="总请求上限"
+                disabled={!languageRouting}
                 type="number"
-                min={1}
-                max={20}
+                min={fields.max_total_requests?.min}
+                max={fields.max_total_requests?.max}
                 className={" w-20"}
                 value={total}
                 onChange={(e) => update(ids, limit, Number(e.target.value))}
@@ -203,9 +212,10 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
               总时间（秒）{" "}
               <Input
                 aria-label="调用总时间"
+                disabled={!languageRouting}
                 type="number"
-                min={1}
-                max={86400}
+                min={fields.deadline_seconds?.min}
+                max={fields.deadline_seconds?.max}
                 className={" w-24"}
                 value={deadline}
                 onChange={(e) =>
@@ -214,9 +224,9 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
               />
             </label>
           </div>
-          {singleModel && (
+          {!languageRouting && (
             <p className="mt-2 text-xs text-slate-500">
-              嵌入与重排当前固定一个模型、单次请求。上述重试预算用于语言模型调用。
+              嵌入与重排当前为单次请求；上述转移与重试预算仅用于语言模型调用。
             </p>
           )}
           {draft && revision !== active.revision && (
@@ -237,13 +247,14 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
               label: `${feature.name} (${feature.bindings.length})`,
             }))}
           />
+          <p className="mt-2 text-sm leading-6 text-slate-600">{active.description}</p>
           {error !== null && (
             <p className="mt-3 border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-700">
               {error}
             </p>
           )}
 
-          <p className="mt-3 text-[13px] text-slate-500" hidden={singleModel}>
+          <p className="mt-3 text-[13px] text-slate-500" hidden={!languageRouting}>
             共 {ids.length} 个候选，最多实际尝试 {effective} 个可用模型、{total}{" "}
             次请求。前面的模型可能耗尽预算，后续模型不保证执行。
           </p>
@@ -288,21 +299,19 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
                         className="border-t border-slate-100"
                       >
                         <td className="py-2 pr-3">
-                          <Input
-                            type="number"
-                            min={1}
-                            max={ids.length}
-                            className={" w-16"}
+                          {/* 选择完整顺位后再移动，避免输入两位数字时第一位就触发重排。 */}
+                          <Select<number>
+                            className="w-28"
+                            virtual={false}
                             aria-label={
                               (model?.display_name ?? "模型") + "优先级"
                             }
                             value={index + 1}
-                            onChange={(event) =>
-                              setPriority(
-                                modelRowId,
-                                Number(event.target.value),
-                              )
-                            }
+                            options={ids.map((_, position) => ({
+                              value: position + 1,
+                              label: position === 0 ? "1 · 首选" : `${position + 1} · 备选`,
+                            }))}
+                            onChange={(position) => setPriority(modelRowId, position)}
                           />
                         </td>
                         <td className="py-2 pr-3">
@@ -342,9 +351,18 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
                         <td className="border-b border-slate-100 py-2 text-right whitespace-nowrap">
                           <Button
                             htmlType="button"
+                            className="mr-1"
+                            disabled={index === 0}
+                            aria-label={(model?.display_name ?? "模型") + "置顶"}
+                            onClick={() => setPriority(modelRowId, 1)}
+                          >
+                            置顶
+                          </Button>
+                          <Button
+                            htmlType="button"
                             className={" mr-1"}
                             disabled={index === 0}
-                            aria-label="提高优先级"
+                            aria-label={(model?.display_name ?? "模型") + "提高优先级"}
                             onClick={() => shift(index, -1)}
                           >
                             ↑
@@ -353,10 +371,19 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
                             htmlType="button"
                             className={" mr-1"}
                             disabled={index === ids.length - 1}
-                            aria-label="降低优先级"
+                            aria-label={(model?.display_name ?? "模型") + "降低优先级"}
                             onClick={() => shift(index, 1)}
                           >
                             ↓
+                          </Button>
+                          <Button
+                            htmlType="button"
+                            className="mr-1"
+                            disabled={index === ids.length - 1}
+                            aria-label={(model?.display_name ?? "模型") + "置底"}
+                            onClick={() => setPriority(modelRowId, ids.length)}
+                          >
+                            置底
                           </Button>
                           <Button
                             danger
@@ -396,10 +423,10 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
             <Button
               htmlType="button"
 
-              disabled={pendingAdd === "" || ids.length >= maxBindings}
+              disabled={active.binding_available === false || pendingAdd === "" || ids.length >= maxBindings}
               onClick={add}
             >
-              加到最低级
+              添加为备选
             </Button>
             <span className="text-[13px] text-slate-400">
               最多 {maxBindings} 个
@@ -413,15 +440,9 @@ export function FeatureBindingsPanel({ features, models, onChanged }: Props) {
                 disabled={
                   busy ||
                   !dirty ||
-                  !Number.isInteger(limit) ||
-                  limit < 1 ||
-                  limit > 10 ||
-                  !Number.isInteger(total) ||
-                  total < 1 ||
-                  total > 20 ||
-                  !Number.isInteger(deadline) ||
-                  deadline < 1 ||
-                  deadline > 86400
+                  !withinNumericRule(limit, fields.failover_limit) ||
+                  !withinNumericRule(total, fields.max_total_requests) ||
+                  !withinNumericRule(deadline, fields.deadline_seconds)
                 }
                 onClick={save}
               >

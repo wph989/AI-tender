@@ -504,7 +504,7 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     )[0]["module_key"]
     result = knowledge.retry_report(
         runtime.report["id"],
-        knowledge.RetryInput(module_keys=[key], max_output_tokens=16384, timeout_seconds=1200),
+        knowledge.RetryInput(module_keys=[key], max_output_tokens=262144, timeout_seconds=1200),
         env.request,
     )
     assert result["status"] == "pending"
@@ -515,7 +515,7 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     assert [r["model_calls"] for r in rows] == [1, 0]
     assert [r["attempt"] for r in rows] == [1, 2]
     assert rows[0]["limits"]["max_output_tokens"] == 8192
-    assert rows[1]["limits"]["max_output_tokens"] == 16384
+    assert rows[1]["limits"]["max_output_tokens"] == 262144
     assert rows[0]["limits"]["timeout_seconds"] == 1800
     assert rows[1]["limits"]["timeout_seconds"] == 1200
     assert rows[0]["thread_id"] != rows[1]["thread_id"]
@@ -570,6 +570,121 @@ def test_canceled_report_retries_failed_and_canceled_modules(env):
     )
     assert runs and all(row["status"] == "pending" and row["attempt"] == 2 for row in runs)
     assert knowledge.get_report(report_id, env.request)["status"] == "pending"
+
+
+def test_cancel_without_worker_closes_queued_and_orphaned_modules(env):
+    runtime = prepared_runtime(env)
+    report_id = runtime.report["id"]
+    env.db.execute("UPDATE agent_module_run SET status='running' WHERE id=:id",
+                   {"id": runtime.run["id"]})
+    env.db.execute("UPDATE analysis_module SET status='running' WHERE id=:id",
+                   {"id": runtime.run["module_id"]})
+    result = knowledge.cancel_report(report_id, env.request)
+    assert result == {"status": "canceled", "canceling": False}
+    assert knowledge.cancel_report(report_id, env.request) == result
+    current = knowledge.get_report(report_id, env.request)
+    assert all(m["status"] == "canceled" for m in current["modules"])
+    assert all(r["status"] == "canceled" for m in current["modules"] for r in m["runs"])
+    selected = current["modules"][3]
+    knowledge.retry_report(report_id, knowledge.RetryInput(
+        module_keys=[selected["module_key"]]), env.request)
+    after = knowledge.get_report(report_id, env.request)
+    assert [(m["id"], m["runs"][-1]["attempt"]) for m in after["modules"]
+            if m["status"] == "pending"] == [(selected["id"], 2)]
+
+
+def test_cancel_before_modules_created_can_retry(env):
+    row = report(env)
+    knowledge.cancel_report(row["id"], env.request)
+    assert knowledge.retry_report(row["id"], knowledge.RetryInput(), env.request)[
+        "status"] == "waiting"
+
+
+def test_retry_before_modules_created_persists_new_limits(env):
+    """模块尚未创建时没有运行账可承载预算;必须更新报告快照供 prepare_report 使用。"""
+    row = report(env)
+    knowledge.cancel_report(row["id"], env.request)
+    knowledge.retry_report(
+        row["id"],
+        knowledge.RetryInput(max_output_tokens=12345, timeout_seconds=4321),
+        env.request,
+    )
+    persisted = knowledge.report_row(env.request, row["id"])["runtime_settings"]
+    assert persisted["max_output_tokens"] == 12345
+    assert persisted["timeout_seconds"] == 4321
+    prepared, _ = worker.prepare_report(env.db, knowledge.report_row(env.request, row["id"]))
+    run = env.db.rows(
+        """SELECT a.limits FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
+        WHERE m.report_id=:id ORDER BY a.id LIMIT 1""",
+        {"id": prepared["id"]},
+    )[0]
+    assert run["limits"]["max_output_tokens"] == 12345
+    assert run["limits"]["timeout_seconds"] == 4321
+
+
+def test_retry_waits_for_canceled_controller_to_exit(env):
+    from tender.api.errors import ApiProblem
+
+    runtime = prepared_runtime(env)
+    report_id = runtime.report["id"]
+    with env.engine.connect() as controller:
+        controller.execute(text("SELECT pg_advisory_lock(hashtextextended(:key,0))"),
+                           {"key": f"analysis_report:{report_id}"})
+        try:
+            assert knowledge.cancel_report(report_id, env.request)["canceling"]
+            assert knowledge.get_report(report_id, env.request)["canceling"]
+            with pytest.raises(ApiProblem) as caught:
+                knowledge.retry_report(report_id, knowledge.RetryInput(), env.request)
+            assert caught.value.code == "cancellation_pending"
+        finally:
+            controller.execute(text("SELECT pg_advisory_unlock(hashtextextended(:key,0))"),
+                               {"key": f"analysis_report:{report_id}"})
+    assert not knowledge.get_report(report_id, env.request)["canceling"]
+    assert knowledge.retry_report(report_id, knowledge.RetryInput(), env.request)[
+        "status"] == "pending"
+
+
+def test_cancel_interrupts_active_module_and_releases_quota(env, monkeypatch):
+    runtime = prepared_runtime(env)
+    started, stopped = asyncio.Event(), asyncio.Event()
+
+    class Model:
+        async def aclose(self):
+            pass
+
+    async def blocked_request(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(worker, "_routing_model", lambda *a, **kw: Model())
+    monkeypatch.setattr(worker, "build_module_agent", lambda **kw: (None, {}))
+    monkeypatch.setattr(worker, "invoke_module", blocked_request)
+
+    async def scenario():
+        task = asyncio.create_task(worker.execute_module(
+            env.db, runtime.report, runtime.run | {
+                "module_key": next(iter(knowledge.MODULES)),
+            }, runtime.sources))
+        try:
+            await asyncio.wait_for(started.wait(), 10)
+            canceled = await asyncio.to_thread(
+                knowledge.cancel_report, runtime.report["id"], env.request)
+            assert canceled["canceling"]
+            await asyncio.wait_for(task, 5)
+            assert stopped.is_set()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    run_async(scenario())
+    current = knowledge.get_report(runtime.report["id"], env.request)
+    assert not current["canceling"]
+    assert all(m["status"] == "canceled" for m in current["modules"])
+    assert all(r["status"] == "canceled" for m in current["modules"] for r in m["runs"])
 
 
 def test_explicit_retry_reparses_completed_module_from_scratch(env):

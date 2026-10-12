@@ -59,3 +59,12 @@ export const capabilityLabel: Record<string, string> = {
   vision: "视觉",
   multimodal_embedding: "图文嵌入",
 };
+
+/** 页面只执行服务端下发的范围；旧接口未返回元数据时由服务端完成最终校验。 */
+export function withinNumericRule(
+  value: number, rule?: import("@/types/llm").ParameterSchema,
+): boolean {
+  return Number.isFinite(value) && (rule?.type !== "integer" || Number.isInteger(value)) &&
+    (rule?.min === undefined || value >= rule.min) &&
+    (rule?.max === undefined || value <= rule.max);
+}

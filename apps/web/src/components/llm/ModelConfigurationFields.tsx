@@ -101,7 +101,8 @@ export function ModelConfigurationFields({
           if (!rule) return null;
           const current = value.values[key];
           return (
-            <Form.Item label={rule.label} key={key}>
+            <Form.Item label={rule.label} key={key}
+              extra={key === "max_tokens" ? "实际输出取本项与任务输出预算的较小值；留空使用任务预算。" : undefined}>
               {rule.type === "enum" ? (
                 <Select
                   aria-label={rule.label}

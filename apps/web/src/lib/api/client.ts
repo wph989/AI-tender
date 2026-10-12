@@ -377,8 +377,8 @@ export async function loadProject(projectId: number): Promise<WireProjectDetail>
 }
 
 export interface UploadOptions {
-  tier: ParseTier;
-  ocrMode: "auto" | "txt" | "ocr";
+  tier: ParseTier | "";
+  ocrMode: "auto" | "txt" | "ocr" | "";
   autoParse: boolean;
   /** 不传时由后端按扩展名推断（清单/图纸/其余）。 */
   role?: FileRole | null;
@@ -408,8 +408,9 @@ export async function uploadProjectFiles(
   for (const file of files) form.append("files", file);
   if (archive !== null) form.append("archive", archive);
   form.append("auto_parse", String(options.autoParse));
-  form.append("tier", options.tier);
-  form.append("ocr_mode", options.ocrMode);
+  // 默认选择省略字段，由服务端在创建任务时冻结配置中心的当前值。
+  if (options.tier) form.append("tier", options.tier);
+  if (options.ocrMode) form.append("ocr_mode", options.ocrMode);
   if (options.role) form.append("role", options.role);
 
   return await new Promise<UploadResult>((resolve, reject) => {

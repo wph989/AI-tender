@@ -22,7 +22,7 @@ import {
   listReleases,
   rollbackRelease,
 } from "@/lib/api/config";
-import { LAYERS, itemsOfLayer } from "@/lib/config/draft";
+import { LAYERS, isModelConfig, itemsOfLayer } from "@/lib/config/draft";
 import { message } from "@/lib/errors";
 import type {
   ConfigItem,
@@ -37,6 +37,19 @@ import { ReleasePanel } from "./ReleasePanel";
 type LoadState = "loading" | "ready" | "error";
 
 export function ConfigCenter() {
+  return (
+    <PageShell
+      breadcrumb={[<span>设置</span>, <span>配置中心</span>]}
+      eyebrow="设置 · 配置"
+      title="配置中心"
+      description="管理文件转换、解析与抽取规则。模型与分析预算请到模型管理调整。"
+    >
+      <ConfigWorkspace scope="system" />
+    </PageShell>
+  );
+}
+
+export function ConfigWorkspace({ scope }: { scope: "system" | "models" }) {
   const [section, setSection] = useState("L1");
   const [items, setItems] = useState<ConfigItem[]>([]);
   const [role, setRole] = useState("");
@@ -61,7 +74,9 @@ export function ConfigCenter() {
       listReleases(),
     ]);
     if (sequence !== loadSequence.current) return;
-    setItems(itemsResponse.items);
+    setItems(itemsResponse.items.filter(
+      (item) => isModelConfig(item.key) === (scope === "models"),
+    ));
     setRole(itemsResponse.role);
     setActive(itemsResponse.active);
     setReleases(releaseList);
@@ -72,7 +87,7 @@ export function ConfigCenter() {
     selectedId.current = fallback?.id ?? null;
     const nextDetail = fallback === undefined ? null : await getRelease(fallback.id);
     if (sequence === loadSequence.current && selectedId.current === (fallback?.id ?? null)) setDetail(nextDetail);
-  }, []);
+  }, [scope]);
 
   useEffect(() => {
     let alive = true;
@@ -136,43 +151,36 @@ export function ConfigCenter() {
   };
 
   return (
-    <PageShell
-      breadcrumb={[
-        <span>设置</span>,
-        <span className="text-slate-600">配置中心</span>,
-      ]}
-      eyebrow="设置 · 配置"
-      title="配置中心"
-      description="管理运行、解析与抽取规则，查看每一次配置发布的影响。"
-      actions={
-        <>
-          <span className="text-[13px] text-slate-500">
-            角色{" "}
-            <span className={DATA_CLASS + " text-slate-700"}>
-              {role === "" ? "—" : role}
-            </span>
+    <>
+      <div className="mb-4 flex flex-wrap items-center gap-4">
+        <span className="text-[13px] text-slate-500">
+          角色{" "}
+          <span className={DATA_CLASS + " text-slate-700"}>
+            {role === "" ? "—" : role}
           </span>
-          <span className="text-[13px] text-slate-500">
-            生效版本{" "}
-            <span className={DATA_CLASS + " text-slate-700"}>
-              {active === null ? "—" : "v" + active.version_no}
-            </span>
+        </span>
+        <span className="text-[13px] text-slate-500">
+          生效版本{" "}
+          <span className={DATA_CLASS + " text-slate-700"}>
+            {active === null ? "—" : "v" + active.version_no}
           </span>
-          <Button
-            htmlType="button"
-
-            disabled={busy}
-            onClick={() =>
-              void run("刷新失败", async () => {
-                setInfo(null);
-              })
-            }
-          >
-            刷新
-          </Button>
-        </>
-      }
-    >
+        </span>
+        <Button
+          htmlType="button"
+          disabled={busy}
+          onClick={() => state === "ready"
+            ? void run("刷新失败", async () => { setInfo(null); })
+            : retry()}
+        >
+          刷新
+        </Button>
+      </div>
+      {scope === "models" && (
+        <p className="mb-4 text-sm text-slate-500">
+          分析预算用于新建与补跑的模块；模型自身的输出上限仍同时生效。
+          配置版本与配置中心共用，发布和回滚会作用于整个版本。
+        </p>
+      )}
       {state === "loading" && (
         <p className="text-[14px] text-slate-500">正在加载配置…</p>
       )}
@@ -203,18 +211,19 @@ export function ConfigCenter() {
 
       {state === "ready" && (
         <Tabs
-          activeKey={section}
+          activeKey={section === "releases" || items.some((item) => item.layer === section)
+            ? section : items[0]?.layer ?? "releases"}
           onChange={setSection}
           destroyOnHidden={false}
           items={[
-            ...LAYERS.map((layer) => ({
+            ...LAYERS.filter((layer) => itemsOfLayer(items, layer).length > 0).map((layer) => ({
               key: layer,
               label:
                 layer === "L1"
-                  ? "运行参数"
+                  ? scope === "models" ? "分析运行预算" : "运行参数"
                   : layer === "L2"
-                    ? "解析配置"
-                    : "抽取配置",
+                    ? scope === "models" ? "模型辅助解析" : "解析配置"
+                    : scope === "models" ? "抽取模型策略" : "抽取配置",
               forceRender: true,
               children: (
                 <LayerEditor
@@ -277,6 +286,6 @@ export function ConfigCenter() {
           ]}
         />
       )}
-    </PageShell>
+    </>
   );
 }

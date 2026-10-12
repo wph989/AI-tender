@@ -66,7 +66,19 @@ def test_validate_value_accepts_expected_types(key: str, value: object) -> None:
 def test_context_budget_has_no_upper_bound() -> None:
     """上下文预算不该被人工上限卡死：可用范围由当前绑定模型的窗口决定。"""
     assert schema.validate_value("analysis.context_tokens", 262144) is None
-    assert schema.validate_value("analysis.context_tokens", 4095) is not None
+    assert schema.validate_value("analysis.context_tokens", 1) is None
+    assert schema.validate_value("analysis.context_tokens", 0) is not None
+
+
+@pytest.mark.parametrize("value", [1, 511, 16385, 262144])
+def test_output_budget_accepts_positive_integers_without_upper_bound(value: int) -> None:
+    """同时覆盖原下限和上限之外的合法值，防止旧范围重新阻断配置保存。"""
+    assert schema.validate_value("analysis.max_output_tokens", value) is None
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, "8192"])
+def test_output_budget_rejects_non_positive_or_non_integer_values(value: object) -> None:
+    assert schema.validate_value("analysis.max_output_tokens", value) is not None
 
 
 def test_diff_values_only_lists_changes() -> None:
@@ -86,7 +98,7 @@ def test_diff_values_ignores_identical_values() -> None:
 def test_write_denial_follows_layer_permissions() -> None:
     assert schema.write_denial("operator", ["convert.max_inflight"]) is None
     assert schema.write_denial("operator", ["mineru.tier"]) is not None
-    assert schema.write_denial("admin", ["extract.scope.per_lot"]) is None
+    assert schema.write_denial("admin", ["extract.rerun.min_sample"]) is None
     assert schema.write_denial("viewer", ["convert.max_inflight"]) is not None
     assert schema.write_denial("reviewer", ["mineru.tier"]) is not None
 
@@ -98,3 +110,44 @@ def test_write_denial_rejects_unknown_role() -> None:
 def test_gated_keys_only_keeps_l2_l3() -> None:
     keys = ["convert.max_inflight", "mineru.tier", "extract.strategy.dual_route"]
     assert schema.gated_keys(keys) == {"mineru.tier", "extract.strategy.dual_route"}
+
+
+@pytest.mark.parametrize("key", [
+    entry.key for entry in schema.ITEMS if entry.key.startswith("analysis.")
+])
+def test_analysis_budgets_have_no_artificial_maximum(key: str) -> None:
+    assert schema.validate_value(key, 1000000) is None
+    assert schema.validate_value(key, 1) is None
+    assert schema.validate_value(key, -1) is not None
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.1, float("inf"), float("nan")])
+def test_ratio_must_be_finite_and_between_zero_and_one(value: float) -> None:
+    assert schema.validate_value("extract.rerun.hide_threshold", value) is not None
+
+
+def test_nonnegative_budgets_keep_pause_and_no_retry_semantics() -> None:
+    for key in ("convert.max_inflight", "parse.max_inflight", "extract.max_inflight",
+                "analysis.max_subagent_retries", "job.retry.convert_500"):
+        assert schema.validate_value(key, 0) is None
+    assert schema.validate_value("analysis.max_inflight", 0) is not None
+
+
+def test_unimplemented_controls_are_readonly_even_for_admin() -> None:
+    assert schema.write_denial("admin", ["preprocess.denoise"]) is not None
+    assert schema.write_denial("admin", ["mineru.page_range"]) is not None
+    assert schema.write_denial("admin", ["mineru.tier"]) is None
+
+
+def test_poll_maximum_cannot_be_smaller_than_initial_interval() -> None:
+    assert schema.validate_values(schema.resolve_values({"job.poll.max_interval_ms": 1000}))
+    values = schema.resolve_values({"job.poll.initial_interval_ms": 1000})
+    assert schema.validate_values(values) is None
+
+
+def test_parse_defaults_and_explicit_overrides_use_validated_active_values() -> None:
+    values = {"mineru.tier": "advanced", "mineru.ocr_mode": "ocr"}
+    assert schema.parse_options(values) == {"tier": "advanced", "ocr_mode": "ocr"}
+    assert schema.parse_options(values, "basic") == {"tier": "basic", "ocr_mode": "ocr"}
+    with pytest.raises(ValueError):
+        schema.parse_options(values, "unsupported")

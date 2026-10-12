@@ -213,7 +213,7 @@ async def answer_with_agent(
                     SummarizationMiddleware(
                         RoutedAgentModel(router=model),
                         backend=backend,
-                        trigger=("tokens", int(limits.context_tokens * 0.8)),
+                        trigger=("tokens", max(1, limits.context_tokens * 4 // 5)),
                         keep=("messages", 4),
                         token_counter=context_size,
                         trim_tokens_to_summarize=limits.context_tokens,
@@ -236,7 +236,10 @@ async def answer_with_agent(
             )
             with tracing_context(enabled=False):
                 await graph.ainvoke(
-                    {"messages": [("user", task)], "files": {}}, config={"recursion_limit": 128}
+                    {"messages": [("user", task)], "files": {}},
+                    config={"recursion_limit": max(
+                        128, 4 * (limits.max_model_calls + limits.max_tool_calls)
+                    )},
                 )
             return state["draft"], research
     except TimeoutError as exc:

@@ -191,7 +191,9 @@ def test_canceled_retry_cannot_reactivate_the_previous_snapshot(basis, run_statu
     assert retried.status_code == 202
     basis.db.execute("UPDATE agent_module_run SET status=:status WHERE module_id=:id",
                      {"status": run_status, "id": basis.module_id})
-    assert basis.client.post(basis.path + "/cancel").status_code == 200
+    # 模拟取消已落库、执行者仍在退出的窗口；无执行者的 HTTP 取消现会直接结束运行账。
+    basis.db.execute("UPDATE analysis_report SET status='canceled' WHERE id=:id",
+                     {"id": basis.report_id})
     assert publish_data_snapshot(basis.db, basis.report_id) is None
     request = {"snapshot_id": first["id"], "purpose": "outline",
                "lot_id": first["data"]["lots"][0]["lot_id"]}
@@ -218,7 +220,12 @@ def test_superseded_pending_attempt_does_not_block_the_new_terminal_snapshot(bas
         assert basis.client.post(basis.path + "/retry", json={
             "module_keys": ["project_basic_info_parsing"],
         }).status_code == 202
-        assert basis.client.post(basis.path + "/cancel").status_code == 200
+        basis.db.execute("UPDATE analysis_report SET status='canceled' WHERE id=:id",
+                         {"id": basis.report_id})
+    # 构造旧版本遗留的 pending attempt；新取消接口会清理，但历史记录仍须兼容读取。
+    basis.db.execute("""UPDATE agent_module_run SET status='pending' WHERE module_id=:id
+        AND attempt<(SELECT max(attempt) FROM agent_module_run WHERE module_id=:id)""",
+        {"id": basis.module_id})
     basis.db.execute("""UPDATE agent_module_run SET status='canceled' WHERE module_id=:id
         AND attempt=(SELECT max(attempt) FROM agent_module_run WHERE module_id=:id)""",
         {"id": basis.module_id})
@@ -227,6 +234,25 @@ def test_superseded_pending_attempt_does_not_block_the_new_terminal_snapshot(bas
     second = publish_data_snapshot(basis.db, basis.report_id)
     assert second["revision"] == first["revision"] + 1
     assert basis.client.get(basis.path + "/data").json()["stale"] is False
+
+
+@pytest.mark.parametrize("run_status", ["pending", "running"])
+def test_cancel_orphaned_retry_publishes_new_snapshot_without_reusing_old_data(basis, run_status):
+    first = publish_data_snapshot(basis.db, basis.report_id)
+    assert basis.client.post(basis.path + "/retry", json={
+        "module_keys": ["project_basic_info_parsing"],
+    }).status_code == 202
+    basis.db.execute("UPDATE agent_module_run SET status=:status WHERE module_id=:id",
+                     {"status": run_status, "id": basis.module_id})
+    result = basis.client.post(basis.path + "/cancel")
+    assert result.json() == {"status": "canceled", "canceling": False}
+    current = basis.client.get(basis.path + "/data").json()
+    assert current["revision"] == first["revision"] + 1
+    assert current["data"]["readiness"] == "unavailable"
+    assert basis.client.post(basis.path + "/context", json={
+        "snapshot_id": first["id"], "purpose": "outline",
+        "lot_id": first["data"]["lots"][0]["lot_id"],
+    }).status_code == 409
 
 
 def test_known_project_lots_missing_from_analysis_require_explicit_selection(basis):

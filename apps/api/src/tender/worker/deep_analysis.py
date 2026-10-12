@@ -307,6 +307,8 @@ async def execute_module(
                     state=state,
                     save=save,
                     max_retries=limits.max_subagent_retries,
+                    # 每轮可能包含检索、模型、工具和摘要节点，步数随预算增长而非固定卡在256。
+                    recursion_limit=max(256, 4 * (limits.max_model_calls + limits.max_tool_calls)),
                     task=(
                         f"分析模块：{MODULES[module['module_key']]}。项目设置："
                         + encode(

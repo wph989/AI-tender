@@ -35,7 +35,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
   const [error, setError] = useState<string | null>(null);
   useFeedback(error);
 
-  const writable = items.every((item) => item.writable);
+  const writable = items.some((item) => item.writable);
 
   const draftCount = items.filter(
     (item) =>
@@ -97,7 +97,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
 
       {!writable && (
         <p className="mt-3 border border-amber-200 bg-amber-50 px-2 py-1 text-[13px] text-amber-800">
-          当前角色只读该层，写操作会被服务端拒绝。
+          该层当前没有可修改项；未接入配置的原因见下方说明。
         </p>
       )}
 
@@ -124,13 +124,21 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                 <p className="mt-0.5 text-[13px] text-slate-500">
                   {item.description}
                 </p>
+                {item.readonly_reason && (
+                  <p className="mt-1 text-xs text-slate-500">只读：{item.readonly_reason}</p>
+                )}
+                {item.key === "analysis.context_tokens" && Number(value) < 4096 && (
+                  <p className="mt-1 text-xs text-amber-700">
+                    固定指令和工具说明也占用上下文，较小预算可能无法容纳完整任务。
+                  </p>
+                )}
               </div>
               {item.value_type === "bool" ? (
                 <Select<string>
                   aria-label={item.description || item.key}
                   className={" w-full"}
                   value={String(value)}
-                  disabled={!writable || busy}
+                  disabled={!item.writable || busy}
                   onChange={(selectedValue) =>
                     setDrafts((current) => ({
                       ...current,
@@ -141,6 +149,17 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                   <Select.Option value="true">true</Select.Option>
                   <Select.Option value="false">false</Select.Option>
                 </Select>
+              ) : item.choices ? (
+                <Select<string>
+                  aria-label={item.description || item.key}
+                  className="w-full"
+                  value={value}
+                  disabled={!item.writable || busy}
+                  options={item.choices.map((choice) => ({ value: choice, label: choice }))}
+                  onChange={(selectedValue) => setDrafts((current) => ({
+                    ...current, [item.key]: selectedValue,
+                  }))}
+                />
               ) : (
                 <Input
                   className={
@@ -155,7 +174,10 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                       : "text"
                   }
                   value={value}
-                  disabled={!writable || busy}
+                  min={item.minimum}
+                  max={item.maximum}
+                  step={item.value_type === "number" ? "any" : 1}
+                  disabled={!item.writable || busy}
                   onChange={(event) =>
                     setDrafts((current) => ({
                       ...current,

@@ -88,7 +88,7 @@ _MARK_DISPATCHED_SQL = """
 
 
 def registry() -> ConfigRegistry:
-    """进程内单例：beat 每 5 秒跑一次，不该每次都新建 Redis 连接。"""
+    """进程内单例：beat 每秒唤醒，不该每次都新建 Redis 连接。"""
     global _registry
     if _registry is None:
         _registry = ConfigRegistry(_engine, RedisConfigCache())
@@ -152,11 +152,11 @@ def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
 
 @celery_app.task(bind=True, name="tender.worker.dispatch.dispatch_pending", max_retries=0)
 def dispatch_pending(self: Any) -> dict[str, int]:
-    """beat 每 5 秒唤醒；实际间隔由 `dispatch.interval_seconds` 决定（只能拉长）。"""
+    """beat 每秒唤醒；实际派发间隔读取当前配置，无需因调小间隔重启beat。"""
     global _last_run_at
     company_id = settings.company_id()
     resolved = registry().resolved(company_id)
-    interval = float(resolved.get("dispatch.interval_seconds") or 5)
+    interval = float(resolved["dispatch.interval_seconds"])
     now = time.monotonic()
     if now - _last_run_at < interval:
         return {}

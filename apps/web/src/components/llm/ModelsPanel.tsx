@@ -42,16 +42,18 @@ import type {
   ModelInput,
   ModelPatchInput,
   ModelKind,
+  ParameterSchema,
 } from "@/types/llm";
 
 interface Props {
   providers: LlmProvider[];
   models: LlmModel[];
   profiles: AdapterProfile[];
+  fields?: Record<string, ParameterSchema>;
   onChanged: () => Promise<void>;
 }
 
-export function ModelsPanel({ providers, models, profiles, onChanged }: Props) {
+export function ModelsPanel({ providers, models, profiles, fields = {}, onChanged }: Props) {
   const { modal, message: toast } = App.useApp();
   const [dirty, setDirty] = useState(false);
   const [page, setPage] = useState(1);
@@ -288,6 +290,7 @@ export function ModelsPanel({ providers, models, profiles, onChanged }: Props) {
             providers={providers}
             model={models.find((m) => m.id === editing) ?? null}
             profiles={profiles}
+            fields={fields}
             busy={busy}
             onSubmit={save}
             onDirty={() => setDirty(true)}
@@ -493,6 +496,7 @@ function ModelForm({
   providers,
   model,
   profiles,
+  fields,
   busy,
   onSubmit,
   onDirty,
@@ -500,6 +504,7 @@ function ModelForm({
   providers: LlmProvider[];
   model: LlmModel | null;
   profiles: AdapterProfile[];
+  fields: Record<string, ParameterSchema>;
   busy: boolean;
   onSubmit: (input: ModelInput | ModelPatchInput) => void;
   onDirty: () => void;
@@ -690,14 +695,14 @@ function ModelForm({
         rules={[
           {
             required: true,
-            type: "integer",
-            min: 1,
-            max: 600,
-            message: "请输入 1–600 之间的整数",
+            type: "number",
+            min: fields.timeout_seconds?.min,
+            max: fields.timeout_seconds?.max,
+            message: "请输入允许范围内的秒数",
           },
         ]}
       >
-        <InputNumber min={1} max={600} />
+        <InputNumber min={fields.timeout_seconds?.min} max={fields.timeout_seconds?.max} />
       </Form.Item>
       <Form.Item
         label="失败后额外重试次数"
@@ -707,13 +712,13 @@ function ModelForm({
           {
             required: true,
             type: "integer",
-            min: 0,
-            max: 10,
-            message: "请输入 0–10 之间的整数",
+            min: fields.extra_retries?.min,
+            max: fields.extra_retries?.max,
+            message: "请输入允许范围内的整数",
           },
         ]}
       >
-        <InputNumber min={0} max={10} />
+        <InputNumber min={fields.extra_retries?.min} max={fields.extra_retries?.max} />
       </Form.Item>
       <Form.Item label="启用模型" name="enabled" valuePropName="checked">
         <Switch />

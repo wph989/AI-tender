@@ -23,11 +23,22 @@ from sqlalchemy.exc import IntegrityError
 
 from tender.api.common import engine
 from tender.api.errors import ApiProblem
-from tender.application.llm_registry import DEFAULT_FAILOVER_LIMIT, FEATURES, binding_rows
+from tender.application.llm_registry import (
+    DEFAULT_FAILOVER_LIMIT,
+    FEATURE_DESCRIPTIONS,
+    FEATURES,
+    INACTIVE_FEATURES,
+    MAX_BINDINGS,
+    binding_rows,
+)
 from tender.application.model_probes import PROBE_IMAGE
 from tender.application.model_profiles import (
     ADAPTER_VERSION,
+    FEATURE_FIELDS,
+    LANGUAGE,
+    MODEL_FIELDS,
     PROFILES,
+    field_bounds,
     required_kind,
     supported_parameters,
     test_capabilities,
@@ -100,13 +111,19 @@ class ModelCreate(BaseModel):
         "image_generation",
     ] = "chat_completions"
     capabilities: list[str] = Field(default_factory=lambda: ["text_input", "json_output"])
-    extra_retries: int = Field(default=1, ge=0, le=10, strict=True)
+    extra_retries: int = Field(
+        default=1, strict=True, **field_bounds(MODEL_FIELDS["extra_retries"])
+    )
     provider_id: int
     model_id: str = Field(min_length=1, max_length=200)
     display_name: str | None = Field(default=None, max_length=200)
-    timeout_seconds: float | None = Field(default=None, ge=1, le=600)
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    max_tokens: int | None = Field(default=None, gt=0, le=100000, strict=True)
+    timeout_seconds: float | None = Field(
+        default=None, allow_inf_nan=False, **field_bounds(MODEL_FIELDS["timeout_seconds"])
+    )
+    temperature: float | None = Field(default=None, **field_bounds(LANGUAGE["temperature"]))
+    max_tokens: int | None = Field(
+        default=None, strict=True, **field_bounds(LANGUAGE["max_tokens"])
+    )
     parameters: dict[str, Any] = Field(default_factory=dict)
     supported_parameters: list[str] | None = None
     enabled: bool = True
@@ -131,11 +148,17 @@ class ModelPatch(BaseModel):
         | None
     ) = None
     capabilities: list[str] | None = None
-    extra_retries: int | None = Field(default=None, ge=0, le=10, strict=True)
+    extra_retries: int | None = Field(
+        default=None, strict=True, **field_bounds(MODEL_FIELDS["extra_retries"])
+    )
     display_name: str | None = Field(default=None, min_length=1, max_length=200)
-    timeout_seconds: float | None = Field(default=None, ge=1, le=600)
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    max_tokens: int | None = Field(default=None, gt=0, le=100000, strict=True)
+    timeout_seconds: float | None = Field(
+        default=None, allow_inf_nan=False, **field_bounds(MODEL_FIELDS["timeout_seconds"])
+    )
+    temperature: float | None = Field(default=None, **field_bounds(LANGUAGE["temperature"]))
+    max_tokens: int | None = Field(
+        default=None, strict=True, **field_bounds(LANGUAGE["max_tokens"])
+    )
     parameters: dict[str, Any] | None = None
     supported_parameters: list[str] | None = None
     enabled: bool | None = None
@@ -162,21 +185,31 @@ class BindingsRequest(BaseModel):
 
     # 有序即优先级：第 1 个是 1 级，见 application/llm_registry.binding_rows
     model_ids: list[Annotated[int, Field(strict=True, gt=0)]] = Field(
-        default_factory=list, max_length=10
+        default_factory=list, max_length=MAX_BINDINGS
     )
     revision: int = Field(ge=1)
     # 绑定与预算在同一事务保存，避免前端两次写入留下半份配置。
-    failover_limit: int | None = Field(default=None, ge=1, le=10, strict=True)
-    max_total_requests: int | None = Field(default=None, ge=1, le=20, strict=True)
-    deadline_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
+    failover_limit: int | None = Field(
+        default=None, strict=True, **field_bounds(FEATURE_FIELDS["failover_limit"])
+    )
+    max_total_requests: int | None = Field(
+        default=None, strict=True, **field_bounds(FEATURE_FIELDS["max_total_requests"])
+    )
+    deadline_seconds: int | None = Field(
+        default=None, strict=True, **field_bounds(FEATURE_FIELDS["deadline_seconds"])
+    )
 
 
 class FeaturePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    failover_limit: int = Field(ge=1, le=10, strict=True)
-    max_total_requests: int = Field(default=6, ge=1, le=20, strict=True)
-    deadline_seconds: int = Field(default=600, ge=1, le=86400, strict=True)
+    failover_limit: int = Field(strict=True, **field_bounds(FEATURE_FIELDS["failover_limit"]))
+    max_total_requests: int = Field(
+        default=6, strict=True, **field_bounds(FEATURE_FIELDS["max_total_requests"])
+    )
+    deadline_seconds: int = Field(
+        default=600, strict=True, **field_bounds(FEATURE_FIELDS["deadline_seconds"])
+    )
     revision: int = Field(ge=1)
 
 
@@ -510,7 +543,9 @@ def llm_settings() -> dict[str, Any]:
         "secret_key_ready": secret_key_ready(),
         "adapter_profiles": PROFILES,
         "test_valid_seconds": 604800,
-        "max_bindings": 10,
+        "max_bindings": MAX_BINDINGS,
+        "model_fields": MODEL_FIELDS,
+        "feature_fields": FEATURE_FIELDS,
         "default_max_total_requests": 6,
     }
 
@@ -1346,7 +1381,8 @@ ORDER BY fm.feature_key, fm.priority"""
                 "failover_limit": int(configured["failover_limit"])
                 if configured
                 else DEFAULT_FAILOVER_LIMIT,
-                "description": str(configured["description"]) if configured else "",
+                "description": FEATURE_DESCRIPTIONS[key],
+                "binding_available": key not in INACTIVE_FEATURES,
                 "bindings": bindings,
             }
         )
@@ -1357,6 +1393,8 @@ ORDER BY fm.feature_key, fm.priority"""
 def update_feature(feature_key: str, payload: FeaturePatch, request: Request) -> dict[str, Any]:
     if feature_key not in {key for key, _ in FEATURES}:
         raise ApiProblem(404, "not_found", "功能不存在")
+    if feature_key in INACTIVE_FEATURES:
+        raise ApiProblem(409, "feature_unavailable", "该功能尚未接入业务调用，无需设置路由预算")
     with engine(request).begin() as c:
         row = c.execute(
             text("SELECT revision FROM llm_feature WHERE key=:key FOR UPDATE"), {"key": feature_key}
@@ -1386,6 +1424,8 @@ def replace_bindings(
 ) -> dict[str, Any]:
     if feature_key not in {key for key, _ in FEATURES}:
         raise ApiProblem(404, "not_found", "功能不存在")
+    if feature_key in INACTIVE_FEATURES and payload.model_ids:
+        raise ApiProblem(409, "feature_unavailable", "该功能尚未接入业务调用，请在模型列表测试")
     if feature_key in {"embedding", "rerank"} and len(payload.model_ids) > 1:
         raise ApiProblem(400, "invalid_argument", "当前向量与重排功能只支持绑定一个模型")
     rows = binding_rows(payload.model_ids)

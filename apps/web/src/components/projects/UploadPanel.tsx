@@ -41,8 +41,8 @@ const TIER_OPTIONS: { value: ParseTier; label: string }[] = [
 ];
 
 export interface UploadOptionsState {
-  tier: ParseTier;
-  ocrMode: "auto" | "txt" | "ocr";
+  tier: ParseTier | "";
+  ocrMode: "auto" | "txt" | "ocr" | "";
   autoParse: boolean;
   role: FileRole | "";
 }
@@ -83,8 +83,8 @@ export function UploadPanel({ busy, onUpload }: Props) {
   const [batch, setBatch] = useState<BatchRow[] | null>(null);
   const [ratio, setRatio] = useState<number | null>(null);
   const [options, setOptions] = useState<UploadOptionsState>({
-    tier: "standard",
-    ocrMode: "auto",
+    tier: "",
+    ocrMode: "",
     autoParse: true,
     role: "",
   });
@@ -225,6 +225,7 @@ export function UploadPanel({ busy, onUpload }: Props) {
                 setOptions({ ...options, tier: selectedValue as ParseTier })
               }
             >
+              <Select.Option value="">使用配置中心默认值</Select.Option>
               {TIER_OPTIONS.map((item) => (
                 <Select.Option key={item.value} value={String(item.value)}>
                   {item.label}
@@ -245,6 +246,7 @@ export function UploadPanel({ busy, onUpload }: Props) {
                 })
               }
             >
+              <Select.Option value="">使用配置中心默认值</Select.Option>
               <Select.Option value="auto">自动判断</Select.Option>
               <Select.Option value="txt">使用文本层</Select.Option>
               <Select.Option value="ocr">强制 OCR 识别</Select.Option>

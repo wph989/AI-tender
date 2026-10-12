@@ -80,6 +80,27 @@ describe("formatValue", () => {
 });
 
 describe("buildPatch", () => {
+  it("校验服务端范围与枚举，未声明最大值时允许大预算", () => {
+    const entries = [
+      item({ key: "budget", minimum: 1 }),
+      item({ key: "ratio", value_type: "number", minimum: 0, maximum: 1 }),
+      item({ key: "mode", value_type: "string", choices: ["auto", "ocr"] }),
+    ];
+    expect(buildPatch(entries, { budget: "262144" })).toEqual({
+      patch: { budget: 262144 }, errors: [],
+    });
+    expect(buildPatch(entries, { budget: "0", ratio: "1.1", mode: "unknown" })).toEqual({
+      patch: {},
+      errors: ["budget 超出允许范围", "ratio 超出允许范围", "mode 请选择支持的值"],
+    });
+  });
+
+  it("只读项不能进入提交补丁", () => {
+    expect(buildPatch([item({ key: "reserved", writable: false })], {
+      reserved: "1",
+    })).toEqual({ patch: {}, errors: ["reserved 当前只读"] });
+  });
+
   it("清空数值不能变成零并发或零阈值", () => {
     const result = buildPatch(ITEMS, {
       "convert.max_inflight": "",

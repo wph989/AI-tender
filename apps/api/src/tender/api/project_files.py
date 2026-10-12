@@ -21,6 +21,7 @@ from tender.api.common import blobs, engine, project_file_row
 from tender.api.errors import ApiProblem
 from tender.api.storage import stream_object
 from tender.application.knowledge_store import sync_sources
+from tender.config.schema import parse_options
 from tender.core import settings
 from tender.domain.errors import TenderError
 from tender.ports.blob_store import BlobStoreError
@@ -79,8 +80,8 @@ async def upload_files(
     files: Annotated[list[UploadFile] | None, File()] = None,
     archive: Annotated[UploadFile | None, File()] = None,
     auto_parse: Annotated[bool, Form()] = True,
-    tier: Annotated[str, Form()] = "standard",
-    ocr_mode: Annotated[str, Form()] = "auto",
+    tier: Annotated[str | None, Form()] = None,
+    ocr_mode: Annotated[str | None, Form()] = None,
     role: Annotated[str | None, Form()] = None,
 ) -> dict[str, object]:
     _ensure_project(project_id, request)
@@ -211,8 +212,8 @@ async def replace_file(
     request: Request,
     file: Annotated[UploadFile, File()],
     auto_parse: Annotated[bool, Form()] = True,
-    tier: Annotated[str, Form()] = "standard",
-    ocr_mode: Annotated[str, Form()] = "auto",
+    tier: Annotated[str | None, Form()] = None,
+    ocr_mode: Annotated[str | None, Form()] = None,
 ) -> dict[str, object]:
     _validate_parse_config(tier, ocr_mode)
     old = project_file_row(engine(request), project_id, file_id)
@@ -278,8 +279,8 @@ async def _add_project_file(
     item: FileInput,
     role: str,
     auto_parse: bool,
-    tier: str,
-    ocr_mode: str,
+    tier: str | None,
+    ocr_mode: str | None,
     replaces_id: int | None,
     sort_no: int | None = None,
     display_name: str | None = None,
@@ -307,6 +308,12 @@ async def _add_project_file(
     company = settings.company_id()
     # 先读活动配置（可能走 Redis 缓存）再开事务：不在事务里等网络。
     active_config = request.app.state.components.configs.active(company)
+    try:
+        options = parse_options(
+            active_config.resolved if active_config is not None else {}, tier, ocr_mode
+        )
+    except ValueError as exc:
+        raise ApiProblem(400, "invalid_argument", str(exc)) from exc
     job_id: str | None = None
     with engine(request).begin() as connection:
         project = connection.execute(
@@ -391,7 +398,7 @@ async def _add_project_file(
                     "stage": stage,
                     "progress": json.dumps({}),
                     "config_snapshot": json.dumps(
-                        {"tier": tier, "ocr_mode": ocr_mode, "auto_parse": auto_parse}
+                        {**options, "auto_parse": auto_parse}
                     ),
                     "config_snapshot_id": snapshot_id,
                 },
@@ -488,10 +495,10 @@ def _role_is_parseable(role: str, extension: str) -> bool:
     return role in _PARSEABLE_ROLES and extension.lower() in _PARSEABLE_EXTENSIONS
 
 
-def _validate_parse_config(tier: str, ocr_mode: str) -> None:
-    if tier not in {"flash", "basic", "standard", "advanced"}:
+def _validate_parse_config(tier: str | None, ocr_mode: str | None) -> None:
+    if tier is not None and tier not in {"flash", "basic", "standard", "advanced"}:
         raise ApiProblem(400, "invalid_argument", "tier 不受支持")
-    if ocr_mode not in {"auto", "txt", "ocr"}:
+    if ocr_mode is not None and ocr_mode not in {"auto", "txt", "ocr"}:
         raise ApiProblem(400, "invalid_argument", "ocr_mode 不受支持")
 
 

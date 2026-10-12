@@ -26,9 +26,7 @@ _TASK_ROUTES = {
     "tender.worker.regression.run_regression": {"queue": "regression"},
 }
 
-# 唤醒粒度固定 5 秒：`dispatch.interval_seconds` 只能把实际派发间隔拉长，不能缩短——
-# beat 自己不读配置，靠 tick 内部节流（worker/dispatch.py）。写成配置驱动会让
-# "改配置"依赖 beat 重启，恰好违背配置中心的初衷。
+# 每秒唤醒，再由派发任务按当前配置节流，使1秒间隔也能生效而无需重启beat。
 _BEAT_SCHEDULE = {
     "dispatch-knowledge": {
         "task": "tender.worker.knowledge.dispatch_knowledge",
@@ -36,7 +34,7 @@ _BEAT_SCHEDULE = {
     },
     "dispatch-pending": {
         "task": "tender.worker.dispatch.dispatch_pending",
-        "schedule": 5.0,
+        "schedule": 1.0,
     },
 }
 

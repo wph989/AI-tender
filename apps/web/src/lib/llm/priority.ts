@@ -6,9 +6,6 @@
  * 算出一个新数组再整表提交，单独改某一行的数字会造出空洞与同级。
  */
 
-/** 与后端 api/llm_registry.MAX_BINDINGS 一致；超过这个数量后端直接拒绝。 */
-export const MAX_BINDINGS = 10;
-
 /**
  * 把 modelId 移到第 target 级，其余模型保持原相对顺序。
  *
