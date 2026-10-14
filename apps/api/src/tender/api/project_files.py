@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
-import json
 import mimetypes
 import zipfile
 from pathlib import PurePosixPath
@@ -14,13 +13,14 @@ from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import func, insert, select, update
 from starlette.responses import Response
 
+from tender.adapters.pg.models import Job, Project, ProjectFile
+from tender.adapters.pg.repositories.knowledge import sync_sources
 from tender.api.common import blobs, engine, project_file_row
 from tender.api.errors import ApiProblem
 from tender.api.storage import stream_object
-from tender.application.knowledge_store import sync_sources
 from tender.config.schema import parse_options
 from tender.core import settings
 from tender.domain.errors import TenderError
@@ -157,36 +157,35 @@ def patch_file(
     if not fields:
         raise ApiProblem(400, "invalid_argument", "至少需要修改一个文件字段")
     project_file_row(engine(request), project_id, file_id)
-    assignments: list[str] = []
-    params: dict[str, object] = {
-        "project_id": project_id,
-        "file_id": file_id,
-        "company_id": settings.company_id(),
-    }
+    values: dict[str, object] = {}
     if "display_name" in fields:
         name = (payload.display_name or "").strip()
         if not name:
             raise ApiProblem(400, "invalid_argument", "显示名称不能为空")
-        assignments.append("display_name = :display_name")
-        params["display_name"] = name
+        values["display_name"] = name
     if "role" in fields:
-        new_role = _validate_role(payload.role)
-        assignments.append("role = :role")
-        params["role"] = new_role
+        values["role"] = _validate_role(payload.role)
     if "sort_no" in fields:
-        assignments.append("sort_no = :sort_no")
-        params["sort_no"] = payload.sort_no
+        values["sort_no"] = payload.sort_no
+    # project 侧条件收窄租户：company_id 不在 project_file 上，只能经项目主键回连。
+    owned_project = (
+        select(Project.id)
+        .where(
+            Project.id == project_id,
+            Project.company_id == settings.company_id(),
+            Project.deleted_at.is_(None),
+        )
+        .scalar_subquery()
+    )
     with engine(request).begin() as connection:
         updated = connection.execute(
-            text(
-                f"""UPDATE project_file AS pf
-                    SET {", ".join(assignments)}
-                    FROM project AS p
-                    WHERE pf.project_id = p.id AND pf.project_id = :project_id
-                      AND pf.id = :file_id AND p.company_id = :company_id
-                      AND p.deleted_at IS NULL AND pf.deleted_at IS NULL"""
-            ),
-            params,
+            update(ProjectFile)
+            .where(
+                ProjectFile.project_id == owned_project,
+                ProjectFile.id == file_id,
+                ProjectFile.deleted_at.is_(None),
+            )
+            .values(**values)
         ).rowcount
     if not updated:
         raise ApiProblem(404, "not_found", "项目文件不存在")
@@ -236,20 +235,24 @@ async def replace_file(
 
 @router.delete("/{file_id}", status_code=204)
 def delete_file(project_id: int, file_id: int, request: Request) -> Response:
+    owned_project = (
+        select(Project.id)
+        .where(
+            Project.id == project_id,
+            Project.company_id == settings.company_id(),
+            Project.deleted_at.is_(None),
+        )
+        .scalar_subquery()
+    )
     with engine(request).begin() as connection:
         updated = connection.execute(
-            text(
-                """UPDATE project_file AS pf SET deleted_at = now()
-                   FROM project AS p
-                   WHERE pf.project_id = p.id AND pf.project_id = :project_id
-                     AND pf.id = :file_id AND p.company_id = :company_id
-                     AND p.deleted_at IS NULL AND pf.deleted_at IS NULL"""
-            ),
-            {
-                "project_id": project_id,
-                "file_id": file_id,
-                "company_id": settings.company_id(),
-            },
+            update(ProjectFile)
+            .where(
+                ProjectFile.project_id == owned_project,
+                ProjectFile.id == file_id,
+                ProjectFile.deleted_at.is_(None),
+            )
+            .values(deleted_at=func.now())
         ).rowcount
     if not updated:
         raise ApiProblem(404, "not_found", "项目文件不存在")
@@ -317,23 +320,23 @@ async def _add_project_file(
     job_id: str | None = None
     with engine(request).begin() as connection:
         project = connection.execute(
-            text(
-                """SELECT id FROM project
-                   WHERE id = :project_id AND company_id = :company_id
-                     AND deleted_at IS NULL FOR UPDATE"""
-            ),
-            {"project_id": project_id, "company_id": company},
+            select(Project.id)
+            .where(
+                Project.id == project_id,
+                Project.company_id == company,
+                Project.deleted_at.is_(None),
+            )
+            .with_for_update()
         ).scalar_one_or_none()
         if project is None:
             raise ApiProblem(404, "not_found", "项目不存在")
         if replaces_id is not None:
             replaces = connection.execute(
-                text(
-                    """SELECT id FROM project_file
-                       WHERE id = :file_id AND project_id = :project_id
-                         AND deleted_at IS NULL"""
-                ),
-                {"file_id": replaces_id, "project_id": project_id},
+                select(ProjectFile.id).where(
+                    ProjectFile.id == replaces_id,
+                    ProjectFile.project_id == project_id,
+                    ProjectFile.deleted_at.is_(None),
+                )
             ).scalar_one_or_none()
             if replaces is None:
                 raise ApiProblem(404, "not_found", "待替换文件不存在")
@@ -341,36 +344,29 @@ async def _add_project_file(
         if sort_no is None:
             sort_no = int(
                 connection.execute(
-                    text(
-                        """SELECT COALESCE(MAX(sort_no), -1) + 1 FROM project_file
-                           WHERE project_id = :project_id AND deleted_at IS NULL"""
-                    ),
-                    {"project_id": project_id},
+                    select(func.coalesce(func.max(ProjectFile.sort_no), -1) + 1).where(
+                        ProjectFile.project_id == project_id,
+                        ProjectFile.deleted_at.is_(None),
+                    )
                 ).scalar_one()
             )
         project_file_id = int(
             connection.execute(
-                text(
-                    """INSERT INTO project_file
-                           (project_id, version_id, role, display_name, is_parseable,
-                            replaces_id, sort_no, original_key, sha256, mime, size_bytes)
-                       VALUES
-                           (:project_id, NULL, :role, :display_name, :is_parseable,
-                            :replaces_id, :sort_no, :original_key, :sha256, :mime, :size_bytes)
-                       RETURNING id"""
-                ),
-                {
-                    "project_id": project_id,
-                    "role": role,
-                    "display_name": name,
-                    "is_parseable": parseable,
-                    "replaces_id": replaces_id,
-                    "sort_no": sort_no,
-                    "original_key": original_key,
-                    "sha256": original_sha,
-                    "mime": raw_mime,
-                    "size_bytes": len(item.content),
-                },
+                insert(ProjectFile)
+                .values(
+                    project_id=project_id,
+                    version_id=None,
+                    role=role,
+                    display_name=name,
+                    is_parseable=parseable,
+                    replaces_id=replaces_id,
+                    sort_no=sort_no,
+                    original_key=original_key,
+                    sha256=original_sha,
+                    mime=raw_mime,
+                    size_bytes=len(item.content),
+                )
+                .returning(ProjectFile.id)
             ).scalar_one()
         )
         sync_sources(connection, project_id)
@@ -381,27 +377,18 @@ async def _add_project_file(
                 connection, active_config
             )
             connection.execute(
-                text(
-                    """INSERT INTO job
-                           (id, company_id, project_id, project_file_id, version_id,
-                            status, stage, progress, config_snapshot, config_snapshot_id)
-                       VALUES
-                           (:id, :company_id, :project_id, :project_file_id, NULL,
-                            'pending', :stage, CAST(:progress AS JSONB),
-                            CAST(:config_snapshot AS JSONB), :config_snapshot_id)"""
-                ),
-                {
-                    "id": job_id,
-                    "company_id": company,
-                    "project_id": project_id,
-                    "project_file_id": project_file_id,
-                    "stage": stage,
-                    "progress": json.dumps({}),
-                    "config_snapshot": json.dumps(
-                        {**options, "auto_parse": auto_parse}
-                    ),
-                    "config_snapshot_id": snapshot_id,
-                },
+                insert(Job).values(
+                    id=job_id,
+                    company_id=company,
+                    project_id=project_id,
+                    project_file_id=project_file_id,
+                    version_id=None,
+                    status="pending",
+                    stage=stage,
+                    progress={},
+                    config_snapshot={**options, "auto_parse": auto_parse},
+                    config_snapshot_id=snapshot_id,
+                )
             )
 
     return {

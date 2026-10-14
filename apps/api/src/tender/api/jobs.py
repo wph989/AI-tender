@@ -8,8 +8,9 @@ from collections.abc import AsyncIterator, Iterator
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import text
+from sqlalchemy import func, select, update
 
+from tender.adapters.pg.models import Job
 from tender.api.common import engine
 from tender.api.errors import ApiProblem
 from tender.core import settings
@@ -22,12 +23,19 @@ def _payload(request: Request, job_id: str) -> dict[str, object] | None:
     with engine(request).connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT id, status, stage, progress, error_code, error_message,
-                          version_id, run_id, created_at, updated_at, finished_at
-                   FROM job WHERE id = :job_id AND company_id = :company_id"""
-                ),
-                {"job_id": job_id, "company_id": settings.company_id()},
+                select(
+                    Job.id,
+                    Job.status,
+                    Job.stage,
+                    Job.progress,
+                    Job.error_code,
+                    Job.error_message,
+                    Job.version_id,
+                    Job.run_id,
+                    Job.created_at,
+                    Job.updated_at,
+                    Job.finished_at,
+                ).where(Job.id == job_id, Job.company_id == settings.company_id())
             )
             .mappings()
             .first()
@@ -119,20 +127,24 @@ def cancel_job(job_id: str, request: Request) -> dict[str, object]:
     db = engine(request)
     with db.begin() as connection:
         canceled = connection.execute(
-            text(
-                """UPDATE job
-                   SET status = 'canceled', error_code = 'canceled_by_user',
-                       error_message = '任务已由用户取消', finished_at = now(), updated_at = now()
-                   WHERE id = :job_id AND company_id = :company_id
-                     AND status NOT IN ('completed','partial','failed','canceled')
-                   RETURNING id"""
-            ),
-            {"job_id": job_id, "company_id": settings.company_id()},
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.company_id == settings.company_id(),
+                Job.status.not_in(("completed", "partial", "failed", "canceled")),
+            )
+            .values(
+                status="canceled",
+                error_code="canceled_by_user",
+                error_message="任务已由用户取消",
+                finished_at=func.now(),
+                updated_at=func.now(),
+            )
+            .returning(Job.id)
         ).scalar_one_or_none()
         if canceled is None:
             current = connection.execute(
-                text("SELECT status FROM job WHERE id = :job_id AND company_id = :company_id"),
-                {"job_id": job_id, "company_id": settings.company_id()},
+                select(Job.status).where(Job.id == job_id, Job.company_id == settings.company_id())
             ).scalar_one_or_none()
             if current is None:
                 raise ApiProblem(404, "not_found", "任务不存在")

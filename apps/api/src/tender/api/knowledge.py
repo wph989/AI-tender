@@ -9,17 +9,33 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import delete, exists, func, insert, select, update
 
+from tender.adapters.pg.models import (
+    AgentModuleRun,
+    AnalysisModule,
+    AnalysisReport,
+    Job,
+    KnowledgeAnswer,
+    KnowledgeCollection,
+    KnowledgeIndex,
+    Lot,
+    Project,
+    ProjectFile,
+    ProjectKnowledgeCollection,
+)
+from tender.adapters.pg.repositories.agent_runtime import (
+    cancel_unlocked_runs,
+    execution_active,
+    lock_project,
+    try_lock_report_execution,
+)
+from tender.adapters.pg.repositories.knowledge import KnowledgeStore
 from tender.api.common import engine, project_row
 from tender.api.errors import ApiProblem
 from tender.api.parsing import ParseRequest, _create_parse_job
 from tender.api.project_files import _role_is_parseable
-from tender.application.agent_runtime import (
-    cancel_unlocked_runs,
-    execution_active,
-    limits_snapshot,
-)
+from tender.application.agent_runtime import limits_snapshot
 from tender.application.analysis_data import (
     DATA_VERSION,
     ContextError,
@@ -40,14 +56,10 @@ from tender.application.knowledge import (
     align_citation,
     dedupe_citations,
     merge_field_entries,
-)
-from tender.application.knowledge_retrieval import retrieve_chunks
-from tender.application.knowledge_store import (
-    KnowledgeStore,
-    encode,
     source_signature,
     source_state,
 )
+from tender.application.knowledge_retrieval import retrieve_chunks
 from tender.config.schema import field_bounds
 from tender.core import settings
 from tender.core.di import create_embedding_gateway
@@ -124,14 +136,10 @@ def collection_or_404(request: Request, collection_id: int) -> dict:
 
 def project_collection(request: Request, project_id: int) -> int:
     project_row(engine(request), project_id)
-    rows = store(request).rows(
-        """SELECT id FROM knowledge_collection
-        WHERE upload_project_id = :id AND company_id = :company_id AND deleted_at IS NULL""",
-        {"id": project_id},
-    )
-    if not rows:
+    own = store(request).collection_for_project(project_id)
+    if own is None:
         raise ApiProblem(404, "not_found", "项目资料库尚未创建")
-    return rows[0]["id"]
+    return own
 
 
 def public_sources(request: Request, ids: list[int]) -> list[dict]:
@@ -140,13 +148,7 @@ def public_sources(request: Request, ids: list[int]) -> list[dict]:
 
 @router.get("/knowledge/collections")
 def list_collections(request: Request) -> dict:
-    return {
-        "items": store(request).rows("""SELECT k.*, count(f.id) AS file_count
-        FROM knowledge_collection k JOIN project p ON p.id = k.upload_project_id
-        LEFT JOIN project_file f ON f.project_id = p.id AND f.deleted_at IS NULL
-        WHERE k.company_id = :company_id AND k.deleted_at IS NULL AND p.deleted_at IS NULL
-        GROUP BY k.id ORDER BY k.is_project, k.id DESC""")
-    }
+    return {"items": store(request).collection_overview()}
 
 
 @router.post("/knowledge/collections", status_code=201)
@@ -156,21 +158,29 @@ def create_collection(payload: CollectionInput, request: Request) -> dict:
         raise ApiProblem(400, "invalid_argument", "知识库名称不能为空")
     with engine(request).begin() as connection:
         pid = connection.execute(
-            text("""INSERT INTO project (company_id, name, kind)
-            VALUES (:company, :name, 'knowledge') RETURNING id"""),
-            {"company": settings.company_id(), "name": name},
+            insert(Project)
+            .values(company_id=settings.company_id(), name=name, kind="knowledge")
+            .returning(Project.id)
         ).scalar_one()
         row = (
             connection.execute(
-                text("""INSERT INTO knowledge_collection
-            (company_id, name, purpose, upload_project_id) VALUES (:company, :name, :purpose, :pid)
-            RETURNING *"""),
-                {
-                    "company": settings.company_id(),
-                    "name": name,
-                    "purpose": payload.purpose,
-                    "pid": pid,
-                },
+                insert(KnowledgeCollection)
+                .values(
+                    company_id=settings.company_id(),
+                    name=name,
+                    purpose=payload.purpose,
+                    upload_project_id=pid,
+                )
+                .returning(
+                    KnowledgeCollection.id,
+                    KnowledgeCollection.company_id,
+                    KnowledgeCollection.name,
+                    KnowledgeCollection.purpose,
+                    KnowledgeCollection.upload_project_id,
+                    KnowledgeCollection.is_project,
+                    KnowledgeCollection.created_at,
+                    KnowledgeCollection.deleted_at,
+                )
             )
             .mappings()
             .one()
@@ -211,10 +221,8 @@ def update_collection(collection_id: int, payload: CollectionInput, request: Req
     # 用途变更不能悄悄改变已有答案的证据含义，只允许在空库时改。
     if payload.purpose != collection["purpose"] and store(request).sources([collection_id]):
         raise ApiProblem(409, "collection_not_empty", "已有资料的知识库不能修改用途，请新建知识库")
-    store(request).execute(
-        """UPDATE knowledge_collection SET name=:name, purpose=:purpose
-        WHERE id=:id AND company_id=:company_id""",
-        {"name": payload.name.strip(), "purpose": payload.purpose, "id": collection_id},
+    store(request).update_collection(
+        collection_id, name=payload.name.strip(), purpose=payload.purpose
     )
     return get_collection(collection_id, request)
 
@@ -224,10 +232,7 @@ def delete_collection(collection_id: int, request: Request) -> dict:
     collection = collection_or_404(request, collection_id)
     if collection["is_project"]:
         raise ApiProblem(409, "project_collection", "请从项目入口管理项目资料")
-    store(request).execute(
-        "UPDATE knowledge_collection SET deleted_at=now() WHERE id=:id AND company_id=:company_id",
-        {"id": collection_id},
-    )
+    store(request).soft_delete_collection(collection_id)
     return {"deleted": True}
 
 
@@ -236,25 +241,25 @@ def reindex_collection(collection_id: int, request: Request) -> dict:
     collection_or_404(request, collection_id)
     count = 0
     with engine(request).begin() as connection:
-        connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": -collection_id})
+        lock_project(connection, -collection_id)
         for source in store(request).sources([collection_id]):
             if source_state(source) not in {"ready", "partial"}:
                 continue
             pending = connection.execute(
-                text("""SELECT id FROM knowledge_index WHERE source_id=:id
-                AND run_id=:run AND status IN ('pending','running')"""),
-                {"id": source["source_id"], "run": source["parse_run_id"]},
+                select(KnowledgeIndex.id).where(
+                    KnowledgeIndex.source_id == source["source_id"],
+                    KnowledgeIndex.run_id == source["parse_run_id"],
+                    KnowledgeIndex.status.in_(("pending", "running")),
+                )
             ).first()
             if pending:
                 continue
             connection.execute(
-                text("""INSERT INTO knowledge_index (source_id, version_id, run_id)
-                VALUES (:source, :version, :run)"""),
-                {
-                    "source": source["source_id"],
-                    "version": source["version_id"],
-                    "run": source["parse_run_id"],
-                },
+                insert(KnowledgeIndex).values(
+                    source_id=source["source_id"],
+                    version_id=source["version_id"],
+                    run_id=source["parse_run_id"],
+                )
             )
             count += 1
     return {"queued_count": count}
@@ -302,60 +307,50 @@ async def test_embedding(request: Request) -> dict:
 
 @router.post("/knowledge/sources/{source_id}/process", status_code=202)
 def process_source(source_id: int, request: Request) -> dict:
-    rows = store(request).rows(
-        """SELECT f.*,s.collection_id FROM knowledge_source s
-        JOIN project_file f ON f.id=s.project_file_id JOIN project p ON p.id=f.project_id
-        JOIN knowledge_collection k ON k.id=s.collection_id
-        WHERE s.id=:id AND p.company_id=:company_id AND k.company_id=:company_id
-          AND f.deleted_at IS NULL AND p.deleted_at IS NULL AND k.deleted_at IS NULL""",
-        {"id": source_id},
-    )
-    if not rows:
+    source = store(request).source_for_processing(source_id)
+    if source is None:
         raise ApiProblem(404, "not_found", "资料不存在")
-    source = rows[0]
     suffix = PurePosixPath(source["display_name"]).suffix.lower()
     if not _role_is_parseable(source["role"], suffix):
         raise ApiProblem(
             409, "unsupported_format", "此格式暂不支持解析，请提供 PDF、Office 或文本版本"
         )
-    store(request).execute(
-        "UPDATE project_file SET is_parseable=true WHERE id=:id", {"id": source["id"]}
-    )
+    db = store(request)
+    db.mark_source_parseable(source["id"])
     if source["version_id"] is not None:
-        prior = store(request).rows(
-            "SELECT id FROM parse_run WHERE version_id=:id", {"id": source["version_id"]}
-        )
         return _create_parse_job(
-            source["version_id"], ParseRequest(reason="资料重新处理"), request, force=bool(prior)
+            source["version_id"],
+            ParseRequest(reason="资料重新处理"),
+            request,
+            force=db.has_parse_run(source["version_id"]),
         )
     config = request.app.state.components.configs
     active = config.active(settings.company_id())
     with engine(request).begin() as connection:
         connection.execute(
-            text("SELECT id FROM project_file WHERE id=:id FOR UPDATE"), {"id": source["id"]}
+            select(ProjectFile.id).where(ProjectFile.id == source["id"]).with_for_update()
         )
         inflight = connection.execute(
-            text("""SELECT id FROM job WHERE project_file_id=:id
-            AND status IN ('pending','running','submitting') AND finished_at IS NULL"""),
-            {"id": source["id"]},
+            select(Job.id).where(
+                Job.project_file_id == source["id"],
+                Job.status.in_(("pending", "running", "submitting")),
+                Job.finished_at.is_(None),
+            )
         ).first()
         if inflight:
             raise ApiProblem(409, "process_in_flight", "该资料已有处理任务")
         job_id = "job_" + uuid4().hex
         connection.execute(
-            text("""INSERT INTO job
-            (id,company_id,project_id,project_file_id,status,stage,config_snapshot,config_snapshot_id)
-            VALUES (:job,:company,:project,:file,'pending',:stage,
-                    CAST(:snapshot AS JSONB),:config)"""),
-            {
-                "job": job_id,
-                "company": settings.company_id(),
-                "project": source["project_id"],
-                "file": source["id"],
-                "stage": "probing" if suffix == ".pdf" else "converting",
-                "snapshot": encode({"tier": "standard", "ocr_mode": "auto", "auto_parse": True}),
-                "config": config.snapshot_for_job(connection, active),
-            },
+            insert(Job).values(
+                id=job_id,
+                company_id=settings.company_id(),
+                project_id=source["project_id"],
+                project_file_id=source["id"],
+                status="pending",
+                stage="probing" if suffix == ".pdf" else "converting",
+                config_snapshot={"tier": "standard", "ocr_mode": "auto", "auto_parse": True},
+                config_snapshot_id=config.snapshot_for_job(connection, active),
+            )
         )
     return {"job_id": job_id, "status": "pending"}
 
@@ -381,13 +376,13 @@ def link_collections(project_id: int, payload: LinkedCollections, request: Reque
             raise ApiProblem(400, "invalid_collection", "请关联独立知识库；项目材料按各项目隔离")
     with engine(request).begin() as connection:
         connection.execute(
-            text("DELETE FROM project_knowledge_collection WHERE project_id=:id"),
-            {"id": project_id},
+            delete(ProjectKnowledgeCollection).where(
+                ProjectKnowledgeCollection.project_id == project_id
+            )
         )
         for cid in ids:
             connection.execute(
-                text("INSERT INTO project_knowledge_collection VALUES (:p,:c)"),
-                {"p": project_id, "c": cid},
+                insert(ProjectKnowledgeCollection).values(project_id=project_id, collection_id=cid)
             )
     return {"linked_collection_ids": ids}
 
@@ -396,25 +391,13 @@ def link_collections(project_id: int, payload: LinkedCollections, request: Reque
 def analysis_status(project_id: int, request: Request) -> dict:
     own_id = project_collection(request, project_id)
     db = store(request)
-    project = db.rows(
-        """SELECT analysis_category, analysis_topics FROM project
-        WHERE id=:id AND company_id=:company_id""",
-        {"id": project_id},
-    )[0]
-    lots = db.rows(
-        """SELECT id, name, analysis_category AS category, analysis_topics AS topics
-        FROM lot WHERE project_id=:id ORDER BY sort_no,id""",
-        {"id": project_id},
-    )
-    reports = db.rows(
-        """SELECT id,status,created_at,finished_at,allow_partial FROM analysis_report
-        WHERE project_id=:id AND company_id=:company_id ORDER BY id DESC LIMIT 30""",
-        {"id": project_id},
-    )
+    project = db.analysis_settings(project_id)
+    if project is None:
+        raise ApiProblem(404, "not_found", "项目不存在")
     return {
         **project,
-        "lots": lots,
-        "reports": reports,
+        "lots": db.project_lots(project_id),
+        "reports": db.analysis_reports(project_id),
         "sources": public_sources(request, [own_id]),
         "categories": CATEGORIES,
         "topics": TOPICS,
@@ -428,30 +411,20 @@ def save_settings(project_id: int, payload: AnalysisSettings, request: Request) 
         set(lot.topics or []) - TOPICS.keys() for lot in payload.lots
     ):
         raise ApiProblem(400, "invalid_topic", "存在不支持的分析专题")
-    known = {
-        row["id"]
-        for row in store(request).rows(
-            "SELECT id FROM lot WHERE project_id=:id", {"id": project_id}
-        )
-    }
+    known = set(store(request).project_lot_ids(project_id))
     if any(lot.id not in known for lot in payload.lots):
         raise ApiProblem(400, "invalid_lot", "标段不属于当前项目")
     with engine(request).begin() as connection:
         connection.execute(
-            text("""UPDATE project SET analysis_category=:category,
-            analysis_topics=CAST(:topics AS JSONB) WHERE id=:id"""),
-            {"id": project_id, "category": payload.category, "topics": encode(payload.topics)},
+            update(Project)
+            .where(Project.id == project_id)
+            .values(analysis_category=payload.category, analysis_topics=payload.topics)
         )
         for lot in payload.lots:
             connection.execute(
-                text("""UPDATE lot SET analysis_category=:category,
-                analysis_topics=CAST(:topics AS JSONB) WHERE id=:id AND project_id=:project"""),
-                {
-                    "id": lot.id,
-                    "project": project_id,
-                    "category": lot.category,
-                    "topics": encode(lot.topics) if lot.topics is not None else None,
-                },
+                update(Lot)
+                .where(Lot.id == lot.id, Lot.project_id == project_id)
+                .values(analysis_category=lot.category, analysis_topics=lot.topics)
             )
     return analysis_status(project_id, request)
 
@@ -484,38 +457,33 @@ def start_analysis(project_id: int, payload: AnalysisInput, request: Request) ->
     ]
     runtime_settings = limits_snapshot(db)
     with engine(request).begin() as connection:
-        connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": project_id})
+        lock_project(connection, project_id)
         active = connection.execute(
-            text("""SELECT id FROM analysis_report WHERE project_id=:id
-            AND status IN ('waiting','pending','running')"""),
-            {"id": project_id},
+            select(AnalysisReport.id).where(
+                AnalysisReport.project_id == project_id,
+                AnalysisReport.status.in_(("waiting", "pending", "running")),
+            )
         ).scalar_one_or_none()
         if active:
             raise ApiProblem(409, "analysis_in_flight", "项目已有分析任务，请等待或取消等待任务")
         row = (
             connection.execute(
-                text("""INSERT INTO analysis_report
-            (project_id,company_id,allow_partial,category,topics,lot_settings,source_snapshot,
-             skill_version,skill_snapshot,runtime_version,runtime_settings,reference_snapshot)
-            VALUES (:project,:company,:partial,:category,
-                    CAST(:topics AS JSONB),CAST(:lots AS JSONB),
-                    CAST(:sources AS JSONB),:skill,CAST(:rules AS JSONB),:runtime,
-                    CAST(:runtime_settings AS JSONB),CAST(:references AS JSONB))
-                    RETURNING id,status"""),
-                {
-                    "project": project_id,
-                    "company": settings.company_id(),
-                    "partial": payload.allow_partial,
-                    "category": state["analysis_category"],
-                    "topics": encode(state["analysis_topics"]),
-                    "lots": encode(state["lots"]),
-                    "sources": encode(state["sources"]),
-                    "skill": skill_version(rules),
-                    "rules": encode(rules),
-                    "runtime": RUNTIME_VERSION,
-                    "runtime_settings": encode(runtime_settings),
-                    "references": encode(references),
-                },
+                insert(AnalysisReport)
+                .values(
+                    project_id=project_id,
+                    company_id=settings.company_id(),
+                    allow_partial=payload.allow_partial,
+                    category=state["analysis_category"],
+                    topics=state["analysis_topics"],
+                    lot_settings=state["lots"],
+                    source_snapshot=state["sources"],
+                    skill_version=skill_version(rules),
+                    skill_snapshot=rules,
+                    runtime_version=RUNTIME_VERSION,
+                    runtime_settings=runtime_settings,
+                    reference_snapshot=references,
+                )
+                .returning(AnalysisReport.id, AnalysisReport.status)
             )
             .mappings()
             .one()
@@ -524,14 +492,10 @@ def start_analysis(project_id: int, payload: AnalysisInput, request: Request) ->
 
 
 def report_row(request: Request, report_id: int) -> dict:
-    rows = store(request).rows(
-        """SELECT r.* FROM analysis_report r JOIN project p ON p.id=r.project_id
-        WHERE r.id=:id AND r.company_id=:company_id AND p.deleted_at IS NULL""",
-        {"id": report_id},
-    )
-    if not rows:
+    report = store(request).report(report_id)
+    if report is None:
         raise ApiProblem(404, "not_found", "报告不存在")
-    return rows[0]
+    return report
 
 
 def visible_items(
@@ -601,41 +565,35 @@ def get_report(report_id: int, request: Request) -> dict:
     report = report_row(request, report_id)
     report.pop("skill_snapshot", None)
     db = store(request)
-    modules = db.rows(
-        "SELECT * FROM analysis_module WHERE report_id=:id ORDER BY id", {"id": report_id}
-    )
+    modules = db.report_modules(report_id)
     allowed = db.collections_for_project(report["project_id"])
     for module in modules:
         # 工具日志只供服务端重放，不在产品界面暴露整段中间提示词。
         module.pop("trace", None)
         module.pop("business_data", None)
-    runs = db.rows(
-        """SELECT a.id,a.module_id,a.attempt,a.thread_id,a.status,a.started_at,
-        a.deadline_at,a.finished_at,a.lease_until,a.model_calls,a.tool_calls,
-        a.prompt_tokens,a.completion_tokens,a.limits,a.error_message,
-        CASE WHEN a.state->'staged_items_verified'='true'::jsonb
-             THEN a.state->'staged_items' ELSE '[]'::jsonb END AS saved_items
-        FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
-        WHERE m.report_id=:id AND a.company_id=:company_id ORDER BY a.attempt""",
-        {"id": report_id},
-    )
+    runs = db.report_runs(report_id)
     for module in modules:
         module["runs"] = [r for r in runs if r["module_id"] == module["id"]]
         latest = module["runs"][-1] if module["runs"] else {}
         merged = {item["id"]: item for item in module["items"]}
         # 已有报告的合格暂存字段也可直接展示，无需补跑模型或重写历史运行账。
         if module["status"] != "completed":
-            merged.update({
-                item["id"]: item for item in latest.get("saved_items") or []
-                if item.get("verification") == "supported"
-            })
+            merged.update(
+                {
+                    item["id"]: item
+                    for item in latest.get("saved_items") or []
+                    if item.get("verification") == "supported"
+                }
+            )
         # 同一字段的多版本在这里并成一行，历史报告也不再出现重复行与重复定位。
         module["items"] = visible_items(
             db,
-            display_items(merge_field_entries(
-                list(merged.values()),
-                is_outline=module["module_key"] == "bid_format_outline_parsing",
-            )),
+            display_items(
+                merge_field_entries(
+                    list(merged.values()),
+                    is_outline=module["module_key"] == "bid_format_outline_parsing",
+                )
+            ),
             allowed,
         )
     for run in runs:
@@ -648,11 +606,17 @@ def get_report(report_id: int, request: Request) -> dict:
         source_signature(current["sources"]) != source_signature(report["source_snapshot"])
         or current["analysis_category"] != report["category"]
         or current["analysis_topics"] != report["topics"]
-        or [lot for lot in current["lots"] if not (
-            lot["id"] in report.get("derived_lot_ids", [])
-            and lot["id"] not in {old["id"] for old in report["lot_settings"]}
-            and lot["category"] is None and lot["topics"] is None
-        )] != report["lot_settings"]
+        or [
+            lot
+            for lot in current["lots"]
+            if not (
+                lot["id"] in report.get("derived_lot_ids", [])
+                and lot["id"] not in {old["id"] for old in report["lot_settings"]}
+                and lot["category"] is None
+                and lot["topics"] is None
+            )
+        ]
+        != report["lot_settings"]
         # 参考来源快照只有当前运行时才会记录；旧报告该列为空，比较会恒判为已变化。
         or (
             not retired
@@ -678,33 +642,36 @@ def data_snapshot(request: Request, report_id: int, snapshot_id: int | None = No
     report = report_row(request, report_id)
     if report["runtime_version"] != RUNTIME_VERSION:
         raise ApiProblem(409, "data_reanalysis_required", "此报告没有业务数据，请重新发起分析")
-    rows = store(request).rows(
-        "SELECT * FROM analysis_data_snapshot WHERE report_id=:report"
-        + (" AND id=:snapshot" if snapshot_id is not None else "") + " ORDER BY id DESC LIMIT 1",
-        {"report": report_id, "snapshot": snapshot_id},
-    )
-    if not rows:
+    snapshot = store(request).data_snapshot(report_id, snapshot_id)
+    if snapshot is None:
         raise ApiProblem(409, "data_not_ready", "正式业务数据快照尚未就绪")
-    return rows[0]
+    return snapshot
 
 
 @router.get("/analysis/reports/{report_id}/data")
 def get_analysis_data(
-    report_id: int, request: Request, snapshot_id: int | None = Query(None, gt=0),
+    report_id: int,
+    request: Request,
+    snapshot_id: int | None = Query(None, gt=0),
 ) -> dict:
     snapshot = data_snapshot(request, report_id, snapshot_id)
     report = get_report(report_id, request)
     db = store(request)
     return {
-        "report_id": report_id, "snapshot_id": snapshot["id"], "revision": snapshot["revision"],
+        "report_id": report_id,
+        "snapshot_id": snapshot["id"],
+        "revision": snapshot["revision"],
         "schema_version": snapshot["schema_version"],
         "stale": (
-            report["stale"] or report["status"] in {"waiting", "pending", "running"}
+            report["stale"]
+            or report["status"] in {"waiting", "pending", "running"}
             or data_snapshot(request, report_id)["id"] != snapshot["id"]
             or not snapshot_matches_report(db, snapshot)
         ),
         "data": accessible_data(
-            db, snapshot["data"], db.collections_for_project(report["project_id"]),
+            db,
+            snapshot["data"],
+            db.collections_for_project(report["project_id"]),
             sources=snapshot["input_snapshot"]["source_snapshot"]
             + snapshot["input_snapshot"]["reference_snapshot"],
         ),
@@ -719,14 +686,17 @@ def context_data(request: Request, report_id: int, snapshot: dict) -> tuple[dict
     db = store(request)
     allowed = db.collections_for_project(report["project_id"])
     data = accessible_data(
-        db, snapshot["data"], allowed,
+        db,
+        snapshot["data"],
+        allowed,
         sources=snapshot["input_snapshot"]["source_snapshot"]
         + snapshot["input_snapshot"]["reference_snapshot"],
     )
     if any(g["code"] == "source_unavailable" for g in data["gaps"]):
         raise ApiProblem(409, "source_unavailable", "部分来源已删除或撤销访问，请更新分析")
     if (
-        report["stale"] or data_snapshot(request, report_id)["id"] != snapshot["id"]
+        report["stale"]
+        or data_snapshot(request, report_id)["id"] != snapshot["id"]
         or not snapshot_matches_report(db, snapshot)
     ):
         raise ApiProblem(409, "data_stale", "依据已更新，请使用当前有效分析快照")
@@ -742,13 +712,18 @@ async def get_analysis_context(report_id: int, payload: ContextInput, request: R
     except ContextError as exc:
         raise ApiProblem(422, exc.code, str(exc)) from exc
     if payload.purpose == "content":
-        sources = [s for s in report["reference_snapshot"]
-                   if s["purpose"] in {"company", "history"}]
+        sources = [
+            s for s in report["reference_snapshot"] if s["purpose"] in {"company", "history"}
+        ]
         if sources and context["requirements"]:
             db = store(request)
             rows, meta = await retrieve_chunks(
-                db, sources, "\n".join(r["text"] for r in context["requirements"]),
-                lambda: None, create_embedding_gateway, embedding_timeout=15,
+                db,
+                sources,
+                "\n".join(r["text"] for r in context["requirements"]),
+                lambda: None,
+                create_embedding_gateway,
+                embedding_timeout=15,
             )
             # 不只重查参考片段；招标依据也可能在等待参考检索时被撤销或重跑。
             context_data(request, report_id, snapshot)
@@ -757,17 +732,38 @@ async def get_analysis_context(report_id: int, payload: ContextInput, request: R
                 if row["collection_id"] not in live:
                     continue
                 try:
-                    citation = db.resolve({k: row[k] for k in (
-                        "source_id", "collection_id", "project_id", "project_file_id", "version_id",
-                        "parse_run_id", "element_id", "anchor", "page_no", "bbox", "file_name",
-                    )} | {"purpose": row["purpose"], "quote": row["content"]})
+                    citation = db.resolve(
+                        {
+                            k: row[k]
+                            for k in (
+                                "source_id",
+                                "collection_id",
+                                "project_id",
+                                "project_file_id",
+                                "version_id",
+                                "parse_run_id",
+                                "element_id",
+                                "anchor",
+                                "page_no",
+                                "bbox",
+                                "file_name",
+                            )
+                        }
+                        | {"purpose": row["purpose"], "quote": row["content"]}
+                    )
                 except LookupError as exc:
                     raise ApiProblem(
-                        409, "source_unavailable", "参考来源已撤销，请更新分析",
+                        409,
+                        "source_unavailable",
+                        "参考来源已撤销，请更新分析",
                     ) from exc
-                context["references"].append({
-                    "purpose": row["purpose"], "text": row["content"], "citation": citation,
-                })
+                context["references"].append(
+                    {
+                        "purpose": row["purpose"],
+                        "text": row["content"],
+                        "citation": citation,
+                    }
+                )
             context["reference_warning"] = meta.get("warning")
     return context
 
@@ -776,13 +772,24 @@ async def get_analysis_context(report_id: int, payload: ContextInput, request: R
 def cancel_report(report_id: int, request: Request) -> dict:
     report_row(request, report_id)
     with engine(request).begin() as connection:
-        status = connection.execute(text("""SELECT status FROM analysis_report
-            WHERE id=:id AND company_id=:company FOR UPDATE"""),
-            {"id": report_id, "company": settings.company_id()}).scalar_one()
+        status = connection.execute(
+            select(AnalysisReport.status)
+            .where(
+                AnalysisReport.id == report_id,
+                AnalysisReport.company_id == settings.company_id(),
+            )
+            .with_for_update()
+        ).scalar_one()
         if status in {"waiting", "pending", "running", "canceled"}:
-            connection.execute(text("""UPDATE analysis_report SET status='canceled',
-                finished_at=COALESCE(finished_at,now()),lease_until=NULL WHERE id=:id"""),
-                {"id": report_id})
+            connection.execute(
+                update(AnalysisReport)
+                .where(AnalysisReport.id == report_id)
+                .values(
+                    status="canceled",
+                    finished_at=func.coalesce(AnalysisReport.finished_at, func.now()),
+                    lease_until=None,
+                )
+            )
             cancel_unlocked_runs(connection, report_id)
             status = "canceled"
         canceling = status == "canceled" and execution_active(connection, report_id)
@@ -800,19 +807,9 @@ def run_events(
 ) -> dict:
     report_row(request, report_id)
     db = store(request)
-    runs = db.rows(
-        """SELECT a.id FROM agent_module_run a
-        JOIN analysis_module m ON m.id=a.module_id
-        WHERE a.id=:run AND m.report_id=:report AND a.company_id=:company_id""",
-        {"run": run_id, "report": report_id},
-    )
-    if not runs:
+    if not db.run_belongs_to_report(run_id, report_id):
         raise ApiProblem(404, "not_found", "模块运行记录不存在")
-    rows = db.rows(
-        """SELECT id,kind,detail,created_at FROM agent_run_event
-        WHERE run_id=:run AND id>:after ORDER BY id LIMIT :limit""",
-        {"run": run_id, "after": after, "limit": limit},
-    )
+    rows = db.run_events(run_id, after=after, limit=limit)
     return {"events": rows, "next_after": rows[-1]["id"] if rows else after}
 
 
@@ -832,44 +829,42 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
         raise ApiProblem(400, "invalid_module", "未知解析模块")
     explicit = bool(payload.module_keys)
     with engine(request).begin() as connection:
-        connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": report["project_id"]})
+        lock_project(connection, report["project_id"])
         # 并发点击补跑只能有一个请求创建新 attempt，不能重复重置预算。
         current_status = connection.execute(
-            text("SELECT status FROM analysis_report WHERE id=:id FOR UPDATE"), {"id": report_id}
+            select(AnalysisReport.status).where(AnalysisReport.id == report_id).with_for_update()
         ).scalar_one()
         if current_status in {"waiting", "pending", "running"}:
             raise ApiProblem(409, "report_running", "报告已进入执行，请勿重复补跑")
         # 控制器持有整个执行周期的会话锁；旧 finally 完成前不可重置报告状态。
-        if execution_active(connection, report_id) or not connection.execute(text(
-            "SELECT pg_try_advisory_xact_lock(hashtextextended(:key,0))"
-        ), {"key": f"analysis_report:{report_id}"}).scalar_one():
+        if execution_active(connection, report_id) or not try_lock_report_execution(
+            connection, report_id
+        ):
             raise ApiProblem(409, "cancellation_pending", "任务正在停止，请等待模块退出后重新解析")
         if current_status == "canceled":
             cancel_unlocked_runs(connection, report_id)
         other = connection.execute(
-            text("""SELECT id FROM analysis_report WHERE project_id=:project
-            AND id<>:id AND status IN ('waiting','pending','running')"""),
-            {"project": report["project_id"], "id": report_id},
+            select(AnalysisReport.id).where(
+                AnalysisReport.project_id == report["project_id"],
+                AnalysisReport.id != report_id,
+                AnalysisReport.status.in_(("waiting", "pending", "running")),
+            )
         ).first()
         if other:
             raise ApiProblem(409, "analysis_in_flight", "项目已有其它分析任务")
         # 未指定模块时只补跑失败/已取消模块，保留已完成成果；显式指定时连已完成模块
         # 一起重跑，否则“重新解析本专题”会被静默忽略。
-        scope = "" if explicit else " AND status IN ('failed','canceled')"
-        rows = (
-            connection.execute(
-                text(
-                    "SELECT id,status FROM analysis_module WHERE report_id=:id"
-                    " AND module_key=ANY(:keys)" + scope + " FOR UPDATE"
-                ),
-                {"id": report_id, "keys": keys},
-            )
-            .mappings()
-            .all()
+        modules_query = (
+            select(AnalysisModule.id, AnalysisModule.status)
+            .where(AnalysisModule.report_id == report_id, AnalysisModule.module_key.in_(keys))
+            .with_for_update()
         )
-        has_modules = connection.execute(text(
-            "SELECT EXISTS (SELECT 1 FROM analysis_module WHERE report_id=:id)"
-        ), {"id": report_id}).scalar_one()
+        if not explicit:
+            modules_query = modules_query.where(AnalysisModule.status.in_(("failed", "canceled")))
+        rows = connection.execute(modules_query).mappings().all()
+        has_modules = connection.execute(
+            select(exists().where(AnalysisModule.report_id == report_id))
+        ).scalar_one()
         if not rows and (explicit or has_modules):
             raise ApiProblem(
                 409, "nothing_to_retry", "没有需要补跑的模块；重新解析已完成模块请显式指定模块"
@@ -877,15 +872,16 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
         # 已完成的模块重新解析时必须从零开始，否则继承的旧草稿会让新图直接收尾（等于没重跑）。
         restarted = {row["id"] for row in rows if row["status"] == "completed"}
         if restarted:
-            connection.execute(text("""UPDATE analysis_module SET items='[]'::jsonb,
-                business_data='{}'::jsonb WHERE id=ANY(:ids)"""), {"ids": sorted(restarted)})
+            connection.execute(
+                update(AnalysisModule)
+                .where(AnalysisModule.id.in_(sorted(restarted)))
+                .values(items=[], business_data={})
+            )
         retried = [row["id"] for row in rows]
         connection.execute(
-            text(
-                "UPDATE analysis_module SET status='pending',error_message=NULL"
-                " WHERE id=ANY(:ids)"
-            ),
-            {"ids": retried},
+            update(AnalysisModule)
+            .where(AnalysisModule.id.in_(retried))
+            .values(status="pending", error_message=None)
         )
         # 限值取配置中心当前值：用户调整预算后补跑必须生效，不能被创建时的旧快照锁死。
         limits = limits_snapshot(store(request))
@@ -895,23 +891,23 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             limits["timeout_seconds"] = payload.timeout_seconds
         if not has_modules:
             connection.execute(
-                text("UPDATE analysis_report SET runtime_settings=CAST(:limits AS JSONB)"
-                     " WHERE id=:id"),
-                {"id": report_id, "limits": encode(limits)},
+                update(AnalysisReport)
+                .where(AnalysisReport.id == report_id)
+                .values(runtime_settings=limits)
             )
         # 已有模块的运行账不因补跑改写；无模块的报告更新快照供延迟创建使用。
         for module_id in sorted(retried):
             attempt = connection.execute(
-                text("SELECT COALESCE(max(attempt),0)+1 FROM agent_module_run WHERE module_id=:id"),
-                {"id": module_id},
+                select(func.coalesce(func.max(AgentModuleRun.attempt), 0) + 1).where(
+                    AgentModuleRun.module_id == module_id
+                )
             ).scalar_one()
             previous_state = (
                 connection.execute(
-                    text(
-                        "SELECT state FROM agent_module_run WHERE module_id=:id "
-                        "ORDER BY attempt DESC LIMIT 1"
-                    ),
-                    {"id": module_id},
+                    select(AgentModuleRun.state)
+                    .where(AgentModuleRun.module_id == module_id)
+                    .order_by(AgentModuleRun.attempt.desc())
+                    .limit(1)
                 ).scalar_one_or_none()
                 or {}
             )
@@ -940,10 +936,17 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
                 carry.pop("field_failures", None)
                 carry.pop("unavailable_submissions", None)
                 for key in (
-                    "loaded_skill", "correction_failures", "tool_failures",
-                    "consecutive_tool_failures", "identical_tool_calls", "read_tool_cache",
-                    "progress_message_id", "progress_signature", "no_progress_rounds",
-                    "finish_only", "subagent_retries",
+                    "loaded_skill",
+                    "correction_failures",
+                    "tool_failures",
+                    "consecutive_tool_failures",
+                    "identical_tool_calls",
+                    "read_tool_cache",
+                    "progress_message_id",
+                    "progress_signature",
+                    "no_progress_rounds",
+                    "finish_only",
+                    "subagent_retries",
                 ):
                     carry.pop(key, None)
                 # 旧校验失败可能遗留收尾意图；新 attempt 必须允许补读并重新确认完成。
@@ -956,18 +959,14 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
                 except ValueError:
                     carry = {}
             connection.execute(
-                text("""INSERT INTO agent_module_run
-                (module_id,company_id,attempt,thread_id,limits,state)
-                VALUES (:module,:company,:attempt,:thread,CAST(:limits AS JSONB),
-                        CAST(:state AS JSONB))"""),
-                {
-                    "module": module_id,
-                    "company": settings.company_id(),
-                    "attempt": attempt,
-                    "thread": f"analysis:{report_id}:{module_id}:{attempt}",
-                    "limits": encode(limits),
-                    "state": encode(carry),
-                },
+                insert(AgentModuleRun).values(
+                    module_id=module_id,
+                    company_id=settings.company_id(),
+                    attempt=attempt,
+                    thread_id=f"analysis:{report_id}:{module_id}:{attempt}",
+                    limits=limits,
+                    state=carry,
+                )
             )
         # 已固定检索批次的报告直接进入执行；从未开始的报告需要重新等候资料可用。
         status = (
@@ -976,9 +975,9 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             else "waiting"
         )
         connection.execute(
-            text("""UPDATE analysis_report SET status=:status,lease_until=NULL,
-            error_message=NULL,finished_at=NULL WHERE id=:id"""),
-            {"id": report_id, "status": status},
+            update(AnalysisReport)
+            .where(AnalysisReport.id == report_id)
+            .values(status=status, lease_until=None, error_message=None, finished_at=None)
         )
     return {"id": report_id, "status": status}
 
@@ -997,17 +996,15 @@ def enqueue_question(
     with engine(request).begin() as connection:
         row = (
             connection.execute(
-                text("""INSERT INTO knowledge_answer
-            (company_id,project_id,collection_ids,question,snapshot)
-            VALUES (:company,:project,CAST(:ids AS JSONB),:question,CAST(:snapshot AS JSONB))
-            RETURNING id,status"""),
-                {
-                    "company": settings.company_id(),
-                    "project": project_id,
-                    "ids": encode(ids),
-                    "question": question,
-                    "snapshot": encode({"sources": sources}),
-                },
+                insert(KnowledgeAnswer)
+                .values(
+                    company_id=settings.company_id(),
+                    project_id=project_id,
+                    collection_ids=ids,
+                    question=question,
+                    snapshot={"sources": sources},
+                )
+                .returning(KnowledgeAnswer.id, KnowledgeAnswer.status)
             )
             .mappings()
             .one()
@@ -1033,12 +1030,9 @@ def ask_project(project_id: int, payload: AskInput, request: Request) -> dict:
 @router.get("/knowledge/answers/{answer_id}")
 def get_answer(answer_id: int, request: Request) -> dict:
     db = store(request)
-    rows = db.rows(
-        "SELECT * FROM knowledge_answer WHERE id=:id AND company_id=:company_id", {"id": answer_id}
-    )
-    if not rows:
+    answer = db.answer(answer_id)
+    if answer is None:
         raise ApiProblem(404, "not_found", "回答不存在")
-    answer = rows[0]
     allowed = (
         db.collections_for_project(answer["project_id"])
         if answer["project_id"]

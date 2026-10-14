@@ -11,16 +11,27 @@ SQL 里的口径（哪些尝试算已复核、按 review_mode 分档）无法被
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, delete, exists, func, insert, select, update
+from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.engine import Connection
 
+from tender.adapters.pg.models import (
+    ConfigRelease,
+    Element,
+    Evidence,
+    Extraction,
+    FieldInstance,
+    GoldItem,
+    RegressionRun,
+    ReviewAction,
+    ReviewTask,
+)
 from tender.api.common import configs, engine, queue, role
 from tender.api.errors import ApiProblem
 from tender.application import stats
@@ -38,106 +49,160 @@ _REGRESSION_TASK = "tender.worker.regression.run_regression"
 _PRIMARY_MODE = "item"
 _MODE_KEYS = ("item", "batch", "spot_check")
 
-_WINDOW_SQL = "CAST(:since AS TIMESTAMPTZ) IS NULL OR ra.created_at >= CAST(:since AS TIMESTAMPTZ)"
 
-# 一条尝试可能被复核多次（例如抽检又看了一遍）：只认最后一次结论，
-# 否则同一个 attempt 会同时进分子和分母。
-_VERDICT_SQL = f"""
-    SELECT DISTINCT ON (ra.attempt_id)
-           ra.attempt_id, ra.action, ra.review_mode
-    FROM review_action AS ra
-    WHERE {_WINDOW_SQL}
-    ORDER BY ra.attempt_id, ra.created_at DESC, ra.id DESC
-"""
+def _verdict(since: datetime | None) -> Any:
+    """每个 attempt 的最后一次复核结论；抽检又看一遍时只认最新那次。
 
-_ATTEMPT_SQL = f"""
-    WITH verdict AS ({_VERDICT_SQL})
-    SELECT e.field_key, e.machine_attempt_no AS attempt_no, v.review_mode, v.action,
-           count(*) AS n
-    FROM verdict AS v
-    JOIN extraction AS e ON e.id = v.attempt_id
-    WHERE e.machine_attempt_no IS NOT NULL
-    GROUP BY e.field_key, e.machine_attempt_no, v.review_mode, v.action
-"""
-
-_INSTANCE_SQL = f"""
-    WITH verdict AS ({_VERDICT_SQL}),
-    reviewed AS (
-        SELECT fi.field_key, v.review_mode, e.instance_id, e.machine_attempt_no, v.action
-        FROM verdict AS v
-        JOIN extraction AS e ON e.id = v.attempt_id
-        JOIN field_instance AS fi ON fi.id = e.instance_id
-        WHERE e.machine_attempt_no IS NOT NULL
+    一次尝试可能被复核多次（例如抽检又看了一遍），只认最后一次结论，
+    否则同一个 attempt 会同时进分子和分母。
+    """
+    query = (
+        select(
+            ReviewAction.attempt_id,
+            ReviewAction.action,
+            ReviewAction.review_mode,
+            ReviewAction.instance_id,
+            ReviewAction.created_at,
+        )
+        .ext(distinct_on(ReviewAction.attempt_id))
+        .order_by(
+            ReviewAction.attempt_id,
+            ReviewAction.created_at.desc(),
+            ReviewAction.id.desc(),
+        )
     )
-    SELECT field_key, review_mode,
-           count(DISTINCT instance_id) AS reviewed,
-           count(DISTINCT instance_id) FILTER (WHERE machine_attempt_no <= 1) AS cum_1_total,
-           count(DISTINCT instance_id) FILTER (WHERE machine_attempt_no <= 1 AND action = 'confirm')
-               AS cum_1_pass,
-           count(DISTINCT instance_id) FILTER (WHERE machine_attempt_no <= 2) AS cum_2_total,
-           count(DISTINCT instance_id) FILTER (WHERE machine_attempt_no <= 2 AND action = 'confirm')
-               AS cum_2_pass,
-           count(DISTINCT instance_id) FILTER (WHERE machine_attempt_no <= 3) AS cum_3_total,
-           count(DISTINCT instance_id) FILTER (WHERE machine_attempt_no <= 3 AND action = 'confirm')
-               AS cum_3_pass
-    FROM reviewed
-    GROUP BY field_key, review_mode
-"""
+    if since is not None:
+        query = query.where(ReviewAction.created_at >= since)
+    return query.subquery("verdict")
 
-_MANUAL_SQL = f"""
-    WITH verdict AS ({_VERDICT_SQL}),
-    reviewed AS (
-        SELECT DISTINCT fi.field_key, e.instance_id
-        FROM verdict AS v
-        JOIN extraction AS e ON e.id = v.attempt_id
-        JOIN field_instance AS fi ON fi.id = e.instance_id
-        WHERE e.machine_attempt_no IS NOT NULL
+
+def _attempt_query(since: datetime | None) -> Any:
+    v = _verdict(since)
+    return (
+        select(
+            Extraction.field_key,
+            Extraction.machine_attempt_no.label("attempt_no"),
+            v.c.review_mode,
+            v.c.action,
+            func.count().label("n"),
+        )
+        .select_from(v)
+        .join(Extraction, Extraction.id == v.c.attempt_id)
+        .where(Extraction.machine_attempt_no.is_not(None))
+        .group_by(
+            Extraction.field_key,
+            Extraction.machine_attempt_no,
+            v.c.review_mode,
+            v.c.action,
+        )
     )
-    SELECT r.field_key,
-           count(DISTINCT r.instance_id) AS reviewed,
-           count(DISTINCT r.instance_id) FILTER (WHERE m.instance_id IS NOT NULL) AS manual
-    FROM reviewed AS r
-    LEFT JOIN (SELECT DISTINCT instance_id FROM extraction WHERE trigger = 'manual_edit') AS m
-           ON m.instance_id = r.instance_id
-    GROUP BY r.field_key
-"""
 
-# 线上监控埋点（09 第 9 节）：404 率必须恒为 0；bbox 为空 = 降级成页级定位。
-_EVIDENCE_SQL = """
-    SELECT count(*) AS total,
-           count(*) FILTER (WHERE e.bbox_x0 IS NULL) AS bbox_missing,
-           count(*) FILTER (WHERE el.id IS NULL) AS anchor_missing
-    FROM evidence AS e
-    JOIN extraction AS x ON x.id = e.extraction_id
-    LEFT JOIN element AS el
-           ON el.version_id = e.version_id AND el.run_id = x.run_id AND el.anchor = e.anchor
-    WHERE CAST(:since AS TIMESTAMPTZ) IS NULL
-       OR e.created_at >= CAST(:since AS TIMESTAMPTZ)
-"""
 
-_SPOT_CHECK_SQL = f"""
-    WITH verdict AS (
-        SELECT DISTINCT ON (ra.attempt_id)
-               ra.attempt_id, ra.instance_id, ra.action, ra.review_mode, ra.created_at
-        FROM review_action AS ra
-        WHERE {_WINDOW_SQL}
-        ORDER BY ra.attempt_id, ra.created_at DESC, ra.id DESC
+def _instance_query(since: datetime | None) -> Any:
+    v = _verdict(since)
+    reviewed = (
+        select(
+            FieldInstance.field_key,
+            v.c.review_mode,
+            Extraction.instance_id,
+            Extraction.machine_attempt_no,
+            v.c.action,
+        )
+        .select_from(v)
+        .join(Extraction, Extraction.id == v.c.attempt_id)
+        .join(FieldInstance, FieldInstance.id == Extraction.instance_id)
+        .where(Extraction.machine_attempt_no.is_not(None))
+        .subquery("reviewed")
     )
-    SELECT v.attempt_id, e.field_key
-    FROM verdict AS v
-    JOIN extraction AS e ON e.id = v.attempt_id
-    WHERE v.action = 'confirm' AND v.review_mode = 'batch'
-      AND (
-        cardinality(CAST(:field_keys AS TEXT[])) = 0
-        OR e.field_key = ANY(CAST(:field_keys AS TEXT[]))
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM review_action AS sc
-        WHERE sc.instance_id = v.instance_id AND sc.review_mode = 'spot_check'
-          AND sc.created_at >= v.created_at
-      )
-    ORDER BY random() LIMIT :size
-"""
+    reviewed_count = func.count(func.distinct(reviewed.c.instance_id))
+    confirmed = reviewed.c.action == "confirm"
+    return select(
+        reviewed.c.field_key,
+        reviewed.c.review_mode,
+        reviewed_count.label("reviewed"),
+        reviewed_count.filter(reviewed.c.machine_attempt_no <= 1).label("cum_1_total"),
+        reviewed_count.filter((reviewed.c.machine_attempt_no <= 1) & confirmed).label("cum_1_pass"),
+        reviewed_count.filter(reviewed.c.machine_attempt_no <= 2).label("cum_2_total"),
+        reviewed_count.filter((reviewed.c.machine_attempt_no <= 2) & confirmed).label("cum_2_pass"),
+        reviewed_count.filter(reviewed.c.machine_attempt_no <= 3).label("cum_3_total"),
+        reviewed_count.filter((reviewed.c.machine_attempt_no <= 3) & confirmed).label("cum_3_pass"),
+    ).group_by(reviewed.c.field_key, reviewed.c.review_mode)
+
+
+def _manual_query(since: datetime | None) -> Any:
+    v = _verdict(since)
+    reviewed = (
+        select(
+            FieldInstance.field_key.label("field_key"),
+            Extraction.instance_id.label("instance_id"),
+        )
+        .select_from(v)
+        .join(Extraction, Extraction.id == v.c.attempt_id)
+        .join(FieldInstance, FieldInstance.id == Extraction.instance_id)
+        .where(Extraction.machine_attempt_no.is_not(None))
+        .distinct()
+        .subquery("reviewed")
+    )
+    manual = (
+        select(Extraction.instance_id.label("instance_id"))
+        .where(Extraction.trigger == "manual_edit")
+        .distinct()
+        .subquery("m")
+    )
+    reviewed_count = func.count(func.distinct(reviewed.c.instance_id))
+    return (
+        select(
+            reviewed.c.field_key,
+            reviewed_count.label("reviewed"),
+            reviewed_count.filter(manual.c.instance_id.is_not(None)).label("manual"),
+        )
+        .select_from(reviewed)
+        .outerjoin(manual, manual.c.instance_id == reviewed.c.instance_id)
+        .group_by(reviewed.c.field_key)
+    )
+
+
+def _evidence_query(since: datetime | None) -> Any:
+    """线上监控埋点（09 第 9 节）：404 率必须恒为 0；bbox 为空 = 降级成页级定位。"""
+    query = (
+        select(
+            func.count().label("total"),
+            func.count().filter(Evidence.bbox_x0.is_(None)).label("bbox_missing"),
+            func.count().filter(Element.id.is_(None)).label("anchor_missing"),
+        )
+        .select_from(Evidence)
+        .join(Extraction, Extraction.id == Evidence.extraction_id)
+        .outerjoin(
+            Element,
+            (Element.version_id == Evidence.version_id)
+            & (Element.run_id == Extraction.run_id)
+            & (Element.anchor == Evidence.anchor),
+        )
+    )
+    if since is not None:
+        query = query.where(Evidence.created_at >= since)
+    return query
+
+
+def _spot_check_query(since: datetime | None, field_keys: list[str], size: int) -> Any:
+    v = _verdict(since)
+    query = (
+        select(v.c.attempt_id, Extraction.field_key)
+        .select_from(v)
+        .join(Extraction, Extraction.id == v.c.attempt_id)
+        .where(
+            v.c.action == "confirm",
+            v.c.review_mode == "batch",
+            ~exists().where(
+                ReviewAction.instance_id == v.c.instance_id,
+                ReviewAction.review_mode == "spot_check",
+                ReviewAction.created_at >= v.c.created_at,
+            ),
+        )
+    )
+    if field_keys:
+        query = query.where(Extraction.field_key.in_(field_keys))
+    return query.order_by(func.random()).limit(size)
 
 
 class SpotCheckRequest(BaseModel):
@@ -162,12 +227,10 @@ def _changed_keys(connection: Connection, company_id: int, values: dict[str, Any
 
     active = (
         connection.execute(
-            text(
-                """SELECT values FROM config_release
-                   WHERE company_id = :company_id AND status = 'active'
-                   ORDER BY id DESC LIMIT 1"""
-            ),
-            {"company_id": company_id},
+            select(ConfigRelease.values)
+            .where(ConfigRelease.company_id == company_id, ConfigRelease.status == "active")
+            .order_by(ConfigRelease.id.desc())
+            .limit(1)
         )
         .mappings()
         .first()
@@ -203,12 +266,9 @@ def trigger_regression_run(release_id: int, request: Request) -> dict[str, Any]:
     with db.begin() as connection:
         release = (
             connection.execute(
-                text(
-                    """SELECT id, status, values FROM config_release
-                       WHERE id = :release_id AND company_id = :company_id
-                       FOR UPDATE"""
-                ),
-                {"release_id": release_id, "company_id": company_id},
+                select(ConfigRelease.id, ConfigRelease.status, ConfigRelease.values)
+                .where(ConfigRelease.id == release_id, ConfigRelease.company_id == company_id)
+                .with_for_update()
             )
             .mappings()
             .first()
@@ -218,12 +278,10 @@ def trigger_regression_run(release_id: int, request: Request) -> dict[str, Any]:
         if release["status"] != "draft":
             raise ApiProblem(409, "release_not_draft", "只有 draft 版本需要回归回放")
         inflight = connection.execute(
-            text(
-                """SELECT id FROM regression_run
-                   WHERE release_id = :release_id AND finished_at IS NULL
-                   ORDER BY id DESC LIMIT 1"""
-            ),
-            {"release_id": release_id},
+            select(RegressionRun.id)
+            .where(RegressionRun.release_id == release_id, RegressionRun.finished_at.is_(None))
+            .order_by(RegressionRun.id.desc())
+            .limit(1)
         ).scalar_one_or_none()
         if inflight is not None:
             raise ApiProblem(
@@ -232,42 +290,38 @@ def trigger_regression_run(release_id: int, request: Request) -> dict[str, Any]:
                 "该版本已有未完成的回归回放",
                 detail={"regression_run_id": int(inflight)},
             )
-        gold_total = int(connection.execute(text("SELECT count(*) FROM gold_item")).scalar_one())
+        gold_total = int(
+            connection.execute(select(func.count()).select_from(GoldItem)).scalar_one()
+        )
         changed = _changed_keys(connection, company_id, dict(release["values"]))
         impact = [entry.as_dict() for entry in gate.build_impact(changed)]
         run_id = int(
             connection.execute(
-                text(
-                    """INSERT INTO regression_run
-                           (release_id, gold_total, pass_count, fail_count, impact_items)
-                       VALUES
-                           (:release_id, :gold_total, 0, 0, CAST(:impact AS JSONB))
-                       RETURNING id"""
-                ),
-                {
-                    "release_id": release_id,
-                    "gold_total": gold_total,
-                    "impact": json.dumps(impact, ensure_ascii=False),
-                },
+                insert(RegressionRun)
+                .values(
+                    release_id=release_id,
+                    gold_total=gold_total,
+                    pass_count=0,
+                    fail_count=0,
+                    impact_items=impact,
+                )
+                .returning(RegressionRun.id)
             ).scalar_one()
         )
         connection.execute(
-            text("UPDATE config_release SET regression_run_id = :run_id WHERE id = :release_id"),
-            {"run_id": run_id, "release_id": release_id},
+            update(ConfigRelease)
+            .where(ConfigRelease.id == release_id)
+            .values(regression_run_id=run_id)
         )
     try:
         task_id = queue(request).enqueue(_REGRESSION_TASK, (run_id,))
     except Exception as exc:  # broker 不可用是暂时的：把这次触发收干净，允许马上重试
         with db.begin() as connection:
+            connection.execute(delete(RegressionRun).where(RegressionRun.id == run_id))
             connection.execute(
-                text("DELETE FROM regression_run WHERE id = :run_id"), {"run_id": run_id}
-            )
-            connection.execute(
-                text(
-                    "UPDATE config_release SET regression_run_id = NULL "
-                    "WHERE id = :release_id AND regression_run_id = :run_id"
-                ),
-                {"run_id": run_id, "release_id": release_id},
+                update(ConfigRelease)
+                .where(ConfigRelease.id == release_id, ConfigRelease.regression_run_id == run_id)
+                .values(regression_run_id=None)
             )
         raise ApiProblem(
             503,
@@ -287,13 +341,25 @@ def get_regression_run(run_id: int, request: Request) -> dict[str, Any]:
     with db.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT rr.*, r.version_no, r.status AS release_status
-                       FROM regression_run AS rr
-                       JOIN config_release AS r ON r.id = rr.release_id
-                       WHERE rr.id = :run_id AND r.company_id = :company_id"""
-                ),
-                {"run_id": run_id, "company_id": company_id},
+                select(
+                    RegressionRun.id,
+                    RegressionRun.release_id,
+                    RegressionRun.gold_total,
+                    RegressionRun.pass_count,
+                    RegressionRun.fail_count,
+                    RegressionRun.baseline_rate,
+                    RegressionRun.anchor_hit,
+                    RegressionRun.by_field,
+                    RegressionRun.failures,
+                    RegressionRun.impact_items,
+                    RegressionRun.started_at,
+                    RegressionRun.finished_at,
+                    ConfigRelease.version_no,
+                    ConfigRelease.status.label("release_status"),
+                )
+                .select_from(RegressionRun)
+                .join(ConfigRelease, ConfigRelease.id == RegressionRun.release_id)
+                .where(RegressionRun.id == run_id, ConfigRelease.company_id == company_id)
             )
             .mappings()
             .first()
@@ -361,32 +427,28 @@ def list_gold_items(
 ) -> dict[str, Any]:
     """回归集条目（可按字段过滤）：值 + 锚点 + 产出时的参数快照（09 第 4.3 节）。"""
     db: Engine = engine(request)
-    where = "TRUE"
-    params: dict[str, Any] = {"limit": limit, "offset": offset}
-    if field_key:
-        where = "field_key = :field_key"
-        params["field_key"] = field_key
     with db.connect() as connection:
+        query = select(
+            GoldItem.id,
+            GoldItem.source_instance_id,
+            GoldItem.version_id,
+            GoldItem.field_key,
+            GoldItem.expected,
+            GoldItem.expected_anchors,
+            GoldItem.origin,
+            GoldItem.param_snapshot,
+            GoldItem.created_at,
+        )
+        counter = select(func.count()).select_from(GoldItem)
+        if field_key:
+            query = query.where(GoldItem.field_key == field_key)
+            counter = counter.where(GoldItem.field_key == field_key)
         rows = (
-            connection.execute(
-                text(
-                    """SELECT id, source_instance_id, version_id, field_key, expected,
-                              expected_anchors, origin, param_snapshot, created_at
-                       FROM gold_item WHERE """
-                    + where
-                    + " ORDER BY id DESC LIMIT :limit OFFSET :offset"
-                ),
-                params,
-            )
+            connection.execute(query.order_by(GoldItem.id.desc()).limit(limit).offset(offset))
             .mappings()
             .all()
         )
-        total = int(
-            connection.execute(
-                text("SELECT count(*) FROM gold_item WHERE " + where),
-                {key: value for key, value in params.items() if key != "limit" and key != "offset"},
-            ).scalar_one()
-        )
+        total = int(connection.execute(counter).scalar_one())
     return {"items": [dict(row) for row in rows], "total": total, "limit": limit, "offset": offset}
 
 
@@ -406,10 +468,10 @@ def field_stats(
     since = _window_start(window)
     db: Engine = engine(request)
     with db.connect() as connection:
-        attempt_rows = connection.execute(text(_ATTEMPT_SQL), {"since": since}).mappings().all()
-        instance_rows = connection.execute(text(_INSTANCE_SQL), {"since": since}).mappings().all()
-        manual_rows = connection.execute(text(_MANUAL_SQL), {"since": since}).mappings().all()
-        evidence = connection.execute(text(_EVIDENCE_SQL), {"since": since}).mappings().one()
+        attempt_rows = connection.execute(_attempt_query(since)).mappings().all()
+        instance_rows = connection.execute(_instance_query(since)).mappings().all()
+        manual_rows = connection.execute(_manual_query(since)).mappings().all()
+        evidence = connection.execute(_evidence_query(since)).mappings().one()
 
     attempts: dict[str, dict[str, dict[int, dict[str, int]]]] = {}
     for row in attempt_rows:
@@ -511,21 +573,16 @@ def create_spot_check(payload: SpotCheckRequest, request: Request) -> dict[str, 
     batch_id = uuid4().hex
     with db.begin() as connection:
         rows = (
-            connection.execute(
-                text(_SPOT_CHECK_SQL),
-                {"since": since, "size": payload.size, "field_keys": list(payload.field_keys)},
-            )
+            connection.execute(_spot_check_query(since, list(payload.field_keys), payload.size))
             .mappings()
             .all()
         )
         task_ids = [
             int(
                 connection.execute(
-                    text(
-                        """INSERT INTO review_task (extraction_id, reason)
-                           VALUES (:extraction_id, 'spot_check') RETURNING id"""
-                    ),
-                    {"extraction_id": int(row["attempt_id"])},
+                    insert(ReviewTask)
+                    .values(extraction_id=int(row["attempt_id"]), reason="spot_check")
+                    .returning(ReviewTask.id)
                 ).scalar_one()
             )
             for row in rows

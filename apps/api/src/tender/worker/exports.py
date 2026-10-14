@@ -2,42 +2,50 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import any_, case, func, literal, select, true, update
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import aliased
 
+from tender.adapters.pg.locks import release_lock, try_acquire_lock
+from tender.adapters.pg.models import (
+    Document,
+    DocumentVersion,
+    Evidence,
+    Extraction,
+    ExtractionConflict,
+    FieldInstance,
+    Job,
+    Lot,
+    Project,
+    ProjectFile,
+    ReviewAction,
+)
+from tender.adapters.pg.session import create_pg_engine
 from tender.adapters.s3 import S3BlobStore
 from tender.application.exporting import workbook_bytes
 from tender.core import settings
 from tender.ports.blob_store import BlobStoreError
 from tender.worker.celery_app import celery_app
 
-_engine = create_engine(settings.database_url(), pool_pre_ping=True)
+_engine = create_pg_engine()
 _TERMINAL = frozenset({"completed", "partial", "failed", "canceled"})
 
 
 @contextmanager
 def _advisory_lock(job_id: str) -> Iterator[bool]:
     with _engine.connect() as connection:
-        acquired = bool(
-            connection.execute(
-                text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))"),
-                {"key": f"job:{job_id}"},
-            ).scalar_one()
-        )
+        acquired = try_acquire_lock(connection, f"job:{job_id}")
         connection.commit()
         try:
             yield acquired
         finally:
             if acquired:
-                connection.execute(
-                    text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
-                    {"key": f"job:{job_id}"},
-                )
+                release_lock(connection, f"job:{job_id}")
                 connection.commit()
 
 
@@ -45,12 +53,13 @@ def _load_job(job_id: str) -> dict[str, Any] | None:
     with _engine.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT j.*, p.name AS project_name, p.deleted_at AS project_deleted_at
-                       FROM job AS j JOIN project AS p ON p.id = j.project_id
-                       WHERE j.id = :id"""
-                ),
-                {"id": job_id},
+                select(
+                    Job,
+                    Project.name.label("project_name"),
+                    Project.deleted_at.label("project_deleted_at"),
+                )
+                .join(Project, Project.id == Job.project_id)
+                .where(Job.id == job_id)
             )
             .mappings()
             .first()
@@ -58,91 +67,135 @@ def _load_job(job_id: str) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
-def _export_rows(job: dict[str, Any]) -> list[dict[str, object]]:
+def _effective_cte(project_id: int) -> Any:
+    """交叉文件的「有效取值」口径：冲突优先，其次人工动作，最后回落到机器状态。
+
+    与同步导出共用同一段 CASE，两侧不能各写一套。
+    """
+    latest_action = (
+        select(ReviewAction.action)
+        .where(ReviewAction.attempt_id == Extraction.id)
+        .order_by(ReviewAction.created_at.desc(), ReviewAction.id.desc())
+        .limit(1)
+        .correlate(Extraction)
+        .lateral("ra")
+    )
+    conflict = (
+        select(ExtractionConflict.id)
+        .where(
+            ExtractionConflict.project_id == project_id,
+            ExtractionConflict.status == "open",
+            ExtractionConflict.field_key == Extraction.field_key,
+            ExtractionConflict.lot_id.is_not_distinct_from(FieldInstance.lot_id),
+            Extraction.id == any_(ExtractionConflict.candidate_ids),
+        )
+        .exists()
+    )
+    effective_status = case(
+        (conflict, "conflict"),
+        (latest_action.c.action == "confirm", "verified"),
+        (latest_action.c.action == "reject", "rejected"),
+        else_=Extraction.status,
+    ).label("effective_status")
+    # fi.lot_id 必须换名：e.* 自带同名 lot_id，
+    # 同名列会让后续 effective.lot_id 报「column reference is ambiguous」。
+    return (
+        select(
+            Extraction,
+            FieldInstance.lot_id.label("fi_lot_id"),
+            Lot.code.label("lot_code"),
+            effective_status,
+        )
+        .join(FieldInstance, FieldInstance.id == Extraction.instance_id)
+        .outerjoin(Lot, Lot.id == FieldInstance.lot_id)
+        .outerjoin(latest_action, true())
+        .cte("effective")
+    )
+
+
+def _export_query(job: dict[str, Any]) -> Any:
     snapshot = job.get("config_snapshot") if isinstance(job.get("config_snapshot"), dict) else {}
     include = snapshot.get("include", "all")
     lot_id = snapshot.get("lot_id")
-    clauses = [
-        "file.project_id = :project_id",
-        "file.deleted_at IS NULL",
-        "effective.is_current = true",
-    ]
-    params: dict[str, object] = {
-        "project_id": job["project_id"],
-        "company_id": settings.company_id(),
-    }
-    if isinstance(lot_id, int):
-        clauses.append("effective.lot_id = :lot_id")
-        params["lot_id"] = lot_id
-    if include == "review":
-        clauses.append("effective.effective_status IN ('need_review','conflict','not_found')")
-    elif include == "verified":
-        clauses.append("effective.effective_status = 'verified'")
-    with _engine.connect() as connection:
-        rows = (
-            connection.execute(
-                text(
-                    f"""WITH effective AS (
-                            SELECT e.*, fi.lot_id, l.code AS lot_code,
-                                   CASE
-                                       WHEN EXISTS (
-                                           SELECT 1 FROM extraction_conflict AS ec
-                                           WHERE ec.project_id = :project_id
-                                             AND ec.status = 'open'
-                                             AND ec.field_key = e.field_key
-                                             AND ec.lot_id IS NOT DISTINCT FROM fi.lot_id
-                                             AND e.id = ANY(ec.candidate_ids)
-                                       ) THEN 'conflict'
-                                       WHEN ra.action = 'confirm' THEN 'verified'
-                                       WHEN ra.action = 'reject' THEN 'rejected'
-                                       ELSE e.status
-                                   -- 与同步导出保持一致，不能和 e.* 中的 status 重名。
-                                   END AS effective_status
-                            FROM extraction AS e
-                            JOIN field_instance AS fi ON fi.id = e.instance_id
-                            LEFT JOIN lot AS l ON l.id = fi.lot_id
-                            LEFT JOIN LATERAL (
-                                SELECT action FROM review_action
-                                WHERE attempt_id = e.id
-                                ORDER BY created_at DESC, id DESC LIMIT 1
-                            ) AS ra ON true
-                        )
-                        SELECT effective.field_key, effective.group_key, effective.value_text,
-                               effective.lot_code, effective.confidence,
-                               effective.effective_status AS status,
-                               effective.machine_attempt_no,
-                               file.display_name, ev.page_no, ev.quote, review.comment
-                        FROM effective
-                        JOIN document_version AS v ON v.id = effective.version_id
-                        JOIN document AS d ON d.id = v.document_id
-                        JOIN LATERAL (
-                            SELECT pf.project_id, pf.display_name, pf.deleted_at
-                            FROM project_file AS pf
-                            WHERE pf.version_id = v.id AND pf.project_id = :project_id
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM project_file AS replacement
-                                  WHERE replacement.replaces_id = pf.id
-                                    AND replacement.deleted_at IS NULL
-                              )
-                            ORDER BY CASE pf.role WHEN 'main' THEN 0 ELSE 1 END,
-                                     pf.sort_no, pf.id LIMIT 1
-                        ) AS file ON true
-                        LEFT JOIN evidence AS ev ON ev.extraction_id = effective.id
-                        LEFT JOIN LATERAL (
-                            SELECT comment FROM review_action
-                            WHERE instance_id = effective.instance_id
-                              AND action IN ('correct','supplement')
-                            ORDER BY created_at DESC, id DESC LIMIT 1
-                        ) AS review ON true
-                        WHERE d.company_id = :company_id AND d.deleted_at IS NULL
-                          AND {" AND ".join(clauses)}
-                        ORDER BY effective.group_key, effective.field_key, effective.id, ev.seq"""
-                ),
-                params,
-            )
-            .mappings()
-            .all()
+    project_id = job["project_id"]
+    effective = _effective_cte(project_id)
+
+    # 引用未删除替身的那一版文件：同一 version 可能挂在多个 project_file 下。
+    replacement = aliased(ProjectFile)
+    current_file = (
+        select(ProjectFile.project_id, ProjectFile.display_name, ProjectFile.deleted_at)
+        .where(
+            ProjectFile.version_id == DocumentVersion.id,
+            ProjectFile.project_id == project_id,
+            ~select(replacement.id)
+            .where(replacement.replaces_id == ProjectFile.id, replacement.deleted_at.is_(None))
+            .exists(),
         )
+        .order_by(
+            case((ProjectFile.role == "main", 0), else_=1), ProjectFile.sort_no, ProjectFile.id
+        )
+        .limit(1)
+        .correlate(DocumentVersion)
+        .lateral("file")
+    )
+    latest_review = (
+        select(ReviewAction.comment)
+        .where(
+            ReviewAction.instance_id == effective.c.instance_id,
+            ReviewAction.action.in_(("correct", "supplement")),
+        )
+        .order_by(ReviewAction.created_at.desc(), ReviewAction.id.desc())
+        .limit(1)
+        .correlate(effective)
+        .lateral("review")
+    )
+
+    conditions = [
+        current_file.c.project_id == project_id,
+        current_file.c.deleted_at.is_(None),
+        effective.c.is_current.is_(True),
+    ]
+    if isinstance(lot_id, int):
+        conditions.append(effective.c.fi_lot_id == lot_id)
+    if include == "review":
+        conditions.append(
+            effective.c.effective_status.in_(("need_review", "conflict", "not_found"))
+        )
+    elif include == "verified":
+        conditions.append(effective.c.effective_status == "verified")
+
+    return (
+        select(
+            effective.c.field_key,
+            effective.c.group_key,
+            effective.c.value_text,
+            effective.c.lot_code,
+            effective.c.confidence,
+            effective.c.effective_status.label("status"),
+            effective.c.machine_attempt_no,
+            current_file.c.display_name,
+            Evidence.page_no,
+            Evidence.quote,
+            latest_review.c.comment,
+        )
+        .select_from(effective)
+        .join(DocumentVersion, DocumentVersion.id == effective.c.version_id)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .join(current_file, true())
+        .outerjoin(Evidence, Evidence.extraction_id == effective.c.id)
+        .outerjoin(latest_review, true())
+        .where(
+            Document.company_id == settings.company_id(),
+            Document.deleted_at.is_(None),
+            *conditions,
+        )
+        .order_by(effective.c.group_key, effective.c.field_key, effective.c.id, Evidence.seq)
+    )
+
+
+def _export_rows(job: dict[str, Any]) -> list[dict[str, object]]:
+    with _engine.connect() as connection:
+        rows = connection.execute(_export_query(job)).mappings().all()
     return [
         {
             "字段名": row["field_key"],
@@ -173,27 +226,28 @@ def _set_state(
     error_message: str | None = None,
 ) -> None:
     with _engine.begin() as connection:
+        conditions = [Job.id == job_id]
+        if status != "canceled":
+            conditions.append(Job.status != "canceled")
+        now = datetime.now(UTC)
         connection.execute(
-            text(
-                """UPDATE job SET status = :status, stage = 'exporting',
-                       progress = COALESCE(CAST(:progress AS JSONB), progress),
-                       error_code = :error_code, error_message = :error_message,
-                       updated_at = :now,
-                       finished_at = CASE WHEN :terminal THEN :now ELSE NULL END
-                   WHERE id = :id
-                     AND (status <> 'canceled' OR :status = 'canceled')"""
-            ),
-            {
-                "id": job_id,
-                "status": status,
-                "progress": json.dumps(progress, ensure_ascii=False)
-                if progress is not None
-                else None,
-                "error_code": error_code,
-                "error_message": error_message[:2000] if error_message else None,
-                "now": datetime.now(UTC),
-                "terminal": status in _TERMINAL,
-            },
+            update(Job)
+            .where(*conditions)
+            .values(
+                status=status,
+                stage="exporting",
+                # progress=None 表示不改动既有进度，保留 COALESCE 语义。
+                progress=func.coalesce(
+                    literal(progress, type_=JSONB)
+                    if progress is not None
+                    else literal(None, type_=JSONB),
+                    Job.progress,
+                ),
+                error_code=error_code,
+                error_message=error_message[:2000] if error_message else None,
+                updated_at=now,
+                finished_at=now if status in _TERMINAL else None,
+            )
         )
 
 

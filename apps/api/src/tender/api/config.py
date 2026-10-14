@@ -12,15 +12,16 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, func, insert, select, update
 from sqlalchemy.engine import Connection
 
+from tender.adapters.pg.locks import acquire_xact_lock
+from tender.adapters.pg.models import ConfigAudit, ConfigRelease, RegressionRun
 from tender.api.common import configs, engine
 from tender.api.errors import ApiProblem
 from tender.config import audit, gate, schema
@@ -93,11 +94,9 @@ def _mask_stored(key: str, value: Any) -> Any:
 def _release_row(connection: Connection, release_id: int, company_id: int) -> Mapping[str, Any]:
     row = (
         connection.execute(
-            text(
-                """SELECT * FROM config_release
-                   WHERE id = :id AND company_id = :company_id"""
-            ),
-            {"id": release_id, "company_id": company_id},
+            select(ConfigRelease).where(
+                ConfigRelease.id == release_id, ConfigRelease.company_id == company_id
+            )
         )
         .mappings()
         .first()
@@ -110,12 +109,10 @@ def _release_row(connection: Connection, release_id: int, company_id: int) -> Ma
 def _active_row(connection: Connection, company_id: int) -> Mapping[str, Any] | None:
     return (
         connection.execute(
-            text(
-                """SELECT * FROM config_release
-                   WHERE company_id = :company_id AND status = 'active'
-                   ORDER BY id DESC LIMIT 1"""
-            ),
-            {"company_id": company_id},
+            select(ConfigRelease)
+            .where(ConfigRelease.company_id == company_id, ConfigRelease.status == "active")
+            .order_by(ConfigRelease.id.desc())
+            .limit(1)
         )
         .mappings()
         .first()
@@ -141,12 +138,13 @@ def _regression_for(connection: Connection, release_id: int) -> dict[str, Any] |
     """
     row = (
         connection.execute(
-            text(
-                """SELECT * FROM regression_run
-                   WHERE release_id = :release_id AND finished_at IS NOT NULL
-                   ORDER BY id DESC LIMIT 1"""
-            ),
-            {"release_id": release_id},
+            select(RegressionRun)
+            .where(
+                RegressionRun.release_id == release_id,
+                RegressionRun.finished_at.is_not(None),
+            )
+            .order_by(RegressionRun.id.desc())
+            .limit(1)
         )
         .mappings()
         .first()
@@ -174,28 +172,24 @@ def _audit_rows(
     release_id: int | None,
     limit: int,
 ) -> list[dict[str, Any]]:
-    where = "r.company_id = :company_id"
-    params: dict[str, Any] = {"company_id": company_id, "limit": limit}
-    if release_id is not None:
-        where += " AND a.release_id = :release_id"
-        params["release_id"] = release_id
-    rows = (
-        connection.execute(
-            text(
-                """SELECT a.id, a.release_id, a.actor, a.action, a.diff, a.reason,
-                          a.created_at, r.version_no
-                   FROM config_audit AS a
-                   JOIN config_release AS r ON r.id = a.release_id
-                   WHERE """
-                + where
-                + """
-                   ORDER BY a.id DESC LIMIT :limit"""
-            ),
-            params,
+    query = (
+        select(
+            ConfigAudit.id,
+            ConfigAudit.release_id,
+            ConfigAudit.actor,
+            ConfigAudit.action,
+            ConfigAudit.diff,
+            ConfigAudit.reason,
+            ConfigAudit.created_at,
+            ConfigRelease.version_no,
         )
-        .mappings()
-        .all()
+        .select_from(ConfigAudit)
+        .join(ConfigRelease, ConfigRelease.id == ConfigAudit.release_id)
+        .where(ConfigRelease.company_id == company_id)
     )
+    if release_id is not None:
+        query = query.where(ConfigAudit.release_id == release_id)
+    rows = connection.execute(query.order_by(ConfigAudit.id.desc()).limit(limit)).mappings().all()
     return [dict(row) for row in rows]
 
 
@@ -243,18 +237,24 @@ def list_releases(
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     db: Engine = engine(request)
-    params: dict[str, Any] = {"company_id": settings.company_id(), "limit": limit}
-    where = "company_id = :company_id"
+    query = select(
+        ConfigRelease.id,
+        ConfigRelease.version_no,
+        ConfigRelease.status,
+        ConfigRelease.note,
+        ConfigRelease.created_by,
+        ConfigRelease.created_at,
+        ConfigRelease.based_on,
+        ConfigRelease.regression_run_id,
+    ).where(ConfigRelease.company_id == settings.company_id())
     if status:
-        where += " AND status = :status"
-        params["status"] = status
-    columns = (
-        "SELECT id, version_no, status, note, created_by, created_at, based_on,"
-        " regression_run_id FROM config_release WHERE "
-    )
-    statement = text(columns + where + " ORDER BY version_no DESC LIMIT :limit")
+        query = query.where(ConfigRelease.status == status)
     with db.connect() as connection:
-        rows = connection.execute(statement, params).mappings().all()
+        rows = (
+            connection.execute(query.order_by(ConfigRelease.version_no.desc()).limit(limit))
+            .mappings()
+            .all()
+        )
     return {"items": [dict(row) for row in rows]}
 
 
@@ -280,10 +280,7 @@ def create_release(payload: ReleaseCreate, request: Request) -> dict[str, Any]:
     company_id = settings.company_id()
     db: Engine = engine(request)
     with db.begin() as connection:
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": f"config-release:{company_id}"},
-        )
+        acquire_xact_lock(connection, f"config-release:{company_id}")
         if payload.based_on is not None:
             base_row = _release_row(connection, payload.based_on, company_id)
         else:
@@ -297,44 +294,33 @@ def create_release(payload: ReleaseCreate, request: Request) -> dict[str, Any]:
         gated = schema.gated_keys(changed.keys())
         version_no = int(
             connection.execute(
-                text(
-                    """SELECT COALESCE(max(version_no), 0) + 1 FROM config_release
-                       WHERE company_id = :company_id"""
-                ),
-                {"company_id": company_id},
+                select(func.coalesce(func.max(ConfigRelease.version_no), 0) + 1).where(
+                    ConfigRelease.company_id == company_id
+                )
             ).scalar_one()
         )
         if not gated:
             # L1 立即生效：先归档旧 active，再插入新 active——ux_release_active 只允许一个；
             # L2/L3 只落 draft，不碰当前 active。
             connection.execute(
-                text(
-                    """UPDATE config_release SET status = 'archived'
-                       WHERE company_id = :company_id AND status = 'active'"""
-                ),
-                {"company_id": company_id},
+                update(ConfigRelease)
+                .where(ConfigRelease.company_id == company_id, ConfigRelease.status == "active")
+                .values(status="archived")
             )
         status = "draft" if gated else "active"
         release_id = int(
             connection.execute(
-                text(
-                    """INSERT INTO config_release
-                           (company_id, version_no, values, status, based_on,
-                            note, created_by)
-                       VALUES
-                           (:company_id, :version_no, CAST(:values AS JSONB), :status,
-                            :based_on, :note, :created_by)
-                       RETURNING id"""
-                ),
-                {
-                    "company_id": company_id,
-                    "version_no": version_no,
-                    "values": json.dumps(resolved, ensure_ascii=False),
-                    "status": status,
-                    "based_on": base_row["id"] if base_row is not None else None,
-                    "note": payload.note,
-                    "created_by": actor,
-                },
+                insert(ConfigRelease)
+                .values(
+                    company_id=company_id,
+                    version_no=version_no,
+                    values=resolved,
+                    status=status,
+                    based_on=base_row["id"] if base_row is not None else None,
+                    note=payload.note,
+                    created_by=actor,
+                )
+                .returning(ConfigRelease.id)
             ).scalar_one()
         )
         audit.write_audit(
@@ -477,10 +463,7 @@ def activate_release(
     db: Engine = engine(request)
     company_id = settings.company_id()
     with db.begin() as connection:
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": f"config-release:{company_id}"},
-        )
+        acquire_xact_lock(connection, f"config-release:{company_id}")
         row = _release_row(connection, release_id, company_id)
         if row["status"] != "draft":
             raise ApiProblem(409, "release_not_draft", "只有 draft 版本可以激活")
@@ -506,15 +489,12 @@ def activate_release(
             )
         changed = _changed_against_active(connection, company_id, values)
         connection.execute(
-            text(
-                """UPDATE config_release SET status = 'archived'
-                   WHERE company_id = :company_id AND status = 'active'"""
-            ),
-            {"company_id": company_id},
+            update(ConfigRelease)
+            .where(ConfigRelease.company_id == company_id, ConfigRelease.status == "active")
+            .values(status="archived")
         )
         connection.execute(
-            text("UPDATE config_release SET status = 'active' WHERE id = :id"),
-            {"id": release_id},
+            update(ConfigRelease).where(ConfigRelease.id == release_id).values(status="active")
         )
         audit.write_audit(
             connection,
@@ -553,10 +533,7 @@ def rollback_release(
     db: Engine = engine(request)
     company_id = settings.company_id()
     with db.begin() as connection:
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": f"config-release:{company_id}"},
-        )
+        acquire_xact_lock(connection, f"config-release:{company_id}")
         target = _release_row(connection, release_id, company_id)
         if target["status"] == "draft":
             raise ApiProblem(409, "release_not_rollbackable", "draft 版本请先通过门禁再激活")
@@ -572,12 +549,12 @@ def rollback_release(
         changed = schema.diff_values(base, target_resolved)
         if current is not None:
             connection.execute(
-                text("UPDATE config_release SET status = 'rolled_back' WHERE id = :id"),
-                {"id": current["id"]},
+                update(ConfigRelease)
+                .where(ConfigRelease.id == current["id"])
+                .values(status="rolled_back")
             )
         connection.execute(
-            text("UPDATE config_release SET status = 'active' WHERE id = :id"),
-            {"id": release_id},
+            update(ConfigRelease).where(ConfigRelease.id == release_id).values(status="active")
         )
         audit.write_audit(
             connection,

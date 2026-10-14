@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from tender.worker.dispatch import STREAMS, _stage_list, capacity
+from sqlalchemy.dialects import postgresql
+
+from tender.worker.dispatch import STREAMS, _pending_jobs, capacity
 
 
 def test_capacity_subtracts_inflight() -> None:
@@ -44,7 +46,12 @@ def test_parse_stream_covers_post_conversion_handoff() -> None:
     assert parse.task_name == "tender.worker.tasks.submit_parse"
 
 
-def test_stage_list_renders_quoted_constants() -> None:
-    """stage 是拼进 SQL 的常量：写错引号会变成语法错误，必须在单测里钉住形态。"""
+def test_pending_jobs_scope_to_stream_stages() -> None:
+    """stage 由绑定参数带入：写错值不再是语法错误，改在编译结果上钉住各线的筛选条件。"""
     convert = next(stream for stream in STREAMS if stream.name == "convert")
-    assert _stage_list(convert) == "'converting', 'probing'"
+    sql = str(
+        _pending_jobs(convert, 7, 3).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "job.stage IN ('converting', 'probing')" in sql

@@ -7,8 +7,21 @@ from typing import Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import case, exists, func, select, true, update
+from sqlalchemy.dialects.postgresql import distinct_on
+from sqlalchemy.orm import aliased
 
+from tender.adapters.pg.models import (
+    DocumentVersion,
+    Evidence,
+    Extraction,
+    ExtractionConflict,
+    FieldInstance,
+    Project,
+    ProjectFile,
+    ReviewAction,
+    ReviewTask,
+)
 from tender.api.common import engine, project_row
 from tender.api.errors import ApiProblem
 from tender.application.fields import FIELD_BY_KEY
@@ -33,46 +46,70 @@ def list_conflicts(project_id: int, request: Request) -> dict[str, object]:
     with db.connect() as connection:
         conflicts = (
             connection.execute(
-                text(
-                    """SELECT id, field_key, lot_id, candidate_ids, resolved_id,
-                              status, created_at
-                       FROM extraction_conflict
-                       WHERE project_id = :project_id
-                       ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END,
-                                created_at DESC, id DESC"""
-                ),
-                {"project_id": project_id},
+                select(
+                    ExtractionConflict.id,
+                    ExtractionConflict.field_key,
+                    ExtractionConflict.lot_id,
+                    ExtractionConflict.candidate_ids,
+                    ExtractionConflict.resolved_id,
+                    ExtractionConflict.status,
+                    ExtractionConflict.created_at,
+                )
+                .where(ExtractionConflict.project_id == project_id)
+                .order_by(
+                    case((ExtractionConflict.status == "open", 0), else_=1),
+                    ExtractionConflict.created_at.desc(),
+                    ExtractionConflict.id.desc(),
+                )
             )
             .mappings()
             .all()
         )
         ids = sorted({int(item) for conflict in conflicts for item in conflict["candidate_ids"]})
+        first_ev = (
+            select(Evidence.anchor, Evidence.page_no, Evidence.quote)
+            .where(Evidence.extraction_id == Extraction.id)
+            .order_by(Evidence.seq)
+            .limit(1)
+            .correlate(Extraction)
+            .lateral("first_ev")
+        )
+        replacement = aliased(ProjectFile)
         candidates = (
-            connection.execute(
-                text(
-                    """SELECT DISTINCT ON (e.id) e.id, e.version_id, e.field_key,
-                              e.value_json, e.value_text, e.confidence, e.status,
-                              pf.display_name, pf.role, first_ev.anchor,
-                              first_ev.page_no, first_ev.quote
-                       FROM extraction AS e
-                       JOIN project_file AS pf ON pf.version_id = e.version_id
-                       LEFT JOIN LATERAL (
-                           SELECT anchor, page_no, quote FROM evidence
-                           WHERE extraction_id = e.id ORDER BY seq LIMIT 1
-                       ) AS first_ev ON true
-                       WHERE e.id = ANY(CAST(:ids AS BIGINT[]))
-                         AND pf.project_id = :project_id AND pf.deleted_at IS NULL
-                         AND NOT EXISTS (
-                             SELECT 1 FROM project_file AS replacement
-                             WHERE replacement.replaces_id = pf.id
-                               AND replacement.deleted_at IS NULL
-                         )
-                       ORDER BY e.id, pf.id"""
-                ),
-                {"ids": ids, "project_id": project_id},
+            (
+                connection.execute(
+                    select(
+                        Extraction.id,
+                        Extraction.version_id,
+                        Extraction.field_key,
+                        Extraction.value_json,
+                        Extraction.value_text,
+                        Extraction.confidence,
+                        Extraction.status,
+                        ProjectFile.display_name,
+                        ProjectFile.role,
+                        first_ev.c.anchor,
+                        first_ev.c.page_no,
+                        first_ev.c.quote,
+                    )
+                    .select_from(Extraction)
+                    .join(ProjectFile, ProjectFile.version_id == Extraction.version_id)
+                    .outerjoin(first_ev, true())
+                    .where(
+                        Extraction.id.in_(ids),
+                        ProjectFile.project_id == project_id,
+                        ProjectFile.deleted_at.is_(None),
+                        ~exists().where(
+                            replacement.replaces_id == ProjectFile.id,
+                            replacement.deleted_at.is_(None),
+                        ),
+                    )
+                    .ext(distinct_on(Extraction.id))
+                    .order_by(Extraction.id, ProjectFile.id)
+                )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
             if ids
             else []
         )
@@ -116,15 +153,20 @@ def resolve_conflict(
     with db.begin() as connection:
         conflict = (
             connection.execute(
-                text(
-                    """SELECT ec.id, ec.project_id, ec.candidate_ids, ec.status
-                       FROM extraction_conflict AS ec
-                       JOIN project AS p ON p.id = ec.project_id
-                       WHERE ec.id = :conflict_id AND p.company_id = :company_id
-                         AND p.deleted_at IS NULL
-                       FOR UPDATE OF ec"""
-                ),
-                {"conflict_id": conflict_id, "company_id": settings.company_id()},
+                select(
+                    ExtractionConflict.id,
+                    ExtractionConflict.project_id,
+                    ExtractionConflict.candidate_ids,
+                    ExtractionConflict.status,
+                )
+                .select_from(ExtractionConflict)
+                .join(Project, Project.id == ExtractionConflict.project_id)
+                .where(
+                    ExtractionConflict.id == conflict_id,
+                    Project.company_id == settings.company_id(),
+                    Project.deleted_at.is_(None),
+                )
+                .with_for_update(of=ExtractionConflict)
             )
             .mappings()
             .first()
@@ -143,11 +185,9 @@ def resolve_conflict(
                 raise ApiProblem(400, "invalid_argument", "dismiss 不接受 resolved_id")
             status = "dismissed"
         connection.execute(
-            text(
-                """UPDATE extraction_conflict SET status = :status, resolved_id = :resolved_id
-                   WHERE id = :conflict_id"""
-            ),
-            {"status": status, "resolved_id": resolved_id, "conflict_id": conflict_id},
+            update(ExtractionConflict)
+            .where(ExtractionConflict.id == conflict_id)
+            .values(status=status, resolved_id=resolved_id)
         )
     logger.info(
         "项目冲突已裁定",
@@ -170,48 +210,56 @@ def project_stats(project_id: int, request: Request) -> dict[str, object]:
     with db.connect() as connection:
         totals = (
             connection.execute(
-                text(
-                    """SELECT count(DISTINCT ra.instance_id) AS reviewed,
-                              count(*) FILTER (WHERE ra.action = 'confirm') AS confirmed,
-                              count(*) FILTER (WHERE ra.action = 'correct') AS corrected,
-                              count(*) FILTER (WHERE ra.action = 'supplement') AS supplemented
-                       FROM review_action AS ra
-                       JOIN field_instance AS fi ON fi.id = ra.instance_id
-                       JOIN document_version AS v ON v.id = fi.version_id
-                       JOIN project_file AS pf ON pf.version_id = v.id
-                       WHERE pf.project_id = :project_id AND pf.deleted_at IS NULL"""
-                ),
-                {"project_id": project_id},
+                select(
+                    func.count(func.distinct(ReviewAction.instance_id)).label("reviewed"),
+                    func.count().filter(ReviewAction.action == "confirm").label("confirmed"),
+                    func.count().filter(ReviewAction.action == "correct").label("corrected"),
+                    func.count().filter(ReviewAction.action == "supplement").label("supplemented"),
+                )
+                .select_from(ReviewAction)
+                .join(FieldInstance, FieldInstance.id == ReviewAction.instance_id)
+                .join(DocumentVersion, DocumentVersion.id == FieldInstance.version_id)
+                .join(ProjectFile, ProjectFile.version_id == DocumentVersion.id)
+                .where(ProjectFile.project_id == project_id, ProjectFile.deleted_at.is_(None))
             )
             .mappings()
             .one()
         )
         pending = int(
             connection.execute(
-                text(
-                    """SELECT count(*) FROM review_task AS rt
-                       JOIN extraction AS e ON e.id = rt.extraction_id AND e.is_current = true
-                       JOIN document_version AS v ON v.id = e.version_id
-                       JOIN project_file AS pf ON pf.version_id = v.id
-                       WHERE pf.project_id = :project_id AND pf.deleted_at IS NULL
-                         AND rt.status = 'open'"""
-                ),
-                {"project_id": project_id},
+                select(func.count())
+                .select_from(ReviewTask)
+                .join(
+                    Extraction,
+                    (Extraction.id == ReviewTask.extraction_id) & Extraction.is_current.is_(True),
+                )
+                .join(DocumentVersion, DocumentVersion.id == Extraction.version_id)
+                .join(ProjectFile, ProjectFile.version_id == DocumentVersion.id)
+                .where(
+                    ProjectFile.project_id == project_id,
+                    ProjectFile.deleted_at.is_(None),
+                    ReviewTask.status == "open",
+                )
             ).scalar_one()
         )
         review_rows = (
             connection.execute(
-                text(
-                    """SELECT fi.id AS instance_id, e.machine_attempt_no, ra.action, ra.review_mode
-                       FROM review_action AS ra
-                       JOIN extraction AS e ON e.id = ra.attempt_id
-                       JOIN field_instance AS fi ON fi.id = ra.instance_id
-                       JOIN document_version AS v ON v.id = e.version_id
-                       JOIN project_file AS pf ON pf.version_id = v.id
-                       WHERE pf.project_id = :project_id AND pf.deleted_at IS NULL
-                         AND e.machine_attempt_no IS NOT NULL"""
-                ),
-                {"project_id": project_id},
+                select(
+                    FieldInstance.id.label("instance_id"),
+                    Extraction.machine_attempt_no,
+                    ReviewAction.action,
+                    ReviewAction.review_mode,
+                )
+                .select_from(ReviewAction)
+                .join(Extraction, Extraction.id == ReviewAction.attempt_id)
+                .join(FieldInstance, FieldInstance.id == ReviewAction.instance_id)
+                .join(DocumentVersion, DocumentVersion.id == Extraction.version_id)
+                .join(ProjectFile, ProjectFile.version_id == DocumentVersion.id)
+                .where(
+                    ProjectFile.project_id == project_id,
+                    ProjectFile.deleted_at.is_(None),
+                    Extraction.machine_attempt_no.is_not(None),
+                )
             )
             .mappings()
             .all()

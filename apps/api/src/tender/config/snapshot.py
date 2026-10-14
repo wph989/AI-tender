@@ -7,17 +7,12 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, insert
 
-_INSERT_SQL = """
-    INSERT INTO job_config_snapshot (release_id, resolved)
-    VALUES (:release_id, CAST(:resolved AS JSONB))
-    RETURNING id
-"""
+from tender.adapters.pg.models import JobConfigSnapshot
 
 
 def save_snapshot(
@@ -35,10 +30,8 @@ def save_snapshot(
         return None
     return int(
         connection.execute(
-            text(_INSERT_SQL),
-            {
-                "release_id": release_id,
-                "resolved": json.dumps(dict(resolved), ensure_ascii=False),
-            },
+            insert(JobConfigSnapshot)
+            .values(release_id=release_id, resolved=dict(resolved))
+            .returning(JobConfigSnapshot.id)
         ).scalar_one()
     )

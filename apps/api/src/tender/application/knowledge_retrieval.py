@@ -3,9 +3,9 @@
 import asyncio
 from collections.abc import Callable
 
-from tender.application.knowledge import rank_chunks
-from tender.application.knowledge_store import KnowledgeStore, source_state
+from tender.application.knowledge import rank_chunks, source_state
 from tender.ports.embedding import EmbeddingModel
+from tender.ports.repository.knowledge import KnowledgeStore
 from tender.ports.rerank import RerankModel
 
 
@@ -50,11 +50,7 @@ async def retrieve_chunks(
             and source.get("index_id")
             and source.get("embedding_signature") == config["signature"]
         ):
-            vectors = await asyncio.to_thread(
-                db.rows,
-                """SELECT ordinal,embedding FROM knowledge_chunk WHERE index_id=:id""",
-                {"id": source["index_id"]},
-            )
+            vectors = await asyncio.to_thread(db.index_vectors, source["index_id"])
             by_ordinal = {r["ordinal"]: r["embedding"] for r in vectors}
             for block in blocks:
                 candidate = by_ordinal.get(block["ordinal"])

@@ -11,10 +11,10 @@ from data_schema import install_data_schema
 from langchain_core.messages import AIMessage, message_to_dict
 from sqlalchemy import create_engine, text
 
+from tender.adapters.pg.repositories.knowledge import KnowledgeStore, sync_sources
 from tender.api import knowledge, projects
 from tender.application.analysis_outline import outline_result
 from tender.application.knowledge import fingerprint, validate_items
-from tender.application.knowledge_store import KnowledgeStore, sync_sources
 from tender.core import settings
 from tender.ports.llm import Completion
 from tender.worker import knowledge as worker

@@ -18,20 +18,28 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, func, select, update
 
+from tender.adapters.pg.models import (
+    ConfigRelease,
+    Element,
+    GoldItem,
+    Lot,
+    ParseRun,
+    ProjectFile,
+    RegressionRun,
+)
+from tender.adapters.pg.session import create_pg_engine
 from tender.application.agent import extract_field
 from tender.application.extraction import TextChunk, build_anchor_document
 from tender.application.fields import FIELD_BY_KEY
 from tender.application.stats import rate, values_match
 from tender.config import gate, schema
-from tender.core import settings
 from tender.domain.errors import ExtractionFailed, ExtractionUnavailable
 from tender.worker.celery_app import celery_app
 
@@ -41,7 +49,7 @@ from tender.worker.extraction import _advisory_lock, _load_elements, _routing_mo
 
 logger = logging.getLogger(__name__)
 
-_engine: Engine = create_engine(settings.database_url(), pool_pre_ping=True)
+_engine: Engine = create_pg_engine()
 
 # 失败分类：前四种计入分母/分母的"失败"一侧，gold_unavailable 只列明细。
 _FAIL_KINDS = frozenset({"value_mismatch", "hallucination", "anchor_404", "extraction_failed"})
@@ -74,14 +82,16 @@ def _load_run(run_id: int) -> Mapping[str, Any] | None:
     with _engine.connect() as connection:
         return (
             connection.execute(
-                text(
-                    """SELECT rr.id, rr.release_id, rr.finished_at, r.company_id, r.values,
-                              r.status AS release_status
-                       FROM regression_run AS rr
-                       JOIN config_release AS r ON r.id = rr.release_id
-                       WHERE rr.id = :run_id"""
-                ),
-                {"run_id": run_id},
+                select(
+                    RegressionRun.id,
+                    RegressionRun.release_id,
+                    RegressionRun.finished_at,
+                    ConfigRelease.company_id,
+                    ConfigRelease.values,
+                    ConfigRelease.status.label("release_status"),
+                )
+                .join(ConfigRelease, ConfigRelease.id == RegressionRun.release_id)
+                .where(RegressionRun.id == run_id)
             )
             .mappings()
             .first()
@@ -91,11 +101,9 @@ def _load_run(run_id: int) -> Mapping[str, Any] | None:
 def _mark_started(run_id: int) -> None:
     with _engine.begin() as connection:
         connection.execute(
-            text(
-                """UPDATE regression_run SET started_at = now(), finished_at = NULL
-                   WHERE id = :run_id AND finished_at IS NULL"""
-            ),
-            {"run_id": run_id},
+            update(RegressionRun)
+            .where(RegressionRun.id == run_id, RegressionRun.finished_at.is_(None))
+            .values(started_at=func.now(), finished_at=None)
         )
 
 
@@ -103,8 +111,7 @@ def _mark_queued(run_id: int) -> None:
     """重试前把 started_at 清掉，页面才能区分"排队等重试"与"正在跑"。"""
     with _engine.begin() as connection:
         connection.execute(
-            text("UPDATE regression_run SET started_at = NULL WHERE id = :run_id"),
-            {"run_id": run_id},
+            update(RegressionRun).where(RegressionRun.id == run_id).values(started_at=None)
         )
 
 
@@ -113,10 +120,14 @@ def _gold_items() -> list[dict[str, Any]]:
     with _engine.connect() as connection:
         rows = (
             connection.execute(
-                text(
-                    """SELECT id, version_id, field_key, expected, expected_anchors, origin
-                       FROM gold_item ORDER BY id"""
-                )
+                select(
+                    GoldItem.id,
+                    GoldItem.version_id,
+                    GoldItem.field_key,
+                    GoldItem.expected,
+                    GoldItem.expected_anchors,
+                    GoldItem.origin,
+                ).order_by(GoldItem.id)
             )
             .mappings()
             .all()
@@ -135,21 +146,20 @@ def _run_for_anchors(version_id: int, anchors: Sequence[str]) -> int | None:
     with _engine.connect() as connection:
         if anchors:
             found = connection.execute(
-                text(
-                    """SELECT run_id FROM element
-                       WHERE version_id = :version_id AND anchor = ANY(CAST(:anchors AS TEXT[]))
-                       ORDER BY run_id DESC LIMIT 1"""
-                ),
-                {"version_id": version_id, "anchors": list(anchors)},
+                select(Element.run_id)
+                .where(Element.version_id == version_id, Element.anchor.in_(list(anchors)))
+                .order_by(Element.run_id.desc())
+                .limit(1)
             ).scalar_one_or_none()
             return int(found) if found is not None else None
         latest = connection.execute(
-            text(
-                """SELECT id FROM parse_run
-                   WHERE version_id = :version_id AND status IN ('completed', 'partial')
-                   ORDER BY id DESC LIMIT 1"""
-            ),
-            {"version_id": version_id},
+            select(ParseRun.id)
+            .where(
+                ParseRun.version_id == version_id,
+                ParseRun.status.in_(("completed", "partial")),
+            )
+            .order_by(ParseRun.id.desc())
+            .limit(1)
         ).scalar_one_or_none()
     return int(latest) if latest is not None else None
 
@@ -158,13 +168,10 @@ def _lots_for_version(version_id: int) -> list[dict[str, Any]]:
     with _engine.connect() as connection:
         rows = (
             connection.execute(
-                text(
-                    """SELECT l.id, l.code, l.name FROM lot AS l
-                       JOIN project_file AS pf ON pf.project_id = l.project_id
-                       WHERE pf.version_id = :version_id AND pf.deleted_at IS NULL
-                       ORDER BY l.sort_no, l.id"""
-                ),
-                {"version_id": version_id},
+                select(Lot.id, Lot.code, Lot.name)
+                .join(ProjectFile, ProjectFile.project_id == Lot.project_id)
+                .where(ProjectFile.version_id == version_id, ProjectFile.deleted_at.is_(None))
+                .order_by(Lot.sort_no, Lot.id)
             )
             .mappings()
             .all()
@@ -273,14 +280,16 @@ def _baseline_rate(connection: Any, company_id: int) -> float | None:
     """当前 active 版本自己的回归通过率；没跑过则 None（门禁跳过不退步判定，冷启动口径）。"""
     row = (
         connection.execute(
-            text(
-                """SELECT rr.pass_count, rr.gold_total FROM regression_run AS rr
-                   JOIN config_release AS r ON r.id = rr.release_id
-                   WHERE r.company_id = :company_id AND r.status = 'active'
-                     AND rr.finished_at IS NOT NULL AND rr.gold_total > 0
-                   ORDER BY rr.id DESC LIMIT 1"""
-            ),
-            {"company_id": company_id},
+            select(RegressionRun.pass_count, RegressionRun.gold_total)
+            .join(ConfigRelease, ConfigRelease.id == RegressionRun.release_id)
+            .where(
+                ConfigRelease.company_id == company_id,
+                ConfigRelease.status == "active",
+                RegressionRun.finished_at.is_not(None),
+                RegressionRun.gold_total > 0,
+            )
+            .order_by(RegressionRun.id.desc())
+            .limit(1)
         )
         .mappings()
         .first()
@@ -293,12 +302,10 @@ def _baseline_rate(connection: Any, company_id: int) -> float | None:
 def _changed_keys(connection: Any, company_id: int, values: Mapping[str, Any]) -> list[str]:
     active = (
         connection.execute(
-            text(
-                """SELECT values FROM config_release
-                   WHERE company_id = :company_id AND status = 'active'
-                   ORDER BY id DESC LIMIT 1"""
-            ),
-            {"company_id": company_id},
+            select(ConfigRelease.values)
+            .where(ConfigRelease.company_id == company_id, ConfigRelease.status == "active")
+            .order_by(ConfigRelease.id.desc())
+            .limit(1)
         )
         .mappings()
         .first()
@@ -367,30 +374,25 @@ def _save_report(
         changed = _changed_keys(connection, company_id, values)
         impact = gate.build_impact(changed, regression_failures=report["failures"])
         connection.execute(
-            text(
-                """UPDATE regression_run
-                   SET gold_total = :gold_total, pass_count = :pass_count, fail_count = :fail_count,
-                       baseline_rate = :baseline_rate, anchor_hit = :anchor_hit,
-                       by_field = CAST(:by_field AS JSONB), failures = CAST(:failures AS JSONB),
-                       impact_items = CAST(:impact AS JSONB), finished_at = now()
-                   WHERE id = :run_id"""
-            ),
-            {
-                "run_id": run_id,
-                "gold_total": report["gold_total"],
-                "pass_count": report["pass_count"],
-                "fail_count": report["fail_count"],
-                "baseline_rate": report["baseline_rate"],
-                "anchor_hit": report["anchor_hit"],
-                "by_field": json.dumps(report["by_field"], ensure_ascii=False),
-                "failures": json.dumps(report["failures"], ensure_ascii=False),
-                "impact": json.dumps([entry.as_dict() for entry in impact], ensure_ascii=False),
-            },
+            update(RegressionRun)
+            .where(RegressionRun.id == run_id)
+            .values(
+                gold_total=report["gold_total"],
+                pass_count=report["pass_count"],
+                fail_count=report["fail_count"],
+                baseline_rate=report["baseline_rate"],
+                anchor_hit=report["anchor_hit"],
+                by_field=report["by_field"],
+                failures=report["failures"],
+                impact_items=[entry.as_dict() for entry in impact],
+                finished_at=func.now(),
+            )
         )
         # 指针与报告一起落库：页面上"这个版本的回放报告是哪个"不再靠猜。
         connection.execute(
-            text("UPDATE config_release SET regression_run_id = :run_id WHERE id = :release_id"),
-            {"run_id": run_id, "release_id": release_id},
+            update(ConfigRelease)
+            .where(ConfigRelease.id == release_id)
+            .values(regression_run_id=run_id)
         )
 
 
@@ -399,13 +401,9 @@ def _finish_error(run_id: int, message: str) -> None:
     with _engine.begin() as connection:
         failures = [{"kind": "replay_error", "message": message[:1000]}]
         connection.execute(
-            text(
-                """UPDATE regression_run
-                   SET failures = CAST(:failures AS JSONB), impact_items = '[]'::jsonb,
-                       finished_at = now()
-                   WHERE id = :run_id"""
-            ),
-            {"run_id": run_id, "failures": json.dumps(failures, ensure_ascii=False)},
+            update(RegressionRun)
+            .where(RegressionRun.id == run_id)
+            .values(failures=failures, impact_items=[], finished_at=func.now())
         )
 
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import html
 import json
 import math
@@ -11,6 +10,29 @@ import unicodedata
 from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from typing import Any
+
+from tender.domain.digest import fingerprint
+
+# 分块与去标签的纯规则落 domain，adapters 的检索仓储也要用；这里按用例层的入口再导出。
+from tender.domain.knowledge_text import plain_text, split_elements
+
+__all__ = [
+    "align_citation",
+    "citation",
+    "dedupe_citations",
+    "dedupe_values",
+    "encode",
+    "fingerprint",
+    "keywords",
+    "merge_field_entries",
+    "plain_text",
+    "rank_chunks",
+    "source_signature",
+    "source_state",
+    "split_elements",
+    "validate_items",
+    "value_cores",
+]
 
 CATEGORIES = {"engineering": "工程", "goods": "货物", "service": "服务"}
 TOPICS = {"installation": "安装施工", "commissioning": "调试验收", "maintenance": "运维服务"}
@@ -22,41 +44,35 @@ PURPOSES = {
 }
 
 
-def plain_text(element: Mapping[str, Any]) -> str:
-    # 表格的完整 HTML 与纯文本同时保留信息；不沿用旧抽取的 6000 字截断。
-    source = str(element.get("html") or element.get("text") or "")
-    return html.unescape(re.sub(r"<[^>]+>", " ", source))
+def encode(value: object) -> str:
+    """JSONB 参数与日志正文共用的序列化口径：中文不转义、未知类型落回字符串。"""
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
-def split_elements(elements: Sequence[Mapping[str, Any]], size: int = 1800) -> list[dict]:
-    if size < 200:
-        raise ValueError("分块长度过小")
-    chunks = []
-    chapter = ""
-    for element in elements:
-        content = plain_text(element)
-        if element.get("type") == "title":
-            chapter = content.strip()
-        for start in range(0, len(content), size):
-            end = min(start + size + 150, len(content))
-            if content[start:end].strip():
-                chunks.append(
-                    {
-                        "element_id": element["id"],
-                        "ordinal": len(chunks),
-                        "char_start": start,
-                        "char_end": end,
-                        "chapter": chapter,
-                        "content": content[start:end],
-                    }
-                )
-    return chunks
+def source_state(source: Mapping[str, Any]) -> str:
+    if not source["is_parseable"]:
+        return "unsupported"
+    if source.get("active_job_id"):
+        return "processing"
+    # 转换或提交失败可能尚无 parse_run，必须回显最新文件处理错误，不能一直显示待处理。
+    if source.get("processing_status") in {"failed", "canceled"}:
+        return "failed"
+    if source.get("parse_status") == "completed":
+        return "ready"
+    if source.get("parse_status") == "partial":
+        return "partial"
+    if source.get("parse_status") in {"failed", "canceled"}:
+        return "failed"
+    return "pending"
 
 
-def fingerprint(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
+def source_signature(sources: Sequence[Mapping[str, Any]]) -> str:
+    return fingerprint(
+        [
+            {k: row.get(k) for k in ("source_id", "version_id", "parse_run_id", "sha256", "role")}
+            for row in sources
+        ]
+    )
 
 
 def normalized(text: str) -> str:

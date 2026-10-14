@@ -13,13 +13,14 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.conninfo import make_conninfo
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
+from store import SqlStore
 from test_knowledge_flow import add_source
 
+from tender.adapters.pg.repositories import agent_runtime as run_store
+from tender.adapters.pg.repositories.provider_cooldown import ProviderCooldown
 from tender.api import knowledge, projects
 from tender.application import agent_runtime
 from tender.application.agent_checkpoints import run_async
-from tender.application.knowledge_store import KnowledgeStore
-from tender.application.provider_cooldown import ProviderCooldown
 from tender.core import settings
 from tender.ports.llm import Completion
 from tender.worker import deep_analysis as worker
@@ -95,7 +96,7 @@ def env(monkeypatch):
     engine = create_engine(url, pool_size=10, max_overflow=10)
     with engine.begin() as connection:
         install_data_schema(connection)
-    db = KnowledgeStore(engine, 1)
+    db = SqlStore(engine, 1)
     request = SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(components=SimpleNamespace(engine=engine))),
         headers={},
@@ -109,7 +110,7 @@ def env(monkeypatch):
         options=f"-csearch_path={schema}",
     )
     # 测试锁空间独立于实际 worker，真实报告不会消耗测试配额。
-    monkeypatch.setattr(agent_runtime, "QUOTA_NAMESPACE", 20000000 + int(uuid4().hex[:5], 16))
+    monkeypatch.setattr(run_store, "QUOTA_NAMESPACE", 20000000 + int(uuid4().hex[:5], 16))
     monkeypatch.setattr(worker, "checkpoint_dsn", lambda: dsn)
     monkeypatch.setattr(settings, "company_id", lambda: 1)
 
@@ -148,6 +149,18 @@ def prepared_runtime(env):
         {"id": row["id"]},
     )[0]
     return agent_runtime.AgentRuntime(env.db, row, run, sources)
+
+
+def prepared_runtimes(env, count: int = 1):
+    """同一报告里按模块顺序取前若干个运行账，用于验证同报告内部的抢槽与收殓。"""
+    row = report(env)
+    row, sources = worker.prepare_report(env.db, row)
+    runs = env.db.rows(
+        """SELECT a.* FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
+        WHERE m.report_id=:id ORDER BY a.id""",
+        {"id": row["id"]},
+    )
+    return [agent_runtime.AgentRuntime(env.db, row, run, sources) for run in runs[:count]]
 
 
 def test_hard_quota_across_reports_and_no_lease_theft(env):
@@ -400,7 +413,7 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     assert not env.db.rows(
         "SELECT objid FROM pg_locks WHERE locktype='advisory' AND classid=:ns"
         " AND objsubid=2 AND granted",
-        {"ns": agent_runtime.QUOTA_NAMESPACE},
+        {"ns": run_store.QUOTA_NAMESPACE},
     )
     # 已完成报告的重复派发不能再调用任何模型。
     from tender.worker import knowledge as entry
@@ -822,3 +835,68 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
         ]
         == 40
     )
+
+
+def test_stale_run_without_holder_returns_to_queue(env):
+    """执行者消失（锁已释放、租约过期、状态仍是 running）的运行必须让位。
+
+    现场故障形态：模块异常收尾失败后留下这种僵尸运行，它没有配额锁却被算作
+    「本报告最靠前的待执行运行」，使同报告后面的模块每次抢槽都被拒绝，整份报告
+    永远停在「分析中」。收殓后再争抢，报告才能继续推进。
+    """
+    first, second = prepared_runtimes(env, 2)
+    try:
+        assert first.claim()
+        # 会话锁随进程消失（release 等价于 PostgreSQL 侧自动释放），但状态与租约照现场保留。
+        first.release()
+        env.db.execute(
+            "UPDATE agent_module_run SET lease_until=now()-interval '1 minute' WHERE id=:id",
+            {"id": first.run["id"]},
+        )
+        # 其他模块抢槽时先收殓僵尸：没有执行者也不再有租约的运行回到排队态。
+        assert not second.claim()
+        assert (
+            env.db.rows(
+                "SELECT status, lease_until FROM agent_module_run WHERE id=:id",
+                {"id": first.run["id"]},
+            )[0]["status"]
+            == "pending"
+        )
+        # 收殓后该模块自身可重新领取，报告不会永久卡在等待配额。
+        assert first.claim()
+    finally:
+        first.release()
+        second.release()
+
+
+def test_publish_failure_still_records_terminal_run_state(env, monkeypatch):
+    """成果发布失败不能带走运行终态。
+
+    业务库缺 business_data 等列时 UPDATE analysis_module 必然报错；若它与运行终态
+    同一事务回滚，留下的就是 lease 已过期的 status='running' 僵尸运行。
+    """
+
+    def broken_publish(self, conn, publish):
+        raise RuntimeError('column "business_data" of relation "analysis_module" does not exist')
+
+    runtime = prepared_runtime(env)
+    try:
+        assert runtime.claim()
+        # 成果发布在运行账实现的 savepoint 内，故障点必须注在真正执行发布的仓储上。
+        monkeypatch.setattr(run_store.AgentRunStore, "_publish", broken_publish)
+        runtime.finish("completed", draft={"fields": [], "business_data": {}, "relations": []})
+        run = env.db.rows(
+            """SELECT status, error_message, lease_until, finished_at
+            FROM agent_module_run WHERE id=:id""",
+            {"id": runtime.run["id"]},
+        )[0]
+        assert run["status"] == "failed"
+        assert "模块成果发布失败" in run["error_message"]
+        assert run["lease_until"] is None and run["finished_at"] is not None
+        module = env.db.rows(
+            "SELECT status FROM analysis_module WHERE id=:id", {"id": runtime.run["module_id"]}
+        )[0]
+        # 成果没发布，模块不能对外显示为完成。
+        assert module["status"] == "failed"
+    finally:
+        runtime.release()

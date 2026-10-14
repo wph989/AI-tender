@@ -24,8 +24,10 @@ from tender.worker import tasks
 def test_parse_handoff_clears_dispatch_latch() -> None:
     """转换完成、交接给解析的那条 UPDATE 必须清空 dispatched_at。"""
     source = inspect.getsource(tasks._finish_file_version)
-    assert "stage = :stage" in source, "阶段推进的写法变了，请同步检查本测试的前提"
-    assert "dispatched_at = CASE WHEN :should_parse THEN NULL" in source, (
+    assert "status=status" in source and "stage=stage" in source, (
+        "阶段推进的写法变了，请同步检查本测试的前提"
+    )
+    assert "dispatched_at=case(" in source and "null()" in source, (
         "推进到 submitting 时没有清 dispatched_at：派发闸门会永远看不到这条 job，解析将停在 pending"
     )
 
@@ -35,6 +37,9 @@ def test_latch_is_preserved_when_the_job_stops_here() -> None:
 
     这条 job 会直接以 completed 收尾；把闩锁清掉会让结算口径里的「已派发」对不上，
     也会让后续如果有人重开这一行时误判成「从未派发」。
+
+    ORM 写法下这条不变式落在 `case` 的 `else_` 分支：只有 should_parse 为真才写 NULL，
+    否则必须原样保留 `Job.dispatched_at`。
     """
     source = inspect.getsource(tasks._finish_file_version)
-    assert "ELSE dispatched_at END" in source, "闩锁只应在进入下一阶段时清空，不能无条件清"
+    assert "else_=Job.dispatched_at" in source, "闩锁只应在进入下一阶段时清空，不能无条件清"

@@ -6,31 +6,16 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, insert, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from tender.adapters.pg.models import ConfigAck, ConfigAudit
 from tender.config.gate import ImpactItem
 
 AUDIT_ACTIONS = frozenset({"create", "acknowledge", "activate", "rollback", "force_activate"})
-
-_AUDIT_SQL = """
-    INSERT INTO config_audit (release_id, actor, action, diff, reason)
-    VALUES (:release_id, :actor, :action, CAST(:diff AS JSONB), :reason)
-"""
-
-_ACK_SQL = """
-    INSERT INTO config_ack (release_id, item_kind, item_ref, actor, comment)
-    VALUES (:release_id, :item_kind, :item_ref, :actor, :comment)
-    ON CONFLICT (release_id, item_kind, item_ref) DO NOTHING
-    RETURNING item_kind, item_ref
-"""
-
-_LOAD_ACKS_SQL = """
-    SELECT item_kind, item_ref FROM config_ack WHERE release_id = :release_id
-"""
 
 
 def write_audit(
@@ -45,14 +30,13 @@ def write_audit(
     if action not in AUDIT_ACTIONS:
         raise ValueError(f"未登记的审计动作：{action}")
     connection.execute(
-        text(_AUDIT_SQL),
-        {
-            "release_id": release_id,
-            "actor": actor,
-            "action": action,
-            "diff": json.dumps(dict(diff), ensure_ascii=False),
-            "reason": reason,
-        },
+        insert(ConfigAudit).values(
+            release_id=release_id,
+            actor=actor,
+            action=action,
+            diff=dict(diff),
+            reason=reason,
+        )
     )
 
 
@@ -68,14 +52,16 @@ def insert_acks(
     inserted: list[tuple[str, str]] = []
     for entry in items:
         row = connection.execute(
-            text(_ACK_SQL),
-            {
-                "release_id": release_id,
-                "item_kind": entry.kind,
-                "item_ref": entry.ref,
-                "actor": actor,
-                "comment": comment,
-            },
+            pg_insert(ConfigAck)
+            .values(
+                release_id=release_id,
+                item_kind=entry.kind,
+                item_ref=entry.ref,
+                actor=actor,
+                comment=comment,
+            )
+            .on_conflict_do_nothing(index_elements=["release_id", "item_kind", "item_ref"])
+            .returning(ConfigAck.item_kind, ConfigAck.item_ref)
         ).first()
         if row is not None:
             inserted.append((entry.kind, entry.ref))
@@ -83,5 +69,7 @@ def insert_acks(
 
 
 def load_acks(connection: Connection, release_id: int) -> list[tuple[str, str]]:
-    rows = connection.execute(text(_LOAD_ACKS_SQL), {"release_id": release_id}).all()
+    rows = connection.execute(
+        select(ConfigAck.item_kind, ConfigAck.item_ref).where(ConfigAck.release_id == release_id)
+    ).all()
     return [(str(row[0]), str(row[1])) for row in rows]

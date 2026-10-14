@@ -17,8 +17,10 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, func, select, update
 
+from tender.adapters.pg.models import Job
+from tender.adapters.pg.session import create_pg_engine
 from tender.adapters.redis_cache import RedisConfigCache
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
@@ -26,7 +28,7 @@ from tender.worker.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-_engine: Engine = create_engine(settings.database_url(), pool_pre_ping=True)
+_engine: Engine = create_pg_engine()
 _registry: ConfigRegistry | None = None
 _last_run_at = 0.0
 
@@ -59,32 +61,41 @@ STREAMS: tuple[Stream, ...] = (
     Stream("export", ("exporting",), None, "tender.worker.exports.export_project"),
 )
 
-_INFLIGHT_SQL = """
-    SELECT count(*) FROM job
-    WHERE company_id = :company_id
-      AND status IN ('pending', 'submitting', 'running')
-      AND finished_at IS NULL
-      AND dispatched_at IS NOT NULL
-      AND stage IN ({stages})
-"""
 
-# LIMIT NULL 在 PostgreSQL 里等价于不限量，导出线靠它一次派发完。
-_PENDING_SQL = """
-    SELECT id FROM job
-    WHERE company_id = :company_id
-      AND status = 'pending'
-      AND finished_at IS NULL
-      AND dispatched_at IS NULL
-      AND stage IN ({stages})
-    ORDER BY created_at, id
-    LIMIT :max_rows
-    FOR UPDATE SKIP LOCKED
-"""
+def _inflight_count(stream: Stream, company_id: int) -> Any:
+    """在途计数口径 =「已派发且未结束」（见模块 docstring）。"""
+    return select(func.count()).where(
+        Job.company_id == company_id,
+        Job.status.in_(("pending", "submitting", "running")),
+        Job.finished_at.is_(None),
+        Job.dispatched_at.is_not(None),
+        Job.stage.in_(stream.stages),
+    )
 
-_MARK_DISPATCHED_SQL = """
-    UPDATE job SET dispatched_at = now(), updated_at = now()
-    WHERE id = :job_id AND dispatched_at IS NULL
-"""
+
+def _pending_jobs(stream: Stream, company_id: int, max_rows: int | None) -> Any:
+    """待派发候选：LIMIT NULL 在 PostgreSQL 里等价于不限量，导出线靠它一次派发完。"""
+    return (
+        select(Job.id)
+        .where(
+            Job.company_id == company_id,
+            Job.status == "pending",
+            Job.finished_at.is_(None),
+            Job.dispatched_at.is_(None),
+            Job.stage.in_(stream.stages),
+        )
+        .order_by(Job.created_at, Job.id)
+        .limit(max_rows)
+        .with_for_update(skip_locked=True)
+    )
+
+
+def _mark_dispatched(job_id: str) -> Any:
+    return (
+        update(Job)
+        .where(Job.id == job_id, Job.dispatched_at.is_(None))
+        .values(dispatched_at=func.now(), updated_at=func.now())
+    )
 
 
 def registry() -> ConfigRegistry:
@@ -93,15 +104,6 @@ def registry() -> ConfigRegistry:
     if _registry is None:
         _registry = ConfigRegistry(_engine, RedisConfigCache())
     return _registry
-
-
-def _stage_list(stream: Stream) -> str:
-    """把 stage 常量拼成 IN 列表。
-
-    stage 来自代码里的 `STREAMS`（不是请求参数），拼进 SQL 没有注入面；
-    这样也避免依赖驱动对 Python 数组的适配，换驱动时行为一致。
-    """
-    return ", ".join("'" + stage + "'" for stage in stream.stages)
 
 
 def capacity(limit: int | None, inflight: int) -> int | None:
@@ -120,24 +122,11 @@ def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
     """
     sent = 0
     with _engine.begin() as connection:
-        stages = _stage_list(stream)
-        inflight = int(
-            connection.execute(
-                text(_INFLIGHT_SQL.format(stages=stages)),
-                {"company_id": company_id},
-            ).scalar_one()
-        )
+        inflight = int(connection.execute(_inflight_count(stream, company_id)).scalar_one())
         room = capacity(limit, inflight)
         if room == 0:
             return 0
-        candidates = (
-            connection.execute(
-                text(_PENDING_SQL.format(stages=stages)),
-                {"company_id": company_id, "max_rows": room},
-            )
-            .mappings()
-            .all()
-        )
+        candidates = connection.execute(_pending_jobs(stream, company_id, room)).mappings().all()
         for row in candidates:
             try:
                 celery_app.send_task(stream.task_name, args=[row["id"]])
@@ -145,7 +134,7 @@ def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
                 # broker 不可用时留待下一 tick；已发出去的消息不受影响。
                 logger.warning("派发 %s 任务失败，下个 tick 重试：%s", stream.name, exc)
                 break
-            connection.execute(text(_MARK_DISPATCHED_SQL), {"job_id": row["id"]})
+            connection.execute(_mark_dispatched(row["id"]))
             sent += 1
     return sent
 

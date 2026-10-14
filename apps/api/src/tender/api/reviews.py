@@ -7,8 +7,20 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import func, insert, select, update
 
+from tender.adapters.pg.models import (
+    Document,
+    DocumentVersion,
+    Element,
+    Evidence,
+    Extraction,
+    FieldInstance,
+    GoldItem,
+    ParseRun,
+    ReviewAction,
+    ReviewTask,
+)
 from tender.api.common import engine
 from tender.api.errors import ApiProblem
 from tender.application.extraction import _locate_quote
@@ -65,17 +77,23 @@ def create_review(
     with db.begin() as connection:
         instance = (
             connection.execute(
-                text(
-                    """SELECT fi.id, fi.version_id, fi.field_key, fi.lot_id,
-                              fi.current_extraction_id, d.company_id
-                       FROM field_instance AS fi
-                       JOIN document_version AS v ON v.id = fi.version_id
-                       JOIN document AS d ON d.id = v.document_id
-                       WHERE fi.id = :instance_id AND d.company_id = :company_id
-                         AND d.deleted_at IS NULL
-                       FOR UPDATE OF fi"""
-                ),
-                {"instance_id": instance_id, "company_id": settings.company_id()},
+                select(
+                    FieldInstance.id,
+                    FieldInstance.version_id,
+                    FieldInstance.field_key,
+                    FieldInstance.lot_id,
+                    FieldInstance.current_extraction_id,
+                    Document.company_id,
+                )
+                .select_from(FieldInstance)
+                .join(DocumentVersion, DocumentVersion.id == FieldInstance.version_id)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    FieldInstance.id == instance_id,
+                    Document.company_id == settings.company_id(),
+                    Document.deleted_at.is_(None),
+                )
+                .with_for_update(of=FieldInstance)
             )
             .mappings()
             .first()
@@ -86,14 +104,14 @@ def create_review(
             raise ApiProblem(409, "attempt_not_current", "复核目标已变化，请刷新结果后重试")
         current = (
             connection.execute(
-                text(
-                    """SELECT e.*, pr.config_snapshot AS parse_config
-                       FROM extraction AS e
-                       LEFT JOIN parse_run AS pr ON pr.id = e.run_id
-                       WHERE e.id = :attempt_id AND e.instance_id = :instance_id
-                       FOR UPDATE OF e"""
-                ),
-                {"attempt_id": payload.attempt_id, "instance_id": instance_id},
+                select(Extraction, ParseRun.config_snapshot.label("parse_config"))
+                .select_from(Extraction)
+                .outerjoin(ParseRun, ParseRun.id == Extraction.run_id)
+                .where(
+                    Extraction.id == payload.attempt_id,
+                    Extraction.instance_id == instance_id,
+                )
+                .with_for_update(of=Extraction)
             )
             .mappings()
             .first()
@@ -108,18 +126,21 @@ def create_review(
             for selected in payload.evidence:
                 element = (
                     connection.execute(
-                        text(
-                            """SELECT id, anchor, page_no, bbox_x0, bbox_y0, bbox_x1, bbox_y1,
-                                      text, source
-                               FROM element
-                               WHERE version_id = :version_id AND run_id = :run_id
-                                 AND anchor = :anchor"""
-                        ),
-                        {
-                            "version_id": instance["version_id"],
-                            "run_id": current["run_id"],
-                            "anchor": selected.anchor,
-                        },
+                        select(
+                            Element.id,
+                            Element.anchor,
+                            Element.page_no,
+                            Element.bbox_x0,
+                            Element.bbox_y0,
+                            Element.bbox_x1,
+                            Element.bbox_y1,
+                            Element.text,
+                            Element.source,
+                        ).where(
+                            Element.version_id == instance["version_id"],
+                            Element.run_id == current["run_id"],
+                            Element.anchor == selected.anchor,
+                        )
                     )
                     .mappings()
                     .first()
@@ -170,86 +191,70 @@ def create_review(
         if action in {"correct", "supplement"}:
             previous_id = int(current["id"])
             connection.execute(
-                text("UPDATE extraction SET is_current = false, updated_at = now() WHERE id = :id"),
-                {"id": previous_id},
+                update(Extraction)
+                .where(Extraction.id == previous_id)
+                .values(is_current=False, updated_at=func.now())
             )
             attempt_no = int(
                 connection.execute(
-                    text(
-                        "SELECT COALESCE(max(attempt_no), 0) + 1 FROM extraction "
-                        "WHERE instance_id = :id"
-                    ),
-                    {"id": instance_id},
+                    select(func.coalesce(func.max(Extraction.attempt_no), 0) + 1).where(
+                        Extraction.instance_id == instance_id
+                    )
                 ).scalar_one()
             )
             evidence_count = len(resolved_evidence)
             result_attempt_id = int(
                 connection.execute(
-                    text(
-                        """INSERT INTO extraction
-                               (instance_id, version_id, run_id, attempt_no, machine_attempt_no,
-                                trigger, field_key, group_key, lot_id, value_json, value_text,
-                                confidence, status, strategy, evidence_count, supersedes_id,
-                                is_current, created_by, field_def_version)
-                           VALUES
-                               (:instance_id, :version_id, :run_id, :attempt_no, NULL,
-                                'manual_edit', :field_key, :group_key, :lot_id,
-                                CAST(:value AS JSONB), :value_text, 1, 'verified', 'manual',
-                                :evidence_count, :supersedes_id, true, :actor, 1)
-                           RETURNING id"""
-                    ),
-                    {
-                        "instance_id": instance_id,
-                        "version_id": instance["version_id"],
-                        "run_id": current["run_id"],
-                        "attempt_no": attempt_no,
-                        "field_key": instance["field_key"],
-                        "group_key": current["group_key"],
-                        "lot_id": instance["lot_id"],
-                        "value": json.dumps(payload.new_value, ensure_ascii=False),
-                        "value_text": value_text,
-                        "evidence_count": evidence_count,
-                        "supersedes_id": previous_id,
-                        "actor": actor,
-                    },
+                    insert(Extraction)
+                    .values(
+                        instance_id=instance_id,
+                        version_id=instance["version_id"],
+                        run_id=current["run_id"],
+                        attempt_no=attempt_no,
+                        machine_attempt_no=None,
+                        trigger="manual_edit",
+                        field_key=instance["field_key"],
+                        group_key=current["group_key"],
+                        lot_id=instance["lot_id"],
+                        value_json=payload.new_value,
+                        value_text=value_text,
+                        confidence=1,
+                        status="verified",
+                        strategy="manual",
+                        evidence_count=evidence_count,
+                        supersedes_id=previous_id,
+                        is_current=True,
+                        created_by=actor,
+                        field_def_version=1,
+                    )
+                    .returning(Extraction.id)
                 ).scalar_one()
             )
             for sequence, item in enumerate(resolved_evidence, start=1):
                 element = item["element"]
                 connection.execute(
-                    text(
-                        """INSERT INTO evidence
-                               (extraction_id, version_id, seq, anchor, element_id, page_no,
-                                bbox_x0, bbox_y0, bbox_x1, bbox_y1, char_start, char_end,
-                                quote, quote_source, match_type)
-                           VALUES
-                               (:extraction_id, :version_id, :seq, :anchor, :element_id, :page_no,
-                                :bbox_x0, :bbox_y0, :bbox_x1, :bbox_y1, :char_start, :char_end,
-                                :quote, :quote_source, 'manual')"""
-                    ),
-                    {
-                        "extraction_id": result_attempt_id,
-                        "version_id": instance["version_id"],
-                        "seq": sequence,
-                        "anchor": item["anchor"],
-                        "element_id": element["id"],
-                        "page_no": element["page_no"],
-                        "bbox_x0": element["bbox_x0"],
-                        "bbox_y0": element["bbox_y0"],
-                        "bbox_x1": element["bbox_x1"],
-                        "bbox_y1": element["bbox_y1"],
-                        "char_start": item["char_start"],
-                        "char_end": item["char_end"],
-                        "quote": item["quote"],
-                        "quote_source": element["source"] or "native",
-                    },
+                    insert(Evidence).values(
+                        extraction_id=result_attempt_id,
+                        version_id=instance["version_id"],
+                        seq=sequence,
+                        anchor=item["anchor"],
+                        element_id=element["id"],
+                        page_no=element["page_no"],
+                        bbox_x0=element["bbox_x0"],
+                        bbox_y0=element["bbox_y0"],
+                        bbox_x1=element["bbox_x1"],
+                        bbox_y1=element["bbox_y1"],
+                        char_start=item["char_start"],
+                        char_end=item["char_end"],
+                        quote=item["quote"],
+                        quote_source=element["source"] or "native",
+                        match_type="manual",
+                    )
                 )
             connection.execute(
-                text(
-                    """UPDATE field_instance SET current_extraction_id = :extraction_id
-                       WHERE id = :instance_id"""
-                ),
-                {"extraction_id": result_attempt_id, "instance_id": instance_id},
+                update(FieldInstance)
+                .where(FieldInstance.id == instance_id)
+                .values(current_extraction_id=result_attempt_id)
             )
 
         evidence_json = (
@@ -268,66 +273,45 @@ def create_review(
         )
         review_action_id = int(
             connection.execute(
-                text(
-                    """INSERT INTO review_action
-                           (instance_id, attempt_id, result_attempt_id, action, review_mode,
-                            old_value, new_value, evidence, actor, comment)
-                       VALUES
-                           (:instance_id, :attempt_id, :result_attempt_id, :action, :review_mode,
-                            CAST(:old_value AS JSONB), CAST(:new_value AS JSONB),
-                            CAST(:evidence AS JSONB), :actor, :comment)
-                       RETURNING id"""
-                ),
-                {
-                    "instance_id": instance_id,
-                    "attempt_id": payload.attempt_id,
-                    "result_attempt_id": result_attempt_id,
-                    "action": action,
-                    "review_mode": payload.review_mode,
-                    "old_value": json.dumps(current["value_json"], ensure_ascii=False)
-                    if current["value_json"] is not None
-                    else None,
-                    "new_value": json.dumps(payload.new_value, ensure_ascii=False)
-                    if payload.new_value is not None
-                    else None,
-                    "evidence": json.dumps(evidence_json, ensure_ascii=False)
-                    if evidence_json is not None
-                    else None,
-                    "actor": actor,
-                    "comment": payload.comment.strip() if payload.comment else None,
-                },
+                insert(ReviewAction)
+                .values(
+                    instance_id=instance_id,
+                    attempt_id=payload.attempt_id,
+                    result_attempt_id=result_attempt_id,
+                    action=action,
+                    review_mode=payload.review_mode,
+                    old_value=current["value_json"],
+                    new_value=payload.new_value,
+                    evidence=evidence_json,
+                    actor=actor,
+                    comment=payload.comment.strip() if payload.comment else None,
+                )
+                .returning(ReviewAction.id)
             ).scalar_one()
         )
         connection.execute(
-            text(
-                """UPDATE review_task SET status = 'resolved', resolved_action_id = :action_id,
-                       resolved_at = now()
-                   WHERE extraction_id = :attempt_id AND status = 'open'"""
-            ),
-            {"action_id": review_action_id, "attempt_id": payload.attempt_id},
+            update(ReviewTask)
+            .where(ReviewTask.extraction_id == payload.attempt_id, ReviewTask.status == "open")
+            .values(
+                status="resolved",
+                resolved_action_id=review_action_id,
+                resolved_at=func.now(),
+            )
         )
         if action in {"correct", "supplement"}:
             param_snapshot = (
                 current["parse_config"] if isinstance(current["parse_config"], dict) else {}
             )
             connection.execute(
-                text(
-                    """INSERT INTO gold_item
-                           (source_instance_id, version_id, field_key, expected,
-                            expected_anchors, origin, param_snapshot)
-                       VALUES
-                           (:instance_id, :version_id, :field_key, CAST(:expected AS JSONB),
-                            CAST(:anchors AS TEXT[]), :origin, CAST(:snapshot AS JSONB))"""
-                ),
-                {
-                    "instance_id": instance_id,
-                    "version_id": instance["version_id"],
-                    "field_key": instance["field_key"],
-                    "expected": json.dumps(payload.new_value, ensure_ascii=False),
-                    "anchors": [item["anchor"] for item in resolved_evidence],
-                    "origin": action,
-                    "snapshot": json.dumps(param_snapshot, ensure_ascii=False),
-                },
+                insert(GoldItem).values(
+                    source_instance_id=instance_id,
+                    version_id=instance["version_id"],
+                    field_key=instance["field_key"],
+                    expected=payload.new_value,
+                    expected_anchors=[item["anchor"] for item in resolved_evidence],
+                    origin=action,
+                    param_snapshot=param_snapshot,
+                )
             )
 
     return {

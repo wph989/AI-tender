@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+from store import SqlStore
 from test_knowledge_flow import add_source
 from test_knowledge_flow import environment as environment
 
@@ -20,7 +21,7 @@ from tender.application.analysis_data import (
     prepare_records,
 )
 from tender.application.analysis_data_store import publish_data_snapshot
-from tender.application.knowledge_store import encode
+from tender.application.knowledge import encode
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TENDER_RUN_DB_TESTS") != "1", reason="需要数据库集成验证"
@@ -38,7 +39,9 @@ def basis(environment):
     ))
     knowledge.save_settings(pid, knowledge.AnalysisSettings(category="goods"), request)
     created = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
-    db = knowledge.store(request)
+    store = knowledge.store(request)
+    # 夹具与终态断言要写测试 schema：直连同一批临时表，但展示与发布仍走仓储。
+    db = SqlStore(store.engine, store.company_id)
     source = db.sources(db.collections_for_project(pid))[0]
     block = db.readable_chunks(source)[0]
 

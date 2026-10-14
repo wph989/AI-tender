@@ -4,8 +4,19 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import Text, case, cast, exists, select, true
+from sqlalchemy.orm import aliased
 
+from tender.adapters.pg.models import (
+    Document,
+    DocumentVersion,
+    Evidence,
+    Extraction,
+    Job,
+    ParseRun,
+    ProjectFile,
+    ReviewAction,
+)
 from tender.api.common import configs, engine, project_row, start_rerun
 from tender.api.errors import ApiProblem
 from tender.api.versions import get_extractions
@@ -25,15 +36,15 @@ def _row_for_extraction(request: Request, extraction_id: int) -> dict[str, objec
     with engine(request).connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT e.version_id, e.instance_id, e.is_current
-                       FROM extraction AS e
-                       JOIN document_version AS v ON v.id = e.version_id
-                       JOIN document AS d ON d.id = v.document_id
-                       WHERE e.id = :id AND d.company_id = :company_id
-                         AND d.deleted_at IS NULL"""
-                ),
-                {"id": extraction_id, "company_id": settings.company_id()},
+                select(Extraction.version_id, Extraction.instance_id, Extraction.is_current)
+                .select_from(Extraction)
+                .join(DocumentVersion, DocumentVersion.id == Extraction.version_id)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    Extraction.id == extraction_id,
+                    Document.company_id == settings.company_id(),
+                    Document.deleted_at.is_(None),
+                )
             )
             .mappings()
             .first()
@@ -57,33 +68,52 @@ def get_extraction(extraction_id: int, request: Request) -> dict[str, object]:
 def get_attempts(extraction_id: int, request: Request) -> dict[str, object]:
     selected = _row_for_extraction(request, extraction_id)
     instance_id = int(selected["instance_id"])
+    newer = aliased(Extraction)
+    latest_action = (
+        select(ReviewAction.action.label("action"))
+        .where(ReviewAction.attempt_id == Extraction.id)
+        .order_by(ReviewAction.created_at.desc(), ReviewAction.id.desc())
+        .limit(1)
+        .correlate(Extraction)
+        .lateral("ra")
+    )
+    superseded = (
+        select(newer.id.label("id"))
+        .where(newer.supersedes_id == Extraction.id)
+        .order_by(newer.attempt_no.desc(), newer.id.desc())
+        .limit(1)
+        .correlate(Extraction)
+        .lateral("superseded")
+    )
     with engine(request).connect() as connection:
         rows = (
             connection.execute(
-                text(
-                    """SELECT e.id, e.instance_id, e.run_id, e.attempt_no,
-                              e.machine_attempt_no, e.trigger, e.hint, e.field_key,
-                              e.group_key, e.value_json, e.value_text, e.confidence,
-                              e.status, e.strategy, e.evidence_count, e.is_current,
-                               e.created_at, ra.action AS review_action,
-                               superseded.id AS superseded_by_id
-                       FROM extraction AS e
-                       LEFT JOIN LATERAL (
-                           SELECT action FROM review_action
-                           WHERE attempt_id = e.id
-                           ORDER BY created_at DESC, id DESC LIMIT 1
-                        ) AS ra ON true
-                       LEFT JOIN LATERAL (
-                           SELECT newer.id
-                           FROM extraction AS newer
-                           WHERE newer.supersedes_id = e.id
-                           ORDER BY newer.attempt_no DESC, newer.id DESC
-                           LIMIT 1
-                       ) AS superseded ON true
-                       WHERE e.instance_id = :instance_id
-                       ORDER BY e.attempt_no DESC"""
-                ),
-                {"instance_id": instance_id},
+                select(
+                    Extraction.id,
+                    Extraction.instance_id,
+                    Extraction.run_id,
+                    Extraction.attempt_no,
+                    Extraction.machine_attempt_no,
+                    Extraction.trigger,
+                    Extraction.hint,
+                    Extraction.field_key,
+                    Extraction.group_key,
+                    Extraction.value_json,
+                    Extraction.value_text,
+                    Extraction.confidence,
+                    Extraction.status,
+                    Extraction.strategy,
+                    Extraction.evidence_count,
+                    Extraction.is_current,
+                    Extraction.created_at,
+                    latest_action.c.action.label("review_action"),
+                    superseded.c.id.label("superseded_by_id"),
+                )
+                .select_from(Extraction)
+                .outerjoin(latest_action, true())
+                .outerjoin(superseded, true())
+                .where(Extraction.instance_id == instance_id)
+                .order_by(Extraction.attempt_no.desc())
             )
             .mappings()
             .all()
@@ -91,15 +121,23 @@ def get_attempts(extraction_id: int, request: Request) -> dict[str, object]:
         evidence_rows = (
             (
                 connection.execute(
-                    text(
-                        """SELECT extraction_id, seq, anchor, page_no, bbox_x0, bbox_y0,
-                              bbox_x1, bbox_y1, char_start, char_end, quote,
-                              quote_source, match_type
-                       FROM evidence
-                       WHERE extraction_id = ANY(CAST(:ids AS BIGINT[]))
-                       ORDER BY extraction_id, seq"""
-                    ),
-                    {"ids": [int(row["id"]) for row in rows]},
+                    select(
+                        Evidence.extraction_id,
+                        Evidence.seq,
+                        Evidence.anchor,
+                        Evidence.page_no,
+                        Evidence.bbox_x0,
+                        Evidence.bbox_y0,
+                        Evidence.bbox_x1,
+                        Evidence.bbox_y1,
+                        Evidence.char_start,
+                        Evidence.char_end,
+                        Evidence.quote,
+                        Evidence.quote_source,
+                        Evidence.match_type,
+                    )
+                    .where(Evidence.extraction_id.in_([int(row["id"]) for row in rows]))
+                    .order_by(Evidence.extraction_id, Evidence.seq)
                 )
                 .mappings()
                 .all()
@@ -204,53 +242,61 @@ def rerun_project(
     hint = payload.hint.strip() if payload.hint and payload.hint.strip() else None
     actor = request.headers.get("x-actor", "local-user")[:200]
     with db.connect() as connection:
+        pf = (
+            select(ProjectFile.id.label("id"))
+            .where(
+                ProjectFile.version_id == Extraction.version_id,
+                ProjectFile.project_id == project_id,
+                ProjectFile.deleted_at.is_(None),
+                ProjectFile.is_parseable.is_(True),
+            )
+            .order_by(
+                case((ProjectFile.role == "main", 0), else_=1),
+                ProjectFile.sort_no,
+                ProjectFile.id,
+            )
+            .limit(1)
+            .correlate(Extraction)
+            .lateral("pf")
+        )
+        latest = (
+            select(ParseRun.id.label("id"))
+            .where(ParseRun.version_id == Extraction.version_id)
+            .order_by(ParseRun.created_at.desc(), ParseRun.id.desc())
+            .limit(1)
+            .correlate(Extraction)
+            .lateral("latest")
+        )
+        # 字段类型与「仅失败项」都按需拼条件：空列表 / False 等价于原 SQL 里的
+        # cardinality(...)=0 与 :only_failed = false 短路。
+        conditions = [
+            Extraction.is_current.is_(True),
+            Document.company_id == settings.company_id(),
+            Document.deleted_at.is_(None),
+            Extraction.run_id == latest.c.id,
+            ParseRun.status.in_(("completed", "partial")),
+            ~exists().where(
+                Job.status.in_(("pending", "submitting", "running")),
+                Job.config_snapshot["instance_id"].as_string()
+                == cast(Extraction.instance_id, Text),
+            ),
+        ]
+        if payload.field_keys:
+            conditions.append(Extraction.field_key.in_(payload.field_keys))
+        if payload.only_failed:
+            conditions.append(Extraction.status.in_(("need_review", "conflict", "not_found")))
         candidates = (
             connection.execute(
-                text(
-                    """SELECT e.id
-                       FROM extraction AS e
-                       JOIN document_version AS v ON v.id = e.version_id
-                       JOIN document AS d ON d.id = v.document_id
-                       JOIN parse_run AS pr ON pr.id = e.run_id
-                       JOIN LATERAL (
-                           SELECT project_file.id
-                           FROM project_file
-                           WHERE project_file.version_id = e.version_id
-                             AND project_file.project_id = :project_id
-                             AND project_file.deleted_at IS NULL
-                             AND project_file.is_parseable = true
-                           ORDER BY CASE project_file.role WHEN 'main' THEN 0 ELSE 1 END,
-                                    project_file.sort_no, project_file.id
-                           LIMIT 1
-                       ) AS pf ON true
-                       JOIN LATERAL (
-                           SELECT id FROM parse_run
-                           WHERE version_id = e.version_id
-                           ORDER BY created_at DESC, id DESC LIMIT 1
-                       ) AS latest ON true
-                       WHERE e.is_current = true AND d.company_id = :company_id
-                         AND d.deleted_at IS NULL
-                         AND e.run_id = latest.id
-                         AND pr.status IN ('completed','partial')
-                         AND (cardinality(CAST(:field_keys AS TEXT[])) = 0
-                              OR e.field_key = ANY(CAST(:field_keys AS TEXT[])))
-                         AND (:only_failed = false
-                              OR e.status IN ('need_review','conflict','not_found'))
-                         AND NOT EXISTS (
-                             SELECT 1 FROM job
-                             WHERE job.status IN ('pending','submitting','running')
-                               AND job.config_snapshot->>'instance_id' = e.instance_id::text
-                         )
-                       ORDER BY e.field_key, e.id
-                       LIMIT :limit"""
-                ),
-                {
-                    "project_id": project_id,
-                    "company_id": settings.company_id(),
-                    "field_keys": payload.field_keys,
-                    "only_failed": payload.only_failed,
-                    "limit": payload.limit,
-                },
+                select(Extraction.id)
+                .select_from(Extraction)
+                .join(DocumentVersion, DocumentVersion.id == Extraction.version_id)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .join(ParseRun, ParseRun.id == Extraction.run_id)
+                .join(pf, true())
+                .join(latest, true())
+                .where(*conditions)
+                .order_by(Extraction.field_key, Extraction.id)
+                .limit(payload.limit)
             )
             .scalars()
             .all()

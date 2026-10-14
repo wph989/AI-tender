@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
-import json
 from uuid import uuid4
 
 from fastapi import Request
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, case, func, insert, select, true
 from sqlalchemy.engine import RowMapping
 
+from tender.adapters.pg.locks import acquire_xact_lock
+from tender.adapters.pg.models import (
+    Document,
+    DocumentVersion,
+    Extraction,
+    FieldInstance,
+    Job,
+    ParseRun,
+    Project,
+    ProjectFile,
+)
 from tender.config import schema
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
@@ -51,13 +61,19 @@ def project_row(db: Engine, project_id: int) -> RowMapping:
     with db.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT id, company_id, name, project_no, owner, status, created_at
-                   FROM project
-                   WHERE id = :project_id AND company_id = :company_id
-                     AND deleted_at IS NULL"""
-                ),
-                {"project_id": project_id, "company_id": settings.company_id()},
+                select(
+                    Project.id,
+                    Project.company_id,
+                    Project.name,
+                    Project.project_no,
+                    Project.owner,
+                    Project.status,
+                    Project.created_at,
+                ).where(
+                    Project.id == project_id,
+                    Project.company_id == settings.company_id(),
+                    Project.deleted_at.is_(None),
+                )
             )
             .mappings()
             .first()
@@ -73,21 +89,22 @@ def project_file_row(db: Engine, project_id: int, file_id: int) -> RowMapping:
     with db.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT pf.*, p.company_id, p.deleted_at AS project_deleted_at,
-                          v.original_key AS version_original_key
-                   FROM project_file AS pf
-                   JOIN project AS p ON p.id = pf.project_id
-                   LEFT JOIN document_version AS v ON v.id = pf.version_id
-                   WHERE pf.project_id = :project_id AND pf.id = :file_id
-                     AND p.company_id = :company_id AND p.deleted_at IS NULL
-                     AND pf.deleted_at IS NULL"""
-                ),
-                {
-                    "project_id": project_id,
-                    "file_id": file_id,
-                    "company_id": settings.company_id(),
-                },
+                select(
+                    ProjectFile,
+                    Project.company_id,
+                    Project.deleted_at.label("project_deleted_at"),
+                    DocumentVersion.original_key.label("version_original_key"),
+                )
+                .select_from(ProjectFile)
+                .join(Project, Project.id == ProjectFile.project_id)
+                .outerjoin(DocumentVersion, DocumentVersion.id == ProjectFile.version_id)
+                .where(
+                    ProjectFile.project_id == project_id,
+                    ProjectFile.id == file_id,
+                    Project.company_id == settings.company_id(),
+                    Project.deleted_at.is_(None),
+                    ProjectFile.deleted_at.is_(None),
+                )
             )
             .mappings()
             .first()
@@ -103,16 +120,31 @@ def version_row(db: Engine, version_id: int) -> RowMapping:
     with db.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT v.id, v.document_id, v.version_no, v.sha256, v.pdf_key, v.pdf_sha256,
-                          v.original_key, v.mime, v.size_bytes, v.is_converted, v.converter,
-                          v.converter_version, v.page_count, v.created_at, d.title, d.company_id
-                   FROM document_version AS v
-                   JOIN document AS d ON d.id = v.document_id
-                   WHERE v.id = :version_id AND d.company_id = :company_id
-                     AND d.deleted_at IS NULL"""
-                ),
-                {"version_id": version_id, "company_id": settings.company_id()},
+                select(
+                    DocumentVersion.id,
+                    DocumentVersion.document_id,
+                    DocumentVersion.version_no,
+                    DocumentVersion.sha256,
+                    DocumentVersion.pdf_key,
+                    DocumentVersion.pdf_sha256,
+                    DocumentVersion.original_key,
+                    DocumentVersion.mime,
+                    DocumentVersion.size_bytes,
+                    DocumentVersion.is_converted,
+                    DocumentVersion.converter,
+                    DocumentVersion.converter_version,
+                    DocumentVersion.page_count,
+                    DocumentVersion.created_at,
+                    Document.title,
+                    Document.company_id,
+                )
+                .select_from(DocumentVersion)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    DocumentVersion.id == version_id,
+                    Document.company_id == settings.company_id(),
+                    Document.deleted_at.is_(None),
+                )
             )
             .mappings()
             .first()
@@ -150,42 +182,63 @@ def start_rerun(
     # 先读活动配置（可能走 Redis 缓存）再开事务：不在事务里等网络。
     active_config = configs.active(company)
     job_id = uuid4().hex
+    # 两个 LATERAL 子查询：按版本挑唯一可解析文件、挑最新解析 run，都是 PostgreSQL 侧
+    # 逐行取一的写法，用 lateral() 表达而不是拆成两次往返。
+    pf = (
+        select(ProjectFile.id.label("project_file_id"), ProjectFile.project_id)
+        .join(Project, Project.id == ProjectFile.project_id)
+        .where(
+            ProjectFile.version_id == Extraction.version_id,
+            ProjectFile.deleted_at.is_(None),
+            ProjectFile.is_parseable.is_(True),
+            Project.company_id == company,
+            Project.deleted_at.is_(None),
+        )
+        .order_by(
+            case((ProjectFile.role == "main", 0), else_=1), ProjectFile.sort_no, ProjectFile.id
+        )
+        .limit(1)
+        .correlate(Extraction)
+        .lateral("pf")
+    )
+    latest = (
+        select(ParseRun.id.label("latest_run_id"))
+        .where(ParseRun.version_id == Extraction.version_id)
+        .order_by(ParseRun.created_at.desc(), ParseRun.id.desc())
+        .limit(1)
+        .correlate(Extraction)
+        .lateral("latest")
+    )
     with db.begin() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT e.id, e.instance_id, e.version_id, e.run_id, e.field_key,
-                              e.is_current, fi.lot_id, v.page_count, pf.project_id,
-                              pf.id AS project_file_id, pr.status AS parse_status,
-                              latest.id AS latest_run_id
-                       FROM extraction AS e
-                       JOIN field_instance AS fi ON fi.id = e.instance_id
-                       JOIN document_version AS v ON v.id = e.version_id
-                       JOIN document AS d ON d.id = v.document_id
-                       JOIN parse_run AS pr ON pr.id = e.run_id
-                       JOIN LATERAL (
-                           SELECT project_file.id, project_file.project_id
-                           FROM project_file
-                           JOIN project ON project.id = project_file.project_id
-                           WHERE project_file.version_id = e.version_id
-                             AND project_file.deleted_at IS NULL
-                             AND project_file.is_parseable = true
-                             AND project.company_id = :company_id
-                             AND project.deleted_at IS NULL
-                           ORDER BY CASE project_file.role WHEN 'main' THEN 0 ELSE 1 END,
-                                    project_file.sort_no, project_file.id
-                           LIMIT 1
-                       ) AS pf ON true
-                       LEFT JOIN LATERAL (
-                           SELECT id FROM parse_run
-                           WHERE version_id = e.version_id
-                           ORDER BY created_at DESC, id DESC LIMIT 1
-                       ) AS latest ON true
-                       WHERE e.id = :extraction_id AND d.company_id = :company_id
-                         AND d.deleted_at IS NULL
-                       FOR UPDATE OF e"""
-                ),
-                {"extraction_id": extraction_id, "company_id": settings.company_id()},
+                select(
+                    Extraction.id,
+                    Extraction.instance_id,
+                    Extraction.version_id,
+                    Extraction.run_id,
+                    Extraction.field_key,
+                    Extraction.is_current,
+                    FieldInstance.lot_id,
+                    DocumentVersion.page_count,
+                    pf.c.project_id,
+                    pf.c.project_file_id,
+                    ParseRun.status.label("parse_status"),
+                    latest.c.latest_run_id,
+                )
+                .select_from(Extraction)
+                .join(FieldInstance, FieldInstance.id == Extraction.instance_id)
+                .join(DocumentVersion, DocumentVersion.id == Extraction.version_id)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .join(ParseRun, ParseRun.id == Extraction.run_id)
+                .join(pf, true())
+                .outerjoin(latest, true())
+                .where(
+                    Extraction.id == extraction_id,
+                    Document.company_id == company,
+                    Document.deleted_at.is_(None),
+                )
+                .with_for_update(of=Extraction)
             )
             .mappings()
             .first()
@@ -199,28 +252,23 @@ def start_rerun(
             "partial",
         }:
             raise ApiProblem(409, "anchor_not_found", "解析 run 已变化，请从当前版本重新抽取")
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": f"rerun:{row['instance_id']}"},
-        )
+        acquire_xact_lock(connection, f"rerun:{row['instance_id']}")
         active = connection.execute(
-            text(
-                """SELECT id FROM job
-                   WHERE status IN ('pending','submitting','running')
-                     AND config_snapshot->>'instance_id' = :instance_id
-                   LIMIT 1"""
-            ),
-            {"instance_id": str(row["instance_id"])},
+            select(Job.id)
+            .where(
+                Job.status.in_(("pending", "submitting", "running")),
+                Job.config_snapshot["instance_id"].as_string() == str(row["instance_id"]),
+            )
+            .limit(1)
         ).scalar_one_or_none()
         if active is not None:
             raise ApiProblem(409, "rerun_in_flight", "该字段已有重跑任务进行中", retryable=True)
         next_attempt = int(
             connection.execute(
-                text(
-                    """SELECT COALESCE(max(machine_attempt_no), 0) + 1
-                       FROM extraction WHERE instance_id = :instance_id AND run_id = :run_id"""
-                ),
-                {"instance_id": row["instance_id"], "run_id": row["run_id"]},
+                select(func.coalesce(func.max(Extraction.machine_attempt_no), 0) + 1).where(
+                    Extraction.instance_id == row["instance_id"],
+                    Extraction.run_id == row["run_id"],
+                )
             ).scalar_one()
         )
         trigger = "hinted_rerun" if hint else "user_rerun"
@@ -234,28 +282,19 @@ def start_rerun(
         }
         snapshot_id = configs.snapshot_for_job(connection, active_config)
         connection.execute(
-            text(
-                """INSERT INTO job
-                       (id, company_id, project_id, project_file_id, version_id, run_id,
-                        status, stage, progress, config_snapshot, config_snapshot_id)
-                   VALUES
-                       (:id, :company_id, :project_id, :project_file_id, :version_id, :run_id,
-                        'pending', 'extracting', CAST(:progress AS JSONB),
-                        CAST(:snapshot AS JSONB), :config_snapshot_id)"""
-            ),
-            {
-                "id": job_id,
-                "company_id": company,
-                "project_id": row["project_id"],
-                "project_file_id": row["project_file_id"],
-                "version_id": row["version_id"],
-                "run_id": row["run_id"],
-                "progress": json.dumps(
-                    {"stage": "extracting", "fields_total": 1, "fields_done": 0}
-                ),
-                "snapshot": json.dumps(snapshot, ensure_ascii=False),
-                "config_snapshot_id": snapshot_id,
-            },
+            insert(Job).values(
+                id=job_id,
+                company_id=company,
+                project_id=row["project_id"],
+                project_file_id=row["project_file_id"],
+                version_id=row["version_id"],
+                run_id=row["run_id"],
+                status="pending",
+                stage="extracting",
+                progress={"stage": "extracting", "fields_total": 1, "fields_done": 0},
+                config_snapshot=snapshot,
+                config_snapshot_id=snapshot_id,
+            )
         )
     # 这里不再直接投递：beat 按 extract.max_inflight 差额派发（worker/dispatch.py）。
     return {

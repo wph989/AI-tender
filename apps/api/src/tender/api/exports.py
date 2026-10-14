@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from uuid import uuid4
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response
-from sqlalchemy import text
+from sqlalchemy import any_, case, exists, insert, select, true
+from sqlalchemy.orm import aliased
 
+from tender.adapters.pg.models import (
+    Document,
+    DocumentVersion,
+    Evidence,
+    Extraction,
+    ExtractionConflict,
+    FieldInstance,
+    Job,
+    Lot,
+    ProjectFile,
+    ReviewAction,
+)
 from tender.api.common import engine, project_row
 from tender.api.errors import ApiProblem
 from tender.api.storage import content_disposition
@@ -29,84 +41,129 @@ def _export_rows(
     include: str,
     limit: int,
 ) -> list[dict[str, object]]:
-    clauses = [
-        "file.project_id = :project_id",
-        "file.deleted_at IS NULL",
-        "effective.is_current = true",
+    # effective CTE：把「是否冲突 / 是否已复核」折算成 effective_status。
+    # 只取外层用得到的列，不再 e.* —— extraction 与 field_instance 都有 lot_id，
+    # 原 SQL 的 e.* + fi.lot_id 会让 effective.lot_id 变成歧义列（指定标段导出时必报错）。
+    latest_action = (
+        select(ReviewAction.action.label("action"))
+        .where(ReviewAction.attempt_id == Extraction.id)
+        .order_by(ReviewAction.created_at.desc(), ReviewAction.id.desc())
+        .limit(1)
+        .correlate(Extraction)
+        .lateral("ra")
+    )
+    open_conflict = exists().where(
+        ExtractionConflict.project_id == project_id,
+        ExtractionConflict.status == "open",
+        ExtractionConflict.field_key == Extraction.field_key,
+        ExtractionConflict.lot_id.is_not_distinct_from(FieldInstance.lot_id),
+        Extraction.id == any_(ExtractionConflict.candidate_ids),
+    )
+    effective = (
+        select(
+            Extraction.id,
+            Extraction.version_id,
+            Extraction.instance_id,
+            Extraction.field_key,
+            Extraction.group_key,
+            Extraction.value_text,
+            Extraction.confidence,
+            Extraction.machine_attempt_no,
+            Extraction.is_current,
+            FieldInstance.lot_id,
+            Lot.code.label("lot_code"),
+            case(
+                (open_conflict, "conflict"),
+                (latest_action.c.action == "confirm", "verified"),
+                (latest_action.c.action == "reject", "rejected"),
+                else_=Extraction.status,
+            ).label("effective_status"),
+        )
+        .select_from(Extraction)
+        .join(FieldInstance, FieldInstance.id == Extraction.instance_id)
+        .outerjoin(Lot, Lot.id == FieldInstance.lot_id)
+        .outerjoin(latest_action, true())
+        .cte("effective")
+    )
+    # file LATERAL：挑该版本唯一未被替代的文件；deleted_at 一起取出，
+    # 由外层过滤，等价于原 SQL 里 LATERAL 选行 + WHERE file.deleted_at IS NULL。
+    replacement = aliased(ProjectFile)
+    file_lat = (
+        select(
+            ProjectFile.display_name.label("display_name"),
+            ProjectFile.deleted_at.label("deleted_at"),
+        )
+        .where(
+            ProjectFile.version_id == effective.c.version_id,
+            ProjectFile.project_id == project_id,
+            ~exists().where(
+                replacement.replaces_id == ProjectFile.id,
+                replacement.deleted_at.is_(None),
+            ),
+        )
+        .order_by(
+            case((ProjectFile.role == "main", 0), else_=1),
+            ProjectFile.sort_no,
+            ProjectFile.id,
+        )
+        .limit(1)
+        .correlate(effective)
+        .lateral("file")
+    )
+    review_lat = (
+        select(ReviewAction.comment.label("comment"))
+        .where(
+            ReviewAction.instance_id == effective.c.instance_id,
+            ReviewAction.action.in_(("correct", "supplement")),
+        )
+        .order_by(ReviewAction.created_at.desc(), ReviewAction.id.desc())
+        .limit(1)
+        .correlate(effective)
+        .lateral("review")
+    )
+    conditions = [
+        Document.company_id == company_id,
+        Document.deleted_at.is_(None),
+        file_lat.c.deleted_at.is_(None),
+        effective.c.is_current.is_(True),
     ]
-    params: dict[str, object] = {
-        "project_id": project_id,
-        "company_id": company_id,
-        "limit": limit,
-    }
     if lot_id is not None:
-        clauses.append("effective.lot_id = :lot_id")
-        params["lot_id"] = lot_id
+        conditions.append(effective.c.lot_id == lot_id)
     if include == "review":
-        clauses.append("effective.effective_status IN ('need_review','conflict','not_found')")
+        conditions.append(
+            effective.c.effective_status.in_(("need_review", "conflict", "not_found"))
+        )
     elif include == "verified":
-        clauses.append("effective.effective_status = 'verified'")
+        conditions.append(effective.c.effective_status == "verified")
     rows = (
         connection.execute(  # type: ignore[attr-defined]
-            text(
-                f"""WITH effective AS (
-                    SELECT e.*, fi.lot_id, l.code AS lot_code,
-                           CASE
-                               WHEN EXISTS (
-                                   SELECT 1 FROM extraction_conflict AS ec
-                                   WHERE ec.project_id = :project_id
-                                     AND ec.status = 'open'
-                                     AND ec.field_key = e.field_key
-                                     AND ec.lot_id IS NOT DISTINCT FROM fi.lot_id
-                                     AND e.id = ANY(ec.candidate_ids)
-                               ) THEN 'conflict'
-                               WHEN ra.action = 'confirm' THEN 'verified'
-                               WHEN ra.action = 'reject' THEN 'rejected'
-                               ELSE e.status
-                           -- e.* 已含 status，派生复核状态必须另命名，避免查询列歧义。
-                           END AS effective_status
-                    FROM extraction AS e
-                    JOIN field_instance AS fi ON fi.id = e.instance_id
-                    LEFT JOIN lot AS l ON l.id = fi.lot_id
-                    LEFT JOIN LATERAL (
-                        SELECT action FROM review_action
-                        WHERE attempt_id = e.id
-                        ORDER BY created_at DESC, id DESC LIMIT 1
-                    ) AS ra ON true
-                )
-                SELECT effective.field_key, effective.group_key, effective.value_text,
-                       effective.lot_code, effective.confidence,
-                       effective.effective_status AS status,
-                       effective.machine_attempt_no,
-                       file.display_name, ev.page_no, ev.quote, review.comment
-                FROM effective
-                JOIN document_version AS v ON v.id = effective.version_id
-                JOIN document AS d ON d.id = v.document_id
-                JOIN LATERAL (
-                    SELECT pf.project_id, pf.display_name, pf.deleted_at
-                    FROM project_file AS pf
-                    WHERE pf.version_id = v.id AND pf.project_id = :project_id
-                      AND NOT EXISTS (
-                          SELECT 1 FROM project_file AS replacement
-                          WHERE replacement.replaces_id = pf.id
-                            AND replacement.deleted_at IS NULL
-                      )
-                    ORDER BY CASE pf.role WHEN 'main' THEN 0 ELSE 1 END,
-                             pf.sort_no, pf.id LIMIT 1
-                ) AS file ON true
-                LEFT JOIN evidence AS ev ON ev.extraction_id = effective.id
-                LEFT JOIN LATERAL (
-                    SELECT comment FROM review_action
-                    WHERE instance_id = effective.instance_id
-                      AND action IN ('correct','supplement')
-                    ORDER BY created_at DESC, id DESC LIMIT 1
-                ) AS review ON true
-                WHERE d.company_id = :company_id AND d.deleted_at IS NULL
-                  AND {" AND ".join(clauses)}
-                ORDER BY effective.group_key, effective.field_key, effective.id, ev.seq
-                LIMIT :limit"""
-            ),
-            params,
+            select(
+                effective.c.field_key,
+                effective.c.group_key,
+                effective.c.value_text,
+                effective.c.lot_code,
+                effective.c.confidence,
+                effective.c.effective_status.label("status"),
+                effective.c.machine_attempt_no,
+                file_lat.c.display_name,
+                Evidence.page_no,
+                Evidence.quote,
+                review_lat.c.comment,
+            )
+            .select_from(effective)
+            .join(DocumentVersion, DocumentVersion.id == effective.c.version_id)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .join(file_lat, true())
+            .outerjoin(Evidence, Evidence.extraction_id == effective.c.id)
+            .outerjoin(review_lat, true())
+            .where(*conditions)
+            .order_by(
+                effective.c.group_key,
+                effective.c.field_key,
+                effective.c.id,
+                Evidence.seq,
+            )
+            .limit(limit)
         )
         .mappings()
         .all()
@@ -153,8 +210,7 @@ def export_project(
         lot_id = int(lot)
         with db.connect() as connection:
             belongs = connection.execute(
-                text("SELECT 1 FROM lot WHERE id = :id AND project_id = :project_id"),
-                {"id": lot_id, "project_id": project_id},
+                select(Lot.id).where(Lot.id == lot_id, Lot.project_id == project_id)
             ).scalar_one_or_none()
         if belongs is None:
             raise ApiProblem(404, "not_found", "标段不存在")
@@ -172,12 +228,10 @@ def export_project(
         with db.connect() as connection:
             file_row = (
                 connection.execute(
-                    text(
-                        """SELECT id, version_id FROM project_file
-                           WHERE project_id = :project_id AND deleted_at IS NULL
-                           ORDER BY sort_no, id LIMIT 1"""
-                    ),
-                    {"project_id": project_id},
+                    select(ProjectFile.id, ProjectFile.version_id)
+                    .where(ProjectFile.project_id == project_id, ProjectFile.deleted_at.is_(None))
+                    .order_by(ProjectFile.sort_no, ProjectFile.id)
+                    .limit(1)
                 )
                 .mappings()
                 .first()
@@ -199,25 +253,18 @@ def export_project(
                 connection, active_config
             )
             connection.execute(
-                text(
-                    """INSERT INTO job
-                           (id, company_id, project_id, project_file_id, version_id,
-                            status, stage, progress, config_snapshot, config_snapshot_id)
-                       VALUES
-                           (:id, :company_id, :project_id, :file_id, :version_id,
-                            'pending', 'exporting', CAST(:progress AS JSONB),
-                            CAST(:snapshot AS JSONB), :config_snapshot_id)"""
-                ),
-                {
-                    "id": job_id,
-                    "company_id": settings.company_id(),
-                    "project_id": project_id,
-                    "file_id": file_row["id"],
-                    "version_id": file_row["version_id"],
-                    "progress": json.dumps({"stage": "exporting"}),
-                    "snapshot": json.dumps(snapshot, ensure_ascii=False),
-                    "config_snapshot_id": snapshot_id,
-                },
+                insert(Job).values(
+                    id=job_id,
+                    company_id=settings.company_id(),
+                    project_id=project_id,
+                    project_file_id=file_row["id"],
+                    version_id=file_row["version_id"],
+                    status="pending",
+                    stage="exporting",
+                    progress={"stage": "exporting"},
+                    config_snapshot=snapshot,
+                    config_snapshot_id=snapshot_id,
+                )
             )
         logger.info(
             "项目 Excel 导出已排队",

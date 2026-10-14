@@ -9,14 +9,9 @@ from contextlib import suppress
 from datetime import UTC, datetime
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from sqlalchemy import text
 
 from tender.application.agent_checkpoints import checkpoint_dsn
-from tender.application.agent_runtime import (
-    AgentRuntime,
-    check_report_access,
-    requeue_unlocked_runs,
-)
+from tender.application.agent_runtime import AgentRuntime, check_report_access
 from tender.application.analysis_data_store import publish_data_snapshot
 from tender.application.analysis_research import AgentLimits, ResearchSession
 from tender.application.analysis_skills import MODULES, verify_items
@@ -26,10 +21,10 @@ from tender.application.deep_analysis import (
     invoke_module,
     validate_project_claims,
 )
-from tender.application.knowledge import normalized
+from tender.application.knowledge import encode, normalized, source_state
 from tender.application.knowledge_retrieval import retrieve_chunks
-from tender.application.knowledge_store import KnowledgeStore, encode, source_state
 from tender.core.di import create_embedding_gateway, create_rerank_gateway
+from tender.ports.repository.knowledge import KnowledgeStore
 from tender.worker.extraction import _routing_model
 
 
@@ -54,20 +49,13 @@ def prepare_report(db: KnowledgeStore, report: dict) -> tuple[dict, list[dict]] 
                 for s in sources
             ],
         }
-        db.execute(
-            "UPDATE analysis_report SET coverage=CAST(:coverage AS JSONB) WHERE id=:id",
-            {"id": report["id"], "coverage": encode(coverage)},
-        )
+        db.set_report_coverage(report["id"], coverage)
         if not any(s["project_id"] == report["project_id"] for s in usable) or (
             missing and not report["allow_partial"]
         ):
             if any(source_state(s) in {"failed", "unsupported", "partial"} for s in missing):
                 raise ValueError("项目资料未完整解析，请修复后重试或选择部分分析")
-            db.execute(
-                """UPDATE analysis_report SET lease_until=now()+interval '30 seconds'
-                WHERE id=:id AND status='waiting'""",
-                {"id": report["id"]},
-            )
+            db.defer_report(report["id"], 30)
             return None
         report = report | {
             "source_snapshot": own,
@@ -77,45 +65,23 @@ def prepare_report(db: KnowledgeStore, report: dict) -> tuple[dict, list[dict]] 
     else:
         usable = [s for s in snapshots if source_state(s) in {"ready", "partial"}]
     check_report_access(db, report, usable)
-    with db.engine.begin() as conn:
-        row = conn.execute(
-            text("""UPDATE analysis_report SET status='running',
-            source_snapshot=CAST(:sources AS JSONB),reference_snapshot=CAST(:references AS JSONB)
-            WHERE id=:id AND status IN ('waiting','pending','running') RETURNING id"""),
-            {
-                "id": report["id"],
-                "sources": encode(report["source_snapshot"]),
-                "references": encode(report["reference_snapshot"]),
-            },
-        ).first()
-        if not row:
+    with db.transaction() as session:
+        if not session.start_report(
+            report["id"],
+            source_snapshot=report["source_snapshot"],
+            reference_snapshot=report["reference_snapshot"],
+        ):
             raise InterruptedError("报告已取消")
-        requeue_unlocked_runs(conn, report["id"])
+        session.requeue_unlocked_runs(report["id"])
         # 全部模块先落库，避免控制器中断导致后半模块从未进入运行管理。
-        for key, title in MODULES.items():
-            module = (
-                conn.execute(
-                    text("""INSERT INTO analysis_module(report_id,module_key,title)
-                VALUES (:report,:key,:title) ON CONFLICT(report_id,module_key)
-                DO UPDATE SET title=EXCLUDED.title RETURNING id,status"""),
-                    {"report": report["id"], "key": key, "title": title},
-                )
-                .mappings()
-                .one()
-            )
+        for module in session.ensure_modules(report["id"], MODULES):
             if module["status"] not in {"pending", "running"}:
                 continue
-            conn.execute(
-                text("""INSERT INTO agent_module_run
-                (module_id,company_id,thread_id,limits)
-                VALUES (:module,:company,:thread,CAST(:limits AS JSONB))
-                ON CONFLICT(module_id,attempt) DO NOTHING"""),
-                {
-                    "module": module["id"],
-                    "company": db.company_id,
-                    "thread": f"analysis:{report['id']}:{module['id']}:1",
-                    "limits": encode(report["runtime_settings"]),
-                },
+            session.ensure_module_run(
+                module["id"],
+                company_id=db.company_id,
+                thread_id=f"analysis:{report['id']}:{module['id']}:1",
+                limits=report["runtime_settings"],
             )
     return report, usable
 
@@ -342,25 +308,8 @@ async def execute_module(
                 await task
         canceled = isinstance(exc, (InterruptedError, asyncio.CancelledError))
         status = "canceled" if canceled else "failed"
-        if runtime.lock_connection is not None:
-            await asyncio.to_thread(runtime.finish, status, str(exc)[:1000])
-        else:
-            # 尚在排队的任务也必须形成终态，避免被取消后仍显示等待配额。
-            with db.engine.begin() as conn:
-                changed = conn.execute(
-                    text("""UPDATE agent_module_run SET status=:status,
-                    error_message=:error,finished_at=now() WHERE id=:id AND status='pending'
-                    RETURNING module_id"""),
-                    {"id": module["id"], "status": status, "error": str(exc)[:1000]},
-                ).scalar_one_or_none()
-                if changed:
-                    conn.execute(
-                        text(
-                            "UPDATE analysis_module SET status=:status,error_message=:error"
-                            " WHERE id=:id"
-                        ),
-                        {"id": changed, "status": status, "error": str(exc)[:1000]},
-                    )
+        # 尚在排队的任务也必须形成终态，避免被取消后仍显示等待配额。
+        await asyncio.to_thread(runtime.abandon, status, str(exc)[:1000])
         if isinstance(exc, asyncio.CancelledError):
             raise
 
@@ -385,53 +334,37 @@ async def analyze_report(db: KnowledgeStore, report: dict) -> None:
         if prepared is None:
             return
         report, sources = prepared
-        modules = db.rows(
-            """SELECT a.*,m.module_key FROM agent_module_run a
-            JOIN analysis_module m ON m.id=a.module_id
-            WHERE m.report_id=:id AND a.status IN ('pending','running')
-              AND a.attempt=(SELECT max(attempt) FROM agent_module_run WHERE module_id=m.id)
-            ORDER BY m.id""",
-            {"id": report["id"]},
-        )
+        modules = db.report_active_modules(report["id"])
         tasks = [
             asyncio.create_task(execute_module(db, report, module, sources)) for module in modules
         ]
         while tasks and not all(t.done() for t in tasks):
-            await asyncio.wait(tasks, timeout=1)
-            await asyncio.to_thread(check_report_access, db, report, sources)
-            db.execute(
-                """UPDATE analysis_report SET lease_until=now()+interval '5 minutes'
-                WHERE id=:id AND status='running'""",
-                {"id": report["id"]},
+            done, _ = await asyncio.wait(
+                tasks, timeout=1, return_when=asyncio.FIRST_EXCEPTION
             )
+            # 收尾异常可能留下占据队首的运行，必须先检查异常再续租；等所有模块
+            # 结束才 gather 会让其余模块永久排队，控制器却一直显示仍在执行。
+            for finished_task in done:
+                finished_task.result()
+            await asyncio.to_thread(check_report_access, db, report, sources)
+            await asyncio.to_thread(db.renew_report_lease, report["id"], 300, status="running")
         await asyncio.gather(*tasks)
-        rows = db.rows(
-            "SELECT * FROM analysis_module WHERE report_id=:id ORDER BY id", {"id": report["id"]}
-        )
+        rows = db.report_modules(report["id"])
         partial = report["coverage"].get("partial") or any(r["status"] != "completed" for r in rows)
         completed = any(r["status"] == "completed" for r in rows)
         status = "failed" if not completed else "partial" if partial else "completed"
-        db.execute(
-            """UPDATE analysis_report SET status=:status,summary=CAST(:summary AS JSONB),
-            error_message=:error,finished_at=now(),lease_until=NULL
-            WHERE id=:id AND status='running'""",
-            {
-                "id": report["id"],
-                "status": status,
-                "error": "没有模块完成，请查看各模块错误并补跑" if not completed else None,
-                "summary": encode(summarize(rows)),
-            },
+        db.finish_report(
+            report["id"],
+            status=status,
+            summary=summarize(rows),
+            error="没有模块完成，请查看各模块错误并补跑" if not completed else None,
         )
     except (Exception, asyncio.CancelledError) as exc:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        db.execute(
-            """UPDATE analysis_report SET status='failed',error_message=:error,
-            finished_at=now(),lease_until=NULL WHERE id=:id AND status<>'canceled'""",
-            {"id": report["id"], "error": str(exc)[:1000]},
-        )
+        db.fail_report(report["id"], str(exc)[:1000])
         if isinstance(exc, asyncio.CancelledError):
             raise
     finally:

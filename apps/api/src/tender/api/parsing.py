@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-import json
 from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import case, func, insert, select, update
 
+from tender.adapters.pg.locks import acquire_xact_lock
+from tender.adapters.pg.models import (
+    Extraction,
+    Job,
+    ParseRun,
+    Project,
+    ProjectFile,
+)
 from tender.api.common import configs, engine, version_row
 from tender.api.errors import ApiProblem
 from tender.application.fields import FIELD_BY_KEY, FIELDS
@@ -51,25 +58,36 @@ def _create_parse_job(
     try:
         options = parse_options(
             active_config.resolved if active_config is not None else {},
-            payload.tier, payload.ocr_mode,
+            payload.tier,
+            payload.ocr_mode,
         )
     except ValueError as exc:
         raise ApiProblem(400, "invalid_argument", str(exc)) from exc
     with db.begin() as connection:
         file_row = (
             connection.execute(
-                text(
-                    """SELECT pf.id AS project_file_id, pf.project_id, pf.display_name,
-                              pf.is_parseable, p.company_id
-                       FROM project_file AS pf
-                       JOIN project AS p ON p.id = pf.project_id
-                       WHERE pf.version_id = :version_id AND pf.deleted_at IS NULL
-                         AND p.company_id = :company_id AND p.deleted_at IS NULL
-                       ORDER BY CASE pf.role WHEN 'main' THEN 0 ELSE 1 END,
-                                pf.sort_no, pf.id LIMIT 1
-                       FOR UPDATE OF pf"""
-                ),
-                {"version_id": version_id, "company_id": settings.company_id()},
+                select(
+                    ProjectFile.id.label("project_file_id"),
+                    ProjectFile.project_id,
+                    ProjectFile.display_name,
+                    ProjectFile.is_parseable,
+                    Project.company_id,
+                )
+                .select_from(ProjectFile)
+                .join(Project, Project.id == ProjectFile.project_id)
+                .where(
+                    ProjectFile.version_id == version_id,
+                    ProjectFile.deleted_at.is_(None),
+                    Project.company_id == settings.company_id(),
+                    Project.deleted_at.is_(None),
+                )
+                .order_by(
+                    case((ProjectFile.role == "main", 0), else_=1),
+                    ProjectFile.sort_no,
+                    ProjectFile.id,
+                )
+                .limit(1)
+                .with_for_update(of=ProjectFile)
             )
             .mappings()
             .first()
@@ -77,37 +95,39 @@ def _create_parse_job(
         if file_row is None or not file_row["is_parseable"]:
             raise ApiProblem(409, "version_not_parseable", "该版本没有可解析的项目文件")
         active = connection.execute(
-            text(
-                """SELECT id FROM job
-                   WHERE version_id = :version_id
-                     AND status IN ('pending','submitting','running')
-                   ORDER BY created_at DESC LIMIT 1"""
-            ),
-            {"version_id": version_id},
+            select(Job.id)
+            .where(
+                Job.version_id == version_id,
+                Job.status.in_(("pending", "submitting", "running")),
+            )
+            .order_by(Job.created_at.desc())
+            .limit(1)
         ).scalar_one_or_none()
         if active is not None:
             raise ApiProblem(409, "parse_in_flight", "该版本已有解析任务进行中", retryable=True)
         prior = connection.execute(
-            text(
-                """SELECT id FROM parse_run
-                   WHERE version_id = :version_id
-                     AND status IN ('pending','running','completed','partial')
-                   ORDER BY created_at DESC, id DESC LIMIT 1"""
-            ),
-            {"version_id": version_id},
+            select(ParseRun.id)
+            .where(
+                ParseRun.version_id == version_id,
+                ParseRun.status.in_(("pending", "running", "completed", "partial")),
+            )
+            .order_by(ParseRun.created_at.desc(), ParseRun.id.desc())
+            .limit(1)
         ).scalar_one_or_none()
         if prior is not None and not force:
             raise ApiProblem(409, "parse_exists", "该版本已有解析结果；如需重建请使用 force")
         if force:
             # 新 run 会重建锚点；旧结果保留历史但暂时不能继续作为已确认结果展示。
+            # 原 SQL 里的 FROM field_instance 只是 e.instance_id 的外键回连（无悬空行），
+            # 对结果无影响，故直接按提取行更新。
             connection.execute(
-                text(
-                    """UPDATE extraction AS e SET status = 'need_review', updated_at = now()
-                       FROM field_instance AS fi
-                       WHERE fi.id = e.instance_id AND e.version_id = :version_id
-                         AND e.is_current = true AND e.status = 'verified'"""
-                ),
-                {"version_id": version_id},
+                update(Extraction)
+                .where(
+                    Extraction.version_id == version_id,
+                    Extraction.is_current.is_(True),
+                    Extraction.status == "verified",
+                )
+                .values(status="need_review", updated_at=func.now())
             )
         job_id = f"job_{uuid4().hex}"
         snapshot = {
@@ -121,24 +141,18 @@ def _create_parse_job(
             connection, active_config
         )
         connection.execute(
-            text(
-                """INSERT INTO job
-                       (id, company_id, project_id, project_file_id, version_id,
-                        status, stage, progress, config_snapshot, config_snapshot_id)
-                   VALUES
-                       (:id, :company_id, :project_id, :project_file_id, :version_id,
-                        'pending', 'submitting', '{}'::jsonb, CAST(:snapshot AS JSONB),
-                        :config_snapshot_id)"""
-            ),
-            {
-                "id": job_id,
-                "company_id": company,
-                "project_id": file_row["project_id"],
-                "project_file_id": file_row["project_file_id"],
-                "version_id": version_id,
-                "snapshot": json.dumps(snapshot, ensure_ascii=False),
-                "config_snapshot_id": snapshot_id,
-            },
+            insert(Job).values(
+                id=job_id,
+                company_id=company,
+                project_id=file_row["project_id"],
+                project_file_id=file_row["project_file_id"],
+                version_id=version_id,
+                status="pending",
+                stage="submitting",
+                progress={},
+                config_snapshot=snapshot,
+                config_snapshot_id=snapshot_id,
+            )
         )
     # 这里不再直接投递：闸门在提交侧（worker/dispatch.py），beat 按 parse.max_inflight 差额派发。
     return {
@@ -219,16 +233,25 @@ def extract_version(
     with db.begin() as connection:
         file_row = (
             connection.execute(
-                text(
-                    """SELECT pf.id AS project_file_id, pf.project_id, pf.is_parseable
-                       FROM project_file AS pf
-                       JOIN project AS p ON p.id = pf.project_id
-                       WHERE pf.version_id = :version_id AND pf.deleted_at IS NULL
-                         AND p.company_id = :company_id AND p.deleted_at IS NULL
-                       ORDER BY CASE pf.role WHEN 'main' THEN 0 ELSE 1 END,
-                                pf.sort_no, pf.id LIMIT 1"""
-                ),
-                {"version_id": version_id, "company_id": company},
+                select(
+                    ProjectFile.id.label("project_file_id"),
+                    ProjectFile.project_id,
+                    ProjectFile.is_parseable,
+                )
+                .select_from(ProjectFile)
+                .join(Project, Project.id == ProjectFile.project_id)
+                .where(
+                    ProjectFile.version_id == version_id,
+                    ProjectFile.deleted_at.is_(None),
+                    Project.company_id == company,
+                    Project.deleted_at.is_(None),
+                )
+                .order_by(
+                    case((ProjectFile.role == "main", 0), else_=1),
+                    ProjectFile.sort_no,
+                    ProjectFile.id,
+                )
+                .limit(1)
             )
             .mappings()
             .first()
@@ -237,12 +260,10 @@ def extract_version(
             raise ApiProblem(409, "version_not_parseable", "该版本没有可解析的项目文件")
         run_row = (
             connection.execute(
-                text(
-                    """SELECT id, status FROM parse_run
-                       WHERE version_id = :version_id
-                       ORDER BY created_at DESC, id DESC LIMIT 1"""
-                ),
-                {"version_id": version_id},
+                select(ParseRun.id, ParseRun.status)
+                .where(ParseRun.version_id == version_id)
+                .order_by(ParseRun.created_at.desc(), ParseRun.id.desc())
+                .limit(1)
             )
             .mappings()
             .first()
@@ -255,18 +276,15 @@ def extract_version(
                 retryable=True,
             )
         # 事务级互斥：并发点击不能各排一个抽取 job（与 start_rerun 同一套做法）。
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": f"extract:{version_id}"},
-        )
+        acquire_xact_lock(connection, f"extract:{version_id}")
         active = connection.execute(
-            text(
-                """SELECT id FROM job
-                   WHERE version_id = :version_id AND stage = 'extracting'
-                     AND status IN ('pending','submitting','running')
-                   LIMIT 1"""
-            ),
-            {"version_id": version_id},
+            select(Job.id)
+            .where(
+                Job.version_id == version_id,
+                Job.stage == "extracting",
+                Job.status.in_(("pending", "submitting", "running")),
+            )
+            .limit(1)
         ).scalar_one_or_none()
         if active is not None:
             raise ApiProblem(409, "rerun_in_flight", "该版本已有抽取任务进行中", retryable=True)
@@ -281,28 +299,19 @@ def extract_version(
         }
         snapshot_id = configs(request).snapshot_for_job(connection, active_config)
         connection.execute(
-            text(
-                """INSERT INTO job
-                       (id, company_id, project_id, project_file_id, version_id, run_id,
-                        status, stage, progress, config_snapshot, config_snapshot_id)
-                   VALUES
-                       (:id, :company_id, :project_id, :project_file_id, :version_id, :run_id,
-                        'pending', 'extracting', CAST(:progress AS JSONB),
-                        CAST(:snapshot AS JSONB), :config_snapshot_id)"""
-            ),
-            {
-                "id": job_id,
-                "company_id": company,
-                "project_id": file_row["project_id"],
-                "project_file_id": file_row["project_file_id"],
-                "version_id": version_id,
-                "run_id": run_id,
-                "progress": json.dumps(
-                    {"stage": "extracting", "fields_total": len(keys), "fields_done": 0}
-                ),
-                "snapshot": json.dumps(snapshot, ensure_ascii=False),
-                "config_snapshot_id": snapshot_id,
-            },
+            insert(Job).values(
+                id=job_id,
+                company_id=company,
+                project_id=file_row["project_id"],
+                project_file_id=file_row["project_file_id"],
+                version_id=version_id,
+                run_id=run_id,
+                status="pending",
+                stage="extracting",
+                progress={"stage": "extracting", "fields_total": len(keys), "fields_done": 0},
+                config_snapshot=snapshot,
+                config_snapshot_id=snapshot_id,
+            )
         )
     # 不直接投递：beat 按 extract.max_inflight 差额派发（worker/dispatch.py）。
     return {

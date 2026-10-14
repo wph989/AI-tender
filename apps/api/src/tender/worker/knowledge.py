@@ -4,20 +4,29 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import select
+from sqlalchemy.orm import aliased
 
+from tender.adapters.pg.models import (
+    KnowledgeCollection,
+    KnowledgeIndex,
+    KnowledgeSource,
+)
+from tender.adapters.pg.repositories.knowledge import KnowledgeStore
+from tender.adapters.pg.repositories.model_test import maintain_model_tests
+from tender.adapters.pg.session import create_pg_engine
+from tender.application.knowledge import source_state
 from tender.application.knowledge_retrieval import retrieve_chunks
-from tender.application.knowledge_store import KnowledgeStore, encode, source_state
 from tender.application.llm_routing import RoutingModel
-from tender.application.model_test_maintenance import maintain_model_tests
 from tender.application.qa_agent import answer_with_agent
 from tender.core import settings
 from tender.core.di import create_embedding_gateway, create_rerank_gateway
 from tender.worker.celery_app import celery_app
 from tender.worker.extraction import _advisory_lock, _routing_model
 
-_engine = create_engine(settings.database_url(), pool_pre_ping=True)
+_engine = create_pg_engine()
 
 
 def _store() -> KnowledgeStore:
@@ -28,22 +37,19 @@ def _model(feature: str, **limits) -> RoutingModel:
     return _routing_model(feature, feature, **limits)
 
 
-def _touch(table: str, record_id: int) -> None:
-    # 表名只来自本模块常量，不能将外部传入的表名拼进 SQL。
-    _store().execute(
-        f"UPDATE {table} SET lease_until=now()+interval '5 minutes' WHERE id=:id", {"id": record_id}
-    )
-    if table == "analysis_report":
-        rows = _store().rows("SELECT status FROM analysis_report WHERE id=:id", {"id": record_id})
-        if not rows or rows[0]["status"] == "canceled":
-            raise InterruptedError("分析已取消")
-
-
-def _finish(table: str, record_id: int, status: str, error: str | None = None) -> None:
-    _store().execute(
-        f"""UPDATE {table} SET status=:status,error_message=:error,
-        finished_at=now(),lease_until=NULL WHERE id=:id AND status<>'canceled' """,
-        {"id": record_id, "status": status, "error": error},
+def _scope(model: Any, company_id: int) -> Any:
+    """三张任务表共用一段派发逻辑：只有 knowledge_index 需顺着来源回查所属公司。"""
+    if model is not KnowledgeIndex:
+        return model.company_id == company_id
+    scoped = aliased(KnowledgeIndex)
+    return KnowledgeIndex.id.in_(
+        select(scoped.id)
+        .join(KnowledgeSource, KnowledgeSource.id == scoped.source_id)
+        .join(KnowledgeCollection, KnowledgeCollection.id == KnowledgeSource.collection_id)
+        .where(
+            KnowledgeCollection.company_id == company_id,
+            KnowledgeCollection.deleted_at.is_(None),
+        )
     )
 
 
@@ -54,57 +60,17 @@ def dispatch_knowledge() -> None:
             return
         db = _store()
         maintain_model_tests(_engine)
-        collections = db.rows("""SELECT k.id FROM knowledge_collection k
-            JOIN project p ON p.id=k.upload_project_id
-            WHERE k.company_id=:company_id AND k.deleted_at IS NULL AND p.deleted_at IS NULL""")
-        for source in db.sources([r["id"] for r in collections]):
+        for source in db.sources(db.collections_pending_index()):
             if source_state(source) not in {"ready", "partial"} or source["index_id"]:
                 continue
-            db.execute(
-                """INSERT INTO knowledge_index (source_id,version_id,run_id)
-                VALUES (:source,:version,:run)""",
-                {
-                    "source": source["source_id"],
-                    "version": source["version_id"],
-                    "run": source["parse_run_id"],
-                },
-            )
+            db.create_index(source)
         # 小批次派发限制消息积压；长任务定期续约，重复消息由会话锁拒绝。
-        for table, task in (
-            ("knowledge_index", "build_index"),
-            ("analysis_report", "analyze_project"),
-            ("knowledge_answer", "answer_question"),
+        for kind, task in (
+            ("index", "build_index"),
+            ("report", "analyze_project"),
+            ("answer", "answer_question"),
         ):
-            ownership = (
-                "id IN (SELECT i.id FROM knowledge_index i "
-                "JOIN knowledge_source s ON s.id=i.source_id "
-                "JOIN knowledge_collection k ON k.id=s.collection_id "
-                "WHERE k.company_id=:company AND k.deleted_at IS NULL)"
-                if table == "knowledge_index"
-                else "company_id=:company"
-            )
-            with _engine.begin() as connection:
-                ids = (
-                    connection.execute(
-                        text(f"""SELECT id FROM {table}
-                    WHERE status IN ('pending','waiting','running')
-                      AND {ownership}
-                      AND (lease_until IS NULL OR lease_until<now()) ORDER BY id LIMIT 2
-                    FOR UPDATE SKIP LOCKED"""),
-                        {"company": settings.company_id()},
-                    )
-                    .scalars()
-                    .all()
-                )
-                for record_id in ids:
-                    connection.execute(
-                        text(
-                            f"UPDATE {table} SET lease_until=now()+interval '5 minutes' "
-                            "WHERE id=:id"
-                        ),
-                        {"id": record_id},
-                    )
-            for record_id in ids:
+            for record_id in db.claim_dispatchable(kind, 2):
                 celery_app.send_task(f"tender.worker.knowledge.{task}", args=[record_id])
 
 
@@ -117,16 +83,9 @@ def build_index(index_id: int) -> None:
 
 async def _build_index(index_id: int) -> None:
     db = _store()
-    rows = db.rows(
-        """SELECT i.*,s.collection_id FROM knowledge_index i
-        JOIN knowledge_source s ON s.id=i.source_id
-        JOIN knowledge_collection k ON k.id=s.collection_id
-        WHERE i.id=:id AND k.company_id=:company_id""",
-        {"id": index_id},
-    )
-    if not rows or rows[0]["status"] not in {"pending", "running"}:
+    index = db.index_for_build(index_id)
+    if index is None or index["status"] not in {"pending", "running"}:
         return
-    index = rows[0]
     client = None
     try:
         db.collection(index["collection_id"])
@@ -140,7 +99,7 @@ async def _build_index(index_id: int) -> None:
         )
         if source is None:
             raise ValueError("资料已更新或删除，请使用最新解析结果重建索引")
-        db.execute("UPDATE knowledge_index SET status='running' WHERE id=:id", {"id": index_id})
+        db.mark_index_running(index_id)
         chunks = db.readable_chunks(source)
         if not chunks:
             raise ValueError("解析结果没有可索引的文字，请检查原文或使用 OCR 重新解析")
@@ -150,37 +109,15 @@ async def _build_index(index_id: int) -> None:
             client = create_embedding_gateway(config)
             vectors = []
             for start in range(0, len(chunks), 16):
-                _touch("knowledge_index", index_id)
+                db.renew_lease("index", index_id)
                 vectors.extend(
                     await client.embed([r["content"] for r in chunks[start : start + 16]])
                 )
             if vectors and any(len(v) != len(vectors[0]) for v in vectors):
                 raise ValueError("向量模型在索引期间改变了维度")
-        with _engine.begin() as connection:
-            connection.execute(
-                text("DELETE FROM knowledge_chunk WHERE index_id=:id"), {"id": index_id}
-            )
-            for i, chunk in enumerate(chunks):
-                connection.execute(
-                    text("""INSERT INTO knowledge_chunk
-                    (index_id,element_id,ordinal,char_start,char_end,chapter,content,embedding)
-                    VALUES (:id,:element_id,:ordinal,:char_start,:char_end,
-                            :chapter,:content,:embedding)"""),
-                    {**chunk, "id": index_id, "embedding": vectors[i] if vectors else None},
-                )
-            connection.execute(
-                text("""UPDATE knowledge_index SET status='completed',
-                embedding_model_id=:model,embedding_signature=:signature,dimension=:dimension,
-                error_message=NULL,finished_at=now(),lease_until=NULL WHERE id=:id"""),
-                {
-                    "id": index_id,
-                    "model": config["id"] if config else None,
-                    "signature": config["signature"] if config else None,
-                    "dimension": len(vectors[0]) if vectors else None,
-                },
-            )
+        db.complete_index(index_id, chunks=chunks, vectors=vectors, config=config)
     except Exception as exc:
-        _finish("knowledge_index", index_id, "failed", str(exc)[:1000])
+        db.finish_task("index", index_id, "failed", str(exc)[:1000])
     finally:
         if client:
             await client.aclose()
@@ -197,20 +134,31 @@ def analyze_project(report_id: int) -> None:
 
 async def _analyze_project(report_id: int) -> None:
     db = _store()
-    rows = db.rows(
-        """SELECT r.* FROM analysis_report r JOIN project p ON p.id=r.project_id
-        WHERE r.id=:id AND r.company_id=:company_id AND p.deleted_at IS NULL""",
-        {"id": report_id},
-    )
-    if not rows or rows[0]["status"] not in {"waiting", "pending", "running"}:
+    if db.accessible_report_status(report_id) not in {"waiting", "pending", "running"}:
         return
-    report = rows[0]
     from tender.application.deep_analysis import RUNTIME_VERSION
+    from tender.application.schema_guard import missing_schema
     from tender.worker.deep_analysis import analyze_report
 
+    # ORM 全列读取也会访问新列，所以先只读旧版已有的状态列，再核对结构；
+    # 否则缺列异常会在门禁前抛出，报告无法记录失败原因并结束派发。
+    absent = missing_schema(db)
+    if absent:
+        db.finish_task(
+            "report",
+            report_id,
+            "failed",
+            "数据库结构落后于当前代码，请先执行数据库迁移；缺少 " + "、".join(absent),
+        )
+        return
+    report = db.report_for_analysis(report_id)
+    if report is None or report["status"] not in {"waiting", "pending", "running"}:
+        return
     # 旧的固定字段解析流程已下线：历史报告只读展示，不能继续执行；版本不一致同样拒绝。
     if report["runtime_version"] != RUNTIME_VERSION:
-        _finish("analysis_report", report_id, "failed", "报告使用已下线的解析流程，请重新发起分析")
+        db.finish_task(
+            "report", report_id, "failed", "报告使用已下线的解析流程，请重新发起分析"
+        )
         return
     await analyze_report(db, report)
 
@@ -227,14 +175,7 @@ def graph_expand(
     db: KnowledgeStore, project_id: int, hits: list[dict], sources: list[dict]
 ) -> tuple[list[dict], list[dict]]:
     source_runs = {(s["source_id"], s["parse_run_id"]) for s in sources}
-    relations = db.rows(
-        """SELECT rel.* FROM knowledge_relation rel
-        JOIN analysis_report r ON r.id=rel.report_id JOIN project p ON p.id=r.project_id
-        WHERE r.project_id=:project AND r.company_id=:company_id AND p.deleted_at IS NULL
-          AND rel.verified AND r.id=(SELECT max(id) FROM analysis_report
-              WHERE project_id=:project AND status IN ('completed','partial'))""",
-        {"project": project_id},
-    )
+    relations = db.verified_relations(project_id)
     relations = [
         r
         for r in relations
@@ -287,12 +228,9 @@ def answer_question(answer_id: int) -> None:
 
 async def _answer_question(answer_id: int) -> None:
     db = _store()
-    answers = db.rows(
-        "SELECT * FROM knowledge_answer WHERE id=:id AND company_id=:company_id", {"id": answer_id}
-    )
-    if not answers or answers[0]["status"] not in {"pending", "running"}:
+    answer = db.answer(answer_id)
+    if answer is None or answer["status"] not in {"pending", "running"}:
         return
-    answer = answers[0]
     try:
         ids = answer["collection_ids"]
         if answer["project_id"] and set(ids) - set(
@@ -302,17 +240,17 @@ async def _answer_question(answer_id: int) -> None:
         for cid in ids:
             db.collection(cid)
         sources = answer["snapshot"]["sources"]
-        db.execute("UPDATE knowledge_answer SET status='running' WHERE id=:id", {"id": answer_id})
+        db.mark_answer_running(answer_id)
 
         async def authorize() -> None:
-            await asyncio.to_thread(_touch, "knowledge_answer", answer_id)
+            await asyncio.to_thread(db.renew_lease, "answer", answer_id)
 
         async def retrieve_selected(selected: list[dict], query: str):
             return await retrieve_chunks(
                 db,
                 selected,
                 query,
-                lambda: _touch("knowledge_answer", answer_id),
+                lambda: db.renew_lease("answer", answer_id),
                 create_embedding_gateway,
                 create_rerank_gateway,
             )
@@ -360,17 +298,7 @@ async def _answer_question(answer_id: int) -> None:
             "graph_relation_count": len(graph_relations),
             "no_evidence": not bool(items),
         }
-        db.execute(
-            """UPDATE knowledge_answer SET items=CAST(:items AS JSONB),
-            relations=CAST(:relations AS JSONB),
-            snapshot=CAST(:snapshot AS JSONB) WHERE id=:id""",
-            {
-                "id": answer_id,
-                "items": encode(items),
-                "relations": encode(relations),
-                "snapshot": encode(snapshot),
-            },
-        )
-        _finish("knowledge_answer", answer_id, "completed")
+        db.save_answer(answer_id, items=items, relations=relations, snapshot=snapshot)
+        db.finish_task("answer", answer_id, "completed")
     except Exception as exc:
-        _finish("knowledge_answer", answer_id, "failed", str(exc)[:1000])
+        db.finish_task("answer", answer_id, "failed", str(exc)[:1000])

@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine
 
 from tender.adapters.celery_queue import CeleryTaskQueue
 from tender.adapters.gotenberg import GotenbergConverter
 from tender.adapters.openai_chat import OpenAIChatModel
 from tender.adapters.openai_embedding import OpenAIEmbeddingModel
+from tender.adapters.pg.session import create_pg_engine
 from tender.adapters.provider_image import ProviderImageModel
 from tender.adapters.redis_cache import RedisConfigCache
 from tender.adapters.rerank_http import HttpRerankModel
@@ -121,7 +122,7 @@ class ApiComponents:
 def create_api_components() -> ApiComponents:
     credentials = settings.gotenberg_credentials()
     blobs = S3BlobStore()
-    engine = create_engine(settings.database_url(), pool_pre_ping=True)
+    engine = create_pg_engine()
     return ApiComponents(
         engine=engine,
         blobs=blobs,

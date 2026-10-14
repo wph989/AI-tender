@@ -11,20 +11,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Connection, Engine, text
+from sqlalchemy import Connection, Engine, select
 
+from tender.adapters.pg.models import ConfigRelease
 from tender.config import schema
 from tender.config.snapshot import save_snapshot
 from tender.core import settings
 from tender.ports.config_cache import ConfigCache
-
-_ACTIVE_SQL = """
-    SELECT id, version_no, values
-    FROM config_release
-    WHERE company_id = :company_id AND status = 'active'
-    ORDER BY id DESC
-    LIMIT 1
-"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +103,17 @@ class ConfigRegistry:
     def _load(self, company_id: int) -> dict[str, Any] | None:
         with self._engine.connect() as connection:
             row = (
-                connection.execute(text(_ACTIVE_SQL), {"company_id": company_id}).mappings().first()
+                connection.execute(
+                    select(ConfigRelease.id, ConfigRelease.version_no, ConfigRelease.values)
+                    .where(
+                        ConfigRelease.company_id == company_id,
+                        ConfigRelease.status == "active",
+                    )
+                    .order_by(ConfigRelease.id.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .first()
             )
         if row is None:
             return None

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
@@ -14,11 +13,38 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import (
+    ARRAY,
+    BigInteger,
+    Text,
+    bindparam,
+    case,
+    exists,
+    func,
+    insert,
+    literal,
+    null,
+    select,
+    update,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from tender.adapters.gotenberg import GotenbergConverter
 from tender.adapters.mineru import MinerUParser
 from tender.adapters.pdfium import InvalidPdfError, PdfInspection, inspect_pdf
+from tender.adapters.pg.locks import acquire_lock, release_lock, try_acquire_lock
+from tender.adapters.pg.models import (
+    Document,
+    DocumentVersion,
+    Element,
+    Job,
+    Page,
+    ParseRun,
+    Project,
+    ProjectFile,
+)
+from tender.adapters.pg.session import create_pg_engine
 from tender.adapters.s3 import S3BlobStore
 from tender.application.middle_json import NormalizedElement, normalize_middle_json
 from tender.config.registry import ConfigRegistry
@@ -34,7 +60,7 @@ from tender.domain.errors import (
 from tender.ports.blob_store import BlobNotFound, BlobStoreError
 from tender.worker.celery_app import celery_app
 
-_engine = create_engine(settings.database_url(), pool_pre_ping=True)
+_engine = create_pg_engine()
 
 
 def _store() -> S3BlobStore:
@@ -56,23 +82,33 @@ def _job(job_id: str) -> Mapping[str, Any] | None:
     with _engine.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT j.*, v.pdf_key, v.pdf_sha256, v.page_count AS version_page_count,
-                          pf.display_name, d.company_id AS document_company_id,
-                          r.provider_job_id, r.provider_version, r.started_at
-                   FROM job AS j
-                   JOIN document_version AS v ON v.id = j.version_id
-                   JOIN project_file AS pf ON pf.id = j.project_file_id
-                   JOIN document AS d ON d.id = v.document_id
-                   LEFT JOIN parse_run AS r ON r.id = j.run_id
-                   WHERE j.id = :job_id"""
-                ),
-                {"job_id": job_id},
+                select(
+                    Job,
+                    DocumentVersion.pdf_key,
+                    DocumentVersion.pdf_sha256,
+                    DocumentVersion.page_count.label("version_page_count"),
+                    ProjectFile.display_name,
+                    Document.company_id.label("document_company_id"),
+                    ParseRun.provider_job_id,
+                    ParseRun.provider_version,
+                    ParseRun.started_at,
+                )
+                .select_from(Job)
+                .join(DocumentVersion, DocumentVersion.id == Job.version_id)
+                .join(ProjectFile, ProjectFile.id == Job.project_file_id)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .outerjoin(ParseRun, ParseRun.id == Job.run_id)
+                .where(Job.id == job_id)
             )
             .mappings()
             .first()
         )
     return row
+
+
+def _jsonb(value: Any) -> Any:
+    """Python 对象 → JSONB 绑定参数，用于 `col || :value` 这类 JSONB 合并。"""
+    return literal(value, type_=JSONB)
 
 
 def _retry_delay(retries: int) -> int:
@@ -83,29 +119,17 @@ def _retry_delay(retries: int) -> int:
 def _advisory_lock(lock_key: str, *, wait: bool) -> Iterator[bool]:
     """用数据库会话锁协调重复投递，进程退出后锁会自动释放。"""
     with _engine.connect() as connection:
-        params = {"lock_key": lock_key}
         if wait:
-            connection.execute(
-                text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"),
-                params,
-            )
+            acquire_lock(connection, lock_key)
             acquired = True
         else:
-            acquired = bool(
-                connection.execute(
-                    text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
-                    params,
-                ).scalar_one()
-            )
+            acquired = try_acquire_lock(connection, lock_key)
         connection.commit()
         try:
             yield acquired
         finally:
             if acquired:
-                connection.execute(
-                    text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-                    params,
-                )
+                release_lock(connection, lock_key)
                 connection.commit()
 
 
@@ -135,17 +159,21 @@ def _file_job(job_id: str) -> Mapping[str, Any] | None:
     with _engine.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT j.*, pf.original_key, pf.sha256 AS source_sha256,
-                          pf.mime AS source_mime, pf.size_bytes AS source_size_bytes,
-                          pf.display_name, pf.replaces_id, p.project_no,
-                          p.company_id AS project_company_id
-                   FROM job AS j
-                   JOIN project_file AS pf ON pf.id = j.project_file_id
-                   JOIN project AS p ON p.id = j.project_id
-                   WHERE j.id = :job_id"""
-                ),
-                {"job_id": job_id},
+                select(
+                    Job,
+                    ProjectFile.original_key,
+                    ProjectFile.sha256.label("source_sha256"),
+                    ProjectFile.mime.label("source_mime"),
+                    ProjectFile.size_bytes.label("source_size_bytes"),
+                    ProjectFile.display_name,
+                    ProjectFile.replaces_id,
+                    Project.project_no,
+                    Project.company_id.label("project_company_id"),
+                )
+                .select_from(Job)
+                .join(ProjectFile, ProjectFile.id == Job.project_file_id)
+                .join(Project, Project.id == Job.project_id)
+                .where(Job.id == job_id)
             )
             .mappings()
             .first()
@@ -161,20 +189,23 @@ def _version_candidate(
     with _engine.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT id, document_id, pdf_key, pdf_sha256, converter,
-                          converter_version, is_converted, page_count
-                   FROM document_version
-                   WHERE company_id = :company_id AND sha256 = :sha256
-                     AND converter_version IS NOT DISTINCT FROM :converter_version
-                   ORDER BY id
-                   LIMIT 1"""
-                ),
-                {
-                    "company_id": company_id,
-                    "sha256": source_sha256,
-                    "converter_version": converter_version,
-                },
+                select(
+                    DocumentVersion.id,
+                    DocumentVersion.document_id,
+                    DocumentVersion.pdf_key,
+                    DocumentVersion.pdf_sha256,
+                    DocumentVersion.converter,
+                    DocumentVersion.converter_version,
+                    DocumentVersion.is_converted,
+                    DocumentVersion.page_count,
+                )
+                .where(
+                    DocumentVersion.company_id == company_id,
+                    DocumentVersion.sha256 == source_sha256,
+                    DocumentVersion.converter_version.is_not_distinct_from(converter_version),
+                )
+                .order_by(DocumentVersion.id)
+                .limit(1)
             )
             .mappings()
             .first()
@@ -189,12 +220,11 @@ def _geometry_is_complete(version: Mapping[str, Any]) -> bool:
     with _engine.connect() as connection:
         counts = (
             connection.execute(
-                text(
-                    """SELECT count(*) AS count, min(page_no) AS first_page,
-                          max(page_no) AS last_page
-                   FROM page WHERE version_id = :version_id"""
-                ),
-                {"version_id": version["id"]},
+                select(
+                    func.count().label("count"),
+                    func.min(Page.page_no).label("first_page"),
+                    func.max(Page.page_no).label("last_page"),
+                ).where(Page.version_id == version["id"])
             )
             .mappings()
             .one()
@@ -241,12 +271,22 @@ def _runtime_values(row: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _execution_start(job_id: str, phase: str) -> datetime:
     """阶段首启时间持久化，进程恢复和消息重试都不能重新获得完整总时限。"""
+    # progress 里已有的 <phase>_started_at 保留（重试不能重置预算），没有就写 now()。
+    key = bindparam("progress_key", phase + "_started_at", type_=Text)
+    path = bindparam("progress_path", [phase + "_started_at"], type_=ARRAY(Text))
     with _engine.begin() as connection:
         value = connection.execute(
-            text("""UPDATE job SET progress=jsonb_set(progress, ARRAY[:key],
-                COALESCE(progress->:key, to_jsonb(now())), true)
-                WHERE id=:id RETURNING progress->>:key"""),
-            {"id": job_id, "key": phase + "_started_at"},
+            update(Job)
+            .where(Job.id == job_id)
+            .values(
+                progress=func.jsonb_set(
+                    Job.progress,
+                    path,
+                    func.coalesce(Job.progress.op("->")(key), func.to_jsonb(func.now())),
+                    True,
+                )
+            )
+            .returning(Job.progress.op("->>")(key))
         ).scalar_one()
     return datetime.fromisoformat(value)
 
@@ -267,7 +307,7 @@ def _poll_delay(values: Mapping[str, Any], attempts: int) -> float:
     maximum = int(values["job.poll.max_interval_ms"])
     # 达到最大间隔后不再计算巨大幂，次数预算调大也不会使退避计算溢出。
     exponent = min(max(0, attempts), max(0, (maximum // initial).bit_length()))
-    return min(maximum, initial * 2 ** exponent) / 1000
+    return min(maximum, initial * 2**exponent) / 1000
 
 
 def _finish_file_version(
@@ -289,75 +329,56 @@ def _finish_file_version(
             replaces_id = row["replaces_id"]
             if replaces_id is not None:
                 document_id = connection.execute(
-                    text(
-                        """SELECT dv.document_id
-                           FROM project_file AS old
-                           JOIN project AS p ON p.id = old.project_id
-                           LEFT JOIN document_version AS dv ON dv.id = old.version_id
-                           WHERE old.id = :file_id AND old.project_id = :project_id
-                             AND p.company_id = :company_id"""
-                    ),
-                    {
-                        "file_id": replaces_id,
-                        "project_id": row["project_id"],
-                        "company_id": row["project_company_id"],
-                    },
+                    select(DocumentVersion.document_id)
+                    .select_from(ProjectFile)
+                    .join(Project, Project.id == ProjectFile.project_id)
+                    .outerjoin(DocumentVersion, DocumentVersion.id == ProjectFile.version_id)
+                    .where(
+                        ProjectFile.id == replaces_id,
+                        ProjectFile.project_id == row["project_id"],
+                        Project.company_id == row["project_company_id"],
+                    )
                 ).scalar_one_or_none()
             if document_id is None:
                 document_id = connection.execute(
-                    text(
-                        """INSERT INTO document (company_id, title, project_no)
-                           VALUES (:company_id, :title, :project_no)
-                           RETURNING id"""
-                    ),
-                    {
-                        "company_id": row["project_company_id"],
-                        "title": row["display_name"],
-                        "project_no": row["project_no"],
-                    },
+                    insert(Document)
+                    .values(
+                        company_id=row["project_company_id"],
+                        title=row["display_name"],
+                        project_no=row["project_no"],
+                    )
+                    .returning(Document.id)
                 ).scalar_one()
             else:
                 connection.execute(
-                    text("SELECT id FROM document WHERE id = :id FOR UPDATE"),
-                    {"id": document_id},
+                    select(Document.id).where(Document.id == document_id).with_for_update()
                 ).one()
             version_no = int(
                 connection.execute(
-                    text(
-                        """SELECT COALESCE(MAX(version_no), 0) + 1
-                           FROM document_version WHERE document_id = :document_id"""
-                    ),
-                    {"document_id": document_id},
+                    select(func.coalesce(func.max(DocumentVersion.version_no), 0) + 1).where(
+                        DocumentVersion.document_id == document_id
+                    )
                 ).scalar_one()
             )
             version_id = int(
                 connection.execute(
-                    text(
-                        """INSERT INTO document_version
-                               (company_id, document_id, version_no, sha256, mime, size_bytes,
-                                original_key, pdf_key, pdf_sha256, is_converted, converter,
-                                converter_version, page_count)
-                           VALUES
-                               (:company_id, :document_id, :version_no, :sha256, :mime,
-                                :size_bytes, :original_key, :pdf_key, :pdf_sha256,
-                                :is_converted, :converter, :converter_version, :page_count)
-                           RETURNING id"""
-                    ),
-                    {
-                        "company_id": row["project_company_id"],
-                        "document_id": document_id,
-                        "version_no": version_no,
-                        "sha256": str(row["source_sha256"]).strip(),
-                        "mime": row["source_mime"],
-                        "size_bytes": row["source_size_bytes"],
-                        "original_key": row["original_key"],
-                        "pdf_key": pdf_key,
-                        "pdf_sha256": pdf_sha256,
-                        "is_converted": is_converted,
-                        "converter": converter,
-                        "converter_version": converter_version,
-                        "page_count": inspection.page_count if inspection else None,
-                    },
+                    insert(DocumentVersion)
+                    .values(
+                        company_id=row["project_company_id"],
+                        document_id=document_id,
+                        version_no=version_no,
+                        sha256=str(row["source_sha256"]).strip(),
+                        mime=row["source_mime"],
+                        size_bytes=row["source_size_bytes"],
+                        original_key=row["original_key"],
+                        pdf_key=pdf_key,
+                        pdf_sha256=pdf_sha256,
+                        is_converted=is_converted,
+                        converter=converter,
+                        converter_version=converter_version,
+                        page_count=inspection.page_count if inspection else None,
+                    )
+                    .returning(DocumentVersion.id)
                 ).scalar_one()
             )
             page_count = inspection.page_count if inspection else 0
@@ -367,19 +388,7 @@ def _finish_file_version(
 
         if inspection is not None:
             page_count = inspection.page_count
-            connection.execute(
-                text(
-                    """INSERT INTO page
-                           (version_id, page_no, width_pt, height_pt, rotation, text_layer)
-                       VALUES
-                           (:version_id, :page_no, :width_pt, :height_pt,
-                            :rotation, :text_layer)
-                       ON CONFLICT (version_id, page_no) DO UPDATE SET
-                           width_pt = EXCLUDED.width_pt,
-                           height_pt = EXCLUDED.height_pt,
-                           rotation = EXCLUDED.rotation,
-                           text_layer = EXCLUDED.text_layer"""
-                ),
+            page_insert = pg_insert(Page).values(
                 [
                     {
                         "version_id": version_id,
@@ -390,26 +399,39 @@ def _finish_file_version(
                         "text_layer": page.has_text_layer,
                     }
                     for page in inspection.pages
-                ],
+                ]
             )
             connection.execute(
-                text("UPDATE document_version SET page_count = :page_count WHERE id = :id"),
-                {"id": version_id, "page_count": page_count},
+                page_insert.on_conflict_do_update(
+                    index_elements=["version_id", "page_no"],
+                    set_={
+                        "width_pt": page_insert.excluded.width_pt,
+                        "height_pt": page_insert.excluded.height_pt,
+                        "rotation": page_insert.excluded.rotation,
+                        "text_layer": page_insert.excluded.text_layer,
+                    },
+                )
+            )
+            connection.execute(
+                update(DocumentVersion)
+                .where(DocumentVersion.id == version_id)
+                .values(page_count=page_count)
             )
 
         connection.execute(
-            text("UPDATE project_file SET version_id = :version_id WHERE id = :file_id"),
-            {"version_id": version_id, "file_id": row["project_file_id"]},
+            update(ProjectFile)
+            .where(ProjectFile.id == row["project_file_id"])
+            .values(version_id=version_id)
         )
         prior_parse = connection.execute(
-            text(
-                """SELECT EXISTS (
-                       SELECT 1 FROM parse_run
-                       WHERE version_id = :version_id
-                         AND status IN ('pending','running','completed','partial')
-                   )"""
-            ),
-            {"version_id": version_id},
+            select(
+                exists(
+                    select(ParseRun.id).where(
+                        ParseRun.version_id == version_id,
+                        ParseRun.status.in_(("pending", "running", "completed", "partial")),
+                    )
+                )
+            )
         ).scalar_one()
         should_parse = auto_parse and not bool(prior_parse)
         status = "pending" if should_parse else "completed"
@@ -418,23 +440,19 @@ def _finish_file_version(
         # 转换阶段占着这个闩锁，阶段推进到 submitting 时必须一并清掉，
         # 否则这条 job 永远不满足闸门条件，解析会停在 pending 不动（2026-10-01 实测踩到）。
         connection.execute(
-            text(
-                """UPDATE job
-                   SET version_id = :version_id, status = :status, stage = :stage,
-                       progress = CAST(:progress AS JSONB), error_code = NULL,
-                       error_message = NULL, updated_at = now(),
-                       dispatched_at = CASE WHEN :should_parse THEN NULL ELSE dispatched_at END,
-                       finished_at = CASE WHEN :should_parse THEN NULL ELSE now() END
-                   WHERE id = :job_id AND status <> 'canceled'"""
-            ),
-            {
-                "job_id": row["id"],
-                "version_id": version_id,
-                "status": status,
-                "stage": stage,
-                "progress": json.dumps({"pages": page_count}),
-                "should_parse": should_parse,
-            },
+            update(Job)
+            .where(Job.id == row["id"], Job.status != "canceled")
+            .values(
+                version_id=version_id,
+                status=status,
+                stage=stage,
+                progress={"pages": page_count},
+                error_code=None,
+                error_message=None,
+                updated_at=func.now(),
+                dispatched_at=case((literal(should_parse), null()), else_=Job.dispatched_at),
+                finished_at=case((literal(should_parse), null()), else_=func.now()),
+            )
         )
     return version_id, page_count, should_parse
 
@@ -454,9 +472,7 @@ async def _convert_office_file(
     row: Mapping[str, Any], store: S3BlobStore, remaining: float, extra_retries: int
 ) -> tuple[int, int, bool]:
     source_sha256 = str(row["source_sha256"]).strip().lower()
-    converter_adapter = _converter(
-        remaining_seconds=remaining, extra_retries=extra_retries
-    )
+    converter_adapter = _converter(remaining_seconds=remaining, extra_retries=extra_retries)
     try:
         converter_version = await converter_adapter.version()
         lock_key = f"version:{row['project_company_id']}:{source_sha256}:{converter_version}"
@@ -567,12 +583,13 @@ def process_file(self: Any, job_id: str) -> None:
         return
     with _engine.begin() as connection:
         changed = connection.execute(
-            text(
-                """UPDATE job SET status = 'running', updated_at = now()
-                   WHERE id = :job_id AND status IN ('pending','running')
-                     AND stage IN ('converting','probing','geometry')"""
-            ),
-            {"job_id": job_id},
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.status.in_(("pending", "running")),
+                Job.stage.in_(("converting", "probing", "geometry")),
+            )
+            .values(status="running", updated_at=func.now())
         ).rowcount
     if not changed:
         return
@@ -620,13 +637,16 @@ def process_file(self: Any, job_id: str) -> None:
 def _reset_file_job(job_id: str, stage: str, code: str, message: str) -> None:
     with _engine.begin() as connection:
         connection.execute(
-            text(
-                """UPDATE job
-                   SET status = 'pending', stage = :stage, error_code = :code,
-                       error_message = :message, updated_at = now(), finished_at = NULL
-                   WHERE id = :job_id AND status = 'running'"""
-            ),
-            {"job_id": job_id, "stage": stage, "code": code, "message": message[:2000]},
+            update(Job)
+            .where(Job.id == job_id, Job.status == "running")
+            .values(
+                status="pending",
+                stage=stage,
+                error_code=code,
+                error_message=message[:2000],
+                updated_at=func.now(),
+                finished_at=None,
+            )
         )
 
 
@@ -634,38 +654,33 @@ def _set_job_failure(job_id: str, code: str, message: str) -> None:
     now = datetime.now(UTC)
     with _engine.begin() as connection:
         row = (
-            connection.execute(
-                text("SELECT run_id FROM job WHERE id = :job_id FOR UPDATE"),
-                {"job_id": job_id},
-            )
+            connection.execute(select(Job.run_id).where(Job.id == job_id).with_for_update())
             .mappings()
             .first()
         )
         if row is None:
             return
         connection.execute(
-            text(
-                """UPDATE job
-                   SET status = 'failed', error_code = :code, error_message = :message,
-                       updated_at = :now, finished_at = :now
-                   WHERE id = :job_id AND status <> 'canceled'"""
-            ),
-            {"job_id": job_id, "code": code, "message": message[:2000], "now": now},
+            update(Job)
+            .where(Job.id == job_id, Job.status != "canceled")
+            .values(
+                status="failed",
+                error_code=code,
+                error_message=message[:2000],
+                updated_at=now,
+                finished_at=now,
+            )
         )
         if row["run_id"] is not None:
             connection.execute(
-                text(
-                    """UPDATE parse_run
-                       SET status = 'failed', error_code = :code, error_message = :message,
-                           finished_at = :now
-                       WHERE id = :run_id"""
-                ),
-                {
-                    "run_id": row["run_id"],
-                    "code": code,
-                    "message": message[:2000],
-                    "now": now,
-                },
+                update(ParseRun)
+                .where(ParseRun.id == row["run_id"])
+                .values(
+                    status="failed",
+                    error_code=code,
+                    error_message=message[:2000],
+                    finished_at=now,
+                )
             )
 
 
@@ -705,12 +720,9 @@ def submit_parse(self: Any, job_id: str) -> None:
 
     with _engine.begin() as connection:
         claimed = connection.execute(
-            text(
-                """UPDATE job
-                   SET status = 'submitting', stage = 'submitting', updated_at = now()
-                   WHERE id = :job_id AND status = 'pending'"""
-            ),
-            {"job_id": job_id},
+            update(Job)
+            .where(Job.id == job_id, Job.status == "pending")
+            .values(status="submitting", stage="submitting", updated_at=func.now())
         ).rowcount
     if not claimed:
         return
@@ -722,9 +734,12 @@ def submit_parse(self: Any, job_id: str) -> None:
         return
     store = _store()
     try:
-        submission = asyncio.run(_within(
-            _remaining(started_at, int(values["job.timeout.parse_minutes"])), _submit(row, store)
-        ))
+        submission = asyncio.run(
+            _within(
+                _remaining(started_at, int(values["job.timeout.parse_minutes"])),
+                _submit(row, store),
+            )
+        )
     except TimeoutError:
         # 提交超时不能断言远端未受理，更不能自动重新提交同一任务。
         _mark_submission_unknown(job_id, "解析提交达到任务总时限，远端受理状态未知")
@@ -735,17 +750,15 @@ def submit_parse(self: Any, job_id: str) -> None:
     except ParseUnavailable as exc:
         with _engine.begin() as connection:
             connection.execute(
-                text(
-                    """UPDATE job
-                       SET status = 'pending', stage = 'submitting',
-                           error_code = :code, error_message = :message, updated_at = now()
-                       WHERE id = :job_id AND status = 'submitting'"""
-                ),
-                {
-                    "job_id": job_id,
-                    "code": exc.code,
-                    "message": str(exc)[:2000],
-                },
+                update(Job)
+                .where(Job.id == job_id, Job.status == "submitting")
+                .values(
+                    status="pending",
+                    stage="submitting",
+                    error_code=exc.code,
+                    error_message=str(exc)[:2000],
+                    updated_at=func.now(),
+                )
             )
         raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
     except ParseFailed as exc:
@@ -754,14 +767,15 @@ def submit_parse(self: Any, job_id: str) -> None:
     except BlobStoreError as exc:
         with _engine.begin() as connection:
             connection.execute(
-                text(
-                    """UPDATE job
-                       SET status = 'pending', stage = 'submitting',
-                           error_code = 'storage_unavailable', error_message = :message,
-                           updated_at = now()
-                       WHERE id = :job_id AND status = 'submitting'"""
-                ),
-                {"job_id": job_id, "message": str(exc)[:2000]},
+                update(Job)
+                .where(Job.id == job_id, Job.status == "submitting")
+                .values(
+                    status="pending",
+                    stage="submitting",
+                    error_code="storage_unavailable",
+                    error_message=str(exc)[:2000],
+                    updated_at=func.now(),
+                )
             )
         raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
     now = datetime.now(UTC)
@@ -769,40 +783,33 @@ def submit_parse(self: Any, job_id: str) -> None:
     try:
         with _engine.begin() as connection:
             run_id = connection.execute(
-                text(
-                    """INSERT INTO parse_run
-                           (version_id, provider, provider_version, tier, schema_version,
-                            status, request_id, provider_job_id, config_snapshot, started_at)
-                       VALUES
-                           (:version_id, 'mineru', :provider_version, :tier, '2.0',
-                            'running', :request_id, :provider_job_id,
-                            CAST(:config_snapshot AS JSONB), :now)
-                       RETURNING id"""
-                ),
-                {
-                    "version_id": row["version_id"],
-                    "provider_version": submission.provider_version,
-                    "tier": snapshot["tier"],
-                    "request_id": job_id,
-                    "provider_job_id": submission.job_id,
-                    "config_snapshot": json.dumps(snapshot),
-                    "now": now,
-                },
+                insert(ParseRun)
+                .values(
+                    version_id=row["version_id"],
+                    provider="mineru",
+                    provider_version=submission.provider_version,
+                    tier=snapshot["tier"],
+                    schema_version="2.0",
+                    status="running",
+                    request_id=job_id,
+                    provider_job_id=submission.job_id,
+                    config_snapshot=snapshot,
+                    started_at=now,
+                )
+                .returning(ParseRun.id)
             ).scalar_one()
             connection.execute(
-                text(
-                    """UPDATE job
-                       SET run_id = :run_id, status = 'running', stage = 'parsing',
-                           progress = progress || CAST(:progress AS JSONB), error_code = NULL,
-                           error_message = NULL, updated_at = :now
-                       WHERE id = :job_id AND status = 'submitting'"""
-                ),
-                {
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "progress": json.dumps({}),
-                    "now": now,
-                },
+                update(Job)
+                .where(Job.id == job_id, Job.status == "submitting")
+                .values(
+                    run_id=run_id,
+                    status="running",
+                    stage="parsing",
+                    progress=Job.progress.op("||")(_jsonb({})),
+                    error_code=None,
+                    error_message=None,
+                    updated_at=now,
+                )
             )
     except Exception as exc:
         # 远端已受理但本地未能保存引用时，不能再次提交同一内容来掩盖不一致。
@@ -847,9 +854,16 @@ def poll_parse(self: Any, job_id: str) -> None:
     # 每次真实轮询前记账；网络错误、服务重启与worker恢复不能重置次数。
     with _engine.begin() as connection:
         connection.execute(
-            text("""UPDATE job SET progress=jsonb_set(progress,'{poll_attempts}',
-                to_jsonb(CAST(:attempts AS bigint)),true) WHERE id=:id"""),
-            {"id": job_id, "attempts": attempts + 1},
+            update(Job)
+            .where(Job.id == job_id)
+            .values(
+                progress=func.jsonb_set(
+                    Job.progress,
+                    bindparam("attempts_path", ["poll_attempts"], type_=ARRAY(Text)),
+                    func.to_jsonb(bindparam("attempts", attempts + 1, type_=BigInteger)),
+                    True,
+                )
+            )
         )
 
     store = _store()
@@ -861,19 +875,19 @@ def poll_parse(self: Any, job_id: str) -> None:
     except ServiceRestarted:
         with _engine.begin() as connection:
             claimed = connection.execute(
-                text(
-                    """UPDATE job SET stage = 'resubmitting', updated_at = now()
-                       WHERE id = :job_id AND status = 'running' AND stage = 'parsing'"""
-                ),
-                {"job_id": job_id},
+                update(Job)
+                .where(Job.id == job_id, Job.status == "running", Job.stage == "parsing")
+                .values(stage="resubmitting", updated_at=func.now())
             ).rowcount
         if not claimed:
             return
         try:
-            submission = asyncio.run(_within(
-                _remaining(started_at, int(values["job.timeout.parse_minutes"])),
-                _submit(row, store),
-            ))
+            submission = asyncio.run(
+                _within(
+                    _remaining(started_at, int(values["job.timeout.parse_minutes"])),
+                    _submit(row, store),
+                )
+            )
         except TimeoutError:
             _mark_submission_unknown(job_id, "重新提交达到任务总时限，远端受理状态未知")
             return
@@ -886,11 +900,9 @@ def poll_parse(self: Any, job_id: str) -> None:
         except (ParseUnavailable, BlobStoreError) as retryable:
             with _engine.begin() as connection:
                 connection.execute(
-                    text(
-                        """UPDATE job SET stage = 'parsing', updated_at = now()
-                           WHERE id = :job_id AND status = 'running'"""
-                    ),
-                    {"job_id": job_id},
+                    update(Job)
+                    .where(Job.id == job_id, Job.status == "running")
+                    .values(stage="parsing", updated_at=func.now())
                 )
             raise self.retry(
                 exc=retryable,
@@ -906,18 +918,14 @@ def poll_parse(self: Any, job_id: str) -> None:
             return
         with _engine.begin() as connection:
             connection.execute(
-                text(
-                    """UPDATE parse_run SET provider_job_id = :provider_job_id
-                       WHERE id = :run_id"""
-                ),
-                {"run_id": row["run_id"], "provider_job_id": submission.job_id},
+                update(ParseRun)
+                .where(ParseRun.id == row["run_id"])
+                .values(provider_job_id=submission.job_id)
             )
             connection.execute(
-                text(
-                    """UPDATE job SET stage = 'parsing', updated_at = now()
-                       WHERE id = :job_id AND status = 'running'"""
-                ),
-                {"job_id": job_id},
+                update(Job)
+                .where(Job.id == job_id, Job.status == "running")
+                .values(stage="parsing", updated_at=func.now())
             )
         poll_parse.apply_async(args=(job_id,), countdown=_poll_delay(values, attempts + 1))
         return
@@ -934,12 +942,9 @@ def poll_parse(self: Any, job_id: str) -> None:
     if status.status in {"queued", "running"}:
         with _engine.begin() as connection:
             connection.execute(
-                text(
-                    """UPDATE job
-                       SET progress = progress || CAST(:progress AS JSONB), updated_at = :now
-                       WHERE id = :job_id"""
-                ),
-                {"job_id": job_id, "progress": json.dumps(progress), "now": now},
+                update(Job)
+                .where(Job.id == job_id)
+                .values(progress=Job.progress.op("||")(_jsonb(progress)), updated_at=now)
             )
         poll_parse.apply_async(args=(job_id,), countdown=_poll_delay(values, attempts + 1))
         return
@@ -963,11 +968,9 @@ def poll_parse(self: Any, job_id: str) -> None:
         with _engine.connect() as connection:
             page_rows = (
                 connection.execute(
-                    text(
-                        """SELECT page_no, rotation, text_layer FROM page
-                           WHERE version_id = :version_id ORDER BY page_no"""
-                    ),
-                    {"version_id": row["version_id"]},
+                    select(Page.page_no, Page.rotation, Page.text_layer)
+                    .where(Page.version_id == row["version_id"])
+                    .order_by(Page.page_no)
                 )
                 .mappings()
                 .all()
@@ -989,19 +992,14 @@ def poll_parse(self: Any, job_id: str) -> None:
         except (ParseFailed, ValueError) as exc:
             with _engine.begin() as connection:
                 connection.execute(
-                    text(
-                        """UPDATE parse_run
-                           SET raw_middle_key = :raw_middle_key, page_count = :page_count,
-                               backend = :backend, schema_version = :schema_version
-                           WHERE id = :run_id"""
-                    ),
-                    {
-                        "run_id": row["run_id"],
-                        "raw_middle_key": raw_middle_key,
-                        "page_count": page_count,
-                        "backend": backend,
-                        "schema_version": schema_version,
-                    },
+                    update(ParseRun)
+                    .where(ParseRun.id == row["run_id"])
+                    .values(
+                        raw_middle_key=raw_middle_key,
+                        page_count=page_count,
+                        backend=backend,
+                        schema_version=schema_version,
+                    )
                 )
             code = exc.code if isinstance(exc, ParseFailed) else "invalid_configuration"
             _set_job_failure(job_id, code, str(exc))
@@ -1018,17 +1016,9 @@ def poll_parse(self: Any, job_id: str) -> None:
 
     with _engine.begin() as connection:
         if normalized_elements:
+            # 参数列表交给批量执行，避免 .values([...]) 超出 PostgreSQL 单语句参数上限。
             connection.execute(
-                text(
-                    """INSERT INTO element
-                           (version_id, run_id, page_no, order_no, anchor, type, level,
-                            bbox_x0, bbox_y0, bbox_x1, bbox_y1, text, html, source,
-                            continues_prev, mineru_locator)
-                       VALUES
-                           (:version_id, :run_id, :page_no, :order_no, :anchor, :type, :level,
-                            :bbox_x0, :bbox_y0, :bbox_x1, :bbox_y1, :text, :html, :source,
-                            :continues_prev, :mineru_locator)"""
-                ),
+                insert(Element),
                 [
                     {
                         "version_id": row["version_id"],
@@ -1053,11 +1043,9 @@ def poll_parse(self: Any, job_id: str) -> None:
             )
             inserted_rows = (
                 connection.execute(
-                    text(
-                        """SELECT id, page_no, order_no FROM element
-                           WHERE run_id = :run_id"""
-                    ),
-                    {"run_id": row["run_id"]},
+                    select(Element.id, Element.page_no, Element.order_no).where(
+                        Element.run_id == row["run_id"]
+                    )
                 )
                 .mappings()
                 .all()
@@ -1075,54 +1063,44 @@ def poll_parse(self: Any, job_id: str) -> None:
                 parent = normalized_elements[element.parent_index]
                 parent_updates.append(
                     {
-                        "id": element_ids[(element.page_no, element.order_no)],
-                        "parent_id": element_ids[(parent.page_no, parent.order_no)],
+                        "element_id": element_ids[(element.page_no, element.order_no)],
+                        "parent_element_id": element_ids[(parent.page_no, parent.order_no)],
                     }
                 )
             if parent_updates:
                 connection.execute(
-                    text("UPDATE element SET parent_id = :parent_id WHERE id = :id"),
+                    update(Element)
+                    .where(Element.id == bindparam("element_id"))
+                    .values(parent_id=bindparam("parent_element_id")),
                     parent_updates,
                 )
         connection.execute(
-            text(
-                """UPDATE parse_run
-                   SET status = :status, raw_middle_key = :raw_middle_key,
-                       page_count = :page_count, backend = :backend,
-                       schema_version = COALESCE(:schema_version, schema_version),
-                       elapsed_ms = :elapsed_ms, error_code = :error_code,
-                       error_message = :error_message, finished_at = :now
-                   WHERE id = :run_id"""
-            ),
-            {
-                "run_id": row["run_id"],
-                "status": terminal_status,
-                "raw_middle_key": raw_middle_key,
-                "page_count": page_count,
-                "backend": backend,
-                "schema_version": schema_version,
-                "elapsed_ms": elapsed_ms,
-                "error_code": error_code,
-                "error_message": error_message,
-                "now": now,
-            },
+            update(ParseRun)
+            .where(ParseRun.id == row["run_id"])
+            .values(
+                status=terminal_status,
+                raw_middle_key=raw_middle_key,
+                page_count=page_count,
+                backend=backend,
+                schema_version=func.coalesce(schema_version, ParseRun.schema_version),
+                elapsed_ms=elapsed_ms,
+                error_code=error_code,
+                error_message=error_message,
+                finished_at=now,
+            )
         )
         updated_rows = connection.execute(
-            text(
-                """UPDATE job
-                   SET status = :status, stage = 'parsing',
-                       progress = CAST(:progress AS JSONB), error_code = :error_code,
-                       error_message = :error_message, updated_at = :now, finished_at = :now
-                   WHERE id = :job_id AND status <> 'canceled'"""
-            ),
-            {
-                "job_id": job_id,
-                "status": terminal_status,
-                "progress": json.dumps(progress),
-                "error_code": error_code,
-                "error_message": error_message,
-                "now": now,
-            },
+            update(Job)
+            .where(Job.id == job_id, Job.status != "canceled")
+            .values(
+                status=terminal_status,
+                stage="parsing",
+                progress=progress,
+                error_code=error_code,
+                error_message=error_message,
+                updated_at=now,
+                finished_at=now,
+            )
         )
         updated_count = updated_rows.rowcount
 
@@ -1131,7 +1109,7 @@ def poll_parse(self: Any, job_id: str) -> None:
         # 独立知识库只建立可检索原文，不能套用招标字段给历史资料制造当前项目结论。
         with _engine.connect() as connection:
             kind = connection.execute(
-                text("SELECT kind FROM project WHERE id=:id"), {"id": row["project_id"]}
+                select(Project.kind).where(Project.id == row["project_id"])
             ).scalar_one()
         if kind == "knowledge":
             return

@@ -4,10 +4,25 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import any_, case, func, select, true
 from sqlalchemy.engine import Connection
 from starlette.responses import Response
 
+from tender.adapters.pg.models import (
+    Document,
+    DocumentVersion,
+    Element,
+    Evidence,
+    Extraction,
+    ExtractionConflict,
+    FieldInstance,
+    Job,
+    Lot,
+    Page,
+    ParseRun,
+    ProjectFile,
+    ReviewAction,
+)
 from tender.api.common import bbox, engine, version_row
 from tender.api.errors import ApiProblem
 from tender.api.storage import stream_object
@@ -23,20 +38,17 @@ router = APIRouter(prefix="/api/v1/versions", tags=["versions"])
 def _latest_run_id(connection: Connection, version_id: int) -> int | None:
     """最近一次可用的解析 run；锚点与章节树都只在 run 内唯一。"""
     return connection.execute(
-        text(
-            """SELECT id FROM parse_run
-               WHERE version_id = :version_id AND status IN ('completed','partial')
-               ORDER BY created_at DESC, id DESC LIMIT 1"""
-        ),
-        {"version_id": version_id},
+        select(ParseRun.id)
+        .where(ParseRun.version_id == version_id, ParseRun.status.in_(("completed", "partial")))
+        .order_by(ParseRun.created_at.desc(), ParseRun.id.desc())
+        .limit(1)
     ).scalar_one_or_none()
 
 
 def _run_belongs_to_version(connection: Connection, version_id: int, run_id: int) -> bool:
     """显式指定 run 时校验归属：拿别份文档的 run_id 会拼出错误的章节树与锚点。"""
     found = connection.execute(
-        text("SELECT 1 FROM parse_run WHERE id = :run_id AND version_id = :version_id"),
-        {"run_id": run_id, "version_id": version_id},
+        select(ParseRun.id).where(ParseRun.id == run_id, ParseRun.version_id == version_id)
     ).scalar_one_or_none()
     return found is not None
 
@@ -84,20 +96,17 @@ def get_pages(
     with db.connect() as connection:
         total = int(
             connection.execute(
-                text("SELECT count(*) FROM page WHERE version_id = :version_id"),
-                {"version_id": version_id},
+                select(func.count()).select_from(Page).where(Page.version_id == version_id)
             ).scalar_one()
         )
-        query = """SELECT page_no, width_pt, height_pt, rotation, text_layer
-                   FROM page WHERE version_id = :version_id"""
-        params: dict[str, object] = {"version_id": version_id}
+        query = select(
+            Page.page_no, Page.width_pt, Page.height_pt, Page.rotation, Page.text_layer
+        ).where(Page.version_id == version_id)
         if from_page > 1:
-            query += " AND page_no >= :from_page"
-            params["from_page"] = from_page
+            query = query.where(Page.page_no >= from_page)
         if to_page is not None:
-            query += " AND page_no <= :to_page"
-            params["to_page"] = to_page
-        rows = connection.execute(text(query + " ORDER BY page_no"), params).mappings().all()
+            query = query.where(Page.page_no <= to_page)
+        rows = connection.execute(query.order_by(Page.page_no)).mappings().all()
     return {
         "total": total,
         "page_count": int(version["page_count"] or total),
@@ -125,27 +134,30 @@ def get_elements(
     with db.connect() as connection:
         run_id = parse_run_id
         if run_id is None:
-            run_id = connection.execute(
-                text(
-                    """SELECT id FROM parse_run
-                       WHERE version_id = :version_id AND status IN ('completed','partial')
-                       ORDER BY created_at DESC, id DESC LIMIT 1"""
-                ),
-                {"version_id": version_id},
-            ).scalar_one_or_none()
+            run_id = _latest_run_id(connection, version_id)
         if run_id is None:
             return {"run_id": None, "elements": []}
         rows = (
             connection.execute(
-                text(
-                    """SELECT id, parent_id, anchor, type, level, page_no, order_no,
-                              bbox_x0, bbox_y0, bbox_x1, bbox_y1, text, html, source,
-                              continues_prev
-                       FROM element
-                       WHERE version_id = :version_id AND run_id = :run_id
-                       ORDER BY page_no, order_no"""
-                ),
-                {"version_id": version_id, "run_id": run_id},
+                select(
+                    Element.id,
+                    Element.parent_id,
+                    Element.anchor,
+                    Element.type,
+                    Element.level,
+                    Element.page_no,
+                    Element.order_no,
+                    Element.bbox_x0,
+                    Element.bbox_y0,
+                    Element.bbox_x1,
+                    Element.bbox_y1,
+                    Element.text,
+                    Element.html,
+                    Element.source,
+                    Element.continues_prev,
+                )
+                .where(Element.version_id == version_id, Element.run_id == run_id)
+                .order_by(Element.page_no, Element.order_no)
             )
             .mappings()
             .all()
@@ -183,26 +195,30 @@ def get_page_elements(
     with db.connect() as connection:
         chosen_run = parse_run_id
         if chosen_run is None:
-            chosen_run = connection.execute(
-                text(
-                    """SELECT id FROM parse_run
-                       WHERE version_id = :version_id AND status IN ('completed','partial')
-                       ORDER BY created_at DESC, id DESC LIMIT 1"""
-                ),
-                {"version_id": version_id},
-            ).scalar_one_or_none()
+            chosen_run = _latest_run_id(connection, version_id)
         if chosen_run is None:
             return {"page_no": page_no, "elements": []}
         rows = (
             connection.execute(
-                text(
-                    """SELECT anchor, type, page_no, bbox_x0, bbox_y0, bbox_x1, bbox_y1,
-                              text, source, continues_prev, order_no
-                       FROM element
-                       WHERE version_id = :version_id AND run_id = :run_id AND page_no = :page_no
-                       ORDER BY order_no"""
-                ),
-                {"version_id": version_id, "run_id": chosen_run, "page_no": page_no},
+                select(
+                    Element.anchor,
+                    Element.type,
+                    Element.page_no,
+                    Element.bbox_x0,
+                    Element.bbox_y0,
+                    Element.bbox_x1,
+                    Element.bbox_y1,
+                    Element.text,
+                    Element.source,
+                    Element.continues_prev,
+                    Element.order_no,
+                )
+                .where(
+                    Element.version_id == version_id,
+                    Element.run_id == chosen_run,
+                    Element.page_no == page_no,
+                )
+                .order_by(Element.order_no)
             )
             .mappings()
             .all()
@@ -241,25 +257,25 @@ def resolve_anchor(
     with db.connect() as connection:
         run_id = parse_run_id
         if run_id is None:
-            run_id = connection.execute(
-                text(
-                    """SELECT id FROM parse_run
-                       WHERE version_id = :version_id AND status IN ('completed','partial')
-                       ORDER BY created_at DESC, id DESC LIMIT 1"""
-                ),
-                {"version_id": version_id},
-            ).scalar_one_or_none()
+            run_id = _latest_run_id(connection, version_id)
         row = None
         if run_id is not None:
             row = (
                 connection.execute(
-                    text(
-                        """SELECT anchor, type, page_no, bbox_x0, bbox_y0, bbox_x1, bbox_y1, text
-                           FROM element
-                           WHERE version_id = :version_id AND run_id = :run_id
-                             AND anchor = :anchor"""
-                    ),
-                    {"version_id": version_id, "run_id": run_id, "anchor": anchor},
+                    select(
+                        Element.anchor,
+                        Element.type,
+                        Element.page_no,
+                        Element.bbox_x0,
+                        Element.bbox_y0,
+                        Element.bbox_x1,
+                        Element.bbox_y1,
+                        Element.text,
+                    ).where(
+                        Element.version_id == version_id,
+                        Element.run_id == run_id,
+                        Element.anchor == anchor,
+                    )
                 )
                 .mappings()
                 .first()
@@ -285,67 +301,121 @@ def get_extractions(
 ) -> dict[str, object]:
     db = engine(request)
     version_row(db, version_id)
-    clauses = ["e.version_id = :version_id", "e.is_current = true", "d.company_id = :company_id"]
-    params: dict[str, object] = {
-        "version_id": version_id,
-        "company_id": settings.company_id(),
-    }
-    if group_key:
-        clauses.append("e.group_key = :group_key")
-        params["group_key"] = group_key
     statuses = [part.strip() for part in status.split(",") if part.strip()] if status else []
-    status_clause = ""
-    if statuses:
-        status_clause = "WHERE e.status = ANY(CAST(:statuses AS TEXT[]))"
-        params["statuses"] = statuses
     with db.connect() as connection:
+        latest_action = (
+            select(ReviewAction.action.label("action"))
+            .where(ReviewAction.attempt_id == Extraction.id)
+            .order_by(ReviewAction.created_at.desc(), ReviewAction.id.desc())
+            .limit(1)
+            .correlate(Extraction)
+            .lateral("ra")
+        )
+        # 冲突探测：冲突组必须挂在同一个项目的有效文件版本下，故子查询里连 project_file。
+        open_conflict = (
+            select(1)
+            .select_from(ExtractionConflict)
+            .join(
+                ProjectFile,
+                (ProjectFile.project_id == ExtractionConflict.project_id)
+                & (ProjectFile.version_id == Extraction.version_id)
+                & ProjectFile.deleted_at.is_(None),
+            )
+            .where(
+                ExtractionConflict.field_key == Extraction.field_key,
+                ExtractionConflict.lot_id.is_not_distinct_from(FieldInstance.lot_id),
+                ExtractionConflict.status == "open",
+                Extraction.id == any_(ExtractionConflict.candidate_ids),
+            )
+            .exists()
+        )
+        conditions = [
+            Extraction.version_id == version_id,
+            Extraction.is_current.is_(True),
+            Document.company_id == settings.company_id(),
+        ]
+        if group_key:
+            conditions.append(Extraction.group_key == group_key)
+        current = (
+            select(
+                Extraction.id,
+                Extraction.instance_id,
+                Extraction.run_id,
+                Extraction.machine_attempt_no,
+                Extraction.attempt_no,
+                Extraction.trigger,
+                Extraction.field_key,
+                Extraction.group_key,
+                Extraction.value_json,
+                Extraction.value_text,
+                Extraction.confidence,
+                Extraction.status.label("stored_status"),
+                Extraction.strategy,
+                Extraction.evidence_count,
+                FieldInstance.lot_id,
+                Lot.code.label("lot_code"),
+                case(
+                    (open_conflict, "conflict"),
+                    (latest_action.c.action == "confirm", "verified"),
+                    (latest_action.c.action == "reject", "rejected"),
+                    else_=Extraction.status,
+                ).label("status"),
+            )
+            .select_from(Extraction)
+            .join(DocumentVersion, DocumentVersion.id == Extraction.version_id)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .join(FieldInstance, FieldInstance.id == Extraction.instance_id)
+            .outerjoin(Lot, Lot.id == FieldInstance.lot_id)
+            .outerjoin(latest_action, true())
+            .where(*conditions)
+            .cte("current_extractions")
+        )
+        query = (
+            select(
+                current.c.id,
+                current.c.instance_id,
+                current.c.run_id,
+                current.c.machine_attempt_no,
+                current.c.attempt_no,
+                current.c.trigger,
+                current.c.field_key,
+                current.c.group_key,
+                current.c.value_json,
+                current.c.value_text,
+                current.c.confidence,
+                current.c.stored_status,
+                current.c.status,
+                current.c.strategy,
+                current.c.evidence_count,
+                current.c.lot_id,
+                current.c.lot_code,
+                Evidence.anchor,
+                Evidence.page_no,
+                Evidence.bbox_x0,
+                Evidence.bbox_y0,
+                Evidence.bbox_x1,
+                Evidence.bbox_y1,
+                Evidence.char_start,
+                Evidence.char_end,
+                Evidence.quote,
+                Evidence.quote_source,
+                Evidence.match_type,
+                Evidence.seq,
+            )
+            .select_from(current)
+            .outerjoin(Evidence, Evidence.extraction_id == current.c.id)
+        )
+        if statuses:
+            query = query.where(current.c.status.in_(statuses))
         rows = (
             connection.execute(
-                text(
-                    f"""WITH current_extractions AS (
-                        SELECT e.id, e.instance_id, e.run_id, e.machine_attempt_no, e.attempt_no,
-                               e.trigger, e.field_key, e.group_key, e.value_json, e.value_text,
-                               e.confidence, e.status AS stored_status, e.strategy,
-                               e.evidence_count, fi.lot_id, l.code AS lot_code,
-                               CASE
-                                   WHEN EXISTS (
-                                       SELECT 1
-                                       FROM extraction_conflict AS ec
-                                       JOIN project_file AS cpf
-                                         ON cpf.project_id = ec.project_id
-                                        AND cpf.version_id = e.version_id
-                                        AND cpf.deleted_at IS NULL
-                                       WHERE ec.field_key = e.field_key
-                                         AND ec.lot_id IS NOT DISTINCT FROM fi.lot_id
-                                         AND ec.status = 'open'
-                                         AND e.id = ANY(ec.candidate_ids)
-                                   ) THEN 'conflict'
-                                   WHEN ra.action = 'confirm' THEN 'verified'
-                                   WHEN ra.action = 'reject' THEN 'rejected'
-                                   ELSE e.status
-                               END AS status
-                        FROM extraction AS e
-                        JOIN document_version AS v ON v.id = e.version_id
-                        JOIN document AS d ON d.id = v.document_id
-                        JOIN field_instance AS fi ON fi.id = e.instance_id
-                        LEFT JOIN lot AS l ON l.id = fi.lot_id
-                        LEFT JOIN LATERAL (
-                            SELECT action FROM review_action
-                            WHERE attempt_id = e.id
-                            ORDER BY created_at DESC, id DESC LIMIT 1
-                        ) AS ra ON true
-                        WHERE {" AND ".join(clauses)}
-                    )
-                    SELECT e.*, ev.anchor, ev.page_no, ev.bbox_x0, ev.bbox_y0,
-                           ev.bbox_x1, ev.bbox_y1, ev.char_start, ev.char_end,
-                           ev.quote, ev.quote_source, ev.match_type, ev.seq
-                    FROM current_extractions AS e
-                    LEFT JOIN evidence AS ev ON ev.extraction_id = e.id
-                    {status_clause}
-                    ORDER BY e.group_key NULLS LAST, e.field_key, e.lot_code NULLS FIRST,
-                             e.id, ev.seq"""
-                ),
-                params,
+                query.order_by(
+                    current.c.group_key.nulls_last(),
+                    current.c.field_key,
+                    current.c.lot_code.nulls_first(),
+                    current.c.id,
+                    Evidence.seq,
+                )
             )
             .mappings()
             .all()
@@ -435,25 +505,33 @@ def get_version(version_id: int, request: Request) -> dict[str, object]:
         # 项目级动作（导出、冲突、批量重跑）都按 project_id 定位，版本详情顺手带上，
         # 前端就不用为了拿它再拉一次项目详情。
         project_id = connection.execute(
-            text(
-                """SELECT project_id FROM project_file
-                   WHERE version_id = :version_id AND deleted_at IS NULL
-                   ORDER BY CASE role WHEN 'main' THEN 0 ELSE 1 END, sort_no, id
-                   LIMIT 1"""
-            ),
-            {"version_id": version_id},
+            select(ProjectFile.project_id)
+            .where(ProjectFile.version_id == version_id, ProjectFile.deleted_at.is_(None))
+            .order_by(
+                case((ProjectFile.role == "main", 0), else_=1), ProjectFile.sort_no, ProjectFile.id
+            )
+            .limit(1)
         ).scalar_one_or_none()
         runs = (
             connection.execute(
-                text(
-                    """SELECT id, provider, provider_version, tier, backend, status, page_count,
-                              config_snapshot ->> 'ocr_mode' AS ocr_mode,
-                              elapsed_ms, error_code, error_message, started_at, finished_at,
-                              created_at
-                       FROM parse_run WHERE version_id = :version_id
-                       ORDER BY created_at DESC, id DESC"""
-                ),
-                {"version_id": version_id},
+                select(
+                    ParseRun.id,
+                    ParseRun.provider,
+                    ParseRun.provider_version,
+                    ParseRun.tier,
+                    ParseRun.backend,
+                    ParseRun.status,
+                    ParseRun.page_count,
+                    ParseRun.config_snapshot["ocr_mode"].as_string().label("ocr_mode"),
+                    ParseRun.elapsed_ms,
+                    ParseRun.error_code,
+                    ParseRun.error_message,
+                    ParseRun.started_at,
+                    ParseRun.finished_at,
+                    ParseRun.created_at,
+                )
+                .where(ParseRun.version_id == version_id)
+                .order_by(ParseRun.created_at.desc(), ParseRun.id.desc())
             )
             .mappings()
             .all()
@@ -461,15 +539,17 @@ def get_version(version_id: int, request: Request) -> dict[str, object]:
         # 只取最近一条：界面上要解释的是「这一次为什么没有结果」，不是抽取历史。
         extraction_job = (
             connection.execute(
-                text(
-                    """SELECT j.status, j.error_code, j.error_message,
-                              j.progress, j.created_at, j.finished_at
-                       FROM job AS j
-                       WHERE j.version_id = :version_id AND j.stage = 'extracting'
-                       ORDER BY j.created_at DESC, j.id DESC
-                       LIMIT 1"""
-                ),
-                {"version_id": version_id},
+                select(
+                    Job.status,
+                    Job.error_code,
+                    Job.error_message,
+                    Job.progress,
+                    Job.created_at,
+                    Job.finished_at,
+                )
+                .where(Job.version_id == version_id, Job.stage == "extracting")
+                .order_by(Job.created_at.desc(), Job.id.desc())
+                .limit(1)
             )
             .mappings()
             .first()
@@ -512,13 +592,20 @@ def get_outline(
             return {"run_id": None, "items": []}
         rows = (
             connection.execute(
-                text(
-                    """SELECT id, parent_id, anchor, page_no, level, text
-                       FROM element
-                       WHERE version_id = :version_id AND run_id = :run_id AND type = 'title'
-                       ORDER BY page_no, order_no"""
-                ),
-                {"version_id": version_id, "run_id": run_id},
+                select(
+                    Element.id,
+                    Element.parent_id,
+                    Element.anchor,
+                    Element.page_no,
+                    Element.level,
+                    Element.text,
+                )
+                .where(
+                    Element.version_id == version_id,
+                    Element.run_id == run_id,
+                    Element.type == "title",
+                )
+                .order_by(Element.page_no, Element.order_no)
             )
             .mappings()
             .all()
@@ -561,13 +648,20 @@ def resolve_anchors(
             return {"run_id": None, "items": [], "missing": ordered}
         rows = (
             connection.execute(
-                text(
-                    """SELECT anchor, type, page_no, bbox_x0, bbox_y0, bbox_x1, bbox_y1, text
-                       FROM element
-                       WHERE version_id = :version_id AND run_id = :run_id
-                         AND anchor = ANY(CAST(:anchors AS TEXT[]))"""
-                ),
-                {"version_id": version_id, "run_id": run_id, "anchors": ordered},
+                select(
+                    Element.anchor,
+                    Element.type,
+                    Element.page_no,
+                    Element.bbox_x0,
+                    Element.bbox_y0,
+                    Element.bbox_x1,
+                    Element.bbox_y1,
+                    Element.text,
+                ).where(
+                    Element.version_id == version_id,
+                    Element.run_id == run_id,
+                    Element.anchor.in_(ordered),
+                )
             )
             .mappings()
             .all()

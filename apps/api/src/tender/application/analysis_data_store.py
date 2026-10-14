@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import copy
 
-from sqlalchemy import text
-
 from tender.application.analysis_data import DATA_VERSION, assemble_dataset, data_gap
-from tender.application.knowledge import fingerprint
-from tender.application.knowledge_store import KnowledgeStore, encode, source_state
+from tender.application.deep_analysis import RUNTIME_VERSION
+from tender.application.knowledge import fingerprint, source_state
+from tender.ports.repository.knowledge import KnowledgeStore
 
 
 def snapshot_manifest(status: str, runs: list[dict], modules: list[dict]) -> str:
@@ -31,76 +30,51 @@ def unfinished_runs(runs: list[dict]) -> bool:
 
 
 def snapshot_matches_report(db: KnowledgeStore, snapshot: dict) -> bool:
-    # 用一条查询读取运行账和模块成果，避免多次查询跨过提交边界而拼出混合版本。
-    rows = db.rows("""SELECT r.status,
-        (SELECT COALESCE(jsonb_agg(a ORDER BY a.id), '[]'::jsonb) FROM (
-            SELECT a.id,a.status,a.attempt,a.module_id FROM agent_module_run a
-            JOIN analysis_module m ON m.id=a.module_id WHERE m.report_id=r.id
-        ) a) AS runs,
-        (SELECT COALESCE(jsonb_agg(m ORDER BY m.id), '[]'::jsonb) FROM (
-            SELECT id,module_key,status,business_data FROM analysis_module WHERE report_id=r.id
-        ) m) AS modules
-        FROM analysis_report r WHERE r.id=:id AND r.company_id=:company_id""",
-        {"id": snapshot["report_id"]})
-    if not rows:
+    # 运行账与模块成果一次读出，避免多次查询跨过提交边界而拼出混合版本。
+    state = db.snapshot_state(snapshot["report_id"])
+    if state is None:
         return False
-    current = rows[0]
     return (
-        current["status"] not in {"waiting", "pending", "running"}
-        and not unfinished_runs(current["runs"])
-        and snapshot_manifest(current["status"], current["runs"], current["modules"])
+        state["status"] not in {"waiting", "pending", "running"}
+        and not unfinished_runs(state["runs"])
+        and snapshot_manifest(state["status"], state["runs"], state["modules"])
         == snapshot["manifest_hash"]
     )
 
 
 def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
-    reports = db.rows(
-        "SELECT * FROM analysis_report WHERE id=:id AND company_id=:company_id",
-        {"id": report_id},
-    )
-    if not reports or reports[0]["runtime_version"] != "deepagents-0.7.22-v3":
+    report = db.report(report_id)
+    if report is None or report["runtime_version"] != RUNTIME_VERSION:
         return None
-    with db.engine.begin() as conn:
-        conn.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": reports[0]["project_id"]})
-        report = dict(conn.execute(
-            text("SELECT * FROM analysis_report WHERE id=:id FOR UPDATE"), {"id": report_id},
-        ).mappings().one())
-        if report["status"] in {"waiting", "pending", "running"}:
+    if report["status"] in {"waiting", "pending", "running"}:
+        return None
+    # 项目会话锁 + 报告行锁串行化并发发布；整段读写在同一个事务里，避免混合版本。
+    with db.transaction() as session:
+        session.lock_project(report["project_id"])
+        locked = session.lock_report(report_id)
+        if locked["status"] in {"waiting", "pending", "running"}:
             return None
-        runs = [dict(r) for r in conn.execute(text("""SELECT a.id,a.status,a.attempt,a.module_id
-            FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
-            WHERE m.report_id=:id ORDER BY a.id"""), {"id": report_id}).mappings()]
+        runs = session.report_runs(report_id)
         if unfinished_runs(runs):
             return None
-        modules = [dict(m) for m in conn.execute(
-            text("SELECT * FROM analysis_module WHERE report_id=:id ORDER BY id"),
-            {"id": report_id},
-        ).mappings()]
-        digest = snapshot_manifest(report["status"], runs, modules)
-        existing = conn.execute(
-            text("SELECT * FROM analysis_data_snapshot "
-                 "WHERE report_id=:id AND manifest_hash=:hash"),
-            {"id": report_id, "hash": digest},
-        ).mappings().first()
+        modules = session.report_modules(report_id)
+        digest = snapshot_manifest(locked["status"], runs, modules)
+        existing = session.snapshot_by_manifest(report_id, digest)
         if existing:
-            return dict(existing)
+            return existing
         lots = []
-        derived = set(report["derived_lot_ids"])
+        derived = set(locked["derived_lot_ids"])
         for module in modules:
             if module["module_key"] != "project_basic_info_parsing":
                 continue
             for record in module["business_data"].get("records", []):
                 if record["kind"] != "lot" or record.get("verification") != "supported":
                     continue
-                lot_id = conn.execute(text("""SELECT id FROM lot
-                    WHERE project_id=:project AND code=:code ORDER BY id LIMIT 1"""),
-                    {"project": report["project_id"], "code": record["code"]}).scalar_one_or_none()
+                lot_id = session.lot_id_for_code(locked["project_id"], record["code"])
                 if lot_id is None:
-                    lot_id = conn.execute(text("""INSERT INTO lot (project_id,code,name,sort_no)
-                        SELECT :project,:code,:name,COALESCE(max(sort_no),-1)+1
-                        FROM lot WHERE project_id=:project RETURNING id"""),
-                        {"project": report["project_id"], "code": record["code"],
-                         "name": record["title"]}).scalar_one()
+                    lot_id = session.create_lot(
+                        locked["project_id"], code=record["code"], name=record["title"]
+                    )
                     derived.add(lot_id)
                 item = copy.deepcopy(record) | {"lot_id": lot_id}
                 duplicate = next((v for v in lots if v["lot_id"] == lot_id), None)
@@ -111,12 +85,11 @@ def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
                     duplicate["citations"].extend(record["citations"])
                 else:
                     lots.append(item)
-        conn.execute(text("UPDATE analysis_report SET derived_lot_ids=:ids WHERE id=:id"),
-                     {"ids": sorted(derived), "id": report_id})
+        session.set_derived_lots(report_id, sorted(derived))
         data = assemble_dataset(modules, lots)
         catalog = [c for c in data["coverage"]
                    if c["module_key"] == "project_basic_info_parsing" and c["topic"] == "lots"]
-        missing_lots = {lot["id"] for lot in report["lot_settings"]} - {
+        missing_lots = {lot["id"] for lot in locked["lot_settings"]} - {
             lot["lot_id"] for lot in lots
         }
         catalog_incomplete = any(
@@ -130,27 +103,24 @@ def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
             ))
             if data["readiness"] == "usable":
                 data["readiness"] = "partial"
-        for source in report["source_snapshot"]:
+        for source in locked["source_snapshot"]:
             if source_state(source) != "ready":
                 data["gaps"].append(data_gap(
                     "missing_source", "招标材料未完整就绪：" + source.get("file_name", ""),
                 ))
                 if data["readiness"] == "usable":
                     data["readiness"] = "partial"
-        revision = conn.execute(text("""SELECT COALESCE(max(revision),0)+1
-            FROM analysis_data_snapshot WHERE report_id=:id"""), {"id": report_id}).scalar_one()
-        row = conn.execute(text("""INSERT INTO analysis_data_snapshot
-            (report_id,revision,schema_version,manifest_hash,input_snapshot,data)
-            VALUES (:report,:revision,:version,:hash,CAST(:inputs AS JSONB),CAST(:data AS JSONB))
-            RETURNING *"""), {
-                "report": report_id, "revision": revision, "version": DATA_VERSION,
-                "hash": digest, "data": encode(data),
-                "inputs": encode({k: report[k] for k in (
-                    "source_snapshot", "reference_snapshot", "category", "topics", "lot_settings",
-                    "runtime_version", "skill_version",
-                )}),
-            }).mappings().one()
-        return dict(row)
+        return session.insert_snapshot(
+            report_id=report_id,
+            revision=session.next_snapshot_revision(report_id),
+            schema_version=DATA_VERSION,
+            manifest_hash=digest,
+            inputs={k: locked[k] for k in (
+                "source_snapshot", "reference_snapshot", "category", "topics", "lot_settings",
+                "runtime_version", "skill_version",
+            )},
+            data=data,
+        )
 
 
 def accessible_data(

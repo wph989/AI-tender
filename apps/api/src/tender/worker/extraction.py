@@ -11,8 +11,37 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import (
+    case,
+    exists,
+    func,
+    insert,
+    select,
+    update,
+)
+from sqlalchemy.dialects.postgresql import distinct_on
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import aliased
 
+from tender.adapters.pg.locks import acquire_xact_lock, release_lock, try_acquire_lock
+from tender.adapters.pg.models import (
+    Element,
+    Evidence,
+    Extraction,
+    ExtractionConflict,
+    FieldInstance,
+    Job,
+    LlmCallLog,
+    LlmFeature,
+    LlmFeatureModel,
+    LlmModel,
+    LlmProvider,
+    Lot,
+    Project,
+    ProjectFile,
+    ReviewTask,
+)
+from tender.adapters.pg.session import create_pg_engine
 from tender.adapters.redis_cache import RedisConfigCache
 from tender.application.agent import extract_field
 from tender.application.extraction import build_anchor_document, identify_lots
@@ -25,7 +54,7 @@ from tender.core.secrets import SecretKeyUnavailable, decrypt_secret
 from tender.domain.errors import ExtractionFailed, ExtractionUnavailable
 from tender.worker.celery_app import celery_app
 
-_engine = create_engine(settings.database_url(), pool_pre_ping=True)
+_engine = create_pg_engine()
 _config_registry_instance: ConfigRegistry | None = None
 
 
@@ -43,21 +72,13 @@ _TERMINAL = frozenset({"completed", "partial", "failed", "canceled"})
 @contextmanager
 def _advisory_lock(lock_key: str) -> Iterator[bool]:
     with _engine.connect() as connection:
-        acquired = bool(
-            connection.execute(
-                text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": lock_key},
-            ).scalar_one()
-        )
+        acquired = try_acquire_lock(connection, lock_key)
         connection.commit()
         try:
             yield acquired
         finally:
             if acquired:
-                connection.execute(
-                    text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-                    {"lock_key": lock_key},
-                )
+                release_lock(connection, lock_key)
                 connection.commit()
 
 
@@ -65,15 +86,16 @@ def _load_job(job_id: str) -> Mapping[str, Any] | None:
     with _engine.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT j.*, pf.display_name, p.company_id AS project_company_id,
-                          p.deleted_at AS project_deleted_at
-                       FROM job AS j
-                       JOIN project_file AS pf ON pf.id = j.project_file_id
-                       JOIN project AS p ON p.id = j.project_id
-                       WHERE j.id = :job_id"""
-                ),
-                {"job_id": job_id},
+                select(
+                    Job,
+                    ProjectFile.display_name,
+                    Project.company_id.label("project_company_id"),
+                    Project.deleted_at.label("project_deleted_at"),
+                )
+                .select_from(Job)
+                .join(ProjectFile, ProjectFile.id == Job.project_file_id)
+                .join(Project, Project.id == Job.project_id)
+                .where(Job.id == job_id)
             )
             .mappings()
             .first()
@@ -85,14 +107,26 @@ def _load_elements(version_id: int, run_id: int) -> list[dict[str, Any]]:
     with _engine.connect() as connection:
         rows = (
             connection.execute(
-                text(
-                    """SELECT id, run_id, page_no, order_no, anchor, type, level, parent_id,
-                              bbox_x0, bbox_y0, bbox_x1, bbox_y1, text, html, source, continues_prev
-                       FROM element
-                       WHERE version_id = :version_id AND run_id = :run_id
-                       ORDER BY page_no, order_no"""
-                ),
-                {"version_id": version_id, "run_id": run_id},
+                select(
+                    Element.id,
+                    Element.run_id,
+                    Element.page_no,
+                    Element.order_no,
+                    Element.anchor,
+                    Element.type,
+                    Element.level,
+                    Element.parent_id,
+                    Element.bbox_x0,
+                    Element.bbox_y0,
+                    Element.bbox_x1,
+                    Element.bbox_y1,
+                    Element.text,
+                    Element.html,
+                    Element.source,
+                    Element.continues_prev,
+                )
+                .where(Element.version_id == version_id, Element.run_id == run_id)
+                .order_by(Element.page_no, Element.order_no)
             )
             .mappings()
             .all()
@@ -107,38 +141,31 @@ def _upsert_lots(project_id: int, elements: list[dict[str, Any]]) -> list[dict[s
             if candidate.confidence < 0.75:
                 continue
             existing = connection.execute(
-                text("SELECT id FROM lot WHERE project_id = :project_id AND code = :code LIMIT 1"),
-                {"project_id": project_id, "code": candidate.code},
+                select(Lot.id)
+                .where(Lot.project_id == project_id, Lot.code == candidate.code)
+                .limit(1)
             ).scalar_one_or_none()
             if existing is None:
                 next_sort = int(
                     connection.execute(
-                        text(
-                            "SELECT COALESCE(max(sort_no), -1) + 1 FROM lot "
-                            "WHERE project_id = :project_id"
-                        ),
-                        {"project_id": project_id},
+                        select(func.coalesce(func.max(Lot.sort_no), -1) + 1).where(
+                            Lot.project_id == project_id
+                        )
                     ).scalar_one()
                 )
                 connection.execute(
-                    text(
-                        """INSERT INTO lot (project_id, code, name, sort_no)
-                           VALUES (:project_id, :code, :name, :sort_no)"""
-                    ),
-                    {
-                        "project_id": project_id,
-                        "code": candidate.code,
-                        "name": candidate.name,
-                        "sort_no": next_sort,
-                    },
+                    insert(Lot).values(
+                        project_id=project_id,
+                        code=candidate.code,
+                        name=candidate.name,
+                        sort_no=next_sort,
+                    )
                 )
         rows = (
             connection.execute(
-                text(
-                    "SELECT id, code, name FROM lot "
-                    "WHERE project_id = :project_id ORDER BY sort_no, id"
-                ),
-                {"project_id": project_id},
+                select(Lot.id, Lot.code, Lot.name)
+                .where(Lot.project_id == project_id)
+                .order_by(Lot.sort_no, Lot.id)
             )
             .mappings()
             .all()
@@ -156,17 +183,21 @@ def _field_keys(snapshot: Mapping[str, Any]) -> list[str]:
 
 def _log_call(record: CallRecord) -> None:
     data = asdict(record)
-    columns = ",".join(data)
-    values = ",".join(":" + key for key in data)
     # 首次先插入 running；返回后只补写同一请求，不新增第二条调用账。
+    insert_call = pg_insert(LlmCallLog).values(**data)
     with _engine.begin() as c:
         c.execute(
-            text(f"""INSERT INTO llm_call_log({columns}) VALUES ({values})
-            ON CONFLICT (invocation_id,request_ordinal) DO UPDATE SET
-            status=EXCLUDED.status,http_status=EXCLUDED.http_status,latency_ms=EXCLUDED.latency_ms,
-            prompt_tokens=EXCLUDED.prompt_tokens,completion_tokens=EXCLUDED.completion_tokens,
-            error_message=EXCLUDED.error_message"""),
-            data,
+            insert_call.on_conflict_do_update(
+                index_elements=["invocation_id", "request_ordinal"],
+                set_={
+                    "status": insert_call.excluded.status,
+                    "http_status": insert_call.excluded.http_status,
+                    "latency_ms": insert_call.excluded.latency_ms,
+                    "prompt_tokens": insert_call.excluded.prompt_tokens,
+                    "completion_tokens": insert_call.excluded.completion_tokens,
+                    "error_message": insert_call.excluded.error_message,
+                },
+            )
         )
 
 
@@ -191,22 +222,37 @@ def _load_candidates(feature_key: str, purpose: str) -> list[ModelCandidate]:
     with _engine.connect() as connection:
         rows = (
             connection.execute(
-                text(
-                    """SELECT m.id AS model_row_id, m.model_id, m.display_name, m.timeout_seconds,
-                              m.temperature, m.max_tokens, m.extra_retries,m.api_mode,p.protocol,
-                              m.parameters,m.capabilities,
-                              p.name AS provider_name,p.auth_mode,p.api_key_ciphertext,
-                              p.id AS provider_id, p.base_url
-                       FROM llm_feature_model AS fm
-                       JOIN llm_model AS m ON m.id = fm.model_id
-                       JOIN llm_provider AS p ON p.id = m.provider_id
-                       WHERE fm.feature_key = :feature_key
-                         AND m.enabled AND m.deleted_at IS NULL AND m.kind='language'
-                         AND m.capabilities @> '["json_output"]'::jsonb
-                         AND p.enabled AND p.deleted_at IS NULL
-                       ORDER BY fm.priority"""
-                ),
-                {"feature_key": feature_key},
+                select(
+                    LlmModel.id.label("model_row_id"),
+                    LlmModel.model_id,
+                    LlmModel.display_name,
+                    LlmModel.timeout_seconds,
+                    LlmModel.temperature,
+                    LlmModel.max_tokens,
+                    LlmModel.extra_retries,
+                    LlmModel.api_mode,
+                    LlmProvider.protocol,
+                    LlmModel.parameters,
+                    LlmModel.capabilities,
+                    LlmProvider.name.label("provider_name"),
+                    LlmProvider.auth_mode,
+                    LlmProvider.api_key_ciphertext,
+                    LlmProvider.id.label("provider_id"),
+                    LlmProvider.base_url,
+                )
+                .select_from(LlmFeatureModel)
+                .join(LlmModel, LlmModel.id == LlmFeatureModel.model_id)
+                .join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
+                .where(
+                    LlmFeatureModel.feature_key == feature_key,
+                    LlmModel.enabled.is_(True),
+                    LlmModel.deleted_at.is_(None),
+                    LlmModel.kind == "language",
+                    LlmModel.capabilities.contains(["json_output"]),
+                    LlmProvider.enabled.is_(True),
+                    LlmProvider.deleted_at.is_(None),
+                )
+                .order_by(LlmFeatureModel.priority)
             )
             .mappings()
             .all()
@@ -257,7 +303,7 @@ def _routing_model(
     remaining_seconds=None,
     extra_retries_limit: int | None = None,
 ) -> RoutingModel:
-    from tender.application.provider_cooldown import ProviderCooldown
+    from tender.adapters.pg.repositories.provider_cooldown import ProviderCooldown
 
     cooldown = ProviderCooldown(_engine)
     candidates = _load_candidates(feature_key, purpose)
@@ -268,9 +314,7 @@ def _routing_model(
         ]
     with _engine.connect() as c:
         policy = (
-            c.execute(text("SELECT * FROM llm_feature WHERE key=:key"), {"key": feature_key})
-            .mappings()
-            .first()
+            c.execute(select(LlmFeature).where(LlmFeature.key == feature_key)).mappings().first()
         )
 
     def recheck(snapshot: ModelCandidate) -> ModelCandidate | None:
@@ -321,46 +365,60 @@ def _refresh_conflict(
     lot_id: int | None,
 ) -> None:
     lock_key = f"conflict:{project_id}:{field_key}:{lot_id or 0}"
-    connection.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
+    acquire_xact_lock(connection, lock_key)
+    replacement = aliased(ProjectFile)
     rows = (
         connection.execute(
-            text(
-                """SELECT DISTINCT ON (e.version_id) e.id, e.version_id, e.value_json,
-                          pf.role, pf.created_at
-                   FROM extraction AS e
-                   JOIN field_instance AS fi ON fi.id = e.instance_id
-                   JOIN project_file AS pf ON pf.version_id = e.version_id
-                   WHERE pf.project_id = :project_id AND pf.deleted_at IS NULL
-                     AND NOT EXISTS (
-                         SELECT 1 FROM project_file AS replacement
-                         WHERE replacement.replaces_id = pf.id
-                           AND replacement.deleted_at IS NULL
-                     )
-                     AND pf.role IN ('main','clarification','addendum')
-                     AND e.is_current = true AND e.field_key = :field_key
-                     AND e.status <> 'not_found' AND e.value_json IS NOT NULL
-                     AND fi.lot_id IS NOT DISTINCT FROM :lot_id
-                   ORDER BY e.version_id,
-                            CASE pf.role WHEN 'addendum' THEN 0
-                                 WHEN 'clarification' THEN 1 ELSE 2 END,
-                            pf.created_at DESC, e.id DESC"""
-            ),
-            {"project_id": project_id, "field_key": field_key, "lot_id": lot_id},
+            select(
+                Extraction.id,
+                Extraction.version_id,
+                Extraction.value_json,
+                ProjectFile.role,
+                ProjectFile.created_at,
+            )
+            .select_from(Extraction)
+            .join(FieldInstance, FieldInstance.id == Extraction.instance_id)
+            .join(ProjectFile, ProjectFile.version_id == Extraction.version_id)
+            .where(
+                ProjectFile.project_id == project_id,
+                ProjectFile.deleted_at.is_(None),
+                ~exists().where(
+                    replacement.replaces_id == ProjectFile.id,
+                    replacement.deleted_at.is_(None),
+                ),
+                ProjectFile.role.in_(("main", "clarification", "addendum")),
+                Extraction.is_current.is_(True),
+                Extraction.field_key == field_key,
+                Extraction.status != "not_found",
+                Extraction.value_json.is_not(None),
+                FieldInstance.lot_id.is_not_distinct_from(lot_id),
+            )
+            .ext(distinct_on(Extraction.version_id))
+            .order_by(
+                Extraction.version_id,
+                case(
+                    (ProjectFile.role == "addendum", 0),
+                    (ProjectFile.role == "clarification", 1),
+                    else_=2,
+                ),
+                ProjectFile.created_at.desc(),
+                Extraction.id.desc(),
+            )
         )
         .mappings()
         .all()
     )
     existing_id = connection.execute(
-        text(
-            """SELECT id FROM extraction_conflict
-               WHERE project_id = :project_id AND field_key = :field_key
-                 AND lot_id IS NOT DISTINCT FROM :lot_id AND status = 'open'
-               ORDER BY id DESC LIMIT 1 FOR UPDATE"""
-        ),
-        {"project_id": project_id, "field_key": field_key, "lot_id": lot_id},
+        select(ExtractionConflict.id)
+        .where(
+            ExtractionConflict.project_id == project_id,
+            ExtractionConflict.field_key == field_key,
+            ExtractionConflict.lot_id.is_not_distinct_from(lot_id),
+            ExtractionConflict.status == "open",
+        )
+        .order_by(ExtractionConflict.id.desc())
+        .limit(1)
+        .with_for_update()
     ).scalar_one_or_none()
     distinct_values = {
         json.dumps(row["value_json"], ensure_ascii=False, sort_keys=True) for row in rows
@@ -369,36 +427,26 @@ def _refresh_conflict(
         if existing_id is not None:
             # 新结果已经消除了差异，关闭旧的 open 记录但不自动指定胜出值。
             connection.execute(
-                text(
-                    """UPDATE extraction_conflict
-                       SET status = 'dismissed', resolved_id = NULL
-                       WHERE id = :id"""
-                ),
-                {"id": existing_id},
+                update(ExtractionConflict)
+                .where(ExtractionConflict.id == existing_id)
+                .values(status="dismissed", resolved_id=None)
             )
         return
     candidate_ids = [int(row["id"]) for row in rows]
     if existing_id is None:
         connection.execute(
-            text(
-                """INSERT INTO extraction_conflict
-                       (project_id, field_key, lot_id, candidate_ids)
-                   VALUES (:project_id, :field_key, :lot_id, CAST(:candidate_ids AS BIGINT[]))"""
-            ),
-            {
-                "project_id": project_id,
-                "field_key": field_key,
-                "lot_id": lot_id,
-                "candidate_ids": candidate_ids,
-            },
+            insert(ExtractionConflict).values(
+                project_id=project_id,
+                field_key=field_key,
+                lot_id=lot_id,
+                candidate_ids=candidate_ids,
+            )
         )
     else:
         connection.execute(
-            text(
-                "UPDATE extraction_conflict SET candidate_ids = CAST(:ids AS BIGINT[]) "
-                "WHERE id = :id"
-            ),
-            {"ids": candidate_ids, "id": existing_id},
+            update(ExtractionConflict)
+            .where(ExtractionConflict.id == existing_id)
+            .values(candidate_ids=candidate_ids)
         )
 
 
@@ -420,8 +468,7 @@ def _persist_result(
         evidence_items = []
     with _engine.begin() as connection:
         stored_progress = connection.execute(
-            text("SELECT progress FROM job WHERE id = :job_id FOR UPDATE"),
-            {"job_id": job["id"]},
+            select(Job.progress).where(Job.id == job["id"]).with_for_update()
         ).scalar_one_or_none()
         progress = dict(stored_progress) if isinstance(stored_progress, dict) else {}
         completed = progress.get("completed_fields")
@@ -447,51 +494,42 @@ def _persist_result(
             }
         )
         instance_id = connection.execute(
-            text(
-                """SELECT id FROM field_instance
-                   WHERE version_id = :version_id AND field_key = :field_key
-                     AND lot_id IS NOT DISTINCT FROM :lot_id
-                   FOR UPDATE"""
-            ),
-            {"version_id": version_id, "field_key": field_key, "lot_id": lot_id},
+            select(FieldInstance.id)
+            .where(
+                FieldInstance.version_id == version_id,
+                FieldInstance.field_key == field_key,
+                FieldInstance.lot_id.is_not_distinct_from(lot_id),
+            )
+            .with_for_update()
         ).scalar_one_or_none()
         if instance_id is None:
             instance_id = connection.execute(
-                text(
-                    """INSERT INTO field_instance (version_id, field_key, lot_id)
-                       VALUES (:version_id, :field_key, :lot_id) RETURNING id"""
-                ),
-                {"version_id": version_id, "field_key": field_key, "lot_id": lot_id},
+                insert(FieldInstance)
+                .values(version_id=version_id, field_key=field_key, lot_id=lot_id)
+                .returning(FieldInstance.id)
             ).scalar_one()
 
         previous = (
             connection.execute(
-                text(
-                    """SELECT id, attempt_no FROM extraction
-                   WHERE instance_id = :instance_id AND is_current = true
-                   FOR UPDATE"""
-                ),
-                {"instance_id": instance_id},
+                select(Extraction.id, Extraction.attempt_no)
+                .where(Extraction.instance_id == instance_id, Extraction.is_current.is_(True))
+                .with_for_update()
             )
             .mappings()
             .first()
         )
         attempt_no = int(
             connection.execute(
-                text(
-                    "SELECT COALESCE(max(attempt_no), 0) + 1 FROM extraction "
-                    "WHERE instance_id = :instance_id"
-                ),
-                {"instance_id": instance_id},
+                select(func.coalesce(func.max(Extraction.attempt_no), 0) + 1).where(
+                    Extraction.instance_id == instance_id
+                )
             ).scalar_one()
         )
         machine_attempt_no = int(
             connection.execute(
-                text(
-                    """SELECT COALESCE(max(machine_attempt_no), 0) + 1
-                       FROM extraction WHERE instance_id = :instance_id AND run_id = :run_id"""
-                ),
-                {"instance_id": instance_id, "run_id": run_id},
+                select(func.coalesce(func.max(Extraction.machine_attempt_no), 0) + 1).where(
+                    Extraction.instance_id == instance_id, Extraction.run_id == run_id
+                )
             ).scalar_one()
         )
         trigger = str(
@@ -501,87 +539,67 @@ def _persist_result(
         )
         if previous is not None:
             connection.execute(
-                text("UPDATE extraction SET is_current = false, updated_at = now() WHERE id = :id"),
-                {"id": previous["id"]},
+                update(Extraction)
+                .where(Extraction.id == previous["id"])
+                .values(is_current=False, updated_at=func.now())
             )
         value_json = result.get("value")
         extraction_id = connection.execute(
-            text(
-                """INSERT INTO extraction
-                       (instance_id, version_id, run_id, attempt_no, machine_attempt_no,
-                        trigger, hint, field_key, group_key, value_json, value_text,
-                        confidence, status, strategy, evidence_count, supersedes_id,
-                        is_current, created_by, field_def_version, llm_model_id, llm_model_name)
-                   VALUES
-                       (:instance_id, :version_id, :run_id, :attempt_no, :machine_attempt_no,
-                        :trigger, :hint, :field_key, :group_key, CAST(:value_json AS JSONB),
-                        :value_text, :confidence, :status, :strategy, :evidence_count,
-                        :supersedes_id, true, :created_by, 1, :llm_model_id, :llm_model_name)
-                   RETURNING id"""
-            ),
-            {
-                "instance_id": instance_id,
-                "version_id": version_id,
-                "run_id": run_id,
-                "attempt_no": attempt_no,
-                "machine_attempt_no": machine_attempt_no,
-                "trigger": trigger,
-                "hint": (job.get("config_snapshot") or {}).get("hint")
+            insert(Extraction)
+            .values(
+                instance_id=instance_id,
+                version_id=version_id,
+                run_id=run_id,
+                attempt_no=attempt_no,
+                machine_attempt_no=machine_attempt_no,
+                trigger=trigger,
+                hint=(job.get("config_snapshot") or {}).get("hint")
                 if isinstance(job.get("config_snapshot"), dict)
                 else None,
-                "field_key": field.key,
-                "group_key": field.group_key,
-                "value_json": json.dumps(value_json, ensure_ascii=False),
-                "value_text": result.get("value_text", "未找到"),
-                "confidence": float(result.get("confidence", 0)),
-                "status": result.get("status", "need_review"),
-                "strategy": result.get("strategy", "llm"),
-                "evidence_count": len(evidence_items),
-                "supersedes_id": previous["id"] if previous is not None else None,
-                "llm_model_id": result.get("registry_model_id"),
-                "llm_model_name": result.get("model"),
-                "created_by": (job.get("config_snapshot") or {}).get("actor", "system")
+                field_key=field.key,
+                group_key=field.group_key,
+                value_json=value_json,
+                value_text=result.get("value_text", "未找到"),
+                confidence=float(result.get("confidence", 0)),
+                status=result.get("status", "need_review"),
+                strategy=result.get("strategy", "llm"),
+                evidence_count=len(evidence_items),
+                supersedes_id=previous["id"] if previous is not None else None,
+                is_current=True,
+                field_def_version=1,
+                llm_model_id=result.get("registry_model_id"),
+                llm_model_name=result.get("model"),
+                created_by=(job.get("config_snapshot") or {}).get("actor", "system")
                 if isinstance(job.get("config_snapshot"), dict)
                 else "system",
-            },
+            )
+            .returning(Extraction.id)
         ).scalar_one()
         for sequence, item in enumerate(evidence_items, start=1):
             element = item["element"]
             connection.execute(
-                text(
-                    """INSERT INTO evidence
-                           (extraction_id, version_id, seq, anchor, element_id, page_no,
-                            bbox_x0, bbox_y0, bbox_x1, bbox_y1, char_start, char_end,
-                            quote, quote_source, match_type)
-                       VALUES
-                           (:extraction_id, :version_id, :seq, :anchor, :element_id, :page_no,
-                            :bbox_x0, :bbox_y0, :bbox_x1, :bbox_y1, :char_start, :char_end,
-                            :quote, :quote_source, :match_type)"""
-                ),
-                {
-                    "extraction_id": extraction_id,
-                    "version_id": version_id,
-                    "seq": sequence,
-                    "anchor": item["anchor"],
-                    "element_id": element["id"],
-                    "page_no": element["page_no"],
-                    "bbox_x0": element["bbox_x0"],
-                    "bbox_y0": element["bbox_y0"],
-                    "bbox_x1": element["bbox_x1"],
-                    "bbox_y1": element["bbox_y1"],
-                    "char_start": item.get("char_start"),
-                    "char_end": item.get("char_end"),
-                    "quote": item.get("quote") or element.get("text") or "",
-                    "quote_source": element.get("source") or "native",
-                    "match_type": item.get("match_type", "manual"),
-                },
+                insert(Evidence).values(
+                    extraction_id=extraction_id,
+                    version_id=version_id,
+                    seq=sequence,
+                    anchor=item["anchor"],
+                    element_id=element["id"],
+                    page_no=element["page_no"],
+                    bbox_x0=element["bbox_x0"],
+                    bbox_y0=element["bbox_y0"],
+                    bbox_x1=element["bbox_x1"],
+                    bbox_y1=element["bbox_y1"],
+                    char_start=item.get("char_start"),
+                    char_end=item.get("char_end"),
+                    quote=item.get("quote") or element.get("text") or "",
+                    quote_source=element.get("source") or "native",
+                    match_type=item.get("match_type", "manual"),
+                )
             )
         connection.execute(
-            text(
-                """UPDATE field_instance SET current_extraction_id = :extraction_id
-                   WHERE id = :instance_id"""
-            ),
-            {"extraction_id": extraction_id, "instance_id": instance_id},
+            update(FieldInstance)
+            .where(FieldInstance.id == instance_id)
+            .values(current_extraction_id=extraction_id)
         )
         _refresh_conflict(connection, int(job["project_id"]), field.key, lot_id)
         if failure_message or result.get("status") in {"need_review", "conflict"}:
@@ -593,23 +611,17 @@ def _persist_result(
                 else "bad_quote"
             )
             connection.execute(
-                text(
-                    """INSERT INTO review_task (extraction_id, reason)
-                       VALUES (:extraction_id, :reason)"""
-                ),
-                {"extraction_id": extraction_id, "reason": reason},
+                insert(ReviewTask).values(extraction_id=extraction_id, reason=reason)
             )
         connection.execute(
-            text(
-                """UPDATE job SET progress = CAST(:progress AS JSONB), error_code = NULL,
-                       error_message = NULL, updated_at = :now
-                   WHERE id = :job_id"""
-            ),
-            {
-                "job_id": job["id"],
-                "progress": json.dumps(progress, ensure_ascii=False),
-                "now": datetime.now(UTC),
-            },
+            update(Job)
+            .where(Job.id == job["id"])
+            .values(
+                progress=progress,
+                error_code=None,
+                error_message=None,
+                updated_at=datetime.now(UTC),
+            )
         )
 
 
@@ -628,33 +640,31 @@ def _failed_field_result() -> dict[str, Any]:
 def _job_canceled(job_id: str) -> bool:
     """取消是协作式的：字段之间查一次状态，已取消就不再产出新结果。"""
     with _engine.connect() as connection:
-        status = connection.execute(
-            text("SELECT status FROM job WHERE id = :job_id"), {"job_id": job_id}
-        ).scalar_one_or_none()
+        status = connection.execute(select(Job.status).where(Job.id == job_id)).scalar_one_or_none()
     return status == "canceled"
 
 
 def _set_job_state(
     job_id: str, status: str, code: str | None = None, message: str | None = None
 ) -> None:
+    now = datetime.now(UTC)
     finished = status in _TERMINAL
+    # 已是 canceled 的任务不允许被别的状态覆盖；只有取消自己可以写回 canceled。
+    conditions = (
+        [Job.id == job_id] if status == "canceled" else [Job.id == job_id, Job.status != "canceled"]
+    )
     with _engine.begin() as connection:
         connection.execute(
-            text(
-                """UPDATE job SET status = :status, stage = 'extracting',
-                       error_code = :code, error_message = :message, updated_at = :now,
-                       finished_at = CASE WHEN :finished THEN :now ELSE NULL END
-                   WHERE id = :job_id
-                     AND (status <> 'canceled' OR :status = 'canceled')"""
-            ),
-            {
-                "job_id": job_id,
-                "status": status,
-                "code": code,
-                "message": message[:2000] if message else None,
-                "now": datetime.now(UTC),
-                "finished": finished,
-            },
+            update(Job)
+            .where(*conditions)
+            .values(
+                status=status,
+                stage="extracting",
+                error_code=code,
+                error_message=message[:2000] if message else None,
+                updated_at=now,
+                finished_at=now if finished else None,
+            )
         )
 
 
@@ -662,8 +672,7 @@ def _mark_field_error(job_id: str, field_key: str, message: str) -> None:
     with _engine.begin() as connection:
         row = (
             connection.execute(
-                text("SELECT progress, config_snapshot FROM job WHERE id = :job_id FOR UPDATE"),
-                {"job_id": job_id},
+                select(Job.progress, Job.config_snapshot).where(Job.id == job_id).with_for_update()
             )
             .mappings()
             .one()
@@ -686,15 +695,9 @@ def _mark_field_error(job_id: str, field_key: str, message: str) -> None:
             }
         )
         connection.execute(
-            text(
-                """UPDATE job SET progress = CAST(:progress AS JSONB), updated_at = :now
-                   WHERE id = :job_id"""
-            ),
-            {
-                "job_id": job_id,
-                "progress": json.dumps(progress, ensure_ascii=False),
-                "now": datetime.now(UTC),
-            },
+            update(Job)
+            .where(Job.id == job_id)
+            .values(progress=progress, updated_at=datetime.now(UTC))
         )
 
 
@@ -820,28 +823,19 @@ def create_extraction_job(
     with _engine.begin() as connection:
         snapshot_id = _config_registry().snapshot_for_job(connection, active_config)
         connection.execute(
-            text(
-                """INSERT INTO job
-                       (id, company_id, project_id, project_file_id, version_id, run_id,
-                        status, stage, progress, config_snapshot, config_snapshot_id)
-                   VALUES
-                       (:id, :company_id, :project_id, :project_file_id, :version_id, :run_id,
-                        'pending', 'extracting', CAST(:progress AS JSONB),
-                        CAST(:snapshot AS JSONB), :config_snapshot_id)"""
-            ),
-            {
-                "id": job_id,
-                "company_id": settings.company_id(),
-                "project_id": project_id,
-                "project_file_id": project_file_id,
-                "version_id": version_id,
-                "run_id": run_id,
-                "progress": json.dumps(
-                    {"stage": "extracting", "fields_total": len(keys), "fields_done": 0}
-                ),
-                "snapshot": json.dumps(snapshot, ensure_ascii=False),
-                "config_snapshot_id": snapshot_id,
-            },
+            insert(Job).values(
+                id=job_id,
+                company_id=settings.company_id(),
+                project_id=project_id,
+                project_file_id=project_file_id,
+                version_id=version_id,
+                run_id=run_id,
+                status="pending",
+                stage="extracting",
+                progress={"stage": "extracting", "fields_total": len(keys), "fields_done": 0},
+                config_snapshot=snapshot,
+                config_snapshot_id=snapshot_id,
+            )
         )
     # 这里不再直接投递：beat 按 extract.max_inflight 差额派发（worker/dispatch.py）。
     return job_id

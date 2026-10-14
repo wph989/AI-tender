@@ -1,8 +1,8 @@
 ﻿# 前端界面重构交接
 
-更新日期：2026-10-12
+更新日期：2026-10-13
 
-> **2026-10-12 最新交接**：见文件末尾「配置入口、功能绑定及任务取消/补跑修复」。代码、前端运行缓存和验证已完成：后端679 passed / 9 skipped，前端79单测、40浏览器用例及最终构建通过。业务库仍为0010，完整备份和0010→0012 SQL已准备；已询问现场迁移/后端重启授权，收到明确确认后才执行。下面2026-10-11提示保留作历史，当前状态以末尾为准。
+> **2026-10-13 最新交接**：见文件末尾「ORM 落地第二、三步：端口/适配器分层与裸 SQL 收口」。ORM 替换已按用户要求推进到：第一步落地 typed declarative 模型 + 唯一引擎入口 + 模型↔DDL 契约测试；第二、三步落地 ports 协议 + adapters 仓储，`api/`/`worker/`/`application/` 的业务裸 SQL 已全部迁走（`text()` 只剩 `adapters/pg` 里 ORM 表达不到的系统目录查询）。离线验证 `tests/unit tests/contract` → 654 passed / 9 skipped，ruff 全过，`lint-imports` 5 kept / 0 broken。**后端本轮未重启（用户要求推迟）**；`tests/integration` 三个用例已改指新仓储入口并全绿（`TENDER_RUN_DB_TESTS=1` → 72 passed），期间修掉 `KnowledgeSession` 事务未真正提交的真实缺陷。数据库/Redis 网络中断已恢复，报告 #16 的 818 运行中、819–826 排队、814–817 待补跑。下面更早的提示保留作历史，当前状态以末尾为准。
 
 工作目录：`G:\aicode\AI-tender`
 
@@ -1682,3 +1682,177 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 - 报告在模块尚未创建前被取消后补跑时,本次配置中心的预算和显式 `max_output_tokens` / `timeout_seconds` 会写回 `analysis_report.runtime_settings`,供 `prepare_report` 延迟创建首个运行账使用;已有模块时仍不改写报告旧快照。
 - 新增适配器瞬时版本失败回归、模块创建前补跑预算继承集成回归。后端全套 `uv run pytest tests/unit tests/contract tests/integration -q --tb=short` → **681 passed / 9 skipped**;Ruff、`lint-imports` 5 kept / 0 broken、`git diff --check` 通过。
 - 仍然是隔离 schema/临时表与测试替身,没有执行现场迁移、重启服务、真实模型调用、提交或推送。
+
+
+#### 2026-10-12 修复分析卡死:僵尸运行饿死整份报告（已现场迁移并重启）
+
+现场现象:报告 #16 一直停在「分析中」,13 个模块 0 完成,首个模块的计数冻结在模型请求 19/80、工具调用 26/100。
+
+根因（数据库、检查点与 `pg_locks` 三方证据确证）:
+
+- 业务库仍是 `0010_analysis_guards`,缺 `analysis_module.business_data`、`analysis_report.derived_lot_ids` 与 `analysis_data_snapshot` 表,而运行中的代码（`deepagents-0.7.22-v3`）已依赖它们。
+- 模块运行 #930（project_basic_info_parsing）跑完检索、提交并通过校验,在 `AgentRuntime.save()` 发布已核实成果时因缺列报 `UndefinedColumn`;图节点异常退出,心跳随之停止（租约停在最后一次心跳 +45s）。
+- 异常收尾走 `AgentRuntime.finish()`,但其中 `UPDATE analysis_module` 同样引用 `business_data`,报同一个错,把同一事务里的「运行终态」一并回滚——于是留下租约早已过期却永远 `status='running'` 的僵尸运行;LangGraph 检查点的 `pending_writes` 里至今留着这条 ProgrammingError。
+- `claim()` 先选「本报告最靠前的、尚未持锁的运行」作为 first,僵尸 #930 虽然不持有配额锁却仍占着这个名次,同报告其余 12 个模块每次抢槽都被 `first != self` 拒绝;报告租约由仍活着的控制器每秒续期,`dispatch_knowledge` 不满足重派条件,而 `requeue_unlocked_runs` 只在控制器启动时执行一次——三重叠加成永久卡死。
+- 同类僵尸在报告 11（run 807）、13（853）、14（904）、15（917）同样存在,是固定通路而非偶发:任何模块级异常都可能把整份报告卡死。
+
+代码修复:
+
+- `application/agent_runtime.py`:`finish()` 改为先用 `SELECT ... FOR UPDATE` 校验运行归属,成果发布移入 `begin_nested()` savepoint——缺列只回滚成果,运行与模块的失败终态照常提交,模块状态降为 `failed` 并写明「模块成果发布失败: ...」,另记 `publish_failed` 事件;新增 `_publish()` 承载成果与关系写入。
+- 同文件 `claim()`:取 first 之前先收殓「租约已过期且无人持有配额锁」的僵尸运行,降级为 `pending` 交回争抢,既解除饿死也让僵尸模块自身能被重新领取。
+- 新增 `application/schema_guard.py`:探测分析链路强依赖的列与表;`worker/knowledge.py` 的 `_analyze_project` 在版本校验之后、模型预算之前核对,缺对象立刻失败并写明「请先执行数据库迁移」,不再跑到发布成果那一步才炸。
+- 新增两项集成回归:`test_stale_run_without_holder_returns_to_queue`、`test_publish_failure_still_records_terminal_run_state`。
+
+现场变更（已获用户明确授权「按你的建议做,也能执行数据库迁移」）:
+
+- 停止 API/worker/beat（原 pid 31408/5160/8732）;停止前确认无在跑任务、无残留 advisory 锁。
+- 新备份 `.tmp/backups/20261012-233511-before-0012.dump`（26,191,873 bytes）,`pg_restore --list` 目录校验含关键表。
+- `alembic upgrade head`:`0010_analysis_guards` → `0012_config_limits (head)`;迁移后 `missing_schema` 返回空列表。
+- 收殓报告 11/13/14/15 上遗留的 running 运行（脚本复用 `cancel_unlocked_runs`,幂等,收殓后均为 0）;报告 16 保留原状交由调度自愈。
+- 按 `scripts/start-backend.ps1` 重启三个进程（api 33300 / worker 32216 / beat 24772）,`/api/v1/healthz` 返回 `{"status":"ok"}`。
+
+验证:
+
+- 后端 `PYTHONUTF8=1 TENDER_RUN_DB_TESTS=1 .venv/Scripts/python.exe -m pytest tests/unit tests/contract tests/integration -q` → **683 passed / 9 skipped**;Ruff 检查本轮改动与测试通过,`lint-imports` **5 kept / 0 broken**,`git diff --check` 通过。
+- 重启后报告 16 自动恢复:僵尸 #930 被收殓,模块 814 以「模块总时长预算已耗尽,恢复不会重置时限」明确失败并落终态;模块 815 正常开始并持续产生 model/tool 事件,模块 816 起排队——原先被饿死的位置已经打通。
+- 待办:报告 16 的模块 814 需在界面用「补跑本模块」重跑,其余 12 个模块会依次执行完。
+
+未做:未提交、未推送,未改动前端。
+
+### 2026-10-13 ORM 落地第一步：模型与会话工厂（用户明确要求数据访问走 ORM）
+
+背景：用户指出「我要求用 orm，这才是正确的工程设计，当前做法是不正确的」。核对结论：docs/工程/10 §3.6 本来就写明「SQLAlchemy 2.0 typed declarative + `Mapped[...]`」，§4.2 的目录约定也有 `adapters/pg/{session.py, models/, repositories/}`，但代码一直只有 Core 的 `text()` 直查——属实现欠账，不是设计分歧。本轮补齐地基；迁移体系不动（事实源仍是 设计文档 → 迁移 `_STATEMENTS` → 契约测试）。
+
+本轮新增/修改：
+
+- 新增 `adapters/pg/models/`：41 张业务表（483 列）的 typed declarative 模型，按域拆成 documents / projects / extraction / configs / jobs / llm / knowledge / analysis 八个模块。刻意不复制默认值、索引、约束、外键行级行为，也不声明 `relationship()`——理由写在 `models/base.py`：第二事实源必然漂移；写入时未赋值的列不进 INSERT，由数据库默认值补齐；仓储层写显式 join。
+- 新增 `adapters/pg/session.py`：`create_pg_engine()`（全项目唯一引擎构造入口，默认 `pool_pre_ping=True`）、`create_session_factory()`、`pg_session()` 上下文管理器。
+- 新增契约测试 `tests/contract/test_orm_models_match_ddl.py`：模型的表名/列名/可空性/类型与全部迁移顺序执行后的库逐一比对（43 个断言）；解析器失效会显式失败而不是静默空转。
+- 引擎入口收口：`core/di.py` 与 6 个 worker（dispatch / regression / knowledge / extraction / exports / tasks）的 `create_engine(settings.database_url(), pool_pre_ping=True)` 全部替换为 `create_pg_engine()`（行为等价）；regression.py 不再需要 settings 导入。`agent_runtime.py` 的 NullPool 锁引擎未动：application 不能 import adapters（分层契约「application 与 adapters 互不引用」），要等装配点传参或仓储化（阶段 2）。
+
+验证（离线）：`PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/unit tests/contract -q` → **654 passed / 9 skipped**；ruff 通过；`lint-imports` **5 kept / 0 broken**。
+
+阶段 2/3 待办：
+
+- ports 增加仓储 Protocol，`adapters/pg/repositories/` 提供实现，application 改为经 Protocol 取数（这是让 application 用上 ORM 的唯一合法通道）。
+- 逐个替换 `text()` 调用点（大头：api/llm.py 55、worker/tasks.py 42、agent_runtime.py 35、worker/extraction.py 34、api/knowledge.py 33）。
+- LATERAL / DISTINCT ON / 咨询锁 / 部分索引等复杂查询保留 SQL 形态，但同样收进 repositories。
+- Alembic 是否切 autogenerate：现状是手写 SQL 逐字对应设计文档 + 契约测试守卫，默认不改，等用户决定。
+
+现场状态提醒（2026-10-13 已恢复）：数据库/Redis 主机 172.29.199.222 的网络中断已由用户恢复（5432/6379 连通，延迟 0.00s），后端三进程按 `start-backend.ps1` 重启（api 14004 / worker 24896 / beat 8464），`/api/v1/healthz` 返回 `{"status":"ok"}`，worker/beat 日志不再有 ConnectionError。
+
+恢复后报告 #16 的进展（全部由调度自愈，未人工干预）：
+
+- 模块 816（run 932）被新版 `claim()` 收殓后重新领取，因 `deadline_at` 在 10-12 16:36 已耗尽、恢复不重置时限，立即失败并落终态（这与 814 同因，「模块总时长预算已耗尽」）。
+- 模块 817（run 933）10:52:39 启动，10:52:59 失败：`Agent 模块运行失败回退不可用：ConnectError`——网络刚恢复头两分钟到模型服务（model_id 17）的连接不稳定，3 次调用全部 ConnectError。同一时间段 818 也出现过一次 ConnectError（10:53:44），随后恢复正常，可见是恢复期的瞬时抖动。
+- 模块 818（run 934）10:52:59 起正常运行，模型/工具调用持续增长。
+- 其余 819–826 排队中。818 与 819–826 的 `deadline_at` 均为新设，不受中断影响。
+
+当前失败待补跑：814、815、816、817（前三个是修复前后遗留的时限耗尽，817 是恢复期瞬时连接错误）。报告到终态后在界面「补跑本模块」逐个重跑；未完成模块也可用省略模块 key 的补跑入口一次性重排。
+
+未做：未提交、未推送，未改动前端。
+
+### 2026-10-13 ORM 落地第二、三步：端口/适配器分层与裸 SQL 收口
+
+承上一节「ORM 落地第一步」的地基（模型 + 唯一引擎入口），本轮按用户选择的方案落地 **ports 协议 + adapters 仓储**，并把生产代码里的 `text()` 直查全部迁走。分层契约仍是 **5 kept / 0 broken**。
+
+新增端口（只有 `typing.Protocol`，是形状文档 + 语义命名，不含 SQL）：
+
+- `ports/repository/knowledge.py`：`KnowledgeStore`（业务库取数）与 `KnowledgeSession`（一次业务库事务；发布快照、领取配额这类多语句原子提交，事务边界属于实现细节）。新增 `complete_index` / `claim_dispatchable` / `start_report` / `requeue_unlocked_runs` / `ensure_modules` / `ensure_module_run` / `agent_run_store` 等。
+- `ports/repository/agent_runtime.py`：`AgentRunStore`（一次 `agent_module_run` 的状态机入口：`claim/guard/heartbeat/reserve/record_call/save/finish/abandon/event/release`），把配额锁、fencing、`pg_locks` 挡在用例层之外。
+- 删除已无使用者的 `ports/repository/configs.py`（`ConfigValues` 无引用；预算上限改由 `db.resolved_config()` 读）。
+
+唯一实现 `adapters/pg/repositories/`：
+
+- `knowledge.py`：`KnowledgeStore` 全量实现（读 + 写回短事务 + `KnowledgeSession`）。写回方法一律 ORM：`update(Model).values(...).returning(...)`、`insert(Model)`、`delete(Model).where(...)`、`select(...).with_for_update(skip_locked=True)`、`func.make_interval(0,0,0,0,0,0,secs)` 表达 `interval 'N seconds'`。`complete_index` 整批替换 `KnowledgeChunk`。
+- `agent_runtime.py`：`AgentRunStore` 实现 + 模块级函数 `lock_project` / `try_lock_report_execution` / `execution_active` / `requeue_unlocked_runs` / `cancel_unlocked_runs`。文件头写明为何此处必须用裸 SQL。
+- `locks.py`：全项目 advisory lock 唯一入口（`acquire_lock`/`try_acquire_lock`/`release_lock`/`acquire_xact_lock`/`try_acquire_xact_lock`/`acquire_xact_lock_id`）。字符串键走 `hashtextextended(:key,0)`，整数键走 `pg_advisory_xact_lock(:id)`，哈希空间不同不会误撞；其它层不再各自拼 SQL。
+
+用例层/worker/API 迁移（改为只依赖端口或 `adapters/pg/locks.py`）：
+
+- `application/agent_runtime.py` 由 507 行裸 SQL 重写为薄门面（`limits_snapshot` / `check_report_access` / `AgentRuntime`），持久化委托 `db.agent_run_store(...)`。
+- `application/schema_guard.py`、`application/analysis_data_store.py` 改依赖端口。
+- `worker/knowledge.py`、`worker/deep_analysis.py` 去掉全部 `sqlalchemy`/模型直接引用，改走 `db.*`；`worker/deep_analysis.py` 的 `prepare_report` 用 `with db.transaction() as session:` 编排。
+- `api/knowledge.py`、`api/projects.py`、`api/project_files.py` 装配改指 `adapters.pg.repositories`；`api/knowledge.py` 的 advisory 锁改调 `lock_project`/`execution_active`/`try_lock_report_execution`。
+- 第三阶段收尾：`api/common.py`（`rerun:` 事务锁）、`api/config.py`（3 处 `config-release:`）、`api/parsing.py`（`extract:`）、`worker/extraction.py`（`_advisory_lock` + `conflict:`）、`worker/exports.py`（`job:`）、`worker/tasks.py`（`_advisory_lock`）全部改用 `adapters/pg/locks.py`。
+- 删除 `application/knowledge_store.py`：死代码（src 无引用），也是应用层最后一段裸 SQL；其 `encode`/`ensure_project_collection`/`sync_sources` 已在 `application/knowledge.py` 与 `adapters/pg/repositories/knowledge.py` 有归宿。
+
+现状（本轮结束时）：
+
+- **`api/` `worker/` `application/` 已无业务裸 SQL**。剩余 `text()` 只在 `adapters/pg/locks.py`、`adapters/pg/repositories/agent_runtime.py`（`pg_locks`/`advisory` 元数据查询）、`adapters/pg/repositories/knowledge.py`（`information_schema` 结构门禁）——ORM 表达不到的系统目录，属刻意保留区，两处文件头都有说明。
+- 契约测试 `tests/contract/test_worker_sql_columns_exist.py` 原扫描 `worker/`，迁移后 worker 已无带别名 SQL 而自失败空转（`assert 0 > 0`）。已改为扫描 `worker/` + `adapters/pg/`（裸 SQL 允许落点）并兼容简化别名（`FROM 表 别名`，适配层风格），回归继续对新落点生效。
+- 新增契约测试 `tests/contract/test_orm_models_match_ddl.py`（第一步引入）：模型表名/列名/可空性/类型与全部迁移顺序执行后的库逐一比对。
+
+验证（离线）：`PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/unit tests/contract -q` → **654 passed / 9 skipped**；`ruff check src/tender/` → **All checks passed**；`lint-imports` → **5 kept / 0 broken**。全部相关模块可正常 import。
+
+集成测试修复与「事务所有权」缺陷（用户要求「这里的也修复」后完成）：
+
+- 三个集成测试改指新入口：`tests/integration/test_{deepagents_runtime,knowledge_flow,analysis_data_flow}.py` 的 `tender.application.knowledge_store` → `adapters.pg.repositories.knowledge`，`tender.application.provider_cooldown` → `adapters.pg.repositories.provider_cooldown`，`application.knowledge.encode` → 保留在 `application.knowledge`。新增 `tests/integration/store.py` 的 `SqlStore`（继承真实仓储，只补两个直连测试 schema 的 SQL 手柄 `rows()`/`execute()`），避免给生产仓储加逃生口。
+- **发现并修复真实缺陷：`KnowledgeSession` 的事务没真正提交。** `Session(bind=外部连接)` 默认以 savepoint 加入连接里已开始的隐式事务，`session.commit()` 只释放 savepoint，连接回池时整笔事务被回滚——发布快照的写入一直在静默丢失（`test_deepagents_runtime` 读不到快照即此因）。现在 `KnowledgeSession.__enter__` 用 `in_transaction()` 区分：引擎给空闲连接就自己 `begin()` 并由本会话提交；引擎给的是已有事务的连接（集成测试共享同一连接）就只借道、绝不提交别人的事务；`Session(..., join_transaction_mode="rollback_only")` 让 Session 只负责 flush。连带 `worker/deep_analysis.py` 的 `prepare_report` 也恢复真实落库。
+- `adapters/pg/repositories/knowledge.py` 新增 `_entity_columns()`：`Session.execute(select(模型)).mappings()` 的键是实体类名（`{'AnalysisReport': <obj>}`）而非列名，凡必须在事务里按列取行的出口都显式列出列，键名回到与 DDL 一致的口径。
+- `AgentRunStore.claim()` 的 `UPDATE ... RETURNING *` 取不到跨表的 `module_key`，改为 `RETURNING id` 后再 join `analysis_module` 回读整行。
+- `tests/contract/test_worker_sql_columns_exist.py` 的扫描面扩到 `worker/` + `adapters/pg/`（裸 SQL 允许落点），兼容 `FROM 表 别名` 的适配层写法。
+
+验证（全量）：
+
+- `PYTHONUTF8=1 TENDER_RUN_DB_TESTS=1 .venv/Scripts/python.exe -m pytest tests/integration -q` → **72 passed**（此前 3 个文件无法收集）。
+- `tests/unit tests/contract -q` → **654 passed / 9 skipped**；`pytest tests/ --collect-only` → 735 collected，无 collection error。
+- `lint-imports` → **5 kept / 0 broken**；`ruff check src/tender/ tests/` 仅余 4 处 `E501`，都在未改动的 `tests/unit/application/test_{deep_analysis,knowledge}.py` 既有长行，与本轮无关。
+
+未做：未提交、未推送，未改动前端；**后端未重启**（用户要求推迟，后台 `start-backend.ps1` 进程仍在运行，不要重复启动）。报告 #16 的 814–817 仍待补跑。
+
+### 2026-10-14 继续修复「进程还在运行，但不再调用模型」
+
+用户要求继续排查并全程使用中文。本轮先读取最新交接，保留已有 ORM 改造及全部未提交变更；没有重复执行已记录的迁移，也没有使用旧 PID 判断当前服务。
+
+确认并修复两处仍存在的漏洞：
+
+- `worker/deep_analysis.py` 的控制器原本等所有模块结束才 `gather` 检查异常。模块在写失败终态或释放资源时再次抛错后，其协程已经退出，但遗留运行仍可能占据队首，其余模块永久等配额，报告控制器仍持续续租。现在用 `FIRST_EXCEPTION` 等待，并在续租前读取已结束任务的结果；未处理异常立即进入原有报告失败收尾、取消并等待其余模块退出。普通业务失败已成功记账时仍允许其余模块继续，报告按原规则形成部分完成。
+- `worker/knowledge.py` 原本先通过 ORM 读取报告全列，再检查数据库结构。未迁移 `derived_lot_ids` 时，全列查询已经报错，结构门禁无法登记可读原因。现在先使用已有的权限/状态查询，仅对可执行报告核对结构，再读取完整报告并核对运行时版本；缺表缺列在模型调用前明确登记迁移提示。
+
+验证：
+
+- 新增 `tests/unit/worker/test_analysis_lifecycle.py`，使用真实控制器与模块执行协程、可控运行账替身，复现收尾异常后的永久等待；修复前两个等待用例均因外层 3 秒截止失败，修复后及时退出并确认其余任务释放资源。
+- 共 10 项新增回归通过，覆盖失败终态写回异常、释放异常、普通失败不阻断后续模块、结构门禁前置、不可访问/已结束报告不改写，以及正常结构继续分析。
+- `PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/unit tests/contract -q --tb=short` → **664 passed / 9 skipped**。
+- 本轮源码及测试 Ruff 通过；`lint-imports` → **5 kept / 0 broken**；`git diff --check` 通过（仅已有 CRLF→LF 提示）。运行护栏文档同步更新。
+
+本轮现场状态与限制：
+
+- `scripts/start-backend.ps1 -Status` 显示 API、worker、beat 均已停止，8300 无监听；这覆盖上一节「后台仍在运行」的旧记录。
+- PostgreSQL 只读连接 8 秒超时；随后按现有配置对 PostgreSQL 与 Redis 做 3 秒 TCP 探测，两者均超时。没有读取到报告 #16 的当前状态，不能据历史交接断言它仍卡在原模块或已完成。
+- 没有执行需要数据库的集成测试、重启后端、发起真实模型请求、迁移、提交或推送。真实恢复验收仍需依赖服务恢复后继续；此前用户推迟重启的要求保留。
+
+### 2026-10-14 修复未提交改动审查发现的两处 ORM 回归
+
+按用户要求修复本轮代码审查确认的问题，保留其余已有未提交更改：
+
+- `adapters/pg/repositories/knowledge.py` 的 `collection_overview()` 改为 `.mappings()` 逐行转字典。`Connection.execute(select(Model, count))` 返回模型各列与计数拼成的扁平行，不是二元组；原实现有知识库数据就会解包失败。
+- `worker/tasks.py` 的解析元素写入恢复为 `connection.execute(insert(Element), rows)`，让驱动按批执行。此前 `.values([...])` 把整批拼成单条 SQL，4096 个元素 × 16 列产生 65536 个参数，超过 PostgreSQL 的 65535 上限。父子元素映射及解析终态写回保持不变。
+- 新增 `tests/unit/adapters/test_pg_knowledge.py`：通过真实 SQLite Connection 验证空列表、完整字段、文件计数、公司/软删除过滤及既有排序。
+- 新增 `tests/unit/worker/test_parse_persistence.py`：运行真实轮询任务的持久化路径，隔离外部服务，实际写入 0、2、4096 个元素并验证父节点与终态。SQLite 测试连接的单语句变量上限设为 65535，用于离线复现参数超限，不替代真实 PostgreSQL 集成验证。
+
+验证：
+
+- 修复前新增测试 **2 failed / 3 passed**，失败项恰为有数据的知识库列表与 4096 元素写入；修复后 **5 passed**。
+- `PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/unit tests/contract -q --tb=short` → **669 passed / 9 skipped**。
+- 源码及新增测试 Ruff 检查通过；新增测试格式检查通过；`lint-imports` **5 kept / 0 broken**；`git diff --check` 通过（仅既有 CRLF→LF 提示）。
+
+本轮未连接真实数据库、未执行数据库集成测试、未重启服务、未迁移、未提交或推送。依赖服务及报告现场状态沿用上一节的待核验说明，没有新增现场结论。
+
+### 2026-10-14 执行真实 PostgreSQL 集成测试
+
+用户要求执行真实 PostgreSQL 集成验证。本轮按当前配置连接数据库，使用现有测试的临时表或独立 schema 隔离业务数据，模型调用使用测试替身。
+
+- 在 `apps/api` 下设置 `PYTHONUTF8=1`、`TENDER_RUN_DB_TESTS=1`、`PGCONNECT_TIMEOUT=8`，执行 `.venv/Scripts/python.exe -m pytest tests/integration -q --tb=short --maxfail=1`。
+- 结果：**72 passed，耗时 71.58 秒，退出码 0**，没有失败或跳过。首次失败即停止的限制未触发，全部现有集成用例执行完毕。
+- 本轮确认 PostgreSQL 已可连接，覆盖此前「数据库连接超时、集成测试未执行」的现场限制；未验证 Redis、业务服务或报告 #16 的当前状态。
+- 本次执行的是现有 PostgreSQL 集成测试集；上一节新增的知识库列表与 4096 元素专项回归仍是 SQLite 离线测试，不将其记为本轮新增 PostgreSQL 用例。
+
+未修改业务代码、未启动或重启业务服务、未调用真实模型、未执行业务库迁移、未提交或推送；迁移兼容性测试仅在隔离测试 schema 内执行并回滚。
+
+### 2026-10-14 数据库迁移核验与提交范围
+
+- 按用户要求对当前配置的业务数据库执行只读核验：`public` 的 Alembic 版本与代码 head 均为 `0012_config_limits`，没有待应用版本；41 张 ORM 业务表、483 个字段均存在。事务确认 `transaction_read_only=on`，未重复执行迁移。
+- 用户随后明确要求提交代码，本次提交范围为已审查的 ORM 端口/仓储迁移、分析任务异常收尾与结构门禁修复、知识库列表及批量元素写入修复、对应测试与交接文档。
+- 提交前验证结果：离线 **669 passed / 9 skipped**，真实 PostgreSQL 集成 **72 passed**，源码及新增测试 Ruff 通过，架构约束 **5 kept / 0 broken**。不包含推送、业务服务重启或真实模型调用。

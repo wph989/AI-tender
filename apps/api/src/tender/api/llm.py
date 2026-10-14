@@ -18,9 +18,23 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, BackgroundTasks, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, delete, exists, func, insert, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
+from tender.adapters.pg.models import (
+    KnowledgeCollection,
+    KnowledgeIndex,
+    KnowledgeSource,
+    LlmCallLog,
+    LlmFeature,
+    LlmFeatureModel,
+    LlmModel,
+    LlmProvider,
+    LlmTest,
+    ProjectFile,
+)
+from tender.adapters.pg.repositories.model_test import maintain_model_tests
 from tender.api.common import engine
 from tender.api.errors import ApiProblem
 from tender.application.llm_registry import (
@@ -45,7 +59,6 @@ from tender.application.model_profiles import (
     validate_base_url,
     validate_model,
 )
-from tender.application.model_test_maintenance import maintain_model_tests
 from tender.core.di import create_embedding_gateway, create_image_gateway
 from tender.core.secrets import (
     SecretKeyUnavailable,
@@ -217,11 +230,9 @@ def _provider_row(db: Engine, provider_id: int) -> dict[str, Any]:
     with db.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT * FROM llm_provider
-                       WHERE id = :id AND deleted_at IS NULL"""
-                ),
-                {"id": provider_id},
+                select(LlmProvider).where(
+                    LlmProvider.id == provider_id, LlmProvider.deleted_at.is_(None)
+                )
             )
             .mappings()
             .first()
@@ -235,15 +246,23 @@ def _model_row(db: Engine, model_id: int) -> dict[str, Any]:
     with db.connect() as connection:
         row = (
             connection.execute(
-                text(
-                    """SELECT m.*, p.name AS provider_name, p.base_url, p.api_key_ciphertext,
-p.protocol,p.auth_mode,p.config_revision AS provider_config_revision,
-p.enabled AS provider_enabled
-FROM llm_model AS m
-JOIN llm_provider AS p ON p.id = m.provider_id
-WHERE m.id = :id AND m.deleted_at IS NULL AND p.deleted_at IS NULL"""
-                ),
-                {"id": model_id},
+                select(
+                    LlmModel,
+                    LlmProvider.name.label("provider_name"),
+                    LlmProvider.base_url,
+                    LlmProvider.api_key_ciphertext,
+                    LlmProvider.protocol,
+                    LlmProvider.auth_mode,
+                    LlmProvider.config_revision.label("provider_config_revision"),
+                    LlmProvider.enabled.label("provider_enabled"),
+                )
+                .select_from(LlmModel)
+                .join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
+                .where(
+                    LlmModel.id == model_id,
+                    LlmModel.deleted_at.is_(None),
+                    LlmProvider.deleted_at.is_(None),
+                )
             )
             .mappings()
             .first()
@@ -359,27 +378,24 @@ def _store_key(connection: Any, provider_id: int, api_key: str | None) -> None:
     if api_key is None:
         return
     connection.execute(
-        text(
-            """UPDATE llm_provider SET credential_revision=credential_revision+1,
-api_key_updated_at=now() WHERE id=:id"""
-        ),
-        {"id": provider_id},
+        update(LlmProvider)
+        .where(LlmProvider.id == provider_id)
+        .values(
+            credential_revision=LlmProvider.credential_revision + 1,
+            api_key_updated_at=func.now(),
+        )
     )
     if api_key == "":
         connection.execute(
-            text(
-                "UPDATE llm_provider SET api_key_ciphertext = NULL, api_key_hint = NULL "
-                "WHERE id = :id"
-            ),
-            {"id": provider_id},
+            update(LlmProvider)
+            .where(LlmProvider.id == provider_id)
+            .values(api_key_ciphertext=None, api_key_hint=None)
         )
         return
     connection.execute(
-        text(
-            "UPDATE llm_provider SET api_key_ciphertext = :ciphertext, api_key_hint = :hint "
-            "WHERE id = :id"
-        ),
-        {"id": provider_id, "ciphertext": encrypt_secret(api_key), "hint": secret_hint(api_key)},
+        update(LlmProvider)
+        .where(LlmProvider.id == provider_id)
+        .values(api_key_ciphertext=encrypt_secret(api_key), api_key_hint=secret_hint(api_key))
     )
 
 
@@ -402,45 +418,47 @@ def _record_call(
     image_count: int | None = None,
     test_id: int | None = None,
 ) -> None:
-    values = {
-        "provider_id": provider_id,
-        "model_id": model_id,
-        "feature_key": feature_key,
-        "purpose": purpose,
-        "status": status,
-        "http_status": http_status,
-        "latency_ms": latency_ms,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "error_message": error[:500] if error else None,
-        "provider_name": snapshot.get("provider_name", snapshot.get("name")),
-        "model_name": snapshot.get("display_name"),
-        "model_key": snapshot.get("model_id"),
-        "vectors": vector_count,
-        "documents": document_count,
-        "images": image_count,
-    }
     with db.begin() as connection:
         if test_id is not None:
-            values["test_id"] = test_id
+            # 测试身份先落账本，结果回写时只更新可变量，避免覆盖建账时的模型快照。
             connection.execute(
-                text("""UPDATE llm_call_log SET status=:status,http_status=:http_status,
-                latency_ms=:latency_ms,prompt_tokens=:prompt_tokens,completion_tokens=:completion_tokens,
-                error_message=:error_message,vector_count=:vectors,document_count=:documents,image_count=:images
-                WHERE id=(SELECT call_log_id FROM llm_test WHERE id=:test_id)"""),
-                values,
+                update(LlmCallLog)
+                .where(
+                    LlmCallLog.id
+                    == select(LlmTest.call_log_id).where(LlmTest.id == test_id).scalar_subquery()
+                )
+                .values(
+                    status=status,
+                    http_status=http_status,
+                    latency_ms=latency_ms,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    error_message=error[:500] if error else None,
+                    vector_count=vector_count,
+                    document_count=document_count,
+                    image_count=image_count,
+                )
             )
         else:
             connection.execute(
-                text("""INSERT INTO llm_call_log
-                (provider_id,model_id,feature_key,purpose,status,http_status,latency_ms,
-                 prompt_tokens,completion_tokens,error_message,provider_name_snapshot,
-                 model_name_snapshot,model_key_snapshot,vector_count,document_count,image_count)
-                VALUES (:provider_id,:model_id,:feature_key,:purpose,:status,:http_status,
-                 :latency_ms,
-                 :prompt_tokens,:completion_tokens,:error_message,:provider_name,:model_name,
-                 :model_key,:vectors,:documents,:images)"""),
-                values,
+                insert(LlmCallLog).values(
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    feature_key=feature_key,
+                    purpose=purpose,
+                    status=status,
+                    http_status=http_status,
+                    latency_ms=latency_ms,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    error_message=error[:500] if error else None,
+                    provider_name_snapshot=snapshot.get("provider_name", snapshot.get("name")),
+                    model_name_snapshot=snapshot.get("display_name"),
+                    model_key_snapshot=snapshot.get("model_id"),
+                    vector_count=vector_count,
+                    document_count=document_count,
+                    image_count=image_count,
+                )
             )
 
 
@@ -450,47 +468,54 @@ def _begin_test(db: Engine, row: dict, capability: str, is_model: bool) -> int:
         if is_model:
             # 调用账本与测试身份同事务建立，登记失败时不能发送供应商请求。
             call_id = c.execute(
-                text("""INSERT INTO llm_call_log(provider_id,model_id,purpose,status,
-                latency_ms,provider_name_snapshot,model_name_snapshot,model_key_snapshot)
-                VALUES (:pid,:mid,'test','running',0,:pn,:mn,:mk) RETURNING id"""),
-                {
-                    "pid": row["provider_id"],
-                    "mid": row["id"],
-                    "pn": row["provider_name"],
-                    "mn": row["display_name"],
-                    "mk": row["model_id"],
-                },
+                insert(LlmCallLog)
+                .values(
+                    provider_id=row["provider_id"],
+                    model_id=row["id"],
+                    purpose="test",
+                    status="running",
+                    latency_ms=0,
+                    provider_name_snapshot=row["provider_name"],
+                    model_name_snapshot=row["display_name"],
+                    model_key_snapshot=row["model_id"],
+                )
+                .returning(LlmCallLog.id)
             ).scalar_one()
         test_id = int(
             c.execute(
-                text("""INSERT INTO llm_test(
-                    provider_id,model_id,capability,provider_revision,model_revision,
-                    timeout_seconds,call_log_id)
-            VALUES (:provider,:model,:capability,:pr,:mr,:timeout,:call_id) RETURNING id"""),
-                {
-                    "provider": row["provider_id"] if is_model else row["id"],
-                    "model": row["id"] if is_model else None,
-                    "capability": capability,
-                    "pr": row["provider_config_revision"] if is_model else row["config_revision"],
-                    "mr": row["config_revision"] if is_model else None,
-                    "timeout": float(row.get("timeout_seconds", 90)),
-                    "call_id": call_id,
-                },
+                insert(LlmTest)
+                .values(
+                    provider_id=row["provider_id"] if is_model else row["id"],
+                    model_id=row["id"] if is_model else None,
+                    capability=capability,
+                    provider_revision=row["provider_config_revision"]
+                    if is_model
+                    else row["config_revision"],
+                    model_revision=row["config_revision"] if is_model else None,
+                    timeout_seconds=float(row.get("timeout_seconds", 90)),
+                    call_log_id=call_id,
+                )
+                .returning(LlmTest.id)
             ).scalar_one()
         )
-        table = "llm_model" if is_model else "llm_provider"
-        provider_revision = ",last_test_provider_revision=:pr" if is_model else ""
+        entity = LlmModel if is_model else LlmProvider
+        values: dict[str, Any] = {
+            "last_test_id": test_id,
+            "last_test_status": "running",
+            "last_test_error": None,
+            "last_test_config_revision": row["config_revision"],
+        }
+        if is_model:
+            values["last_test_provider_revision"] = row.get("provider_config_revision")
         # 测试开始顺序也参与比较，后启动的测试运行中时，旧结果不能倒灌摘要。
         c.execute(
-            text(f"""UPDATE {table} SET last_test_id=:tid,last_test_status='running',
-                last_test_error=NULL,last_test_config_revision=:cr {provider_revision}
-                WHERE id=:id AND config_revision=:cr AND COALESCE(last_test_id,0)<:tid"""),
-            {
-                "tid": test_id,
-                "cr": row["config_revision"],
-                "id": row["id"],
-                "pr": row.get("provider_config_revision"),
-            },
+            update(entity)
+            .where(
+                entity.id == row["id"],
+                entity.config_revision == row["config_revision"],
+                func.coalesce(entity.last_test_id, 0) < test_id,
+            )
+            .values(**values)
         )
         return test_id
 
@@ -504,37 +529,39 @@ def _finish_test(
     latency: int,
     is_model: bool,
 ) -> None:
-    table = "llm_model" if is_model else "llm_provider"
+    entity = LlmModel if is_model else LlmProvider
     with db.begin() as c:
         c.execute(
-            text(
-                "UPDATE llm_test SET status=:s,error_message=:e,latency_ms=:l,"
-                "finished_at=now() WHERE id=:id"
-            ),
-            {"s": status, "e": error, "l": latency, "id": test_id},
+            update(LlmTest)
+            .where(LlmTest.id == test_id)
+            .values(status=status, error_message=error, latency_ms=latency, finished_at=func.now())
         )
-        extra = ",last_test_provider_revision=:pr" if is_model else ""
-        provider_guard = (
-            "AND EXISTS (SELECT 1 FROM llm_provider p WHERE p.id=llm_model.provider_id "
-            "AND p.config_revision=:pr AND p.deleted_at IS NULL)"
-            if is_model
-            else ""
-        )
-        # 结果保留为历史事实；模型测试同时核验供应商版本，防止轮换凭证后回写旧证明。
-        c.execute(
-            text(f"""UPDATE {table} SET last_test_status=:s,last_test_at=now(),
-            last_test_error=:e,last_test_config_revision=:cr,last_test_id=:tid {extra}
-            WHERE id=:id AND config_revision=:cr AND last_test_id=:tid
-                AND deleted_at IS NULL {provider_guard}"""),
-            {
-                "s": status,
-                "e": error,
-                "cr": row["config_revision"],
-                "tid": test_id,
-                "id": row["id"],
-                "pr": row.get("provider_config_revision"),
-            },
-        )
+        values: dict[str, Any] = {
+            "last_test_status": status,
+            "last_test_at": func.now(),
+            "last_test_error": error,
+            "last_test_config_revision": row["config_revision"],
+            "last_test_id": test_id,
+        }
+        if is_model:
+            values["last_test_provider_revision"] = row.get("provider_config_revision")
+        conditions = [
+            entity.id == row["id"],
+            entity.config_revision == row["config_revision"],
+            entity.last_test_id == test_id,
+            entity.deleted_at.is_(None),
+        ]
+        if is_model:
+            # 模型测试同时核验供应商版本，防止轮换凭证后回写旧证明。
+            conditions.append(
+                exists().where(
+                    LlmProvider.id == LlmModel.provider_id,
+                    LlmProvider.config_revision == row.get("provider_config_revision"),
+                    LlmProvider.deleted_at.is_(None),
+                )
+            )
+        # 结果保留为历史事实。
+        c.execute(update(entity).where(*conditions).values(**values))
 
 
 @router.get("/settings")
@@ -595,28 +622,43 @@ def _test_view(row: Mapping[str, Any]) -> dict:
     }
 
 
-_TEST_SELECT = """SELECT t.id,t.provider_id,t.model_id,t.capability,t.provider_revision,
- t.model_revision,t.status,t.latency_ms,t.error_message,t.created_at,t.finished_at,
- t.result,t.invalidated_at,p.config_revision AS current_provider_revision,
- m.config_revision AS current_model_revision
- FROM llm_test t JOIN llm_provider p ON p.id=t.provider_id
- LEFT JOIN llm_model m ON m.id=t.model_id"""
+def _test_select() -> Any:
+    return (
+        select(
+            LlmTest.id,
+            LlmTest.provider_id,
+            LlmTest.model_id,
+            LlmTest.capability,
+            LlmTest.provider_revision,
+            LlmTest.model_revision,
+            LlmTest.status,
+            LlmTest.latency_ms,
+            LlmTest.error_message,
+            LlmTest.created_at,
+            LlmTest.finished_at,
+            LlmTest.result,
+            LlmTest.invalidated_at,
+            LlmProvider.config_revision.label("current_provider_revision"),
+            LlmModel.config_revision.label("current_model_revision"),
+        )
+        .select_from(LlmTest)
+        .join(LlmProvider, LlmProvider.id == LlmTest.provider_id)
+        .outerjoin(LlmModel, LlmModel.id == LlmTest.model_id)
+    )
 
 
 def _attach_test_summaries(db: Engine, models: list[dict]) -> None:
     if not models:
         return
     maintain_model_tests(db)
+    latest = (
+        select(func.max(LlmTest.id))
+        .where(LlmTest.model_id.in_([m["id"] for m in models]))
+        .group_by(LlmTest.model_id, LlmTest.capability)
+    )
     with db.connect() as c:
         tests = (
-            c.execute(
-                text(
-                    _TEST_SELECT + " WHERE t.id IN (SELECT max(id) FROM llm_test "
-                    "WHERE model_id=ANY(CAST(:ids AS BIGINT[])) "
-                    "GROUP BY model_id,capability) ORDER BY t.id DESC"
-                ),
-                {"ids": [m["id"] for m in models]},
-            )
+            c.execute(_test_select().where(LlmTest.id.in_(latest)).order_by(LlmTest.id.desc()))
             .mappings()
             .all()
         )
@@ -633,16 +675,11 @@ def list_tests(
     request: Request, model_id: int | None = None, limit: int = Query(default=30, ge=1, le=100)
 ) -> dict:
     maintain_model_tests(engine(request))
-    condition = " WHERE t.model_id=:model" if model_id is not None else ""
-    params = {"limit": limit}
+    statement = _test_select()
     if model_id is not None:
-        params["model"] = model_id
+        statement = statement.where(LlmTest.model_id == model_id)
     with engine(request).connect() as c:
-        rows = (
-            c.execute(text(_TEST_SELECT + condition + " ORDER BY t.id DESC LIMIT :limit"), params)
-            .mappings()
-            .all()
-        )
+        rows = c.execute(statement.order_by(LlmTest.id.desc()).limit(limit)).mappings().all()
     return {"items": [_test_view(r) for r in rows]}
 
 
@@ -650,7 +687,7 @@ def list_tests(
 def get_test(test_id: int, request: Request) -> dict:
     maintain_model_tests(engine(request))
     with engine(request).connect() as c:
-        row = c.execute(text(_TEST_SELECT + " WHERE t.id=:id"), {"id": test_id}).mappings().first()
+        row = c.execute(_test_select().where(LlmTest.id == test_id)).mappings().first()
     if row is None:
         raise ApiProblem(404, "not_found", "测试记录不存在")
     return _test_view(row)
@@ -664,7 +701,7 @@ def test_preview(test_id: int, request: Request) -> Response:
     with engine(request).connect() as c:
         row = (
             c.execute(
-                text("SELECT preview_data,preview_mime FROM llm_test WHERE id=:id"), {"id": test_id}
+                select(LlmTest.preview_data, LlmTest.preview_mime).where(LlmTest.id == test_id)
             )
             .mappings()
             .one()
@@ -683,10 +720,9 @@ def list_providers(request: Request) -> dict[str, Any]:
     with engine(request).connect() as connection:
         rows = (
             connection.execute(
-                text(
-                    """SELECT * FROM llm_provider
-                       WHERE deleted_at IS NULL ORDER BY name"""
-                )
+                select(LlmProvider)
+                .where(LlmProvider.deleted_at.is_(None))
+                .order_by(LlmProvider.name)
             )
             .mappings()
             .all()
@@ -700,17 +736,15 @@ def create_provider(payload: ProviderCreate, request: Request) -> dict[str, Any]
     try:
         with db.begin() as connection:
             provider_id = connection.execute(
-                text(
-                    """INSERT INTO llm_provider (name, base_url, enabled,protocol,auth_mode)
-                       VALUES (:name, :base_url, :enabled,:protocol,:auth_mode) RETURNING id"""
-                ),
-                {
-                    "name": payload.name,
-                    "base_url": payload.base_url,
-                    "enabled": payload.enabled,
-                    "protocol": payload.protocol,
-                    "auth_mode": payload.auth_mode,
-                },
+                insert(LlmProvider)
+                .values(
+                    name=payload.name,
+                    base_url=payload.base_url,
+                    enabled=payload.enabled,
+                    protocol=payload.protocol,
+                    auth_mode=payload.auth_mode,
+                )
+                .returning(LlmProvider.id)
             ).scalar_one()
             _store_key(connection, int(provider_id), payload.api_key)
     except IntegrityError as exc:
@@ -739,10 +773,9 @@ def update_provider(provider_id: int, payload: ProviderPatch, request: Request) 
         with db.begin() as connection:
             current = (
                 connection.execute(
-                    text(
-                        "SELECT * FROM llm_provider WHERE id=:id AND deleted_at IS NULL FOR UPDATE"
-                    ),
-                    {"id": provider_id},
+                    select(LlmProvider)
+                    .where(LlmProvider.id == provider_id, LlmProvider.deleted_at.is_(None))
+                    .with_for_update()
                 )
                 .mappings()
                 .first()
@@ -752,11 +785,9 @@ def update_provider(provider_id: int, payload: ProviderPatch, request: Request) 
                 if value is None:
                     continue
                 connection.execute(
-                    text(
-                        f"UPDATE llm_provider SET {column} = :value, updated_at = now() "
-                        "WHERE id = :id"
-                    ),
-                    {"id": provider_id, "value": value},
+                    update(LlmProvider)
+                    .where(LlmProvider.id == provider_id)
+                    .values(**{column: value}, updated_at=func.now())
                 )
             _store_key(connection, provider_id, "" if payload.clear_api_key else payload.api_key)
             changed = (
@@ -769,20 +800,26 @@ def update_provider(provider_id: int, payload: ProviderPatch, request: Request) 
                 or payload.clear_api_key
             )
             connection.execute(
-                text(
-                    """UPDATE llm_provider SET revision=revision+1,
-config_revision=config_revision+:changed WHERE id=:id"""
-                ),
-                {"id": provider_id, "changed": int(changed)},
+                update(LlmProvider)
+                .where(LlmProvider.id == provider_id)
+                .values(
+                    revision=LlmProvider.revision + 1,
+                    config_revision=LlmProvider.config_revision + int(changed),
+                )
             )
     except IntegrityError as exc:
         raise ApiProblem(409, "duplicate_name", "供应商名称已存在") from exc
     with db.begin() as c:
         c.execute(
-            text("""UPDATE llm_test t SET invalidated_at=COALESCE(t.invalidated_at,now())
-            FROM llm_provider p WHERE t.provider_id=p.id AND p.id=:id
-            AND t.provider_revision<>p.config_revision"""),
-            {"id": provider_id},
+            update(LlmTest)
+            .where(
+                LlmTest.provider_id == provider_id,
+                LlmTest.provider_revision
+                != select(LlmProvider.config_revision)
+                .where(LlmProvider.id == LlmTest.provider_id)
+                .scalar_subquery(),
+            )
+            .values(invalidated_at=func.coalesce(LlmTest.invalidated_at, func.now()))
         )
     return _provider_out(_provider_row(db, provider_id))
 
@@ -802,30 +839,33 @@ def delete_provider(provider_id: int, request: Request) -> dict[str, Any]:
     _provider_row(db, provider_id)
     with db.begin() as connection:
         connection.execute(
-            text("SELECT id FROM llm_provider WHERE id=:id FOR UPDATE"), {"id": provider_id}
+            select(LlmProvider.id).where(LlmProvider.id == provider_id).with_for_update()
         )
         ids = list(
             connection.execute(
-                text("SELECT id FROM llm_model WHERE provider_id=:id ORDER BY id FOR UPDATE"),
-                {"id": provider_id},
+                select(LlmModel.id)
+                .where(LlmModel.provider_id == provider_id)
+                .order_by(LlmModel.id)
+                .with_for_update()
             ).scalars()
         )
         _check_index_use(connection, ids)
         bound = connection.execute(
-            text(
-                """SELECT 1 FROM llm_feature_model AS fm
-                   JOIN llm_model AS m ON m.id = fm.model_id
-                   WHERE m.provider_id = :id LIMIT 1"""
-            ),
-            {"id": provider_id},
+            select(LlmFeatureModel.id)
+            .select_from(LlmFeatureModel)
+            .join(LlmModel, LlmModel.id == LlmFeatureModel.model_id)
+            .where(LlmModel.provider_id == provider_id)
+            .limit(1)
         ).scalar_one_or_none()
         if bound is not None:
             raise ModelInUse("该供应商下仍有模型绑定到功能，请先解绑")
         connection.execute(
-            text("UPDATE llm_model SET deleted_at=now() WHERE provider_id=:id"), {"id": provider_id}
+            update(LlmModel)
+            .where(LlmModel.provider_id == provider_id)
+            .values(deleted_at=func.now())
         )
         connection.execute(
-            text("UPDATE llm_provider SET deleted_at = now() WHERE id = :id"), {"id": provider_id}
+            update(LlmProvider).where(LlmProvider.id == provider_id).values(deleted_at=func.now())
         )
     return {"status": "deleted"}
 
@@ -912,8 +952,9 @@ def import_models(provider_id: int, payload: ImportRequest, request: Request) ->
     with db.begin() as c:
         current = (
             c.execute(
-                text("SELECT * FROM llm_provider WHERE id=:id AND deleted_at IS NULL FOR UPDATE"),
-                {"id": provider_id},
+                select(LlmProvider)
+                .where(LlmProvider.id == provider_id, LlmProvider.deleted_at.is_(None))
+                .with_for_update()
             )
             .mappings()
             .first()
@@ -922,31 +963,37 @@ def import_models(provider_id: int, payload: ImportRequest, request: Request) ->
         for key in model_ids:
             if not key.strip() or len(key) > 200:
                 raise ApiProblem(422, "invalid_argument", "模型 ID 不能为空或超过 200 字符")
-            created += c.execute(
-                text("""INSERT INTO llm_model(provider_id,model_id,display_name,kind,api_mode,
-capabilities,enabled,timeout_seconds,temperature,max_tokens,extra_retries,parameters,
-supported_parameters,embedding_space_id)
-VALUES (:pid,:key,:key,:kind,:mode,CAST(:caps AS
-JSONB),false,:timeout,:temp,:tokens,:retries,CAST(:params AS JSONB),
-CAST(:supported AS JSONB),:space)
-ON CONFLICT (provider_id,model_id) WHERE deleted_at IS NULL DO NOTHING"""),
-                {
-                    "pid": provider_id,
-                    "key": key,
-                    "kind": payload.kind,
-                    "mode": payload.api_mode,
-                    "caps": json.dumps(payload.capabilities),
-                    "timeout": payload.timeout_seconds or 90,
-                    "temp": payload.temperature,
-                    "tokens": payload.max_tokens,
-                    "retries": payload.extra_retries,
-                    "params": json.dumps(payload.parameters),
-                    "supported": json.dumps(payload.supported_parameters)
-                    if payload.supported_parameters is not None
-                    else None,
-                    "space": uuid4() if payload.kind == "embedding" else None,
-                },
-            ).rowcount
+            # ON CONFLICT DO NOTHING 下 RETURNING 只回传真正插入的行；不能用 rowcount
+            # （带 RETURNING 的语句在 psycopg 下不提供 rowcount）。
+            inserted = (
+                c.execute(
+                    pg_insert(LlmModel)
+                    .values(
+                        provider_id=provider_id,
+                        model_id=key,
+                        display_name=key,
+                        kind=payload.kind,
+                        api_mode=payload.api_mode,
+                        capabilities=payload.capabilities,
+                        enabled=False,
+                        timeout_seconds=payload.timeout_seconds or 90,
+                        temperature=payload.temperature,
+                        max_tokens=payload.max_tokens,
+                        extra_retries=payload.extra_retries,
+                        parameters=payload.parameters,
+                        supported_parameters=payload.supported_parameters,
+                        embedding_space_id=uuid4() if payload.kind == "embedding" else None,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=["provider_id", "model_id"],
+                        index_where=LlmModel.deleted_at.is_(None),
+                    )
+                    .returning(LlmModel.id)
+                )
+                .scalars()
+                .all()
+            )
+            created += len(inserted)
     return {"imported": created, "created": created, "skipped": len(model_ids) - created}
 
 
@@ -959,23 +1006,23 @@ def _validate(protocol: str, model: dict) -> None:
 
 @router.get("/models")
 def list_models(request: Request, provider_id: int | None = None) -> dict[str, Any]:
-    condition = "AND m.provider_id = :provider_id" if provider_id is not None else ""
-    with engine(request).connect() as connection:
-        rows = (
-            connection.execute(
-                text(
-                    f"""SELECT m.*, p.name AS provider_name,p.enabled AS provider_enabled,
-                        p.config_revision AS provider_config_revision, p.protocol
-                        FROM llm_model AS m
-                        JOIN llm_provider AS p ON p.id = m.provider_id
-                        WHERE m.deleted_at IS NULL AND p.deleted_at IS NULL {condition}
-                        ORDER BY p.name, m.display_name"""
-                ),
-                {"provider_id": provider_id} if provider_id is not None else {},
-            )
-            .mappings()
-            .all()
+    statement = (
+        select(
+            LlmModel,
+            LlmProvider.name.label("provider_name"),
+            LlmProvider.enabled.label("provider_enabled"),
+            LlmProvider.config_revision.label("provider_config_revision"),
+            LlmProvider.protocol,
         )
+        .select_from(LlmModel)
+        .join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
+        .where(LlmModel.deleted_at.is_(None), LlmProvider.deleted_at.is_(None))
+        .order_by(LlmProvider.name, LlmModel.display_name)
+    )
+    if provider_id is not None:
+        statement = statement.where(LlmModel.provider_id == provider_id)
+    with engine(request).connect() as connection:
+        rows = connection.execute(statement).mappings().all()
     items = [dict(row) for row in rows]
     _attach_test_summaries(engine(request), items)
     return {"items": [_model_out(row) for row in items]}
@@ -991,44 +1038,33 @@ def create_model(payload: ModelCreate, request: Request) -> dict[str, Any]:
         with db.begin() as connection:
             current = (
                 connection.execute(
-                    text(
-                        "SELECT * FROM llm_provider WHERE id=:id AND deleted_at IS NULL FOR UPDATE"
-                    ),
-                    {"id": payload.provider_id},
+                    select(LlmProvider)
+                    .where(LlmProvider.id == payload.provider_id, LlmProvider.deleted_at.is_(None))
+                    .with_for_update()
                 )
                 .mappings()
                 .first()
             )
             _check_revision(current, None)
             model_id = connection.execute(
-                text(
-                    """INSERT INTO llm_model
-(provider_id, model_id, display_name, timeout_seconds,
-temperature, max_tokens, enabled,kind,api_mode,capabilities,extra_retries,parameters,
-supported_parameters,embedding_space_id)
-VALUES (:provider_id, :model_id, :display_name, :timeout_seconds,
-:temperature, :max_tokens, :enabled,:kind,:mode,CAST(:caps AS JSONB),:retries,
-CAST(:params AS JSONB),CAST(:supported AS JSONB),:space)
-RETURNING id"""
-                ),
-                {
-                    "kind": payload.kind,
-                    "mode": payload.api_mode,
-                    "caps": json.dumps(payload.capabilities),
-                    "retries": payload.extra_retries,
-                    "params": json.dumps(payload.parameters),
-                    "supported": json.dumps(payload.supported_parameters)
-                    if payload.supported_parameters is not None
-                    else None,
-                    "space": uuid4() if payload.kind == "embedding" else None,
-                    "provider_id": payload.provider_id,
-                    "model_id": payload.model_id,
-                    "display_name": display_name,
-                    "timeout_seconds": payload.timeout_seconds or 90,
-                    "temperature": payload.temperature,
-                    "max_tokens": payload.max_tokens,
-                    "enabled": payload.enabled,
-                },
+                insert(LlmModel)
+                .values(
+                    provider_id=payload.provider_id,
+                    model_id=payload.model_id,
+                    display_name=display_name,
+                    timeout_seconds=payload.timeout_seconds or 90,
+                    temperature=payload.temperature,
+                    max_tokens=payload.max_tokens,
+                    enabled=payload.enabled,
+                    kind=payload.kind,
+                    api_mode=payload.api_mode,
+                    capabilities=payload.capabilities,
+                    extra_retries=payload.extra_retries,
+                    parameters=payload.parameters,
+                    supported_parameters=payload.supported_parameters,
+                    embedding_space_id=uuid4() if payload.kind == "embedding" else None,
+                )
+                .returning(LlmModel.id)
             ).scalar_one()
     except IntegrityError as exc:
         raise ApiProblem(409, "duplicate_name", "该供应商下已存在同名模型") from exc
@@ -1048,8 +1084,9 @@ def update_model(model_id: int, payload: ModelPatch, request: Request) -> dict[s
     with db.begin() as c:
         current = (
             c.execute(
-                text("SELECT * FROM llm_model WHERE id=:id AND deleted_at IS NULL FOR UPDATE"),
-                {"id": model_id},
+                select(LlmModel)
+                .where(LlmModel.id == model_id, LlmModel.deleted_at.is_(None))
+                .with_for_update()
             )
             .mappings()
             .first()
@@ -1067,8 +1104,7 @@ def update_model(model_id: int, payload: ModelPatch, request: Request) -> dict[s
         ):
             bound = (
                 c.execute(
-                    text("SELECT feature_key FROM llm_feature_model WHERE model_id=:id"),
-                    {"id": model_id},
+                    select(LlmFeatureModel.feature_key).where(LlmFeatureModel.model_id == model_id)
                 )
                 .scalars()
                 .all()
@@ -1086,15 +1122,7 @@ def update_model(model_id: int, payload: ModelPatch, request: Request) -> dict[s
                 )
             _check_index_use(c, [model_id])
         for column, value in fields.items():
-            is_json = column in {"capabilities", "parameters", "supported_parameters"}
-            expression = "CAST(:value AS JSONB)" if is_json else ":value"
-            c.execute(
-                text(f"UPDATE llm_model SET {column}={expression} WHERE id=:id"),
-                {
-                    "id": model_id,
-                    "value": json.dumps(value) if is_json and value is not None else value,
-                },
-            )
+            c.execute(update(LlmModel).where(LlmModel.id == model_id).values(**{column: value}))
         # 默认参数清单与显式相同清单等价；编辑旧模型时不能仅因表单展开默认值就使证明失效。
         before = dict(row)
         after = row | fields
@@ -1109,39 +1137,46 @@ def update_model(model_id: int, payload: ModelPatch, request: Request) -> dict[s
         # 参数/能力变化重新分配空间身份，旧索引凭证不可被新配置冒用。
         if changed and (row["kind"] == "embedding" or fields.get("kind") == "embedding"):
             c.execute(
-                text("UPDATE llm_model SET embedding_space_id=:space WHERE id=:id"),
-                {
-                    "id": model_id,
-                    "space": uuid4() if fields.get("kind", row["kind"]) == "embedding" else None,
-                },
+                update(LlmModel)
+                .where(LlmModel.id == model_id)
+                .values(
+                    embedding_space_id=uuid4()
+                    if fields.get("kind", row["kind"]) == "embedding"
+                    else None
+                )
             )
         if changed:
             c.execute(
-                text(
-                    "UPDATE llm_test SET invalidated_at=COALESCE(invalidated_at,now()) "
-                    "WHERE model_id=:id"
-                ),
-                {"id": model_id},
+                update(LlmTest)
+                .where(LlmTest.model_id == model_id)
+                .values(invalidated_at=func.coalesce(LlmTest.invalidated_at, func.now()))
             )
         c.execute(
-            text(
-                """UPDATE llm_model SET
-updated_at=now(),revision=revision+1,config_revision=config_revision+:changed WHERE
-id=:id"""
-            ),
-            {"id": model_id, "changed": int(changed)},
+            update(LlmModel)
+            .where(LlmModel.id == model_id)
+            .values(
+                updated_at=func.now(),
+                revision=LlmModel.revision + 1,
+                config_revision=LlmModel.config_revision + int(changed),
+            )
         )
     return _model_out(_model_row(db, model_id))
 
 
 def _check_index_use(c: Any, ids: list[int]) -> None:
     used = c.execute(
-        text("""SELECT 1 FROM knowledge_index i JOIN knowledge_source s ON s.id=i.source_id JOIN
-project_file pf ON pf.id=s.project_file_id JOIN knowledge_collection k ON
-k.id=s.collection_id
-WHERE i.embedding_model_id=ANY(CAST(:ids AS BIGINT[])) AND pf.deleted_at IS NULL AND
-k.deleted_at IS NULL AND i.status IN ('completed','running') LIMIT 1"""),
-        {"ids": ids},
+        select(KnowledgeIndex.id)
+        .select_from(KnowledgeIndex)
+        .join(KnowledgeSource, KnowledgeSource.id == KnowledgeIndex.source_id)
+        .join(ProjectFile, ProjectFile.id == KnowledgeSource.project_file_id)
+        .join(KnowledgeCollection, KnowledgeCollection.id == KnowledgeSource.collection_id)
+        .where(
+            KnowledgeIndex.embedding_model_id.in_(ids),
+            ProjectFile.deleted_at.is_(None),
+            KnowledgeCollection.deleted_at.is_(None),
+            KnowledgeIndex.status.in_(("completed", "running")),
+        )
+        .limit(1)
     ).scalar_one_or_none()
     if used:
         raise ModelInUse("模型仍被有效知识索引使用，请先迁移或移除对应来源")
@@ -1152,18 +1187,15 @@ def delete_model(model_id: int, request: Request) -> dict[str, Any]:
     db = engine(request)
     _model_row(db, model_id)
     with db.begin() as connection:
-        connection.execute(
-            text("SELECT id FROM llm_model WHERE id=:id FOR UPDATE"), {"id": model_id}
-        )
+        connection.execute(select(LlmModel.id).where(LlmModel.id == model_id).with_for_update())
         _check_index_use(connection, [model_id])
         bound = connection.execute(
-            text("SELECT 1 FROM llm_feature_model WHERE model_id = :id LIMIT 1"),
-            {"id": model_id},
+            select(LlmFeatureModel.id).where(LlmFeatureModel.model_id == model_id).limit(1)
         ).scalar_one_or_none()
         if bound is not None:
             raise ModelInUse("该模型仍绑定在功能上，请先解绑")
         connection.execute(
-            text("UPDATE llm_model SET deleted_at = now() WHERE id = :id"), {"id": model_id}
+            update(LlmModel).where(LlmModel.id == model_id).values(deleted_at=func.now())
         )
     return {"status": "deleted"}
 
@@ -1295,16 +1327,13 @@ async def _run_model_test(request: Request, row: dict, test_id: int, capability:
     }
     with db.begin() as c:
         c.execute(
-            text(
-                "UPDATE llm_test SET result=CAST(:result AS JSONB),preview_data=:data,"
-                "preview_mime=:mime WHERE id=:id"
-            ),
-            {
-                "id": test_id,
-                "result": json.dumps(result),
-                "data": preview.data if preview else None,
-                "mime": preview.mime_type if preview else None,
-            },
+            update(LlmTest)
+            .where(LlmTest.id == test_id)
+            .values(
+                result=result,
+                preview_data=preview.data if preview else None,
+                preview_mime=preview.mime_type if preview else None,
+            )
         )
     _record_call(
         db,
@@ -1333,24 +1362,31 @@ def list_features(request: Request) -> dict[str, Any]:
     with engine(request).connect() as connection:
         rows = (
             connection.execute(
-                text(
-                    """SELECT fm.feature_key, fm.priority, m.id AS model_row_id,
-m.model_id, m.display_name, m.enabled,
-p.id AS provider_id, p.name AS provider_name,p.enabled AS
-provider_enabled,m.kind,m.extra_retries
-FROM llm_feature_model AS fm
-JOIN llm_model AS m ON m.id = fm.model_id
-JOIN llm_provider AS p ON p.id = m.provider_id
-WHERE m.deleted_at IS NULL AND p.deleted_at IS NULL
-ORDER BY fm.feature_key, fm.priority"""
+                select(
+                    LlmFeatureModel.feature_key,
+                    LlmFeatureModel.priority,
+                    LlmModel.id.label("model_row_id"),
+                    LlmModel.model_id,
+                    LlmModel.display_name,
+                    LlmModel.enabled,
+                    LlmProvider.id.label("provider_id"),
+                    LlmProvider.name.label("provider_name"),
+                    LlmProvider.enabled.label("provider_enabled"),
+                    LlmModel.kind,
+                    LlmModel.extra_retries,
                 )
+                .select_from(LlmFeatureModel)
+                .join(LlmModel, LlmModel.id == LlmFeatureModel.model_id)
+                .join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
+                .where(LlmModel.deleted_at.is_(None), LlmProvider.deleted_at.is_(None))
+                .order_by(LlmFeatureModel.feature_key, LlmFeatureModel.priority)
             )
             .mappings()
             .all()
         )
         limits = {
             model_row["key"]: model_row
-            for model_row in connection.execute(text("SELECT * FROM llm_feature")).mappings().all()
+            for model_row in connection.execute(select(LlmFeature)).mappings().all()
         }
     items = []
     for key, name in FEATURES:
@@ -1397,7 +1433,7 @@ def update_feature(feature_key: str, payload: FeaturePatch, request: Request) ->
         raise ApiProblem(409, "feature_unavailable", "该功能尚未接入业务调用，无需设置路由预算")
     with engine(request).begin() as c:
         row = c.execute(
-            text("SELECT revision FROM llm_feature WHERE key=:key FOR UPDATE"), {"key": feature_key}
+            select(LlmFeature.revision).where(LlmFeature.key == feature_key).with_for_update()
         ).first()
         if row is None:
             raise ApiProblem(404, "not_found", "功能不存在")
@@ -1406,14 +1442,15 @@ def update_feature(feature_key: str, payload: FeaturePatch, request: Request) ->
                 412, "revision_conflict", "配置已被修改，草稿已保留，请刷新后比较最新版本"
             )
         c.execute(
-            text("""UPDATE llm_feature SET failover_limit=:limit,max_total_requests=:total,
-            deadline_seconds=:deadline,revision=revision+1,updated_at=now() WHERE key=:key"""),
-            {
-                "key": feature_key,
-                "limit": payload.failover_limit,
-                "total": payload.max_total_requests,
-                "deadline": payload.deadline_seconds,
-            },
+            update(LlmFeature)
+            .where(LlmFeature.key == feature_key)
+            .values(
+                failover_limit=payload.failover_limit,
+                max_total_requests=payload.max_total_requests,
+                deadline_seconds=payload.deadline_seconds,
+                revision=LlmFeature.revision + 1,
+                updated_at=func.now(),
+            )
         )
     return _feature_item(request, feature_key)
 
@@ -1436,17 +1473,25 @@ def replace_bindings(
         if rows:
             found = set(
                 connection.execute(
-                    text("""SELECT m.id FROM llm_model m JOIN llm_provider p ON p.id=m.provider_id
-                    WHERE m.id=ANY(CAST(:ids AS BIGINT[])) AND m.deleted_at IS NULL
-                    AND p.deleted_at IS NULL AND m.kind=:kind
-                    AND (m.kind<>'language' OR m.capabilities @> '["json_output"]'::jsonb)
-                    ORDER BY m.id FOR UPDATE OF m"""),
-                    {"ids": payload.model_ids, "kind": required_kind(feature_key)},
+                    select(LlmModel.id)
+                    .select_from(LlmModel)
+                    .join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
+                    .where(
+                        LlmModel.id.in_(payload.model_ids),
+                        LlmModel.deleted_at.is_(None),
+                        LlmProvider.deleted_at.is_(None),
+                        LlmModel.kind == required_kind(feature_key),
+                        or_(
+                            LlmModel.kind != "language",
+                            LlmModel.capabilities.contains(["json_output"]),
+                        ),
+                    )
+                    .order_by(LlmModel.id)
+                    .with_for_update(of=LlmModel)
                 ).scalars()
             )
         locked = connection.execute(
-            text("SELECT revision FROM llm_feature WHERE key = :key FOR UPDATE"),
-            {"key": feature_key},
+            select(LlmFeature.revision).where(LlmFeature.key == feature_key).with_for_update()
         ).scalar_one_or_none()
         if locked is None:
             raise ApiProblem(404, "not_found", "功能不存在")
@@ -1459,26 +1504,26 @@ def replace_bindings(
             if missing:
                 raise ApiProblem(400, "invalid_argument", f"模型不存在或种类与功能不符：{missing}")
         connection.execute(
-            text("DELETE FROM llm_feature_model WHERE feature_key = :key"), {"key": feature_key}
+            delete(LlmFeatureModel).where(LlmFeatureModel.feature_key == feature_key)
         )
         for model_id, priority in rows:
             connection.execute(
-                text(
-                    """INSERT INTO llm_feature_model (feature_key, model_id, priority)
-                       VALUES (:feature_key, :model_id, :priority)"""
-                ),
-                {"feature_key": feature_key, "model_id": model_id, "priority": priority},
+                insert(LlmFeatureModel).values(
+                    feature_key=feature_key, model_id=model_id, priority=priority
+                )
             )
         for column in ("failover_limit", "max_total_requests", "deadline_seconds"):
             value = getattr(payload, column)
             if value is not None:
                 connection.execute(
-                    text(f"UPDATE llm_feature SET {column}=:v WHERE key=:key"),
-                    {"v": value, "key": feature_key},
+                    update(LlmFeature)
+                    .where(LlmFeature.key == feature_key)
+                    .values(**{column: value})
                 )
         connection.execute(
-            text("UPDATE llm_feature SET revision=revision+1,updated_at=now() WHERE key=:key"),
-            {"key": feature_key},
+            update(LlmFeature)
+            .where(LlmFeature.key == feature_key)
+            .values(revision=LlmFeature.revision + 1, updated_at=func.now())
         )
     return _feature_item(request, feature_key)
 
@@ -1499,38 +1544,41 @@ def list_calls(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     conditions = []
-    params: dict[str, Any] = {"limit": limit, "offset": offset}
     if feature_key is not None:
-        conditions.append("c.feature_key = :feature_key")
-        params["feature_key"] = feature_key
+        conditions.append(LlmCallLog.feature_key == feature_key)
     if model_id is not None:
-        conditions.append("c.model_id = :model_id")
-        params["model_id"] = model_id
+        conditions.append(LlmCallLog.model_id == model_id)
     if status is not None:
-        conditions.append("c.status = :status")
-        params["status"] = status
+        conditions.append(LlmCallLog.status == status)
     if invocation_id is not None:
-        conditions.append("c.invocation_id = :invocation_id")
-        params["invocation_id"] = invocation_id
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    order = "c.request_ordinal ASC" if invocation_id else "c.created_at DESC, c.id DESC"
+        conditions.append(LlmCallLog.invocation_id == invocation_id)
+    order = (
+        (LlmCallLog.request_ordinal.asc(),)
+        if invocation_id
+        else (LlmCallLog.created_at.desc(), LlmCallLog.id.desc())
+    )
     with engine(request).connect() as connection:
         total = connection.execute(
-            text(f"SELECT count(*) FROM llm_call_log AS c {where}"), params
+            select(func.count()).select_from(LlmCallLog).where(*conditions)
         ).scalar_one()
         rows = (
             connection.execute(
-                text(
-                    f"""SELECT c.*, COALESCE(c.model_name_snapshot,m.display_name) AS display_name,
-                        COALESCE(c.provider_name_snapshot,p.name) AS provider_name
-                        FROM llm_call_log AS c
-                        LEFT JOIN llm_model AS m ON m.id = c.model_id
-                        LEFT JOIN llm_provider AS p ON p.id = c.provider_id
-                        {where}
-                        ORDER BY {order}
-                        LIMIT :limit OFFSET :offset"""
-                ),
-                params,
+                select(
+                    LlmCallLog,
+                    func.coalesce(LlmCallLog.model_name_snapshot, LlmModel.display_name).label(
+                        "display_name"
+                    ),
+                    func.coalesce(LlmCallLog.provider_name_snapshot, LlmProvider.name).label(
+                        "provider_name"
+                    ),
+                )
+                .select_from(LlmCallLog)
+                .outerjoin(LlmModel, LlmModel.id == LlmCallLog.model_id)
+                .outerjoin(LlmProvider, LlmProvider.id == LlmCallLog.provider_id)
+                .where(*conditions)
+                .order_by(*order)
+                .limit(limit)
+                .offset(offset)
             )
             .mappings()
             .all()
