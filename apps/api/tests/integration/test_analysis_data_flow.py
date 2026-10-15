@@ -87,6 +87,41 @@ def basis(environment):
         )
 
 
+def test_lot_without_original_code_publishes_and_resolves_by_verified_name(basis):
+    state = {}
+    records = [
+        BusinessRecord(
+            key="named-lot", title="A标段", text="A标段", kind="lot", scope=COMMON,
+            citations=[{"block_id": basis.block["block_id"], "quote": "A标段"}],
+        ),
+        BusinessRecord(
+            key="warranty", title="质保要求", text="A标段质保三年", kind="requirement",
+            scope={"kind": "lots", "lot_refs": ["A标段"]}, structuring="complete",
+            citations=[{"block_id": basis.block["block_id"], "quote": "A标段质保三年"}],
+        ),
+    ]
+    items = prepare_records(records, state, {basis.block["block_id"]: basis.block},
+                            "project_basic_info_parsing")
+    for item in items:
+        item["verification"] = "supported"
+    state["staged_items"] = items
+    basis.db.execute(
+        "UPDATE analysis_module SET business_data=CAST(:data AS JSONB) WHERE id=:id",
+        {"data": encode(module_data(state)), "id": basis.module_id},
+    )
+    snapshot = publish_data_snapshot(basis.db, basis.report_id)
+    assert publish_data_snapshot(basis.db, basis.report_id)["id"] == snapshot["id"]
+    lot = snapshot["data"]["lots"][0]
+    assert lot["title"] == "A标段" and lot["code"] is None
+    response = basis.client.post(basis.path + "/context", json={
+        "snapshot_id": snapshot["id"], "purpose": "check", "lot_id": lot["lot_id"],
+    })
+    assert response.status_code == 200
+    requirement = response.json()["requirements"][0]
+    assert requirement["scope"]["lot_ids"] == [lot["lot_id"]]
+    assert requirement["citations"][0]["element_id"] == basis.block["element_id"]
+
+
 def test_terminal_snapshot_is_idempotent_and_context_is_single_lot(basis):
     assert basis.client.get(basis.path + "/data").status_code == 409
     basis.db.execute("UPDATE analysis_report SET status='running' WHERE id=:id",

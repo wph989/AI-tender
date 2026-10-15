@@ -30,7 +30,6 @@ const samplesDir = join(here, "..", "public", "samples");
 const pdfjsDir = join(here, "..", "node_modules", "pdfjs-dist");
 
 const documentJson = JSON.parse(readFileSync(join(samplesDir, "sample-document.json"), "utf8"));
-const extractions = JSON.parse(readFileSync(join(samplesDir, "sample-extractions.json"), "utf8"));
 
 const failures = [];
 const EPS_SIZE = 0.5; // pt
@@ -154,20 +153,6 @@ for (const pageMeta of documentJson.pages) {
       failures.push(
         `p${pageMeta.page_no} ${block.anchor}：bbox 面积是文字面积的 ${ratio.toFixed(1)} 倍，怀疑尺度不对`,
       );
-    }
-  }
-}
-
-// 证据必须指向真实存在的块（假装数据也不能指向空气）
-const anchors = new Set(
-  Object.values(documentJson.blocks_by_page)
-    .flat()
-    .map((block) => block.anchor),
-);
-for (const item of extractions.items) {
-  for (const evidence of item.evidence) {
-    if (!anchors.has(evidence.anchor)) {
-      failures.push(`抽取结果 ${item.field_key} 的证据指向不存在的块：${evidence.anchor}`);
     }
   }
 }

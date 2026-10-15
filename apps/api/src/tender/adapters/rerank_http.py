@@ -4,7 +4,7 @@ import math
 
 import httpx
 
-from tender.domain.errors import ExtractionFailed, ExtractionUnavailable
+from tender.domain.errors import ModelCallFailed, ModelUnavailable
 
 
 class HttpRerankModel:
@@ -35,9 +35,9 @@ class HttpRerankModel:
                 json={"model": self._model, "query": query, "documents": documents, "top_n": top_n},
             )
         except httpx.HTTPError as exc:
-            raise ExtractionUnavailable("重排服务连接失败或超时") from exc
+            raise ModelUnavailable("重排服务连接失败或超时") from exc
         if not response.is_success:
-            raise ExtractionFailed(
+            raise ModelCallFailed(
                 f"重排服务返回 HTTP {response.status_code}", http_status=response.status_code
             )
         try:
@@ -60,7 +60,7 @@ class HttpRerankModel:
                 result.append((index, float(score)))
             return sorted(result, key=lambda item: item[1], reverse=True)
         except (ValueError, KeyError, TypeError) as exc:
-            raise ExtractionFailed("重排服务返回的候选索引、分数或数量无效") from exc
+            raise ModelCallFailed("重排服务返回的候选索引、分数或数量无效") from exc
 
     async def aclose(self):
         if self._owns_client:

@@ -5,7 +5,7 @@ from urllib.parse import quote
 
 import httpx
 
-from tender.domain.errors import ExtractionFailed, ExtractionUnavailable
+from tender.domain.errors import ModelCallFailed, ModelUnavailable
 from tender.ports.model_media import EmbeddingInput
 
 
@@ -80,13 +80,13 @@ class OpenAIEmbeddingModel:
         try:
             response = await self._client.post(path, headers=self._headers, json=body)
         except httpx.HTTPError as exc:
-            raise ExtractionUnavailable("向量服务连接失败或超时") from exc
+            raise ModelUnavailable("向量服务连接失败或超时") from exc
         if response.status_code in {408, 429, 500, 502, 503, 504}:
-            raise ExtractionUnavailable(
+            raise ModelUnavailable(
                 f"向量服务暂不可用：HTTP {response.status_code}", http_status=response.status_code
             )
         if not response.is_success:
-            raise ExtractionFailed(
+            raise ModelCallFailed(
                 f"向量服务拒绝请求：HTTP {response.status_code}", http_status=response.status_code
             )
         try:
@@ -120,7 +120,7 @@ class OpenAIEmbeddingModel:
             ):
                 raise ValueError("向量为空、维度不一致或包含非法数值")
         except (ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError) as exc:
-            raise ExtractionFailed("向量服务响应格式错误或维度与配置不符") from exc
+            raise ModelCallFailed("向量服务响应格式错误或维度与配置不符") from exc
         return vectors
 
     async def aclose(self) -> None:

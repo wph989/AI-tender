@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from tender.adapters.openai_embedding import OpenAIEmbeddingModel
-from tender.domain.errors import ExtractionFailed
+from tender.domain.errors import ModelCallFailed
 
 
 def test_embedding_uses_ordered_float_vectors_and_correct_endpoint():
@@ -46,7 +46,7 @@ def test_malformed_vectors_fail_instead_of_corrupting_index(data):
             transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"data": data})),
         ) as client:
             model = OpenAIEmbeddingModel("http://test", "model", client=client)
-            with pytest.raises(ExtractionFailed):
+            with pytest.raises(ModelCallFailed):
                 await model.embed(["甲"])
 
     asyncio.run(run())

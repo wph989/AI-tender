@@ -20,7 +20,18 @@ export interface FieldValue {
   citations: Citation[];
 }
 
-/** 解析字段：字段名 + 展示分类/顺序 + 解析值列表，证据逐值绑定，前端据此分组并分别定位。 */
+/** 分类与列由服务端从 Skill 固定，正文由 Agent 综合生成，引用单独绑定。 */
+export interface AnalysisOutput {
+  version: string;
+  layout: "table" | "list" | "tree";
+  columns: string[];
+  content: Record<string, string | string[]>;
+  key: string;
+  parent_key: string | null;
+  node_type: "group" | "section" | null;
+}
+
+/** 报告条目沿用历史身份，新增专题 output；问答和历史报告仍使用 values 投影。 */
 export interface AnalysisField {
   id: string;
   field: string;
@@ -30,6 +41,7 @@ export interface AnalysisField {
   note: string;
   verification: string;
   module_keys?: string[];
+  output?: AnalysisOutput;
 }
 
 export interface KnowledgeSource {
@@ -70,6 +82,8 @@ export interface AnalysisModule {
   items: AnalysisField[];
   error_message: string | null;
   runs?: AgentRun[];
+  research_summary?: string;
+  research_gaps?: { key: string; detail: string }[];
 }
 
 export interface AgentRun {
@@ -125,6 +139,7 @@ export interface BusinessRecord {
   kind: "fact" | "requirement" | "lot" | "format_node" | "relation";
   title: string;
   text: string;
+  content?: Record<string, string | string[]>;
   scope: AnalysisScope;
   structuring: "complete" | "partial";
   citations: Citation[];
@@ -183,7 +198,7 @@ export interface AnalysisCoverage {
 
 export interface AnalysisDataset {
   schema_version: string;
-  lots: (BusinessRecord & { lot_id: number; code: string; aliases: string[] })[];
+  lots: (BusinessRecord & { lot_id: number; code: string | null; aliases: string[] })[];
   facts: BusinessRecord[];
   requirements: BusinessRecord[];
   format_nodes: BusinessRecord[];

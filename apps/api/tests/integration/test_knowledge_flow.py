@@ -13,7 +13,6 @@ from sqlalchemy import create_engine, text
 
 from tender.adapters.pg.repositories.knowledge import KnowledgeStore, sync_sources
 from tender.api import knowledge, projects
-from tender.application.analysis_outline import outline_result
 from tender.application.knowledge import fingerprint, validate_items
 from tender.core import settings
 from tender.ports.llm import Completion
@@ -389,20 +388,23 @@ def test_report_preserves_outline_nodes_with_different_parent_paths(environment,
     store = KnowledgeStore(request.app.state.components.engine, 1)
     collection = knowledge.project_knowledge(pid, request)["collection_id"]
     block = store.readable_chunks(store.sources([collection])[0])[0]
-    nodes = [{
-        "id": node_id, "name": name, "parent_id": parent, "node_type": kind,
-        "requirements": requirements,
-        "citations": [{"block_id": block["block_id"], "quote": content}],
-    } for node_id, name, parent, kind, requirements in [
-        ("root", "商务标", None, "group", []),
-        ("lot-a", "甲标段", "root", "section", []),
-        ("license-a", "营业执照", "lot-a", "section", ["须盖章"]),
-        ("lot-b", "乙标段", "root", "section", []),
-        ("license-b", "营业执照", "lot-b", "section", ["须签字"]),
-    ]]
-    items, _ = outline_result({"outline_nodes": nodes}, {block["block_id"]: block})
-    for item in items:
+    # 只构造旧报告的已存历史形状；兼容读取不应依赖已下线的旧格式生成器。
+    history = [
+        ("root", "商务标", "商务标", "无"),
+        ("lot-a", "甲标段", "甲标段", "商务标"),
+        ("license-a", "营业执照", "须盖章", "商务标 / 甲标段"),
+        ("lot-b", "乙标段", "乙标段", "商务标"),
+        ("license-b", "营业执照", "须签字", "商务标 / 乙标段"),
+    ]
+    items = validate_items([{
+        "field": name, "group": "商务标", "note": "上级路径：" + parent_path,
+        "sort_order": order, "values": [{
+            "value": value, "citations": [{"block_id": block["block_id"], "quote": content}],
+        }],
+    } for order, (_, name, value, parent_path) in enumerate(history)], {block["block_id"]: block})
+    for item, (node_id, _, _, _) in zip(items, history, strict=True):
         item["verification"] = "supported"
+        item["id"] = fingerprint(["outline", node_id])[:20]
         if legacy_ids:
             item["id"] = fingerprint([item["field"], item["values"]])[:20]
     conn.execute(

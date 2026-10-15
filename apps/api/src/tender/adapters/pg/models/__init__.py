@@ -4,8 +4,8 @@
 通用约定与「刻意不复制哪些东西」的理由见 base.py。与迁移 DDL 的一致性由
 tests/contract/test_orm_models_match_ddl.py 守住（表名/列名/可空性/类型四样）。
 
-按业务域拆分：documents 解析管线 / projects 项目标段 / extraction 抽取复核 /
-configs 配置回归 / jobs 任务 / llm 模型管理 / knowledge 知识库 / analysis 智能分析。
+按业务域拆分：documents 解析管线 / projects 项目标段 /
+configs 配置审计 / jobs 任务 / llm 模型管理 / knowledge 知识库 / analysis 智能分析。
 """
 
 from tender.adapters.pg.models.analysis import (
@@ -22,7 +22,6 @@ from tender.adapters.pg.models.configs import (
     ConfigItem,
     ConfigRelease,
     JobConfigSnapshot,
-    RegressionRun,
 )
 from tender.adapters.pg.models.documents import (
     Document,
@@ -31,15 +30,6 @@ from tender.adapters.pg.models.documents import (
     Page,
     ParseRun,
     TableCell,
-)
-from tender.adapters.pg.models.extraction import (
-    Evidence,
-    Extraction,
-    ExtractionConflict,
-    FieldInstance,
-    GoldItem,
-    ReviewAction,
-    ReviewTask,
 )
 from tender.adapters.pg.models.jobs import Job
 from tender.adapters.pg.models.knowledge import (
@@ -75,11 +65,6 @@ __all__ = [
     "Document",
     "DocumentVersion",
     "Element",
-    "Evidence",
-    "Extraction",
-    "ExtractionConflict",
-    "FieldInstance",
-    "GoldItem",
     "Job",
     "JobConfigSnapshot",
     "KnowledgeAnswer",
@@ -100,8 +85,5 @@ __all__ = [
     "Project",
     "ProjectFile",
     "ProjectKnowledgeCollection",
-    "RegressionRun",
-    "ReviewAction",
-    "ReviewTask",
     "TableCell",
 ]

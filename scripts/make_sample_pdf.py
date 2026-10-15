@@ -1,4 +1,4 @@
-"""生成合成样本：一份小体量「招标文件」PDF，外加配套的页面几何与假抽取结果。
+"""生成合成样本：一份小体量「招标文件」PDF，外加配套的页面几何与原文坐标。
 
 为什么要合成样本：真实标书是敏感资产，不能进版本库（见 docs/工程/07 第 3 节）。
 为什么样本必须包含旋转页：定位闭环是全项目唯一无法靠单测证明的部分，
@@ -22,10 +22,9 @@ width_pt / height_pt，再带 rotation=90，等于旋转被算了两遍——PDF
 - 为什么字体文件本身不进版本库：生成器只读本机已安装的字体，产物里只有子集字形；
   想换字体用 `--font` 指定（建议开源字体，如 Noto Sans SC）。
 
-一次声明产出三样东西，保证三者永不脱节：
+同时生成 PDF 与坐标元数据，保证文字定位可核验：
     sample-tender.pdf        样本 PDF 本体
     sample-document.json     页面几何 + 块（锚点 / 视觉方向 bbox / 原文）
-    sample-extractions.json  假抽取结果，证据直接指向上面真实的块——所以高亮一定落在真文字上
 
 跑法（仓库根目录）：
     uv run --project apps/api python scripts/make_sample_pdf.py
@@ -340,86 +339,6 @@ class Sample:
 
 
 # field_key / 中文标签 / 分组 / 证据指向的块（按出现顺序，可多处）/ 置信度 / 状态
-FIELDS: list[tuple[str, str, str, tuple[str, ...], float, str]] = [
-    # 注意 p2b1 是页面标题「第二章 投标人须知前附表」，表格里各行的「编列内容」从 p2b2 开始——
-    # 证据必须指向真正写着该字段值的那一格，否则演示时「项目名称」旁边显示的是章节标题，一眼假。
-    ("project_name", "项目名称", "basic_info", ("p2b2",), 0.98, "auto"),
-    ("tender_no", "招标编号", "basic_info", ("p2b3",), 0.99, "auto"),
-    ("max_price", "最高投标限价", "basic_info", ("p2b4",), 0.93, "auto"),
-    ("bid_bond", "投标保证金", "basic_info", ("p2b5",), 0.96, "auto"),
-    ("bid_validity", "投标有效期", "basic_info", ("p2b6",), 0.88, "need_review"),
-    ("bid_open_time", "开标时间", "basic_info", ("p2b7",), 0.95, "auto"),
-    ("bid_open_place", "开标地点", "basic_info", ("p2b8",), 0.91, "auto"),
-    ("duration", "工期", "basic_info", ("p2b9",), 0.90, "auto"),
-        # 同一字段多处溯源：前附表给了付款比例，合同条款里再次出现——
-    # 这是证据列表（逐条定位）的演示样本，跨页两处
-    ("payment", "付款方式", "basic_info", ("p2b10", "p5b4"), 0.72, "need_review"),
-    ("rejection_clause", "废标条款", "risk", ("p3b2",), 0.91, "auto"),
-    ("star_clause", "实质性条款（★）", "scoring", ("p3b3",), 0.94, "auto"),
-    # 旋转页上的证据：高亮框如果落在别处，说明坐标变换错了
-    ("tunnel_method", "隧道施工方法", "tech", ("p4b2",), 0.89, "auto"),
-]
-
-
-def extractions(sample: Sample) -> dict[str, object]:
-    items = []
-    for index, (key, label, group, anchors, confidence, status) in enumerate(FIELDS):
-        blocks = [sample.block(anchor) for anchor in anchors]
-        text = str(blocks[0]["text"])
-        items.append(
-            {
-                "id": 9001 + index,
-                "instance_id": 4102 + index,
-                "machine_attempt_no": 1,
-                "attempt_no": 1,
-                "trigger": "first",
-                "is_current": True,
-                "field_key": key,
-                # 真实接口不带标签（标签来自字段定义），样本里带上省得前端硬编码
-                "field_label": label,
-                "group_key": group,
-                "value_text": text,
-                "confidence": confidence,
-                "status": status,
-                "evidence_count": len(blocks),
-                # 证据按出现顺序排列：前端证据列表的序号就是这里的顺序
-                "evidence": [
-                    {
-                        "anchor": str(block["anchor"]),
-                        "page_no": block["page_no"],
-                        "bbox": block["bbox"],
-                        "char_start": 0,
-                        "char_end": len(str(block["text"])),
-                        "quote": str(block["text"]),
-                        "quote_source": "native",
-                        "match_type": "exact",
-                    }
-                    for block in blocks
-                ],
-            }
-        )
-    # 「未找到」必须显式出现：藏起来会让用户以为系统没跑（见 docs/设计/06 第 9.2 节）
-    items.append(
-        {
-            "id": 9999,
-            "instance_id": 4999,
-            "machine_attempt_no": 1,
-            "attempt_no": 1,
-            "trigger": "first",
-            "is_current": True,
-            "field_key": "performance_bond",
-            "field_label": "履约保证金",
-            "group_key": "basic_info",
-            "value_text": "",
-            "confidence": 0.0,
-            "status": "not_found",
-            "evidence_count": 0,
-            "evidence": [],
-        }
-    )
-    return {"items": items, "total": len(items)}
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="生成合成招标文件样本")
     parser.add_argument(
@@ -443,16 +362,10 @@ def main() -> None:
     (args.out_dir / "sample-document.json").write_text(
         json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n"
     )
-    (args.out_dir / "sample-extractions.json").write_text(
-        json.dumps(extractions(sample), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
     print(f"已生成 {args.out_dir}:")
     print(f"  内嵌字体                 {font_path.name}")
     print(f"  sample-tender.pdf        {len(sample.pages)} 页（其中 1 页 /Rotate 90）")
     print(f"  sample-document.json     {len(sample.pages)} 页 / {len(sample.blocks)} 个块")
-    print(f"  sample-extractions.json  {len(FIELDS) + 1} 条假结果")
 
 
 if __name__ == "__main__":

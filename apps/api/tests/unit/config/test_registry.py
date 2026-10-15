@@ -73,7 +73,7 @@ def test_active_reads_from_cache_and_resolves_defaults() -> None:
 def test_missing_active_release_falls_back_to_defaults() -> None:
     registry = ConfigRegistry(_EmptyEngine(), _FakeCache())  # type: ignore[arg-type]
     assert registry.active(1) is None
-    assert registry.resolved(1)["extract.max_inflight"] == 8
+    assert registry.resolved(1)["analysis.max_inflight"] == 2
 
 
 def test_refresh_writes_cache_and_broadcasts() -> None:

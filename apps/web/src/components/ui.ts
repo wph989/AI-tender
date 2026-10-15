@@ -1,4 +1,4 @@
-/** 共用控件只维护一套样式，避免项目、复核与设置页面出现不同的操作语义。 */
+/** 共用控件只维护一套样式，避免项目、分析与设置页面出现不同的操作语义。 */
 export const INPUT_CLASS =
   "ui-input rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 " +
   "placeholder:text-slate-400 hover:border-slate-300 focus:border-sky-500 focus:outline-none focus:ring-3 focus:ring-sky-100 " +

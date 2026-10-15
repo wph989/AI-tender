@@ -2,7 +2,7 @@
 
 import pytest
 
-import tender.worker.extraction as extraction
+import tender.worker.model_routing as extraction
 from tender.application.llm_routing import ModelCandidate
 
 

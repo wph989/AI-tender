@@ -25,7 +25,7 @@ from tender.application.knowledge import encode, normalized, source_state
 from tender.application.knowledge_retrieval import retrieve_chunks
 from tender.core.di import create_embedding_gateway, create_rerank_gateway
 from tender.ports.repository.knowledge import KnowledgeStore
-from tender.worker.extraction import _routing_model
+from tender.worker.model_routing import _routing_model
 
 
 def prepare_report(db: KnowledgeStore, report: dict) -> tuple[dict, list[dict]] | None:

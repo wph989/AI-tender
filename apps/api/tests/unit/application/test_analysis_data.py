@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
+from synthesis_fixtures import research_calls
 from test_analysis_research import block, session
 from test_deep_analysis import KEY as MODULE
 from test_deep_analysis import SKILL, ScriptedRouter, call
@@ -155,10 +156,10 @@ def test_native_graph_submits_business_records_and_reuses_stable_identity():
         first = record("warranty", title="质保")
         corrected = first.model_copy(update={"title": "质保期限"})
         def submission(value, final):
-            return {"records": [value.model_dump()], "coverage": [], "gaps": [],
+            return {"records": [synthesis_record(value)], "coverage": [], "gaps": [],
                     "research_summary": "已核对质保", "final": final}
         router = ScriptedRouter([
-            call("search_document", {"query": "质保"}, 1),
+            *research_calls(),
             call("submit_analysis", submission(first, False), 2),
             call("submit_analysis", submission(corrected, True), 3),
         ])
@@ -182,7 +183,7 @@ def test_native_graph_submits_business_records_and_reuses_stable_identity():
         assert len(records) == 1 and records[0]["title"] == "质保期限"
         assert reviewed[0]["id"] == reviewed[1]["id"]
         assert records[0]["scope"]["kind"] == "common"
-        assert len(router.requests) == 3
+        assert len(router.requests) == 5
     asyncio.run(run())
 
 
@@ -323,15 +324,24 @@ def test_not_applicable_proofs_are_independent_for_each_lot(legacy_keys):
     assert all(c["citations"][0]["quote"] == quote for c in data["coverage"])
 
 
+def synthesis_record(record):
+    # 数据投影测试仍使用通用业务记录，真实图必须按其专题格式构造综合内容。
+    if record.kind == "format_node":
+        return record.model_dump() | {"content": {"编制要求": [record.text]}}
+    return record.model_dump() | {
+        "group": "项目基本信息", "content": {"字段": record.title, "内容": record.text},
+    }
+
+
 def business_submission(records=(), *, gaps=(), final=False):
-    return {"records": [r.model_dump() for r in records], "coverage": [], "gaps": list(gaps),
+    return {"records": [synthesis_record(r) for r in records], "coverage": [], "gaps": list(gaps),
             "research_summary": "已核对本批结果", "final": final}
 
 
 async def run_business_batches(key, batches, rejected_text=None):
     state, saved = {}, []
     router = ScriptedRouter([
-        call("search_document", {"query": "项目要求"}, 1),
+        *research_calls(query="项目要求"),
         *[call("submit_analysis", batch, index + 2) for index, batch in enumerate(batches)],
     ])
 
@@ -344,14 +354,15 @@ async def run_business_batches(key, batches, rejected_text=None):
     async def review(items):
         for item in items:
             item["verification"] = (
-                "unsupported" if item["business"]["text"] == rejected_text else "supported"
+                "unsupported" if rejected_text in item["business"]["content"].values()
+                or [rejected_text] in item["business"]["content"].values() else "supported"
             )
 
     content = "\n".join(r["text"] for batch in batches for r in batch["records"])
     graph, files = build_module_agent(
         key=key, model=RoutedAgentModel(router=router),
         research=session([block() | {"content": content}]), state=state,
-        snapshot={key + "/SKILL.md": (
+        snapshot={**SKILL, key + "/SKILL.md": (
             f"---\nname: {key.replace('_', '-')}\ndescription: 测试解析\n---\n核对项目"
         ), "__analysis_data_version__": "1", key + "/references/coverage.json": "[]"},
         checkpointer=InMemorySaver(), reserve_tool=noop, save=save, review_support=review,
@@ -372,7 +383,7 @@ def test_partial_format_rollback_requires_repair_before_final_submission():
         business_submission(final=True), business_submission([a], final=True),
     ], rejected_text=moved_b.text))
     # 空 final 不能发布部分回退产生的环，必须让模型收到结构反馈并修正后再完成。
-    assert len(router.requests) == 5
+    assert len(router.requests) == 7
     assert any("循环" in str(messages) for messages, _ in router.requests)
     records = state["draft"]["business_data"]["records"]
     assert {r["key"]: r["parent_key"] for r in records} == {"a": None, "b": "a"}
@@ -436,4 +447,4 @@ def test_final_gaps_replace_history_only_after_successful_verification(keep_unre
                for s in failed_final)
     data = state["draft"]["business_data"]
     assert data["gaps"] == final_gaps
-    assert [r["text"] for r in data["records"]] == [good.text]
+    assert [r["content"]["内容"] for r in data["records"]] == [good.text]

@@ -11,7 +11,7 @@ from tender.adapters.openai_embedding import OpenAIEmbeddingModel
 from tender.adapters.provider_image import ProviderImageModel
 from tender.application.model_probes import PROBE_IMAGE
 from tender.application.model_profiles import validate_model
-from tender.domain.errors import ExtractionFailed
+from tender.domain.errors import ModelCallFailed
 from tender.ports.model_media import EmbeddingInput
 
 
@@ -120,7 +120,7 @@ def test_standard_embedding_never_discards_image_or_accepts_wrong_dimensions():
             with pytest.raises(ValueError, match="不能静默丢弃"):
                 await model.embed_inputs([EmbeddingInput("图片", (PROBE_IMAGE,))])
             assert requests == []
-            with pytest.raises(ExtractionFailed, match="维度"):
+            with pytest.raises(ModelCallFailed, match="维度"):
                 await model.embed(["文本"])
 
     asyncio.run(run())
@@ -193,7 +193,7 @@ def test_image_payload_must_decode_and_never_fetches_returned_url(data):
         async with httpx.AsyncClient(
             base_url="http://fixture/", transport=httpx.MockTransport(handler)
         ) as client:
-            with pytest.raises(ExtractionFailed):
+            with pytest.raises(ModelCallFailed):
                 await ProviderImageModel("http://fixture", "fixture", client=client).generate(
                     "蓝色圆形"
                 )

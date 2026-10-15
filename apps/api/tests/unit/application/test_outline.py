@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tender.application.extraction import build_outline
+from tender.application.document_outline import build_outline
 
 
 def _title(

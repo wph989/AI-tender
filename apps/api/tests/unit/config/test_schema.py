@@ -7,13 +7,13 @@ import pytest
 from tender.config import schema
 
 
-def test_defaults_cover_three_layers() -> None:
+def test_defaults_cover_runtime_and_parsing_layers() -> None:
     layers = {entry.layer for entry in schema.ITEMS}
-    assert layers == {schema.L1, schema.L2, schema.L3}
+    assert layers == {schema.L1, schema.L2}
 
 
-def test_l1_is_not_gated_but_l2_l3_are() -> None:
-    """分层依据是生效代价：L1 只影响速度，L2/L3 会改变结果，必须走门禁。"""
+def test_l1_is_not_gated_but_l2_are() -> None:
+    """分层依据是生效代价：L1 只影响速度，L2 会改变结果，必须走门禁。"""
     for entry in schema.ITEMS:
         assert entry.requires_gate is (entry.layer != schema.L1), entry.key
 
@@ -25,9 +25,9 @@ def test_resolve_values_merges_defaults_with_overrides() -> None:
     assert set(resolved) == {entry.key for entry in schema.ITEMS}
 
 
-def test_resolve_values_keeps_unregistered_keys() -> None:
-    """读取侧宽容：历史 release 里被移除的配置项要原样保留，回滚才不会静默改配置。"""
-    assert schema.resolve_values({"not.registered": 1})["not.registered"] == 1
+def test_resolve_values_excludes_retired_keys() -> None:
+    """历史版本可保留原值，但已下线参数不得重新进入运行配置。"""
+    assert "not.registered" not in schema.resolve_values({"not.registered": 1})
 
 
 def test_item_rejects_unknown_key() -> None:
@@ -43,7 +43,6 @@ def test_item_rejects_unknown_key() -> None:
         ("convert.max_inflight", "4"),
         ("mineru.tier", 5),
         ("llm_aided.title_leveling", 1),
-        ("extract.rerun.hide_threshold", "0.1"),
     ],
 )
 def test_validate_value_rejects_wrong_types(key: str, value: object) -> None:
@@ -54,7 +53,6 @@ def test_validate_value_rejects_wrong_types(key: str, value: object) -> None:
     ("key", "value"),
     [
         ("convert.max_inflight", 4),
-        ("extract.rerun.hide_threshold", 0.15),
         ("mineru.output_formats", ["middle_json", "zip"]),
         ("llm_aided.title_leveling", False),
     ],
@@ -98,7 +96,7 @@ def test_diff_values_ignores_identical_values() -> None:
 def test_write_denial_follows_layer_permissions() -> None:
     assert schema.write_denial("operator", ["convert.max_inflight"]) is None
     assert schema.write_denial("operator", ["mineru.tier"]) is not None
-    assert schema.write_denial("admin", ["extract.rerun.min_sample"]) is None
+    assert schema.write_denial("admin", ["analysis.max_model_calls"]) is None
     assert schema.write_denial("viewer", ["convert.max_inflight"]) is not None
     assert schema.write_denial("reviewer", ["mineru.tier"]) is not None
 
@@ -107,9 +105,9 @@ def test_write_denial_rejects_unknown_role() -> None:
     assert schema.write_denial("root", ["convert.max_inflight"]) is not None
 
 
-def test_gated_keys_only_keeps_l2_l3() -> None:
-    keys = ["convert.max_inflight", "mineru.tier", "extract.strategy.dual_route"]
-    assert schema.gated_keys(keys) == {"mineru.tier", "extract.strategy.dual_route"}
+def test_gated_keys_only_keeps_l2() -> None:
+    keys = ["convert.max_inflight", "mineru.tier", "analysis.max_model_calls"]
+    assert schema.gated_keys(keys) == {"mineru.tier"}
 
 
 @pytest.mark.parametrize("key", [
@@ -121,13 +119,8 @@ def test_analysis_budgets_have_no_artificial_maximum(key: str) -> None:
     assert schema.validate_value(key, -1) is not None
 
 
-@pytest.mark.parametrize("value", [-0.1, 1.1, float("inf"), float("nan")])
-def test_ratio_must_be_finite_and_between_zero_and_one(value: float) -> None:
-    assert schema.validate_value("extract.rerun.hide_threshold", value) is not None
-
-
 def test_nonnegative_budgets_keep_pause_and_no_retry_semantics() -> None:
-    for key in ("convert.max_inflight", "parse.max_inflight", "extract.max_inflight",
+    for key in ("convert.max_inflight", "parse.max_inflight",
                 "analysis.max_subagent_retries", "job.retry.convert_500"):
         assert schema.validate_value(key, 0) is None
     assert schema.validate_value("analysis.max_inflight", 0) is not None

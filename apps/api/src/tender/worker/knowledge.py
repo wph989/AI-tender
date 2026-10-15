@@ -24,7 +24,7 @@ from tender.application.qa_agent import answer_with_agent
 from tender.core import settings
 from tender.core.di import create_embedding_gateway, create_rerank_gateway
 from tender.worker.celery_app import celery_app
-from tender.worker.extraction import _advisory_lock, _routing_model
+from tender.worker.model_routing import _advisory_lock, _routing_model
 
 _engine = create_pg_engine()
 

@@ -1,6 +1,10 @@
 ﻿# 前端界面重构交接
 
-更新日期：2026-10-13
+更新日期：2026-10-15
+
+> **2026-10-15 当前最新交接**：见末尾「修正 Agent 过程门禁与纠错误杀」。用户指出几乎所有专题因 complete_research 失败；已删除检索词精确复述要求，主题漏项、重复和覆盖证明缺项改为可展示缺口，修复空检索误判无进展及清空成果，清理旧格式解析器。最终离线 **608 passed / 9 skipped**，隔离 PostgreSQL **71 passed**，历史展示兼容补验 **2 passed**，Ruff、架构约束、前端类型检查及差异检查通过。临时数据库已停止；未启用业务服务、未调用真实模型、未提交或推送。
+
+> **2026-10-15 最新交接**：见文件末尾「移除字段抽取并重构 Agent 证据汇总输出：实现与验收完成」。旧字段抽取链路已移除，13 个专题改为检索完成后按 Skill 综合输出 JSON；已补修 `analysis` 队列无人消费和报告切换残留状态。离线 **602 passed / 9 skipped**，临时 PostgreSQL 18.3 集成 **70 passed**，前端 **45 项单测、54 项页面测试、类型检查和生产构建通过**。业务数据库本轮未迁移，业务服务未重启，未提交或推送；旧运行环境暂不视为已启用新版。
 
 > **2026-10-13 最新交接**：见文件末尾「ORM 落地第二、三步：端口/适配器分层与裸 SQL 收口」。ORM 替换已按用户要求推进到：第一步落地 typed declarative 模型 + 唯一引擎入口 + 模型↔DDL 契约测试；第二、三步落地 ports 协议 + adapters 仓储，`api/`/`worker/`/`application/` 的业务裸 SQL 已全部迁走（`text()` 只剩 `adapters/pg` 里 ORM 表达不到的系统目录查询）。离线验证 `tests/unit tests/contract` → 654 passed / 9 skipped，ruff 全过，`lint-imports` 5 kept / 0 broken。**后端本轮未重启（用户要求推迟）**；`tests/integration` 三个用例已改指新仓储入口并全绿（`TENDER_RUN_DB_TESTS=1` → 72 passed），期间修掉 `KnowledgeSession` 事务未真正提交的真实缺陷。数据库/Redis 网络中断已恢复，报告 #16 的 818 运行中、819–826 排队、814–817 待补跑。下面更早的提示保留作历史，当前状态以末尾为准。
 
@@ -1856,3 +1860,87 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 - 按用户要求对当前配置的业务数据库执行只读核验：`public` 的 Alembic 版本与代码 head 均为 `0012_config_limits`，没有待应用版本；41 张 ORM 业务表、483 个字段均存在。事务确认 `transaction_read_only=on`，未重复执行迁移。
 - 用户随后明确要求提交代码，本次提交范围为已审查的 ORM 端口/仓储迁移、分析任务异常收尾与结构门禁修复、知识库列表及批量元素写入修复、对应测试与交接文档。
 - 提交前验证结果：离线 **669 passed / 9 skipped**，真实 PostgreSQL 集成 **72 passed**，源码及新增测试 Ruff 通过，架构约束 **5 kept / 0 broken**。不包含推送、业务服务重启或真实模型调用。
+
+### 2026-10-15 移除字段抽取并重构 Agent 证据汇总输出：实现与验收完成
+
+承接用户指定会话及根目录同名任务文档。本轮读取原会话最后记录后继续已有改动，使用 karpathy-guidelines 技能；没有启用子代理。
+
+用户要求与最终行为：
+
+- 旧字段抽取、复抽、字段复核、冲突裁定、字段 Excel 导出及金标回放的业务实现、API、worker、前端入口、专属测试和样例已移除。文件流程只保留转换与解析，默认项目入口为 Agent 分析，`?view=document` 保留文档预览。
+- 13 个专题加载冻结 Skill，先核对资料、全部 coverage 主题和转引，再经 `complete_research` 进入综合阶段。`submit_analysis` 使用 records/content，服务端校验专题分类与列名；原文引用独立保存，仅用于溯源。
+- 技术专题展示项目背景、要求摘要与逐条关键要求；评分保留真实列名及各档次；格式保留父子材料层级。支持性校验包含正文和业务属性，校验失败保留已核实成果，补读新证据后重新确认检索和汇总。研究缺口随报告保留，旧报告只读展示。
+- 新迁移 `0013_retire_extraction` 取消活跃旧抽取/导出任务，删除旧功能绑定、配置及8张旧表、2个关联列，保留解析、Agent、模型调用日志和历史配置版本。历史迁移不改，不支持通过重建空表伪装降级。
+
+本轮补修：
+
+- `scripts/start-backend.ps1` 原消费队列删掉 extract 后漏加 analysis，容器仍保留 extract/regression，导致新版 Agent/问答/索引无人消费。三个部署入口现统一 `tender,convert,parse,analysis`。新增 `tests/contract/test_worker_queues_match_routes.py`，比较生产者真实路由和部署消费列表；修复前三项失败，修复后三项通过。脚本 PowerShell 语法通过，UTF-8 BOM 保留。
+- `ProjectAnalysis.tsx` 按 report.id 重新挂载依据面板；`AnalysisDataPanel.tsx` 新快照加载前清除标段，加载按钮无快照时禁用并固定可访问名称，防止报告切换沿用旧快照或预览请求。
+- `synthesis.spec.ts` 改按 tabpanel 的语义名称定位，避开 Ant Design 内部类名。技术摘要、逐条要求、评分列、三层格式与真实 PDF 定位均已验收。
+- 清理本次代码的3处 Ruff 长行和2处差异空白错误；内置技术输出模板保留背景摘要占位。
+
+最终验证：
+
+- 后端 `PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/unit tests/contract -q --tb=short`：**602 passed / 9 skipped**。
+- `ruff check src/tender tests alembic/versions/0013_retire_extraction.py`：全过；`lint-imports`：**5 kept / 0 broken**。
+- 前端 `pnpm --dir apps/web typecheck`、`test`：**45 passed**；`build`：通过；完整 `test:e2e`：桌面/390px **54 passed**。页面使用拦截 API 和合成 PDF，不代表真实供应商端到端验收。
+- `pnpm --dir apps/web verify:sample`：6页 PDF 页面几何与全部块坐标校验通过。人工查看桌面技术与窄屏评分截图。
+- `git -c core.safecrlf=false diff --check`：通过。
+- 当前配置远程 PostgreSQL 首次集成连接超时，因此本轮改用缓存的 PostgreSQL 18.3 程序包创建临时本地实例（仅 127.0.0.1:55433），空库从基线应用到 `0013_retire_extraction` 后执行全部 `tests/integration`：**70 passed，71.87秒**。退役测试在独立 schema 构造含真实外键的历史数据，核对旧表/列/绑定移除、调用日志保留、解析任务不被取消，事务回滚后没有 retire_test/llm_test schema 残留。
+- 测试库确认 head 为 `0013_retire_extraction`；ORM 当前 **33张表、384列**。测试实例已用 pg_ctl 正常停止，55433 端口已释放。
+
+产物与下一步：
+
+- 最新完整页面日志 `.tmp/synthesis-e2e-final.log`；截图与 trace 由 `apps/web/test-results/` 保存，属测试产物。
+- 临时 PostgreSQL 程序、测试数据目录及日志位于 `.tmp/synthesis-postgres/`，服务已停止。未修改任何部署环境变量或 .env。
+- 代码与隔离验收已完成，仍未应用到真实业务环境。沿用原会话推迟业务服务重启/业务库迁移的要求；后续现场启用需先恢复远程依赖，确认已有任务及备份，再按删数据迁移要求应用0013、启动新版并生成新报告验收。
+- 未调用真实模型、未重启业务 API/worker/beat、未迁移业务数据库、未提交或推送。本轮临时实例的成功不能替代远程业务库连接与现场验收。
+
+### 2026-10-15 修正 Agent 过程门禁与纠错误杀
+
+用户反馈 complete_research 几乎全部失败，错误为「必须逐一交代全部主题」及「主题检索词必须来自实际成功执行的项目检索」，并强调目标是分析招标文档、产出分析结果和精确定位。沿用原会话，不启用子代理，使用 karpathy-guidelines，保留所有已有未提交修改。
+
+原因与修复：
+
+- 旧实现让模型精确复述主题 key 和 query，并在第一个校验问题处停止反馈；不同错误共用同工具三次失败计数。真实检索账已在服务端，重复复述没有业务必要。现 queries 可省略，仅为检索意图；真实 project_searches 直接来自成功工具事件，每轮向模型提供服务端资料和检索记录，压缩历史不会丢失过程账。
+- 主题 key 和 Skill 中文名均可归档；重复说明合并，遗漏及无法确定归属的正式主题保留 unresolved 缺口。覆盖/转引证明缺项降为未决状态，不阻断有明确引用的正文。不同确定性错误组合分别计数，一次反馈全部 issues；同类错误仅更换虚构证据 ID 仍耗尽额度，检查点恢复不能重置计数。
+- 移除 list_documents 调用顺序门禁；资料清单来自服务端，未检索补充资料写入缺口。无真实项目检索、虚构或越权证据仍拒绝。新的成功检索即使没有新命中也算进展；相同请求重放、改名及未校验草稿不算，总调用/证据/时限预算保留。
+- 只有新增证据才要求重新汇总；空检索或只返回已读块时保留已核实成果，并更新实际检索账。coverage/gaps/research_summary 可以省略；清单漏项及关联失误降为 pending 并发布缺口。空说明补齐、长摘要截取，不因过程文案终止模块。
+- 部分表格列缺失时保留有依据的内容；单条技术要求字符串整理为数组，摘要/要求用已提交内容互补，整理后的 content 与业务属性仍全部送支持性校验。格式分组可以嵌套，同批父子/端点不限顺序；循环、缺失父级及错误归属仍拦截。
+- 标段 code 只存原文编号，无编号可以省略。目录用已核实名称作内部查找键，分析数据 code 仍为空；已修复按名称解析范围、补齐标段覆盖及前端类型，未新增迁移。
+- 删除没有生产调用的 analysis_outline.py、旧协议和专属单测，其中包含“最多三级/分组只能为根/正文逐字摘录”的遗留约束。历史报告同名材料/父级路径读取测试直接构造历史形状，不再依赖旧生成器。
+- 13个专题 Skill 和 docs/设计/19-Agent检索与专题汇总.md 同步新规则。新增 test_research_checkpoint_repairs.py，覆盖真实图的检索、修复、综合、缺口、已核实结果保留及定位身份；新增 PostgreSQL 无编号标段发布/幂等/HTTP读取测试。
+
+验证：
+
+- 新回归最初复现7项失败；修复与扩充后全部通过。最后全量 unit/contract：**608 passed / 9 skipped，23.50秒**。旧格式专属9项测试随死代码删除，旧清单硬失败断言改为验证 pending 与结果保留，不能仅按测试数量增减判断覆盖。
+- 隔离 PostgreSQL 18.3 全量集成：**71 passed，55.81秒**；删除旧生成器、调整历史夹具后，两个父级路径兼容用例补验 **2 passed**。未用真实模型，未改写业务库。
+- Ruff 全源码/测试通过；import-linter **5 kept / 0 broken**；前端 pnpm typecheck 与 git diff --check 通过。本轮只改前端类型，没有新增界面或重跑浏览器验收。
+- 重用 .tmp/synthesis-postgres 的临时实例，端口127.0.0.1:55433，库为postgres、角色synthesis_test，确认head为0013_retire_extraction。实例已正常停止，端口无监听。新日志为 .tmp/synthesis-postgres/research-repairs-db.log。PowerShell向postgres单用户后端传stdin需用无BOM UTF-8；本轮只读查询角色/库名，没有改角色或数据。
+
+业务服务与下一步：
+
+- 本轮只完成代码修复与隔离验证，未检查远程业务服务现状、未重启业务服务、未调用真实模型、未迁移业务库、未提交或推送。此前推迟业务启用的约定保留。
+- 若后续要求现场启用，先重新检查依赖、业务服务及在途任务，按已有迁移/备份约定处理；服务加载修复后补跑失败专题，验证真实模型输出与原文定位。不能将测试替身的通过称为线上失败已恢复。
+
+### 2026-10-15 修复未提交更改审查发现的三项问题
+
+用户要求修复本轮审查发现的问题，保留全部已有未提交更改，继续使用 karpathy-guidelines。
+
+- `prepare_records` 先为整批生成归一化 content/text，再解析关系端点，消除同批顺序导致的空端点文本；发布后的 supersedes 关系与旧要求替代状态正常。工具协议与错误提示同步说明同批端点顺序不限。
+- 最终提交省略 `gaps` 或传入 `null` 时沿用已登记缺口；只有显式清单才在校验通过后替换内容缺口。显式空数组仍可清除内容缺口，未解决的检索/转引缺口继续由服务端保留。设计文档同步此语义。
+- 文件管理顶部“预览原文”改用 `?view=document`，修正旧 `?view=fields` 路由进入分析页的问题。
+- 在 `test_research_checkpoint_repairs.py` 新增10项参数化回归，覆盖关系与两个端点的全部6种顺序，以及省略/null/空数组/显式剩余缺口清单。验证正式分析数据中的关系端点身份与 superseded_in，而不只检查工具接受状态。
+
+验证：
+
+- 修复前新增回归 **6 failed / 4 passed**；修复后相关分析与问答用例 **107 passed**，全量 unit/contract **618 passed / 9 skipped**。
+- 本轮变更的 Python 文件 Ruff 检查通过，新增测试段格式检查通过；架构约束 **5 kept / 0 broken**；前端 `pnpm --dir apps/web typecheck` 与 `git diff --check` 通过。
+- 复用4400端口的开发服务，用无界面 Edge 与拦截 API 点击文件管理顶部入口，确认 URL 为 `?view=document`，且出现文档预览标题和项目文件导航。此验证不代表真实资料或供应商端到端验收。
+- 未重启业务服务、未迁移或改写业务数据库、未调用真实模型、未提交或推送。
+
+### 2026-10-15 用户要求提交本轮代码
+
+- 用户明确要求提交代码；提交范围包含字段抽取退役、Agent 综合输出重构、检索门禁修正、三项审查问题修复及对应测试、迁移、部署入口和文档。
+- 采用中文提交信息，不添加作者说明或协作署名；沿用已完成的618项离线测试及前端、架构和浏览器定位入口验证，不重复运行同一验收。
+- 本次仅提交到本地 Git，业务服务启用、真实业务库迁移和推送仍未执行。

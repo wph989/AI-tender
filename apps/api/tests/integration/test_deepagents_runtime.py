@@ -21,6 +21,7 @@ from tender.adapters.pg.repositories.provider_cooldown import ProviderCooldown
 from tender.api import knowledge, projects
 from tender.application import agent_runtime
 from tender.application.agent_checkpoints import run_async
+from tender.application.analysis_skills import MODULES, skill_snapshot
 from tender.core import settings
 from tender.ports.llm import Completion
 from tender.worker import deep_analysis as worker
@@ -214,8 +215,8 @@ def test_resume_preserves_budget_evidence_and_deadline(env):
 class NativeRouter:
     def __init__(self, *, purpose="", **kwargs):
         self.reserve = kwargs["before_request"]
-        # _routing_model 的 purpose 含模块键，据此区分格式模块的提交协议。
-        self.outline = "bid_format_outline_parsing" in purpose
+        self.key = next((key for key in MODULES if key in purpose), "project_basic_info_parsing")
+        self.topics = json.loads(skill_snapshot()[self.key + "/references/coverage.json"])
         self.calls = 0
 
     async def chat(self, messages, tools):
@@ -223,12 +224,26 @@ class NativeRouter:
         await asyncio.sleep(0.01)
         self.calls += 1
         if self.calls == 1:
+            name, args = "list_documents", {}
+        elif self.calls == 2:
             name, args = "search_document", {"query": "质保"}
+        elif self.calls == 3:
+            name, args = "complete_research", {
+                "topics": [{"topic": topic["key"], "status": "searched_not_found",
+                            "queries": ["质保"], "evidence_ids": [], "detail": "本次未识别新增事项"}
+                           for topic in self.topics],
+                "references": [], "research_summary": "已检查项目资料和各专题检索范围",
+            }
         else:
             name, args = (
                 "submit_analysis",
                 {
-                    "records": [], "coverage": [], "gaps": [],
+                    "records": [], "coverage": [
+                        {"topic": topic["key"], "status": "searched_not_found",
+                         "scope": {"kind": "common", "lot_refs": []},
+                         "record_keys": [], "detail": "本次未识别新增事项"}
+                        for topic in self.topics
+                    ], "gaps": [],
                     "research_summary": "已检索质保，当前专题无新增事项",
                     "final": True,
                 },
@@ -269,7 +284,7 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
 
     class EvidenceRouter(NativeRouter):
         async def chat(self, messages, tools):
-            if self.calls == 0:
+            if self.calls < 3:
                 return await super().chat(messages, tools)
             await self.reserve()
             self.calls += 1
@@ -282,13 +297,20 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
             assert all(set(b) == {"id", "text"} for b in result["blocks"])
             args = {
                 "records": [{
-                    "key": "warranty", "kind": "requirement", "title": "质保", "text": "质保三年",
+                    "key": "warranty", "kind": "requirement", "title": "质保",
+                    "group": "项目基本信息",
+                    "content": {"字段": "质保期限", "内容": "质保期限为三年"},
                     "scope": {"kind": "common", "lot_refs": []},
                     "citations": [
                         {"block_id": b["id"], "quote": "质保三年"} for b in result["blocks"]
                     ],
                 }],
-                "coverage": [], "gaps": [],
+                "coverage": [
+                    {"topic": topic["key"], "status": "searched_not_found",
+                     "scope": {"kind": "common", "lot_refs": []},
+                     "record_keys": [], "detail": "仅核实质保条款"}
+                    for topic in self.topics
+                ], "gaps": [],
                 "research_summary": "已核对质保",
                 "final": True,
             }
@@ -331,7 +353,8 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
         return db.readable_chunks(selected_sources[0]), {"mode": "keyword"}
 
     monkeypatch.setattr(
-        worker, "_routing_model", lambda feature, purpose, **kw: EvidenceRouter(**kw)
+        worker, "_routing_model",
+        lambda feature, purpose, **kw: EvidenceRouter(purpose=purpose, **kw),
     )
     monkeypatch.setattr(worker, "retrieve_chunks", retrieve)
     monkeypatch.setattr(env.db, "resolve", resolve)
@@ -371,7 +394,7 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     routers = []
 
     def model(feature_key, purpose, **kwargs):
-        # _routing_model 的 purpose 含模块键，格式模块须走 outline 协议提交。
+        # 各模块使用自己的冻结覆盖清单，检索门禁也在真实检查点中持久化。
         router = NativeRouter(purpose=purpose, **kwargs)
 
         async def broken_close():
@@ -397,7 +420,7 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     assert len(routers) == len(result["modules"]) == 13
     runs = env.db.rows("SELECT * FROM agent_module_run")
     assert len({r["thread_id"] for r in runs}) == 13
-    assert all(r["status"] == "completed" and r["model_calls"] == 2 for r in runs)
+    assert all(r["status"] == "completed" and r["model_calls"] == 4 for r in runs)
     assert all(r["state"]["research"]["seen"] for r in runs)
     assert all(r["state"]["loaded_skill"]["sha256"] for r in runs)
     assert len(env.db.rows("SELECT id FROM agent_run_event WHERE kind='skill_loaded'")) == 13

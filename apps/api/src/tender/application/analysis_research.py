@@ -200,6 +200,8 @@ class ResearchSession:
             {
                 "action": "search_result",
                 "scope": scope,
+                "query": query.strip(),
+                "source_ids": sorted(selected_sources),
                 "block_ids": [
                     b["id" if self.compact_results else "block_id"] for b in result["blocks"]
                 ],

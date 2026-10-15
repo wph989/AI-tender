@@ -96,13 +96,13 @@ class ModelInUse(TenderError):
     code: ClassVar[str] = "model_in_use"
 
 
-class ExtractionFailed(TenderError):
+class ModelCallFailed(TenderError):
     """模型返回非法结构或明确拒绝请求。"""
 
-    code: ClassVar[str] = "extraction_failed"
+    code: ClassVar[str] = "model_call_failed"
 
 
-class InvalidModelOutput(ExtractionFailed):
+class InvalidModelOutput(ModelCallFailed):
     """文本已返回但不满足 JSON 协议，可由调用方给出纠正提示；不代表连接或权限失败。"""
 
 
@@ -110,14 +110,14 @@ class ModelOutputTruncated(InvalidModelOutput):
     """输出额度耗尽；相同额度下反复格式纠正无效，应交给有界路由选择其它模型。"""
 
 
-class ExtractionUnavailable(TenderError):
+class ModelUnavailable(TenderError):
     """模型网关网络、限流或服务端故障，可由 worker 退避重试。"""
 
-    code: ClassVar[str] = "extraction_unavailable"
+    code: ClassVar[str] = "model_unavailable"
     retryable: ClassVar[bool] = True
 
 
-class ModelRefused(ExtractionFailed):
+class ModelRefused(ModelCallFailed):
     """模型明确拒绝时停止调用，不能把拒绝当成更换供应商的理由。"""
 
     code: ClassVar[str] = "model_refused"

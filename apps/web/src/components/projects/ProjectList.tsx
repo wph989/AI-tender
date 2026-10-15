@@ -21,21 +21,18 @@ import { createProject, listProjects } from "@/lib/api/client";
 import { formatTime } from "@/lib/format";
 import type { WireProject } from "@/types/projects";
 
-type Filter = "all" | "pending" | "failed";
+type Filter = "all" | "empty" | "failed";
 const FILTERS: { value: Filter; label: string }[] = [
   { value: "all", label: "全部项目" },
-  { value: "pending", label: "待复核" },
+  { value: "empty", label: "待上传" },
   { value: "failed", label: "需要处理" },
 ];
 
 function projectStatus(project: WireProject) {
   if ((project.failed_count ?? 0) > 0)
     return { label: "处理异常", tone: "failed" };
-  if ((project.review_count ?? 0) > 0)
-    return { label: "待复核", tone: "pending" };
   if ((project.file_count ?? 0) === 0) return { label: "待上传", tone: "" };
-  // 无待办不等于已人工确认，避免把解析完成误报为已核实。
-  return { label: "暂无待办", tone: "ready" };
+  return { label: "已归档", tone: "ready" };
 }
 
 export function ProjectList() {
@@ -115,10 +112,7 @@ export function ProjectList() {
         (sum, item) => sum + (item.file_count ?? 0),
         0,
       ),
-      reviews: (projects ?? []).reduce(
-        (sum, item) => sum + (item.review_count ?? 0),
-        0,
-      ),
+      empty: (projects ?? []).filter((item) => (item.file_count ?? 0) === 0).length,
       failures: (projects ?? []).reduce(
         (sum, item) => sum + (item.failed_count ?? 0),
         0,
@@ -127,8 +121,8 @@ export function ProjectList() {
     [projects],
   );
   const visible = (projects ?? []).filter((item) =>
-    filter === "pending"
-      ? (item.review_count ?? 0) > 0
+    filter === "empty"
+      ? (item.file_count ?? 0) === 0
       : filter === "failed"
         ? (item.failed_count ?? 0) > 0
         : true,
@@ -148,8 +142,8 @@ export function ProjectList() {
     { icon: "file", label: "已归档文件", value: totals.files, tone: "green" },
     {
       icon: "clock",
-      label: "待复核条目",
-      value: totals.reviews,
+      label: "待上传项目",
+      value: totals.empty,
       tone: "orange",
     },
     { icon: "alert", label: "异常文件", value: totals.failures, tone: "red" },
@@ -392,7 +386,7 @@ export function ProjectList() {
                     </span>
                     <span>
                       <Icon name="clock" size={13} />
-                      {project.review_count ?? 0} 项待复核
+                      {project.file_count ?? 0} 份资料
                     </span>
                   </div>
                   <div className="project-card-footer">

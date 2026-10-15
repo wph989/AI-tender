@@ -4,31 +4,20 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import any_, case, func, select, true
+from sqlalchemy import case, func, select
 from sqlalchemy.engine import Connection
 from starlette.responses import Response
 
 from tender.adapters.pg.models import (
-    Document,
-    DocumentVersion,
     Element,
-    Evidence,
-    Extraction,
-    ExtractionConflict,
-    FieldInstance,
-    Job,
-    Lot,
     Page,
     ParseRun,
     ProjectFile,
-    ReviewAction,
 )
 from tender.api.common import bbox, engine, version_row
 from tender.api.errors import ApiProblem
 from tender.api.storage import stream_object
-from tender.application.extraction import build_outline
-from tender.application.fields import FIELD_BY_KEY
-from tender.core import settings
+from tender.application.document_outline import build_outline
 from tender.domain.anchor import Anchor
 from tender.domain.errors import AnchorFormatError
 
@@ -292,218 +281,13 @@ def resolve_anchor(
     }
 
 
-@router.get("/{version_id}/extractions")
-def get_extractions(
-    version_id: int,
-    request: Request,
-    group_key: str | None = None,
-    status: str | None = None,
-) -> dict[str, object]:
-    db = engine(request)
-    version_row(db, version_id)
-    statuses = [part.strip() for part in status.split(",") if part.strip()] if status else []
-    with db.connect() as connection:
-        latest_action = (
-            select(ReviewAction.action.label("action"))
-            .where(ReviewAction.attempt_id == Extraction.id)
-            .order_by(ReviewAction.created_at.desc(), ReviewAction.id.desc())
-            .limit(1)
-            .correlate(Extraction)
-            .lateral("ra")
-        )
-        # 冲突探测：冲突组必须挂在同一个项目的有效文件版本下，故子查询里连 project_file。
-        open_conflict = (
-            select(1)
-            .select_from(ExtractionConflict)
-            .join(
-                ProjectFile,
-                (ProjectFile.project_id == ExtractionConflict.project_id)
-                & (ProjectFile.version_id == Extraction.version_id)
-                & ProjectFile.deleted_at.is_(None),
-            )
-            .where(
-                ExtractionConflict.field_key == Extraction.field_key,
-                ExtractionConflict.lot_id.is_not_distinct_from(FieldInstance.lot_id),
-                ExtractionConflict.status == "open",
-                Extraction.id == any_(ExtractionConflict.candidate_ids),
-            )
-            .exists()
-        )
-        conditions = [
-            Extraction.version_id == version_id,
-            Extraction.is_current.is_(True),
-            Document.company_id == settings.company_id(),
-        ]
-        if group_key:
-            conditions.append(Extraction.group_key == group_key)
-        current = (
-            select(
-                Extraction.id,
-                Extraction.instance_id,
-                Extraction.run_id,
-                Extraction.machine_attempt_no,
-                Extraction.attempt_no,
-                Extraction.trigger,
-                Extraction.field_key,
-                Extraction.group_key,
-                Extraction.value_json,
-                Extraction.value_text,
-                Extraction.confidence,
-                Extraction.status.label("stored_status"),
-                Extraction.strategy,
-                Extraction.evidence_count,
-                FieldInstance.lot_id,
-                Lot.code.label("lot_code"),
-                case(
-                    (open_conflict, "conflict"),
-                    (latest_action.c.action == "confirm", "verified"),
-                    (latest_action.c.action == "reject", "rejected"),
-                    else_=Extraction.status,
-                ).label("status"),
-            )
-            .select_from(Extraction)
-            .join(DocumentVersion, DocumentVersion.id == Extraction.version_id)
-            .join(Document, Document.id == DocumentVersion.document_id)
-            .join(FieldInstance, FieldInstance.id == Extraction.instance_id)
-            .outerjoin(Lot, Lot.id == FieldInstance.lot_id)
-            .outerjoin(latest_action, true())
-            .where(*conditions)
-            .cte("current_extractions")
-        )
-        query = (
-            select(
-                current.c.id,
-                current.c.instance_id,
-                current.c.run_id,
-                current.c.machine_attempt_no,
-                current.c.attempt_no,
-                current.c.trigger,
-                current.c.field_key,
-                current.c.group_key,
-                current.c.value_json,
-                current.c.value_text,
-                current.c.confidence,
-                current.c.stored_status,
-                current.c.status,
-                current.c.strategy,
-                current.c.evidence_count,
-                current.c.lot_id,
-                current.c.lot_code,
-                Evidence.anchor,
-                Evidence.page_no,
-                Evidence.bbox_x0,
-                Evidence.bbox_y0,
-                Evidence.bbox_x1,
-                Evidence.bbox_y1,
-                Evidence.char_start,
-                Evidence.char_end,
-                Evidence.quote,
-                Evidence.quote_source,
-                Evidence.match_type,
-                Evidence.seq,
-            )
-            .select_from(current)
-            .outerjoin(Evidence, Evidence.extraction_id == current.c.id)
-        )
-        if statuses:
-            query = query.where(current.c.status.in_(statuses))
-        rows = (
-            connection.execute(
-                query.order_by(
-                    current.c.group_key.nulls_last(),
-                    current.c.field_key,
-                    current.c.lot_code.nulls_first(),
-                    current.c.id,
-                    Evidence.seq,
-                )
-            )
-            .mappings()
-            .all()
-        )
-
-    grouped: dict[int, dict[str, object]] = {}
-    for row in rows:
-        extraction_id = int(row["id"])
-        extraction = grouped.get(extraction_id)
-        if extraction is None:
-            definition = FIELD_BY_KEY.get(str(row["field_key"]))
-            extraction = {
-                "id": extraction_id,
-                "instance_id": row["instance_id"],
-                "run_id": row["run_id"],
-                "machine_attempt_no": row["machine_attempt_no"],
-                "attempt_no": row["attempt_no"],
-                "trigger": row["trigger"],
-                "is_current": True,
-                "field_key": row["field_key"],
-                "field_label": definition.label if definition else row["field_key"],
-                "group_key": row["group_key"] or "other",
-                "lot_id": row["lot_id"],
-                "lot_code": row["lot_code"],
-                "value": row["value_json"],
-                "value_text": row["value_text"] or "",
-                "confidence": float(row["confidence"] or 0),
-                "status": row["status"],
-                "strategy": row["strategy"],
-                "evidence_count": row["evidence_count"],
-                "evidence": [],
-            }
-            grouped[extraction_id] = extraction
-        if row["anchor"] is not None:
-            evidence = extraction["evidence"]
-            assert isinstance(evidence, list)
-            evidence.append(
-                {
-                    "anchor": row["anchor"],
-                    "page_no": row["page_no"],
-                    "bbox": bbox(row),
-                    "char_start": row["char_start"] if row["char_start"] is not None else 0,
-                    "char_end": row["char_end"] if row["char_end"] is not None else 0,
-                    "quote": row["quote"],
-                    "quote_source": row["quote_source"],
-                    "match_type": row["match_type"],
-                }
-            )
-    items = list(grouped.values())
-    return {"items": items, "total": len(items)}
-
-
-@router.get("/{version_id}/evidence-map")
-def get_evidence_map(version_id: int, request: Request) -> dict[str, object]:
-    items = get_extractions(version_id, request)["items"]
-    by_page: dict[str, list[dict[str, object]]] = {}
-    for extraction in items:
-        assert isinstance(extraction, dict)
-        evidence_items = extraction["evidence"]
-        assert isinstance(evidence_items, list)
-        for evidence in evidence_items:
-            assert isinstance(evidence, dict)
-            page_key = str(evidence["page_no"])
-            by_page.setdefault(page_key, []).append(
-                {
-                    "extraction_id": extraction["id"],
-                    "anchor": evidence["anchor"],
-                    "bbox": evidence["bbox"],
-                    "field_key": extraction["field_key"],
-                }
-            )
-    return {"by_page": by_page}
-
-
 @router.get("/{version_id}")
 def get_version(version_id: int, request: Request) -> dict[str, object]:
-    """版本详情：转换信息 + 解析运行列表 + 最近一次抽取任务。
-
-    为什么要把抽取任务也带上：解析成功而抽取失败时，结果面板原本只能写「暂无数据」，
-    用户看不出是没跑、在跑、还是跑挂了。抽取是独立的 job（stage='extracting'，
-    见 worker/dispatch.py），它的 error_code/error_message 只在 job 行上，
-    版本详情顺手带一条最近的，前端才能把失败原因直接说出来。
-    """
+    """版本详情保留解析批次和失败原因，供文档预览判断可读状态。"""
     db = engine(request)
     version = version_row(db, version_id)
     with db.connect() as connection:
-        # 项目级动作（导出、冲突、批量重跑）都按 project_id 定位，版本详情顺手带上，
-        # 前端就不用为了拿它再拉一次项目详情。
+        # 文档预览通过项目编号返回分析页，避免为了导航额外拉取项目详情。
         project_id = connection.execute(
             select(ProjectFile.project_id)
             .where(ProjectFile.version_id == version_id, ProjectFile.deleted_at.is_(None))
@@ -536,24 +320,6 @@ def get_version(version_id: int, request: Request) -> dict[str, object]:
             .mappings()
             .all()
         )
-        # 只取最近一条：界面上要解释的是「这一次为什么没有结果」，不是抽取历史。
-        extraction_job = (
-            connection.execute(
-                select(
-                    Job.status,
-                    Job.error_code,
-                    Job.error_message,
-                    Job.progress,
-                    Job.created_at,
-                    Job.finished_at,
-                )
-                .where(Job.version_id == version_id, Job.stage == "extracting")
-                .order_by(Job.created_at.desc(), Job.id.desc())
-                .limit(1)
-            )
-            .mappings()
-            .first()
-        )
     return {
         "id": version["id"],
         "document_id": version["document_id"],
@@ -570,7 +336,6 @@ def get_version(version_id: int, request: Request) -> dict[str, object]:
         "page_count": version["page_count"],
         "created_at": version["created_at"],
         "parse_runs": [dict(row) for row in runs],
-        "latest_extraction_job": dict(extraction_job) if extraction_job is not None else None,
     }
 
 

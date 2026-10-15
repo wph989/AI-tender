@@ -244,9 +244,9 @@ services:
       retries: 5
       start_period: 20s
 
-  # 转换 / 解析 / 抽取 / 回归回放都在这里跑。
+  # 转换 / 解析 / Agent 分析及问答都在这里跑。
   # tender 队列跑 beat 派发的调度任务，漏了它任务会永远停在 pending；
-  # regression 是低优先级回放队列，漏了回放会一直排队（见 docs/工程/07 第 1 节）。
+  # analysis 接收知识索引、专题分析和问答，必须与生产者路由同步，避免分析永久排队。
   worker:
     profiles: ["app"]
     <<: *api-base
@@ -257,7 +257,7 @@ services:
       - tender.worker.celery_app
       - worker
       - -Q
-      - tender,convert,parse,extract,regression
+      - tender,convert,parse,analysis
       - -c
       - ${WORKER_CONCURRENCY:-4}
       - -l

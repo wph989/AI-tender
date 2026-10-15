@@ -88,7 +88,7 @@ test("功能大预算可保存，候选上限继续读取服务端规则", async
       deadline_seconds: { type: "integer", min: 1 },
     },
   } }));
-  await page.route("**/api/v1/llm/features/extract/models", async (route) => {
+  await page.route("**/api/v1/llm/features/analysis/models", async (route) => {
     saved = route.request().postDataJSON();
     await route.fulfill({ json: {} });
   });
@@ -325,10 +325,10 @@ test("文件重解析与删除都显示确认弹窗，取消不发送写请求",
   await page.getByRole("button", { name: "重新解析", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText("3 条已确认结果需要重新复核");
+  await expect(dialog).toContainText("重新生成解析批次和原文位置");
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "删除", exact: true }).click();
-  await expect(page.getByRole("dialog")).toContainText("已抽取的结果");
+  await expect(page.getByRole("dialog")).toContainText("报告引用会标记为不可用");
   await page
     .getByRole("dialog")
     .getByRole("button", { name: "取消", exact: true })

@@ -7,24 +7,21 @@
 
 import type { ConfigItem, ConfigLayer, ConfigValueType } from "@/types/config";
 
-export const LAYERS: readonly ConfigLayer[] = ["L1", "L2", "L3"] as const;
+export const LAYERS: readonly ConfigLayer[] = ["L1", "L2"] as const;
 
 // 只调整编辑入口，沿用原配置键和版本链，避免迁移后丢失已保存的预算。
 export function isModelConfig(key: string): boolean {
-  return key.startsWith("analysis.") || key.startsWith("llm_aided.") ||
-    key === "extract.max_inflight" || key.startsWith("extract.strategy.");
+  return key.startsWith("analysis.") || key.startsWith("llm_aided.");
 }
 
 export const LAYER_LABELS: Record<ConfigLayer, string> = {
   L1: "L1 运行参数",
   L2: "L2 解析配置",
-  L3: "L3 抽取配置",
 };
 
 export const LAYER_HINTS: Record<ConfigLayer, string> = {
   L1: "保存后激活：并发与调度读取当前值；分析预算在新建或补跑时生效，已有运行保留快照。",
-  L2: "新任务生效：会改变解析产物，保存后是草稿，需回归门禁 + 逐条确认影响。",
-  L3: "新任务生效：会改变抽取结果，保存后是草稿，需回归门禁 + 逐条确认影响。",
+  L2: "新任务生效：会改变解析产物，保存后是草稿，需逐条确认变更影响。",
 };
 
 export const RELEASE_STATUS_LABELS: Record<string, string> = {
@@ -36,20 +33,13 @@ export const RELEASE_STATUS_LABELS: Record<string, string> = {
 
 export const IMPACT_KIND_LABELS: Record<string, string> = {
   config_changed: "配置项变更",
-  field_def_changed: "字段定义变更",
-  field_removed: "字段删除",
-  regression_failure: "回归失败项",
 };
 
 export const BLOCKER_LABELS: Record<string, string> = {
   impact_not_acknowledged: "变更影响清单还有未确认项",
-  hallucination_rate_not_zero: "幻觉率不为 0",
-  anchor_404_not_zero: "证据反查 404 率不为 0",
-  pass_rate_below_baseline: "回归集通过率低于当前生效版本",
 };
 
 export const SOFT_BREACH_LABELS: Record<string, string> = {
-  first_pass_rate_drop_over_2pp: "首次通过率较当前版本下降超过 2 个百分点",
 };
 
 export function releaseStatusLabel(status: string): string {
@@ -129,7 +119,7 @@ export interface PatchResult {
 /**
  * 草稿 → 提交补丁：没改的项不进补丁，改错类型的不进补丁并报错。
  *
- * "没改的不提交"不是优化，而是正确性要求：L2/L3 的补丁只要带上一个 key
+ * 仅提交实际改变的项：L2 的补丁只要带上一个 key
  * 就会把该版本送进门禁流程，噪声会让影响清单里出现没人真正改过的条目。
  */
 export function buildPatch(

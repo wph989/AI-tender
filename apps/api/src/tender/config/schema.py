@@ -5,7 +5,7 @@
 `tests/contract/test_config_items_match_migration.py` 盯着——手工同步两份清单迟早漂移。
 
 `value_type` 里的 `number` 是 DDL 注释中 `int|bool|string|json|secret` 的补充：
-救回率阈值（`extract.rerun.hide_threshold`）是小数，硬塞进 int 会在页面上显示成 0。
+参数值按登记类型校验，防止前端与执行端对同一个值作出不同解释。
 """
 
 from __future__ import annotations
@@ -17,14 +17,12 @@ from typing import Any
 
 L1 = "L1"
 L2 = "L2"
-L3 = "L3"
-LAYERS: tuple[str, ...] = (L1, L2, L3)
+LAYERS: tuple[str, ...] = (L1, L2)
 
 # 谁能写哪一层（08 第 9 节）：viewer/reviewer 只读，operator 只写 L1，admin 全写。
 WRITERS: dict[str, frozenset[str]] = {
     L1: frozenset({"operator", "admin"}),
     L2: frozenset({"admin"}),
-    L3: frozenset({"admin"}),
 }
 READERS: frozenset[str] = frozenset({"viewer", "reviewer", "operator", "admin"})
 
@@ -48,7 +46,7 @@ def _item(
     default: Any,
     description: str,
 ) -> ConfigItem:
-    # L2/L3 改的是"结果"而不是"速度"，全部走快照与门禁；L1 立即生效，不进回归。
+    # L2 改的是"结果"而不是"速度"，全部走快照与门禁；L1 立即生效，不进回归。
     return ConfigItem(key, layer, value_type, default, description, requires_gate=layer != L1)
 
 
@@ -80,7 +78,6 @@ ITEMS: tuple[ConfigItem, ...] = (
         2,
         "MinerU 侧同时处于 queued+running 的 job 数上限，建议不超过 GPU 数 x2",
     ),
-    _item("extract.max_inflight", L1, "int", 8, "同时在途的 LLM 抽取请求数"),
     _item(
         "dispatch.interval_seconds",
         L1,
@@ -94,7 +91,7 @@ ITEMS: tuple[ConfigItem, ...] = (
     _item("job.timeout.convert_minutes", L1, "int", 10, "转换超时（分钟）"),
     _item("job.timeout.parse_minutes", L1, "int", 60, "解析超时（分钟）"),
     _item("job.retry.convert_500", L1, "int", 3, "Gotenberg 5xx 重试次数（400 不重试）"),
-    _item("queue.priority.batch", L1, "string", "low", "回归回放与批量任务的队列优先级"),
+    _item("queue.priority.batch", L1, "string", "low", "批量任务的队列优先级"),
     # L2 解析配置（08 第 2.2 节）：改的是解析产物，必须绑定快照与门禁
     _item(
         "mineru.tier",
@@ -118,32 +115,13 @@ ITEMS: tuple[ConfigItem, ...] = (
         "all",
         "解析页码范围，必须为 all，否则 title_leveling 失效",
     ),
-    _item("render.crop_dpi", L2, "int", 300, "多模态字段裁剪图 DPI"),
+    _item("render.crop_dpi", L2, "int", 300, "页面裁剪图 DPI"),
     _item("llm_aided.title_leveling", L2, "bool", True, "章节树构建依赖的标题分级"),
     _item("llm_aided.cross_page_table_cell_merge", L2, "bool", True, "跨页表格单元格合并"),
     _item("preprocess.deskew", L2, "bool", True, "扫描件纠偏"),
     _item("preprocess.denoise", L2, "bool", True, "扫描件去噪"),
     _item("preprocess.min_dpi", L2, "int", 300, "低于此值的扫描件先升采样"),
-    # L3 抽取配置（08 第 2.3 节）：只登记文档给了默认值的项；
-    # extract.fields / prompt.version / model / confidence.* 的默认值要等 P3 回归标定，先不种。
-    _item("extract.strategy.dual_route", L3, "bool", True, "规则 + LLM 双路投票"),
-    _item("extract.strategy.second_pass", L3, "bool", True, "低置信字段二次抽取"),
-    _item(
-        "extract.strategy.multimodal",
-        L3,
-        "bool",
-        False,
-        "多模态直读开关（仅表格类字段与扫描件生效）",
-    ),
-    _item("extract.scope.per_lot", L3, "bool", True, "按标段分组输出适用范围"),
-    _item(
-        "extract.rerun.hide_threshold",
-        L3,
-        "number",
-        0.10,
-        "第 2 次机器结果的救回率低于此值时收起重跑按钮",
-    ),
-    _item("extract.rerun.min_sample", L3, "int", 30, "判定重跑按钮所需的最小样本量"),
+
 )
 
 ITEMS_BY_KEY: dict[str, ConfigItem] = {entry.key: entry for entry in ITEMS}
@@ -155,9 +133,7 @@ READONLY_REASONS: dict[str, str] = {
     "mineru.page_range": "当前章节与坐标契约要求解析全部页码 all",
     **dict.fromkeys(
         ("render.crop_dpi", "llm_aided.title_leveling", "llm_aided.cross_page_table_cell_merge",
-         "preprocess.deskew", "preprocess.denoise", "preprocess.min_dpi",
-         "extract.strategy.dual_route", "extract.strategy.second_pass",
-         "extract.strategy.multimodal", "extract.scope.per_lot"),
+         "preprocess.deskew", "preprocess.denoise", "preprocess.min_dpi"),
         "当前执行流程尚未接入该配置",
     ),
 }
@@ -172,12 +148,10 @@ def value_rules(key: str) -> dict[str, Any]:
         return {"choices": ["flash", "basic", "standard", "advanced"]}
     if key == "mineru.ocr_mode":
         return {"choices": ["auto", "txt", "ocr"]}
-    if key == "extract.rerun.hide_threshold":
-        return {"minimum": 0, "maximum": 1}
     if entry.value_type == "int":
         nonnegative = {
             "analysis.max_subagent_retries", "convert.max_inflight", "parse.max_inflight",
-            "extract.max_inflight", "job.retry.convert_500",
+            "job.retry.convert_500",
         }
         return {"minimum": 0 if key in nonnegative else 1}
     return {}
@@ -207,15 +181,9 @@ def default_values() -> dict[str, Any]:
 
 
 def resolve_values(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
-    """默认值 + release 覆盖 = 解析后的完整配置值（08 第 4 节快照语义）。
-
-    这里对未登记的 key 保持宽容，原因是历史 release 里可能存着后来被移除的配置项：
-    读的时候丢掉它们，会让"回滚到当时"变成静默改配置——正是配置中心要防的事。
-    写入侧的严格性不靠这个函数，而是靠 `item()` / `validate_value()` 对每个待写入 key 的校验
-    （未知 key 在写入时就报错，不会进到库里）。
-    """
+    """只解析仍登记的参数；历史快照原样留存，已下线参数不再进入执行配置。"""
     resolved = default_values()
-    resolved.update(overrides or {})
+    resolved.update({k: v for k, v in (overrides or {}).items() if k in ITEMS_BY_KEY})
     return resolved
 
 
@@ -301,5 +269,5 @@ def write_denial(role: str, keys: object) -> str | None:
 
 
 def gated_keys(keys: object) -> frozenset[str]:
-    """这些 key 里需要走回归门禁的部分（L2/L3）。"""
+    """这些 key 里需要走变更门禁的部分（L2）。"""
     return frozenset(str(key) for key in keys if item(str(key)).requires_gate)  # type: ignore[union-attr]

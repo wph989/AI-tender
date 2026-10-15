@@ -119,7 +119,6 @@ class LlmCallLog(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer)
     completion_tokens: Mapped[int | None] = mapped_column(Integer)
     error_message: Mapped[str | None] = mapped_column(Text)
-    extraction_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     invocation_id: Mapped[UUID | None] = mapped_column(Uuid)
     candidate_ordinal: Mapped[int | None] = mapped_column(Integer)

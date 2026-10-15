@@ -66,10 +66,10 @@ function Get-ServiceDefs {
         }
         [pscustomobject]@{
             Name = 'worker'
-            Desc = 'Celery worker（convert/parse/extract/regression）'
+            Desc = 'Celery worker（convert/parse/analysis）'
             Args = @(
                 '-m', 'celery', '-A', 'tender.worker.celery_app', 'worker',
-                '-Q', 'tender,convert,parse,extract,regression',
+                '-Q', 'tender,convert,parse,analysis',
                 '-P', 'threads', '-c', '4', '-l', 'info'
             )
         }
@@ -403,7 +403,7 @@ Write-TrackedState -Services $started
 Write-Host ''
 Write-Host '后端已启动' -ForegroundColor Cyan
 Write-Host '  API      http://127.0.0.1:8300   （/docs 交互文档；/api/v1/healthz 健康检查）'
-Write-Host '  worker   消费 tender / convert / parse / extract / regression 队列'
+Write-Host '  worker   消费 tender / convert / parse / analysis 队列'
 Write-Host '  beat     每 5 秒读配置中心上限并派发差额'
 Write-Host ''
 Write-Host "日志目录：$LogDir" -ForegroundColor DarkGray

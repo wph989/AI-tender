@@ -43,7 +43,7 @@ class Stream:
     task_name: str
 
 
-# 顺序即优先级：转换最轻、解析最贵，抽取依赖解析结果；导出只借道派发，不设闸门。
+# 顺序即优先级：转换完成后才能解析，专题分析由独立报告调度器管理。
 STREAMS: tuple[Stream, ...] = (
     Stream(
         "convert",
@@ -52,13 +52,7 @@ STREAMS: tuple[Stream, ...] = (
         "tender.worker.tasks.process_file",
     ),
     Stream("parse", ("submitting",), "parse.max_inflight", "tender.worker.tasks.submit_parse"),
-    Stream(
-        "extract",
-        ("extracting",),
-        "extract.max_inflight",
-        "tender.worker.tasks.extract_fields",
-    ),
-    Stream("export", ("exporting",), None, "tender.worker.exports.export_project"),
+
 )
 
 
@@ -74,7 +68,7 @@ def _inflight_count(stream: Stream, company_id: int) -> Any:
 
 
 def _pending_jobs(stream: Stream, company_id: int, max_rows: int | None) -> Any:
-    """待派发候选：LIMIT NULL 在 PostgreSQL 里等价于不限量，导出线靠它一次派发完。"""
+    """待派发候选：同一 stage 只派发本轮可用配额内的任务。"""
     return (
         select(Job.id)
         .where(
@@ -107,7 +101,7 @@ def registry() -> ConfigRegistry:
 
 
 def capacity(limit: int | None, inflight: int) -> int | None:
-    """这一轮还能派发几个；None 表示不限（导出线）。"""
+    """这一轮还能派发几个；None 表示没有并发限制。"""
     if limit is None:
         return None
     return max(0, int(limit) - max(0, int(inflight)))

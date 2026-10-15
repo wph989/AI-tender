@@ -1,10 +1,10 @@
-"""持久任务查询、导出下载与 SSE 进度流。"""
+"""持久任务查询与 SSE 进度流。"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -49,36 +49,6 @@ def get_job(job_id: str, request: Request) -> dict[str, object]:
     if payload is None:
         raise ApiProblem(404, "not_found", "任务不存在")
     return payload
-
-
-@router.get("/{job_id}/download")
-def download_export(job_id: str, request: Request) -> StreamingResponse:
-    payload = _payload(request, job_id)
-    if payload is None:
-        raise ApiProblem(404, "not_found", "任务不存在")
-    if payload["stage"] != "exporting" or payload["status"] != "completed":
-        raise ApiProblem(409, "export_not_ready", "导出文件尚未生成")
-    progress = payload.get("progress")
-    key = progress.get("output_key") if isinstance(progress, dict) else None
-    if not isinstance(key, str) or not key:
-        raise ApiProblem(409, "export_not_ready", "导出文件地址尚未写入")
-    blob = request.app.state.components.blobs.open(key)
-
-    def body() -> Iterator[bytes]:
-        try:
-            while chunk := blob.stream.read(64 * 1024):
-                yield chunk
-        finally:
-            blob.stream.close()
-
-    return StreamingResponse(
-        body(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": "attachment; filename=export.xlsx",
-            "Content-Length": str(blob.size_bytes),
-        },
-    )
 
 
 @router.get("/{job_id}/events")

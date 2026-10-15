@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from tender.adapters.openai_chat import OpenAIChatModel
-from tender.domain.errors import ExtractionUnavailable, ModelOutputTruncated, ModelRefused
+from tender.domain.errors import ModelOutputTruncated, ModelRefused, ModelUnavailable
 
 
 class FragmentedStream(httpx.AsyncByteStream):
@@ -73,7 +73,7 @@ def test_stream_joins_only_final_content_and_preserves_trailing_usage():
 
 @pytest.mark.parametrize("done,finish", [(False, "stop"), (True, None)])
 def test_stream_cannot_accept_json_without_both_completion_markers(done, finish):
-    with pytest.raises(ExtractionUnavailable, match="未完整结束"):
+    with pytest.raises(ModelUnavailable, match="未完整结束"):
         complete([event({"content": '{"supported":true}'}, finish)], done=done)
 
 
@@ -94,6 +94,6 @@ def test_stream_token_limit_preserves_usage_even_if_prefix_is_valid_json():
 
 
 def test_stream_error_does_not_expose_provider_payload():
-    with pytest.raises(ExtractionUnavailable) as caught:
+    with pytest.raises(ModelUnavailable) as caught:
         complete([{"error": {"message": "secret-provider-body"}}])
     assert "secret-provider-body" not in str(caught.value)

@@ -1,7 +1,7 @@
 /**
  * 配置草稿 → 提交补丁、文案口径（设计文档 08 第 2、5 节）。
  *
- * 断言的重点是"哪些 key 会被提交"：多提交一个 L2/L3 的 key 就会把版本送进门禁流程，
+ * 断言的重点是"哪些 key 会被提交"：多提交一个 L2 的 key 就会把版本送进门禁流程，
  * 少提交一个则表现为"改了没生效"，两者都不该靠人工点一遍页面才发现。
  */
 
@@ -53,8 +53,8 @@ const ITEMS: ConfigItem[] = [
     value: ["middle_json", "zip"],
   }),
   item({
-    key: "extract.rerun.hide_threshold",
-    layer: "L3",
+    key: "sample.ratio",
+    layer: "L1",
     value_type: "number",
     value: 0.1,
   }),
@@ -104,12 +104,12 @@ describe("buildPatch", () => {
   it("清空数值不能变成零并发或零阈值", () => {
     const result = buildPatch(ITEMS, {
       "convert.max_inflight": "",
-      "extract.rerun.hide_threshold": "   ",
+      "sample.ratio": "   ",
     });
     expect(result.patch).toEqual({});
     expect(result.errors).toEqual([
       "convert.max_inflight 不能为空",
-      "extract.rerun.hide_threshold 不能为空",
+      "sample.ratio 不能为空",
     ]);
   });
   it("没改的项不进补丁", () => {
@@ -122,14 +122,14 @@ describe("buildPatch", () => {
       "convert.max_inflight": "6",
       "llm_aided.title_leveling": "false",
       "mineru.output_formats": '["middle_json"]',
-      "extract.rerun.hide_threshold": "0.2",
+      "sample.ratio": "0.2",
     });
     expect(result.errors).toEqual([]);
     expect(result.patch).toEqual({
       "convert.max_inflight": 6,
       "llm_aided.title_leveling": false,
       "mineru.output_formats": ["middle_json"],
-      "extract.rerun.hide_threshold": 0.2,
+      "sample.ratio": 0.2,
     });
   });
 
@@ -156,15 +156,12 @@ describe("文案口径", () => {
   it("状态与影响清单种类都有中文说法", () => {
     expect(releaseStatusLabel("draft")).toBe("草稿");
     expect(releaseStatusLabel("active")).toBe("生效中");
-    expect(impactKindLabel("regression_failure")).toBe("回归失败项");
+    expect(impactKindLabel("config_changed")).toBe("配置项变更");
   });
 
-  it("门禁阻断码覆盖硬门槛与软门槛", () => {
+  it("门禁显示未确认影响，未知错误保留可追踪代码", () => {
     expect(blockerLabel("impact_not_acknowledged")).toBe(
       "变更影响清单还有未确认项",
-    );
-    expect(blockerLabel("first_pass_rate_drop_over_2pp")).toContain(
-      "2 个百分点",
     );
     expect(blockerLabel("unknown_code")).toBe("unknown_code");
   });

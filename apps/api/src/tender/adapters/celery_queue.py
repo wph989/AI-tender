@@ -10,20 +10,15 @@ from tender.core.settings import redis_url
 
 _TASK_ROUTES = {
     "tender.worker.knowledge.dispatch_knowledge": {"queue": "tender"},
-    "tender.worker.knowledge.build_index": {"queue": "extract"},
-    "tender.worker.knowledge.analyze_project": {"queue": "extract"},
-    "tender.worker.knowledge.answer_question": {"queue": "extract"},
+    "tender.worker.knowledge.build_index": {"queue": "analysis"},
+    "tender.worker.knowledge.analyze_project": {"queue": "analysis"},
+    "tender.worker.knowledge.answer_question": {"queue": "analysis"},
     "tender.worker.tasks.process_file": {"queue": "convert"},
     "tender.worker.tasks.submit_parse": {"queue": "parse"},
     "tender.worker.tasks.poll_parse": {"queue": "parse"},
-    "tender.worker.tasks.extract_fields": {"queue": "extract"},
-    "tender.worker.exports.export_project": {"queue": "extract"},
     # 调度器是短任务（几次数据库查询），但要保证有 worker 消费默认队列；
     # 部署命令里的 -Q 必须包含 tender（见 docs/工程/07 第 1 节）。
     "tender.worker.dispatch.dispatch_pending": {"queue": "tender"},
-    # 回归回放走独立队列：低优先级 + 夜间窗口，与交互任务隔离（docs/工程/10 第 3.5 节）。
-    # 它由 API 直接投递（管理员显式触发），不参与 beat 的差额派发。
-    "tender.worker.regression.run_regression": {"queue": "regression"},
 }
 
 # 每秒唤醒，再由派发任务按当前配置节流，使1秒间隔也能生效而无需重启beat。

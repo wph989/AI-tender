@@ -24,14 +24,12 @@ import {
   loadProject,
   patchProjectFile,
   reparseVersion,
-  rerunExtractionForVersion,
   uploadProjectFiles,
   waitForJob,
 } from "@/lib/api/client";
 import { formatBytes, formatTime } from "@/lib/format";
 import {
   derivePipeline,
-  needsExtractRerun,
   needsReparse,
 } from "@/lib/projects/pipeline";
 import {
@@ -45,22 +43,14 @@ import {
 
 const POLL_MS = 4000;
 
-/**
- * 整份重跑的等待上限：抽取要逐字段过一遍模型（实测 14 个字段约 9 分钟），
- * 默认的 120 秒远远不够。
- */
+/** 文档解析可能较慢，超时后由列表轮询继续跟进。 */
 const VERSION_JOB_TIMEOUT_MS = 20 * 60 * 1000;
 
-/**
- * 待确认的「重新解析」。列表页每一行都可能触发它，而它的代价是重建全部锚点、
- * 把已确认结果打回复核——不能一个点击就落库，所以先挂在状态里出后果横幅。
- */
+/** 重新解析会生成新的原文定位，提交前展示影响说明。 */
 interface ReparseTarget {
   fileId: number;
   versionId: number;
   fileName: string;
-  /** 该版本上已确认的结果条数：横幅里那个 N。 */
-  confirmed: number;
   /**
    * 上一次解析用的档位与 OCR 模式：重新解析是「把这一次修好」，不是顺手换档。
    * 不带上这两个值就会把 advanced / ocr 的文件静默降回默认档（档位变了，用户
@@ -182,7 +172,7 @@ export function ProjectFiles({ projectId }: Props) {
   const handleDelete = async (fileId: number, name: string) => {
     const confirmed = await modal.confirm({
       title: `删除「${name}」？`,
-      content: "已抽取的结果会一并从清单中移除。",
+      content: "此文件将退出项目资料，依赖它的报告引用会标记为不可用。",
       okText: "删除",
       okButtonProps: { danger: true },
     });
@@ -201,12 +191,7 @@ export function ProjectFiles({ projectId }: Props) {
     }
   };
 
-  /**
-   * 重新解析：锚点全部重建、已确认结果全部打回复核。
-   *
-   * 弹横幅而不是直接提交：这是付费最高的一条路（见 docs/设计/05 第 3.11 节），
-   * 用户点它之前必须看见「有多少已确认结果会被打回」。
-   */
+  /** 沿用档位和 OCR 模式，避免修复解析时意外改变解析策略。 */
   const handleReparse = async () => {
     const target = reparseTarget;
     if (target === null) return;
@@ -236,34 +221,7 @@ export function ProjectFiles({ projectId }: Props) {
     }
   };
 
-  /**
-   * 重跑抽取：复用最近一次解析产物，不重建锚点、不作废已确认的结果。
-   *
-   * 这是「解析成功、抽取失败（0 条结果）」的第一出口。不能拿
-   * POST /projects/{id}/rerun 代替：那是从已有结果行里筛候选的，一条都没有时返回 queued = 0。
-   */
-  const handleExtractRerun = async (versionId: number, fileId: number) => {
-    setBusyFileId(fileId);
-    setNotice("已提交重跑抽取，正在等待结果…");
-    try {
-      const queued = await rerunExtractionForVersion(versionId);
-      // 同上：先把行切到「进行中」，列表页的 4 秒轮询才会开始跑。
-      void reload().catch(() => undefined);
-      const job = await waitForJob(queued.job_id, VERSION_JOB_TIMEOUT_MS);
-      if (job.status === "failed" || job.status === "canceled") {
-        throw new Error(job.error_message ?? "重跑抽取失败");
-      }
-      await reload();
-      setNotice(null);
-    } catch (caught: unknown) {
-      setError(caught instanceof Error ? caught.message : "重跑抽取失败");
-    } finally {
-      setBusyFileId(null);
-    }
-  };
-
   const files = project?.files ?? [];
-  const reviewers = files.reduce((sum, file) => sum + file.review_count, 0);
   const running = files.filter((file) => derivePipeline(file).inFlight).length;
 
   return (
@@ -287,12 +245,12 @@ export function ProjectFiles({ projectId }: Props) {
           >
             刷新
           </Button>
-          {/* 默认页已改为综合分析，项目级入口需显式带 view=fields 才能进入字段工作台。 */}
+          {/* 项目默认页展示综合分析，原文预览需要显式指定文档视图。 */}
           <Link
-            href={"/projects/" + projectId + "?view=fields"}
+            href={"/projects/" + projectId + "?view=document"}
             className={PRIMARY_BUTTON_CLASS}
           >
-            打开工作台
+            预览原文
           </Link>
         </>
       }
@@ -334,8 +292,8 @@ export function ProjectFiles({ projectId }: Props) {
         onOk={() => void handleReparse()}
       >
         <p>
-          「{reparseTarget?.fileName}」将重新生成原文位置，原有{" "}
-          {reparseTarget?.confirmed ?? 0} 条已确认结果需要重新复核。
+          「{reparseTarget?.fileName}」将重新生成解析批次和原文位置。
+          已有报告保留原批次引用；需要使用新解析内容时，请重新运行项目分析。
         </p>
       </Modal>
 
@@ -350,7 +308,7 @@ export function ProjectFiles({ projectId }: Props) {
         </span>
         <span>
           <Icon name="clock" size={15} />
-          待复核 <strong>{project === null ? "—" : reviewers}</strong>
+          已就绪 <strong>{project === null ? "—" : files.filter((file) => ["completed", "partial"].includes(file.parse_status ?? "")).length}</strong>
         </span>
       </div>
       <UploadPanel busy={busy} onUpload={handleUpload} />
@@ -503,26 +461,6 @@ export function ProjectFiles({ projectId }: Props) {
                         )}
                     </div>
 
-                    <div className="file-entry-review text-right">
-                      <p className="mb-1 text-[10px] text-slate-400">待复核</p>
-                      {file.review_count > 0 ? (
-                        <span
-                          className={
-                            DATA_CLASS +
-                            " mark-ink px-1 text-[14px] text-slate-900"
-                          }
-                        >
-                          {file.review_count}
-                        </span>
-                      ) : (
-                        <span
-                          className={DATA_CLASS + " text-[14px] text-slate-300"}
-                        >
-                          —
-                        </span>
-                      )}
-                    </div>
-
                     <div className="file-entry-actions">
                       {file.version_id === null ? (
                         <span className="text-[13px] text-slate-400">
@@ -538,35 +476,11 @@ export function ProjectFiles({ projectId }: Props) {
                           }
                           className="whitespace-nowrap rounded-lg px-1.5 py-0.5 text-[13px] text-sky-700 hover:bg-sky-50 hover:underline"
                         >
-                          打开工作台
+                          预览原文
                         </Link>
                       )}
                       {file.version_id !== null && file.is_parseable && (
                         <>
-                          {/*
-                           * 两种重跑的代价差一个量级（见 docs/设计/05 第 3.11 节），所以是两个按钮：
-                           * 抽取没产出时把「重跑抽取」升为主操作——重新解析会白付一次重建锚点的代价。
-                           */}
-                          <Button
-                            type="primary"
-                            htmlType="button"
-                            className={needsExtractRerun(file) ? "" : ""}
-                            disabled={
-                              fileBusy ||
-                              derivePipeline(file).inFlight ||
-                              !["completed", "partial"].includes(
-                                file.parse_status ?? "",
-                              )
-                            }
-                            onClick={() =>
-                              void handleExtractRerun(
-                                file.version_id as number,
-                                file.project_file_id,
-                              )
-                            }
-                          >
-                            重跑抽取
-                          </Button>
                           <Button
                             type="primary"
                             htmlType="button"
@@ -577,7 +491,6 @@ export function ProjectFiles({ projectId }: Props) {
                                 fileId: file.project_file_id,
                                 versionId: file.version_id as number,
                                 fileName: file.display_name,
-                                confirmed: file.confirmed_count,
                                 tier: file.parse_tier ?? "standard",
                                 ocrMode: file.parse_ocr_mode ?? "auto",
                               })

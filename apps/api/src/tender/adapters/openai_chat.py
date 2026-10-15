@@ -13,11 +13,11 @@ from urllib.parse import quote
 import httpx
 
 from tender.domain.errors import (
-    ExtractionFailed,
-    ExtractionUnavailable,
     InvalidModelOutput,
+    ModelCallFailed,
     ModelOutputTruncated,
     ModelRefused,
+    ModelUnavailable,
 )
 from tender.ports.llm import Completion
 from tender.ports.model_media import ModelImage
@@ -149,9 +149,9 @@ class OpenAIChatModel:
                                 parts.append(value)
                         finish = choice.get("finish_reason") or finish
                 except (ValueError, TypeError, AttributeError) as exc:
-                    raise ExtractionUnavailable("LLM 流式响应无效或中断", http_status=200) from exc
+                    raise ModelUnavailable("LLM 流式响应无效或中断", http_status=200) from exc
             if not done or finish is None:
-                raise ExtractionUnavailable("LLM 流式响应未完整结束", http_status=200)
+                raise ModelUnavailable("LLM 流式响应未完整结束", http_status=200)
             if finish == "length":
                 error = ModelOutputTruncated(
                     "模型输出达到token上限，流式正文不完整", http_status=200
@@ -288,17 +288,17 @@ class OpenAIChatModel:
             response = await self._post_completion(path, body)
         except httpx.HTTPError as exc:
             # 仅保留异常类型，区分应用超时和上游断连；原异常文本可能含密钥或请求正文。
-            raise ExtractionUnavailable(f"模型连接失败或请求超时（{type(exc).__name__}）") from exc
+            raise ModelUnavailable(f"模型连接失败或请求超时（{type(exc).__name__}）") from exc
         # 网关可能在供应商超时后返回非标准 5xx（如 Cloudflare 524）；一律按可重试处理。
         if response.status_code in {408, 429} or response.status_code >= 500:
-            error = ExtractionUnavailable(
+            error = ModelUnavailable(
                 f"LLM 网关暂不可用：HTTP {response.status_code}",
                 http_status=response.status_code,
             )
             error.retry_after = _retry_after(response)
             raise error
         if not response.is_success:
-            raise ExtractionFailed(
+            raise ModelCallFailed(
                 f"LLM 网关拒绝请求：HTTP {response.status_code}",
                 http_status=response.status_code,
             )
@@ -342,12 +342,12 @@ class OpenAIChatModel:
             model = payload.get("model", self._model)
             usage = payload.get("usage") or payload.get("usageMetadata") or {}
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
-            raise ExtractionFailed("模型响应不符合所选接口的文本结构") from exc
+            raise ModelCallFailed("模型响应不符合所选接口的文本结构") from exc
         if not isinstance(content, str) or not content.strip():
             # 子 Agent 实测：慢请求被网关在约110秒后截成 200+空正文，重发同一请求仍可能成功。
             # 空正文不是模型能自行纠正的格式问题，按暂不可用重试同一模型，既不降级也不误判为拒绝。
             # 不读取或拼接 reasoning_content，它不能替代模型正式提交的报告。
-            raise ExtractionUnavailable("LLM 网关返回空文本", http_status=200)
+            raise ModelUnavailable("LLM 网关返回空文本", http_status=200)
         if json_mode:
             # 部分兼容服务仍给完整 JSON 加 Markdown 围栏；只移除完整外包装，绝不猜测正文中的 JSON。
             fenced = re.fullmatch(
@@ -394,14 +394,14 @@ class OpenAIChatModel:
         try:
             response = await self._client.get("models", headers=self._headers())
         except httpx.HTTPError as exc:
-            raise ExtractionUnavailable("模型目录连接失败或请求超时") from exc
+            raise ModelUnavailable("模型目录连接失败或请求超时") from exc
         if response.status_code == 429 or response.status_code >= 500:
-            raise ExtractionUnavailable(
+            raise ModelUnavailable(
                 f"LLM 网关暂不可用：HTTP {response.status_code}",
                 http_status=response.status_code,
             )
         if not response.is_success:
-            raise ExtractionFailed(
+            raise ModelCallFailed(
                 f"LLM 网关拒绝请求：HTTP {response.status_code}",
                 http_status=response.status_code,
             )
@@ -409,9 +409,9 @@ class OpenAIChatModel:
             payload: Any = response.json()
             data = payload["models"] if self._protocol == "gemini" else payload["data"]
         except (ValueError, KeyError, TypeError) as exc:
-            raise ExtractionFailed("LLM 网关 /models 响应缺少 data 数组") from exc
+            raise ModelCallFailed("LLM 网关 /models 响应缺少 data 数组") from exc
         if not isinstance(data, list):
-            raise ExtractionFailed("LLM 网关 /models 的 data 不是数组")
+            raise ModelCallFailed("LLM 网关 /models 的 data 不是数组")
         return [
             item.get("id", item.get("name"))
             for item in data

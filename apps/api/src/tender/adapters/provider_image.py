@@ -8,7 +8,7 @@ from urllib.parse import quote
 import httpx
 from PIL import Image, UnidentifiedImageError
 
-from tender.domain.errors import ExtractionFailed, ExtractionUnavailable, ModelRefused
+from tender.domain.errors import ModelCallFailed, ModelRefused, ModelUnavailable
 from tender.ports.model_media import ModelImage
 
 
@@ -63,13 +63,13 @@ class ProviderImageModel:
         try:
             response = await self._client.post(path, headers=self._headers, json=body)
         except httpx.HTTPError as exc:
-            raise ExtractionUnavailable("生图服务连接失败或超时") from exc
+            raise ModelUnavailable("生图服务连接失败或超时") from exc
         if response.status_code in {408, 429, 500, 502, 503, 504}:
-            raise ExtractionUnavailable(
+            raise ModelUnavailable(
                 f"生图服务暂不可用：HTTP {response.status_code}", http_status=response.status_code
             )
         if not response.is_success:
-            raise ExtractionFailed(
+            raise ModelCallFailed(
                 f"生图服务拒绝请求：HTTP {response.status_code}", http_status=response.status_code
             )
         try:
@@ -119,7 +119,7 @@ class ProviderImageModel:
             UnidentifiedImageError,
             Image.DecompressionBombError,
         ) as exc:
-            raise ExtractionFailed(
+            raise ModelCallFailed(
                 "生图响应没有可读取的 PNG/JPEG/WebP；兼容服务需配置 base64 响应"
             ) from exc
 

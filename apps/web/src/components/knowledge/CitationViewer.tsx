@@ -40,18 +40,18 @@ export function CitationViewer({ selected, citations, onReverse }: Props) {
   }, [citations, selected]);
   const index = useMemo<EvidenceIndex>(() => {
     const byPage = new Map<number, EvidenceItem[]>();
-    const byExtraction = new Map<number, EvidenceTarget[]>();
+    const byEvidence = new Map<number, EvidenceTarget[]>();
     refs.forEach((ref, i) => {
       const bbox = toBbox(ref.bbox);
-      const target: EvidenceTarget = { extractionId: i + 1, anchor: ref.anchor, pageNo: ref.page_no, bbox, fieldKey: "citation", label: ref.file_name, quote: ref.quote };
-      byExtraction.set(i + 1, [target]);
+      const target: EvidenceTarget = { evidenceId: i + 1, anchor: ref.anchor, pageNo: ref.page_no, bbox, label: ref.file_name, quote: ref.quote };
+      byEvidence.set(i + 1, [target]);
       if (bbox) {
         const list = byPage.get(ref.page_no) ?? [];
         list.push({ ...target, bbox, badge: list.length + 1 });
         byPage.set(ref.page_no, list);
       }
     });
-    return { byPage, byExtraction };
+    return { byPage, byEvidence };
   }, [refs]);
 
   useEffect(() => {
@@ -73,16 +73,16 @@ export function CitationViewer({ selected, citations, onReverse }: Props) {
     // 报告轮询只更新角标集合，不应把正在阅读的用户重新滚回旧引用。
     if (lastLocated.current === selected) return;
     lastLocated.current = selected;
-    void locate({ extractionId: Math.max(1, refs.findIndex((r) => r.element_id === selected.element_id && r.quote === selected.quote) + 1),
+    void locate({ evidenceId: Math.max(1, refs.findIndex((r) => r.element_id === selected.element_id && r.quote === selected.quote) + 1),
       anchor: selected.anchor, pageNo: selected.page_no, bbox: toBbox(selected.bbox), label: selected.file_name });
   }, [pdf, pages, selected, locate, refs]);
 
   return <section className="citation-viewer" aria-label="引用原文">
     <div className="citation-heading"><strong className="truncate">{selected.file_name}</strong><span>第 {selected.page_no} 页</span></div>
-    <Toolbar pageCount={pages.length} projectId={null} onNotice={setError} showExport={false} />
+    <Toolbar pageCount={pages.length} />
     {(error || notice) && <p role="status" className="notice m-2">{error ?? notice}</p>}
     <div className="min-h-0 flex-1">{pdf && pages.length ? <DocumentViewer pdf={pdf} pages={pages} index={index} registry={registry} onError={setError}
-      onLocate={(item) => { const ref = refs[item.extractionId - 1]; if (ref) onReverse?.(ref); }} />
+      onLocate={(item) => { const ref = refs[item.evidenceId - 1]; if (ref) onReverse?.(ref); }} />
       : <p className="p-8 text-slate-500">正在打开引用原文…</p>}</div>
     <blockquote className="citation-excerpt">{selected.quote}</blockquote>
   </section>;

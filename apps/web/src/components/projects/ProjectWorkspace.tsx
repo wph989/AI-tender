@@ -16,7 +16,7 @@ import type { WireProjectDetail } from "@/types/projects";
 /** 文件以横向标签切换，将横向空间优先留给原文与证据；URL 仍保留当前文件。 */
 export function ProjectWorkspace({ projectId }: { projectId: number }) {
   const params = useSearchParams();
-  return params.get("view") === "fields" || params.has("file") ? (
+  return params.get("view") === "document" || params.has("file") ? (
     <FileWorkspace projectId={projectId} />
   ) : (
     <ProjectAnalysis key={projectId} projectId={projectId} />
@@ -77,7 +77,7 @@ function FileWorkspace({ projectId }: { projectId: number }) {
         </Link>
         <div className="min-w-0">
           <p className="mb-0.5 text-[10px] text-slate-400">
-            项目空间 / 核对工作台
+            项目空间 / 文档预览
           </p>
           <h1>{project?.name ?? "正在加载项目…"}</h1>
         </div>
@@ -190,7 +190,6 @@ function FileWorkspace({ projectId }: { projectId: number }) {
               active.latest_job?.status,
               active.latest_job?.stage,
               active.latest_run_id,
-              active.extraction_count,
             ].join(":")}
             onSettled={() => void reload().catch(() => undefined)}
           />

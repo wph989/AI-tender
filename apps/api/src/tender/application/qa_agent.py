@@ -12,17 +12,43 @@ from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPer
 from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain_core.tools import StructuredTool, ToolException
 from langsmith import tracing_context
+from typing_extensions import TypedDict
 
 from tender.application.analysis_research import AgentLimits, Expand, ResearchSession
 from tender.application.analysis_skills import _module_result, verify_items
 from tender.application.deep_analysis import (
-    FieldInput,
-    RelationInput,
     ResearchMiddleware,
     RoutedAgentModel,
     _relation_unit,
     context_size,
 )
+
+
+class AnswerCitation(TypedDict):
+    block_id: str
+    quote: str
+
+
+class AnswerValue(TypedDict):
+    value: str
+    citations: list[AnswerCitation]
+
+
+class AnswerItem(TypedDict):
+    field: str
+    group: str
+    sort_order: int
+    values: list[AnswerValue]
+    note: str
+
+
+class AnswerRelation(TypedDict):
+    subject: str
+    predicate: str
+    object: str
+    scope: str
+    condition: str
+    citations: list[AnswerCitation]
 
 QA_CONTRACT = """你是本项目知识库的独立问答 Agent，只根据工具读到的原文作答，不使用常识补足。
 用原生工具检索：list_documents 查看可用资料，search_document 检索本项目材料，
@@ -120,8 +146,8 @@ async def answer_with_agent(
         await verify_items(model, items, explain=True, evidence=research.seen)
 
     async def submit_answer(
-        fields: list[FieldInput],
-        relations: list[RelationInput],
+        fields: list[AnswerItem],
+        relations: list[AnswerRelation],
         research_summary: str,
         final: bool = False,
     ) -> dict:

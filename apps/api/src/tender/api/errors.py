@@ -15,9 +15,9 @@ from tender.core.secrets import SecretKeyUnavailable
 from tender.domain.errors import (
     ConversionFailed,
     ConversionUnavailable,
-    ExtractionFailed,
-    ExtractionUnavailable,
+    ModelCallFailed,
     ModelInUse,
+    ModelUnavailable,
     ParseFailed,
     ParseSubmissionUnknown,
     ParseUnavailable,
@@ -54,7 +54,7 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(TenderError)
     async def tender_error_handler(_: Request, exc: TenderError) -> JSONResponse:
-        if isinstance(exc, (ConversionFailed, ExtractionFailed, ParseFailed)):
+        if isinstance(exc, (ConversionFailed, ModelCallFailed, ParseFailed)):
             status = 422
         elif isinstance(exc, (ServiceRestarted, ModelInUse)):
             status = 409
@@ -62,7 +62,7 @@ def install_error_handlers(app: FastAPI) -> None:
             exc,
             (
                 ConversionUnavailable,
-                ExtractionUnavailable,
+                ModelUnavailable,
                 ParseUnavailable,
                 ParseSubmissionUnknown,
             ),

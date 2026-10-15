@@ -32,23 +32,21 @@ def _load_migration() -> ModuleType:
 
 
 def _seed_rows() -> list[tuple[str, str, str, str, str, bool]]:
-    module = _load_migration()
-    sql = "\n".join(module._STATEMENTS)
-    for filename in (
-        "0008_deepagents_runtime.py", "0010_analysis_guards.py", "0012_config_limits.py"
-    ):
-        spec = importlib.util.spec_from_file_location(
-            "_seed_extension", _MIGRATION.parent / filename
-        )
-        extension = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(extension)
-        sql += "\n" + "\n".join(extension._STATEMENTS)
-    rows = [
-        (key, layer, value_type, default, description, requires_gate == "true")
-        for key, layer, value_type, default, description, requires_gate in _ROW_RE.findall(sql)
-    ]
+    rows = {}
+    # 顺序应用种子与退役删除；只拼所有 INSERT 会把已下线参数重新算进 head。
+    for path in sorted(_MIGRATION.parent.glob("[0-9]*.py")):
+        spec = importlib.util.spec_from_file_location("_seed_" + path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for statement in module._STATEMENTS:
+            for key, layer, kind, default, description, gated in _ROW_RE.findall(statement):
+                rows[key] = (key, layer, kind, default, description, gated == "true")
+            deleted = re.search(r"DELETE FROM config_item WHERE key LIKE '([^']+)%'", statement)
+            if deleted:
+                rows = {key: row for key, row in rows.items()
+                        if not key.startswith(deleted[1])}
     assert rows, "迁移里没解析出种子行：写法变了，解析器要跟进"
-    return rows
+    return list(rows.values())
 
 
 def test_seed_keys_match_code_registry() -> None:

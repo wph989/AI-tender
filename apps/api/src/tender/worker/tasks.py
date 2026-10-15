@@ -1089,7 +1089,7 @@ def poll_parse(self: Any, job_id: str) -> None:
                 finished_at=now,
             )
         )
-        updated_rows = connection.execute(
+        connection.execute(
             update(Job)
             .where(Job.id == job_id, Job.status != "canceled")
             .values(
@@ -1101,24 +1101,4 @@ def poll_parse(self: Any, job_id: str) -> None:
                 updated_at=now,
                 finished_at=now,
             )
-        )
-        updated_count = updated_rows.rowcount
-
-    # 任务被取消时上面的更新不生效，不能因为解析结果已经存在就接着排抽取。
-    if terminal_status in {"completed", "partial"} and normalized_elements and updated_count:
-        # 独立知识库只建立可检索原文，不能套用招标字段给历史资料制造当前项目结论。
-        with _engine.connect() as connection:
-            kind = connection.execute(
-                select(Project.kind).where(Project.id == row["project_id"])
-            ).scalar_one()
-        if kind == "knowledge":
-            return
-        # 解析 job 与抽取 job 分开保存，避免解析终态被模型重试覆盖。
-        from tender.worker.extraction import create_extraction_job
-
-        create_extraction_job(
-            int(row["project_id"]),
-            int(row["project_file_id"]),
-            int(row["version_id"]),
-            int(row["run_id"]),
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from hashlib import sha256
 
 from tender.application.analysis_data import semantic_payload
@@ -71,8 +72,10 @@ def correction_count(state: dict, entry: dict) -> int:
     return count
 
 
-def progress_signature(seen: dict, state: dict, *, verified_only: bool = True) -> str:
-    """只有新增原文或通过校验的新事实算进展；改名、工具成功、草稿暂存都不算。"""
+def progress_signature(
+    seen: dict, state: dict, *, verified_only: bool = True, research_events: Sequence[dict] = (),
+) -> str:
+    """新检索、新原文及核实成果算进展；同一检索的重放和草稿改名不能续命。"""
     facts = sorted(
         {
             fingerprint([value.get("value"), value.get("citations"), business_claim(entry)])
@@ -81,7 +84,14 @@ def progress_signature(seen: dict, state: dict, *, verified_only: bool = True) -
             for value in entry.get("values", [])
         }
     )
-    return fingerprint([sorted(seen), facts])
+    searches = sorted({
+        fingerprint([e.get("scope"), normalized(e["query"]), e.get("source_ids", [])])
+        for e in research_events if e["action"] == "search_result"
+    })
+    return fingerprint([
+        sorted(seen), facts, bool(state.get("research_completed")), searches,
+        state.get("research_validation_issues", []),
+    ])
 
 
 def tool_key(name: str, arguments: dict) -> str:
@@ -96,7 +106,14 @@ def tool_key(name: str, arguments: dict) -> str:
     return fingerprint([name, args])
 
 
-def error_feedback(code: str, message: str, *, remaining: int, tool: str = "") -> str:
+def error_feedback(
+    code: str, message: str, *, remaining: int, tool: str = "", details: dict | None = None,
+) -> str:
+    action = "按错误字段修正参数或补读依据；无依据的结论省略，缺口写入research_summary。"
+    if details is not None:
+        action = "逐项修正 issues；真实检索记录由服务端保存，无需复述检索词。未决主题登记缺口。"
+    if remaining <= 0:
+        action = "本次同类问题的纠错额度已耗尽，运行时保留已核实成果及诊断。"
     return json.dumps(
         {
             "ok": False,
@@ -104,9 +121,8 @@ def error_feedback(code: str, message: str, *, remaining: int, tool: str = "") -
             "tool": tool,
             "message": message[:1800],
             "remaining_attempts": max(0, remaining),
-            "next_action": (
-                "按错误字段修正参数或补读依据；无依据的结论省略，缺口写入research_summary。"
-            ),
+            "next_action": action,
+            **({"details": details} if details is not None else {}),
         },
         ensure_ascii=False,
     )

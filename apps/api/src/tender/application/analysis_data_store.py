@@ -70,10 +70,12 @@ def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
             for record in module["business_data"].get("records", []):
                 if record["kind"] != "lot" or record.get("verification") != "supported":
                     continue
-                lot_id = session.lot_id_for_code(locked["project_id"], record["code"])
+                # 项目目录需要稳定查找键；无原文编号时用已核实名称，分析记录中的 code 仍留空。
+                catalog_key = record["code"] or record["title"]
+                lot_id = session.lot_id_for_code(locked["project_id"], catalog_key)
                 if lot_id is None:
                     lot_id = session.create_lot(
-                        locked["project_id"], code=record["code"], name=record["title"]
+                        locked["project_id"], code=catalog_key, name=record["title"]
                     )
                     derived.add(lot_id)
                 item = copy.deepcopy(record) | {"lot_id": lot_id}

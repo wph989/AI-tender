@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, func, insert, or_, select, true, update
+from sqlalchemy import func, insert, or_, select, true, update
 from sqlalchemy.orm import aliased
 from starlette.responses import Response
 
 from tender.adapters.pg.models import (
     DocumentVersion,
-    Extraction,
     Job,
     Lot,
     ParseRun,
@@ -80,7 +79,7 @@ def list_projects(
     limit: int = Query(default=50, ge=1, le=100),
     keyword: str | None = None,
 ) -> dict[str, object]:
-    # 文件数与待复核数在列表里是决策信息（「这个项目还有没有活要干」），
+    # 文件数与处理失败数直接决定项目列表的状态，
     # 让前端逐个项目再发一次请求去数，列表一屏就是十几个请求。
     company = settings.company_id()
     agg_owner = aliased(Project)
@@ -95,17 +94,15 @@ def list_projects(
         .correlate(ProjectFile)
         .lateral("latest_parse")
     )
-    latest_extract = (
-        select(Job.status.label("status"))
-        .where(Job.project_file_id == ProjectFile.id, Job.stage == "extracting")
-        .order_by(Job.created_at.desc(), Job.id.desc())
-        .limit(1)
-        .correlate(ProjectFile)
-        .lateral("latest_extract")
-    )
+    # 旧任务账仍保留；列表只读取文档流水线，不能把退役任务的取消状态当成解析失败。
     latest_job = (
         select(Job.status.label("status"))
-        .where(Job.project_file_id == ProjectFile.id)
+        .where(
+            Job.project_file_id == ProjectFile.id,
+            Job.stage.in_(
+                ("converting", "probing", "geometry", "submitting", "parsing", "resubmitting")
+            ),
+        )
         .order_by(Job.created_at.desc(), Job.id.desc())
         .limit(1)
         .correlate(ProjectFile)
@@ -115,17 +112,12 @@ def list_projects(
         select(
             ProjectFile.project_id,
             func.count(func.distinct(ProjectFile.id)).label("file_count"),
-            func.count(Extraction.id)
-            .filter(Extraction.status.in_(("need_review", "conflict")))
-            .label("review_count"),
             func.max(ProjectFile.created_at).label("last_file_at"),
-            # 失败计数：卷宗脊要能一眼分出「坏了的项目」。只回待复核数的话，
-            # 解析或抽取挂掉的项目会伪装成「没有待办」，那正是列表页最该报警的一种。
+            # 解析或转换失败的文件需要在列表提示，不能被已有版本掩盖。
             func.count(func.distinct(ProjectFile.id))
             .filter(
                 or_(
                     latest_parse.c.status == "failed",
-                    latest_extract.c.status.in_(("failed", "canceled")),
                     latest_job.c.status.in_(("failed", "canceled")),
                 )
             )
@@ -133,12 +125,7 @@ def list_projects(
         )
         .select_from(ProjectFile)
         .join(agg_owner, agg_owner.id == ProjectFile.project_id)
-        .outerjoin(
-            Extraction,
-            and_(Extraction.version_id == ProjectFile.version_id, Extraction.is_current.is_(True)),
-        )
         .outerjoin(latest_parse, true())
-        .outerjoin(latest_extract, true())
         .outerjoin(latest_job, true())
         .where(
             ProjectFile.deleted_at.is_(None),
@@ -153,7 +140,12 @@ def list_projects(
     act = (
         select(Job.project_id, func.max(Job.updated_at).label("last_job_at"))
         .join(job_owner, job_owner.id == Job.project_id)
-        .where(job_owner.company_id == company, job_owner.deleted_at.is_(None))
+        .where(
+            job_owner.company_id == company, job_owner.deleted_at.is_(None),
+            Job.stage.in_(
+                ("converting", "probing", "geometry", "submitting", "parsing", "resubmitting")
+            ),
+        )
         .group_by(Job.project_id)
         .subquery("act")
     )
@@ -174,7 +166,6 @@ def list_projects(
             Project.status,
             Project.created_at,
             func.coalesce(agg.c.file_count, 0).label("file_count"),
-            func.coalesce(agg.c.review_count, 0).label("review_count"),
             func.coalesce(agg.c.failed_count, 0).label("failed_count"),
             last_activity,
         )
@@ -226,31 +217,6 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
         .correlate(ProjectFile)
         .lateral("replacement")
     )
-    # 只认 is_current：历史尝试是追溯用的，算进待复核数会让列表永远清不干净
-    result = (
-        select(
-            func.count().label("total"),
-            func.count()
-            .filter(Extraction.status.in_(("need_review", "conflict")))
-            .label("review_count"),
-            # 已确认条数：重新解析的二次确认要列出「将失效的已确认结果数量」
-            # （见 docs/质量/09 第 5.2 节），列表页因此必须拿到它。
-            func.count().filter(Extraction.status == "verified").label("confirmed_count"),
-        )
-        .where(Extraction.version_id == ProjectFile.version_id, Extraction.is_current.is_(True))
-        .correlate(ProjectFile)
-        .lateral("result")
-    )
-    # 抽取是独立 job（stage='extracting'），文件行本身不带状态；
-    # 不取它的话，抽取失败的文件在列表上看不出和「还没开始」的区别。
-    extraction_job = (
-        select(Job.status.label("status"))
-        .where(Job.project_file_id == ProjectFile.id, Job.stage == "extracting")
-        .order_by(Job.created_at.desc(), Job.id.desc())
-        .limit(1)
-        .correlate(ProjectFile)
-        .lateral("extraction_job")
-    )
     # 转换和解析排队时尚无 parse_run，必须返回任务才能驱动前端轮询。
     latest_job = (
         select(
@@ -261,7 +227,12 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
             Job.error_code.label("error_code"),
             Job.error_message.label("error_message"),
         )
-        .where(Job.project_file_id == ProjectFile.id)
+        .where(
+            Job.project_file_id == ProjectFile.id,
+            Job.stage.in_(
+                ("converting", "probing", "geometry", "submitting", "parsing", "resubmitting")
+            ),
+        )
         .order_by(Job.created_at.desc(), Job.id.desc())
         .limit(1)
         .correlate(ProjectFile)
@@ -289,10 +260,6 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
                     latest.c.ocr_mode.label("parse_ocr_mode"),
                     latest.c.id.label("latest_run_id"),
                     replacement.c.id.label("replaced_by_id"),
-                    func.coalesce(result.c.total, 0).label("extraction_count"),
-                    func.coalesce(result.c.review_count, 0).label("review_count"),
-                    func.coalesce(result.c.confirmed_count, 0).label("confirmed_count"),
-                    extraction_job.c.status.label("extraction_status"),
                     latest_job.c.id.label("latest_job_id"),
                     latest_job.c.status.label("latest_job_status"),
                     latest_job.c.stage.label("latest_job_stage"),
@@ -305,8 +272,6 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
                 .outerjoin(DocumentVersion, DocumentVersion.id == ProjectFile.version_id)
                 .outerjoin(latest, true())
                 .outerjoin(replacement, true())
-                .outerjoin(result, true())
-                .outerjoin(extraction_job, true())
                 .outerjoin(latest_job, true())
                 .where(
                     ProjectFile.project_id == project_id,

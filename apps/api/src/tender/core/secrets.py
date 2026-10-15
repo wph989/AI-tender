@@ -30,7 +30,7 @@ def _fernet() -> tuple[Any, Any]:
     """延迟导入 cryptography。
 
     没装依赖时服务仍要能启动：密钥加解密是管理页的一个功能，
-    不该让解析、复核这些不相关的接口一起 500。真正用到时再给明确报错。
+    不该让解析、文档预览这些不相关的接口一起 500。真正用到时再给明确报错。
     """
     try:
         from cryptography.fernet import Fernet, InvalidToken

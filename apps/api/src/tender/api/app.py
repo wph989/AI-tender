@@ -9,17 +9,12 @@ from fastapi import APIRouter, FastAPI
 
 from tender.api import (
     config,
-    conflicts,
-    exports,
-    extractions,
     jobs,
     knowledge,
     llm,
     parsing,
     project_files,
     projects,
-    quality,
-    reviews,
     versions,
 )
 from tender.api.errors import install_error_handlers
@@ -48,15 +43,9 @@ def create_app(components: ApiComponents | None = None) -> FastAPI:
     app.include_router(project_files.router)
     app.include_router(versions.router)
     app.include_router(parsing.router)
-    app.include_router(extractions.router)
-    app.include_router(reviews.router)
-    app.include_router(conflicts.router)
-    app.include_router(conflicts.conflicts_router)
-    app.include_router(exports.router)
     app.include_router(jobs.router)
     app.include_router(llm.router)
     app.include_router(config.router)
-    app.include_router(quality.router)
     app.include_router(knowledge.router)
     return app
 

@@ -15,11 +15,11 @@ from tender.application.knowledge import (
 )
 from tender.application.knowledge_retrieval import retrieve_chunks
 from tender.domain.errors import (
-    ExtractionFailed,
-    ExtractionUnavailable,
     InvalidModelOutput,
+    ModelCallFailed,
     ModelOutputTruncated,
     ModelRefused,
+    ModelUnavailable,
 )
 from tender.ports.llm import Completion
 
@@ -104,7 +104,8 @@ def test_citation_is_realigned_to_the_value_it_supports():
                     {
                         "value": "招标人地址:浙江省杭州市滨江区滨安路1936号",
                         "citations": [
-                            {"block_id": row["block_id"], "quote": "招标人名称:中国通信工程有限公司"}
+                            {"block_id": row["block_id"],
+                             "quote": "招标人名称:中国通信工程有限公司"}
                         ],
                     }
                 ],
@@ -162,7 +163,8 @@ def test_table_citation_narrows_to_the_cell_that_holds_the_fact():
                     {
                         "value": "标段二：宁波、舟山、绍兴及省干传输、数据",
                         "citations": [
-                            {"block_id": row["block_id"], "quote": "一  杭州、嘉兴、湖州  1130  100%"}
+                            {"block_id": row["block_id"],
+                             "quote": "一  杭州、嘉兴、湖州  1130  100%"}
                         ],
                     }
                 ],
@@ -188,7 +190,8 @@ def test_citation_span_covers_every_fragment_of_a_compound_value():
                 "field": "分值构成",
                 "values": [
                     {
-                        "value": "2.2.1 分值构成：（1）资信业绩部分:见评标办法前附表；（2）监理大纲部分:见评标办法前附表",
+                        "value": ("2.2.1 分值构成：（1）资信业绩部分:见评标办法前附表；"
+                                  "（2）监理大纲部分:见评标办法前附表"),
                         "citations": [{"block_id": row["block_id"], "quote": "2.2.1 分值构成"}],
                     }
                 ],
@@ -412,7 +415,7 @@ def test_repeated_invalid_json_stops_after_two_corrections():
 
 
 @pytest.mark.parametrize(
-    "error", [ExtractionUnavailable("超时"), ExtractionFailed("配置无效"), ModelRefused("拒绝")]
+    "error", [ModelUnavailable("超时"), ModelCallFailed("配置无效"), ModelRefused("拒绝")]
 )
 def test_json_correction_never_retries_connection_configuration_or_refusal(error):
     calls = []

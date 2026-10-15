@@ -1,6 +1,6 @@
 /** 配置中心的前端类型（对齐后端 `tender/api/config.py` 的响应）。 */
 
-export type ConfigLayer = "L1" | "L2" | "L3";
+export type ConfigLayer = "L1" | "L2";
 
 export type ConfigValueType = "int" | "number" | "bool" | "string" | "json" | "secret";
 
@@ -34,7 +34,6 @@ export interface ConfigRelease {
   created_by: string;
   created_at: string;
   based_on: number | null;
-  regression_run_id: number | null;
 }
 
 export interface ConfigChanged {
@@ -71,7 +70,6 @@ export interface ConfigReleaseDetail extends ConfigRelease {
   changed: Record<string, ConfigChanged>;
   impact: ImpactEntry[];
   gate: GateResult;
-  regression: Record<string, unknown> | null;
   audit: ConfigAuditEntry[];
 }
 

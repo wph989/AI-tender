@@ -11,7 +11,7 @@ from test_deep_analysis import call, submitted_field
 from tender.application.analysis_research import AgentLimits
 from tender.application.llm_routing import ModelCandidate, RoutingModel
 from tender.application.qa_agent import QABudgetExceeded, answer_with_agent
-from tender.domain.errors import ExtractionUnavailable
+from tender.domain.errors import ModelUnavailable
 from tender.ports.llm import Completion
 
 
@@ -127,7 +127,7 @@ def test_model_budget_is_shared_by_chat_and_support_review(limit, chat_calls):
 def test_provider_retry_cannot_exceed_question_budget():
     client = Client(
         [
-            ExtractionUnavailable("临时断连"),
+            ModelUnavailable("临时断连"),
             call("search_document", {"query": "质保"}, 1),
         ]
     )

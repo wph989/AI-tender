@@ -21,7 +21,7 @@ from sqlalchemy import Engine, func, insert, select, update
 from sqlalchemy.engine import Connection
 
 from tender.adapters.pg.locks import acquire_xact_lock
-from tender.adapters.pg.models import ConfigAudit, ConfigRelease, RegressionRun
+from tender.adapters.pg.models import ConfigAudit, ConfigRelease
 from tender.api.common import configs, engine
 from tender.api.errors import ApiProblem
 from tender.config import audit, gate, schema
@@ -130,28 +130,6 @@ def _changed_against_active(
     return schema.diff_values(base, schema.resolve_values(values))
 
 
-def _regression_for(connection: Connection, release_id: int) -> dict[str, Any] | None:
-    """回归报告：取最近一次**已完成**的回放；没有报告就是冷启动，门禁只校验影响清单。
-
-    只认 finished_at 非空的报告：正在跑的或半途失败的（replay_error 会写完成时间）都不能
-    拿来做"不倒退"的凭证，回放在跑时按未产出报告处理。
-    """
-    row = (
-        connection.execute(
-            select(RegressionRun)
-            .where(
-                RegressionRun.release_id == release_id,
-                RegressionRun.finished_at.is_not(None),
-            )
-            .order_by(RegressionRun.id.desc())
-            .limit(1)
-        )
-        .mappings()
-        .first()
-    )
-    return dict(row) if row is not None else None
-
-
 def _impact_for(
     connection: Connection,
     release_id: int,
@@ -159,9 +137,7 @@ def _impact_for(
 ) -> tuple[tuple[ImpactItem, ...], list[tuple[str, str]]]:
     company_id = settings.company_id()
     changed = _changed_against_active(connection, company_id, values)
-    regression = _regression_for(connection, release_id)
-    failures = list((regression or {}).get("failures") or [])
-    impact = gate.build_impact(changed.keys(), regression_failures=failures)
+    impact = gate.build_impact(changed.keys())
     return impact, audit.load_acks(connection, release_id)
 
 
@@ -245,7 +221,6 @@ def list_releases(
         ConfigRelease.created_by,
         ConfigRelease.created_at,
         ConfigRelease.based_on,
-        ConfigRelease.regression_run_id,
     ).where(ConfigRelease.company_id == settings.company_id())
     if status:
         query = query.where(ConfigRelease.status == status)
@@ -260,7 +235,7 @@ def list_releases(
 
 @router.post("/releases", status_code=201)
 def create_release(payload: ReleaseCreate, request: Request) -> dict[str, Any]:
-    """创建配置版本：只动 L1 立即生效；含 L2/L3 生成 draft，等回归与确认走完再激活。"""
+    """创建配置版本：只动 L1 立即生效；含 L2 生成 draft，等影响确认走完再激活。"""
     role = _role(request)
     actor = _actor(request)
     if not payload.values:
@@ -301,7 +276,7 @@ def create_release(payload: ReleaseCreate, request: Request) -> dict[str, Any]:
         )
         if not gated:
             # L1 立即生效：先归档旧 active，再插入新 active——ux_release_active 只允许一个；
-            # L2/L3 只落 draft，不碰当前 active。
+            # L2 只落 draft，不碰当前 active。
             connection.execute(
                 update(ConfigRelease)
                 .where(ConfigRelease.company_id == company_id, ConfigRelease.status == "active")
@@ -373,8 +348,7 @@ def get_release(release_id: int, request: Request) -> dict[str, Any]:
         resolved = schema.resolve_values(values)
         changed = _changed_against_active(connection, company_id, values)
         impact, acks = _impact_for(connection, release_id, values)
-        regression = _regression_for(connection, release_id)
-        result = gate.evaluate_gate(impact=impact, acknowledged=acks, regression=regression)
+        result = gate.evaluate_gate(impact=impact, acknowledged=acks)
         audits = _audit_rows(connection, company_id=company_id, release_id=release_id, limit=200)
     return {
         "id": row["id"],
@@ -389,7 +363,6 @@ def get_release(release_id: int, request: Request) -> dict[str, Any]:
         "changed": changed,
         "impact": gate.impact_state(impact, acks),
         "gate": result.as_dict(),
-        "regression": regression,
         "audit": audits,
     }
 
@@ -457,7 +430,7 @@ def activate_release(
     role = _role(request)
     actor = _actor(request)
     if role != "admin":
-        raise ApiProblem(403, "forbidden", "只有 admin 能激活 L2/L3 配置")
+        raise ApiProblem(403, "forbidden", "只有 admin 能激活 L2 配置")
     if payload.force and not (payload.reason and payload.reason.strip()):
         raise ApiProblem(400, "invalid_argument", "强制激活必须填写理由")
     db: Engine = engine(request)
@@ -469,11 +442,9 @@ def activate_release(
             raise ApiProblem(409, "release_not_draft", "只有 draft 版本可以激活")
         values = dict(row["values"])
         impact, acks = _impact_for(connection, release_id, values)
-        regression = _regression_for(connection, release_id)
         result = gate.evaluate_gate(
             impact=impact,
             acknowledged=acks,
-            regression=regression,
             force=payload.force,
         )
         if not result.passed:

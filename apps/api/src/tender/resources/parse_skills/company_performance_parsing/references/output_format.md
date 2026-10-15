@@ -1,56 +1,41 @@
-﻿# company_performance_parsing 业务数据输出
+# 企业业绩输出格式
 
-## 输出协议
+下列 Markdown 只定义展示分类、列名和层级；实际通过工具提交 content JSON。
+正文按全部证据综合，引用独立保存；无依据内容省略，未决事项登记为检索缺口。
 
-通过原生工具 `submit_analysis(records, coverage, gaps, research_summary, final=false)` 分批提交。
-普通专题每批最多3条业务记录，格式专题最多6条。最后明确 `final=true`。
-记录字段由工具 schema 定义，`key` 是本模块内稳定短标识，同一记录纠正时沿用。
-`kind` 为 fact / requirement / lot / format_node / relation；`title` 为名称，`text` 直接写完整事实或要求。
-`scope.kind` 必须为 common / lots / unknown；lots 的 `lot_refs` 填原文标段编号或名称。
-不能因未写标段就认定所有标段适用。公共适用性同样需要原文或上下文依据。
-`citations` 使用 [{"block_id":"实际读取ID","quote":"连续原文"}]，覆盖文本和全部业务属性。
-`conditions` 保留 expression、logic(all/any/mixed/text)、terms(subject/operator/value/unit/time_basis)、exceptions。
-日期起算点和类似项目定义不明时保留未知，不用常识填值。`materials` 列出 name 与 requirement。
-`scoring` 保留 max_points、formula、tiers(condition/points)、deductions；评分项内部的全部档次属于同一项。
-`structuring` 为 complete 或 partial，无法可靠拆解时用 partial 并保留完整 text。
-仅项目概况模块提交 kind=lot，保留 code、title、aliases；其他模块直接填写标段原文指向。
-格式节点用 kind=format_node、node_type(group/section)、parent_key；先父后子，完整保留原文层级。
-修订/冲突用 kind=relation，predicate 为 supersedes/conflicts/requires/contains；端点先提交再填 subject_key/object_key。
-supersedes 表示 subject 替代 object，双方证据和适用范围均须明确，不能按上传时间判断。
-
-`references/coverage.json` 是运行时已加载的主题清单。每个主题登记覆盖状态：
-extracted（关联 record_keys）、searched_not_found（只表示本次没找到）、pending、not_applicable（必须有引用）。
-一个主题可按不同标段分别登记。未核对主题不会被当成完成，不为填满清单编造要求。
-缺口用 gaps 提交 key/topic/scope/code/detail；code 为 unresolved_reference、unknown_condition、scope_unknown、
-conflict、missing_source、incomplete_structure、search_exhausted。检索总结不能替代这些结构化状态。
-转引只是线索，须检索实际条款并完整写进 text；预算耗尽或目标缺失时记录缺口。
-缺口随 final=false 按 key 累积；final=true 须提交全部剩余 gaps，校验通过后替换旧清单。
-全部缺口已解决时最终提交 gaps=[]；最终校验失败仍保留已有缺口。
-来源、页码和坐标由服务端按校验保留的证据ID补齐，模型不生成定位。
-
-## 内容检查清单
-以下主题和字段用于检查覆盖，不要求逐项填满；只有原文明示且有引用的内容才输出。
-- 解析结论只输出投标人企业业绩要求，不输出企业资质、人员配置、财务状况或价格要求。
-
-
+```markdown
 ## 类似项目业绩要求
-- 业绩要求 / 具体描述
+| 业绩要求 | 具体描述 |
+|----------|----------|
+|  |  |
 
 ## 业绩时间范围要求
-- 时间要求 / 具体描述
+| 时间要求 | 具体描述 |
+|----------|----------|
+|  |  |
 
 ## 业绩金额要求
-- 金额要求 / 具体描述
+| 金额要求 | 具体描述 |
+|----------|----------|
+|  |  |
 
 ## 证明材料要求
-- 材料要求 / 具体描述
+| 材料要求 | 具体描述 |
+|----------|----------|
+|  |  |
 
 ## 业绩评分标准
-- 评分标准 / 具体描述
+| 评分标准 | 具体描述 |
+|----------|----------|
+|  |  |
 
 ## 特定行业业绩要求
-- 行业要求 / 具体描述
+| 行业要求 | 具体描述 |
+|----------|----------|
+|  |  |
+```
 
+## 内容约束
 - 业绩要求必须针对投标人企业历史项目经验；人员个人业绩不得写入本模块。
 - 合同金额、数量、年限、完成时间等必须保留原文口径，不得自行换算。
 - 业绩评分标准仅输出直接以企业业绩为评分对象的规则。

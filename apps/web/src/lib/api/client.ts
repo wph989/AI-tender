@@ -1,5 +1,5 @@
 /**
- * 工作台取数与结果操作入口：真实 API 与静态开发样本都集中在这里。
+ * 文档预览与项目文件操作入口。
  *
  * 为什么按 URL 的 versionId 切换：工作台组件不需要知道项目 API 的路由细节，
  * 同一套 PDF.js 与定位逻辑可以直接检查上传后的版本。
@@ -7,11 +7,7 @@
 
 import type { FileRole, ParseTier, UploadResult, WireProject, WireProjectDetail } from "@/types/projects";
 import type {
-  WireAttempt,
   WireBlock,
-  WireConflict,
-  WireExtraction,
-  WireEvidence,
   WireOutlineItem,
   WirePageMeta,
   WireVersionDetail,
@@ -19,16 +15,11 @@ import type {
 
 export interface WorkbenchData {
   pdfUrl: string;
-  /** 项目级动作（导出、冲突裁定）的定位键；静态样本没有项目 → null。 */
+  /** 所属项目，用于返回综合分析。 */
   projectId: number | null;
   pages: WirePageMeta[];
   blocksByPage: Record<string, WireBlock[]>;
-  extractions: WireExtraction[];
-  /**
-   * 最近一次解析运行的终态（null = 还没跑过解析）。
-   * 为什么由工作台自己带：抽取为空时唯一的解释是「解析没成」还是「抽取没成」，
-   * 这个判断必须在结果面板所在的那一层拿得到，否则空态只能写成「暂无数据」。
-   */
+  /** 最近一次解析状态用于解释文档是否已就绪。 */
   parseStatus: string | null;
   /** 解析失败的可读原因（error_message 优先，回落 error_code）。 */
   parseError: string | null;
@@ -36,18 +27,10 @@ export interface WorkbenchData {
   parseTier: string | null;
   /** 最近一次解析用的 OCR 模式：重新解析沿用它，理由同 parseTier。 */
   parseOcrMode: string | null;
-  /** 最近一次抽取任务的状态（null = 从没排过队）；null 与 "failed" 是两种不同的空态。 */
-  extractionStatus: string | null;
-  /** 抽取失败的可读原因；只有失败时才有值。 */
-  extractionError: string | null;
 }
 
 interface PagesResponse {
   pages: WirePageMeta[];
-}
-
-interface ExtractionsResponse {
-  items: WireExtraction[];
 }
 
 interface ElementsResponse {
@@ -55,32 +38,10 @@ interface ElementsResponse {
   elements: WireBlock[];
 }
 
-export interface ReviewEvidenceInput {
-  anchor: string;
-  quote?: string;
-  char_start?: number;
-  char_end?: number;
-}
-
-export interface ReviewInput {
-  attempt_id: number;
-  action: "confirm" | "correct" | "supplement" | "reject";
-  review_mode: "item" | "batch" | "spot_check";
-  new_value?: unknown;
-  evidence?: ReviewEvidenceInput[];
-  comment?: string;
-}
-
-interface RerunResponse {
-  job_id: string;
-  instance_id: number;
-  next_machine_attempt_no: number;
-}
-
 export interface JobResponse {
   id: string;
   status: string;
-  /** 流水线阶段：converting / submitting / parsing / extracting / exporting 等（见 worker/dispatch.py 的 STREAMS）。 */
+  /** 流水线阶段：converting / submitting / parsing 等（见 worker/dispatch.py 的 STREAMS）。 */
   stage?: string | null;
   progress?: Record<string, unknown> | null;
   error_code?: string | null;
@@ -179,10 +140,9 @@ export async function loadWorkbench(versionId: number): Promise<WorkbenchData> {
     throw new Error("versionId 必须是正整数");
   }
   const base = "/api/v1/versions/" + versionId;
-  const [detail, pages, extractions, elements] = await Promise.all([
+  const [detail, pages, elements] = await Promise.all([
     getJson<WireVersionDetail>(base),
     getJson<PagesResponse>(base + "/pages"),
-    getJson<ExtractionsResponse>(base + "/extractions"),
     getJson<ElementsResponse>(base + "/elements"),
   ]);
   const blocksByPage: Record<string, WireBlock[]> = {};
@@ -192,13 +152,11 @@ export async function loadWorkbench(versionId: number): Promise<WorkbenchData> {
     else list.push(element);
   }
   const latestRun = detail.parse_runs[0];
-  const extractJob = detail.latest_extraction_job ?? null;
   return {
     pdfUrl: base + "/file",
     projectId: detail.project_id,
     pages: pages.pages,
     blocksByPage,
-    extractions: extractions.items,
     parseStatus: latestRun?.status ?? null,
     parseError:
       latestRun?.status === "failed"
@@ -206,49 +164,7 @@ export async function loadWorkbench(versionId: number): Promise<WorkbenchData> {
         : null,
     parseTier: latestRun?.tier ?? null,
     parseOcrMode: latestRun?.ocr_mode ?? null,
-    extractionStatus: extractJob?.status ?? null,
-    extractionError:
-      extractJob !== null && (extractJob.status === "failed" || extractJob.status === "canceled")
-        ? (extractJob.error_message ?? extractJob.error_code ?? null)
-        : null,
   };
-}
-
-export interface FieldStat {
-  field_key: string;
-  rerun_button: string;
-}
-
-/**
- * 字段类型级统计（服务端下发 rerun_button，见设计文档 09 第 8 节）。
- *
- * 只取 items：工作台当前只消费重跑按钮口径，首次通过率等留给统计报表。
- */
-export async function loadFieldStats(window = "90d"): Promise<FieldStat[]> {
-  const data = await getJson<{ items: FieldStat[] }>(
-    "/api/v1/stats/fields?scope=all&window=" + encodeURIComponent(window),
-  );
-  return data.items;
-}
-
-export async function submitReview(instanceId: number, input: ReviewInput): Promise<unknown> {
-  return postJson("/api/v1/instances/" + instanceId + "/reviews", input);
-}
-
-export async function rerunExtraction(
-  extractionId: number,
-  hint: string | null = null,
-): Promise<RerunResponse> {
-  return postJson<RerunResponse>("/api/v1/extractions/" + extractionId + "/rerun", {
-    hint: hint?.trim() || null,
-  });
-}
-
-export async function loadAttempts(extractionId: number): Promise<WireAttempt[]> {
-  const response = await getJson<{ items: WireAttempt[] }>(
-    "/api/v1/extractions/" + extractionId + "/attempts",
-  );
-  return response.items;
 }
 
 export async function waitForJob(jobId: string, timeoutMs = 120_000): Promise<JobResponse> {
@@ -260,33 +176,6 @@ export async function waitForJob(jobId: string, timeoutMs = 120_000): Promise<Jo
   }
   throw new Error("任务仍在运行，请稍后刷新结果");
 }
-
-/** 仅供类型导入保持线格式的 evidence 结构稳定。 */
-export type { WireEvidence };
-
-export interface ConflictResolution {
-  action: "resolve" | "dismiss";
-  resolved_id?: number | null;
-  comment?: string | null;
-}
-
-export async function loadConflicts(projectId: number): Promise<WireConflict[]> {
-  const response = await getJson<{ items: WireConflict[] }>(
-    "/api/v1/projects/" + projectId + "/conflicts",
-  );
-  return response.items;
-}
-
-export async function resolveConflict(
-  conflictId: number,
-  input: ConflictResolution,
-): Promise<void> {
-  await postJson("/api/v1/conflicts/" + conflictId + "/resolve", input);
-}
-
-export type ExportOutcome =
-  | { kind: "file"; filename: string; blob: Blob }
-  | { kind: "job"; jobId: string };
 
 /**
  * 从 Content-Disposition 取文件名。
@@ -306,36 +195,6 @@ export function filenameFromDisposition(header: string | null): string | null {
   }
   const plain = /filename="([^"]+)"/i.exec(header);
   return plain?.[1] ?? null;
-}
-
-/** 导出：小项目直接回 xlsx 文件，超过阈值的项目回一个排队 job（见 api/exports.py）。 */
-export async function exportProject(
-  projectId: number,
-  include: "all" | "review" | "verified" = "all",
-): Promise<ExportOutcome> {
-  const response = await fetch("/api/v1/projects/" + projectId + "/export?include=" + include);
-  if (!response.ok) throw await readError(response, "导出失败");
-  const contentType = response.headers.get("content-type") ?? "";
-  if (contentType.includes("spreadsheet")) {
-    return {
-      kind: "file",
-      filename:
-        filenameFromDisposition(response.headers.get("content-disposition")) ?? "抽取结果.xlsx",
-      blob: await response.blob(),
-    };
-  }
-  const payload = (await response.json()) as { job_id: string };
-  return { kind: "job", jobId: payload.job_id };
-}
-
-export async function downloadExportJob(jobId: string): Promise<{ filename: string; blob: Blob }> {
-  const response = await fetch("/api/v1/jobs/" + jobId + "/download");
-  if (!response.ok) throw await readError(response, "下载导出文件失败");
-  return {
-    filename:
-      filenameFromDisposition(response.headers.get("content-disposition")) ?? "抽取结果.xlsx",
-    blob: await response.blob(),
-  };
 }
 
 export function saveBlob(blob: Blob, filename: string): void {
@@ -471,81 +330,6 @@ export async function parseVersion(
   });
 }
 
-/* ---------------------------------------------------------------------------
- * 重跑与复核进度。
- *
- * 三种重跑的代价差一个量级（见 docs/设计/05 第 3.11 节），界面文案必须跟着区分：
- *   单字段重跑  → 秒级，只换一条结果；
- *   重新抽取    → 分钟级，复用解析产物，不动已确认；
- *   重新解析    → 更久，锚点全部重建，已确认结果全部打回复核。
- * ------------------------------------------------------------------------- */
-
-export interface VersionExtractResult {
-  job_id: string;
-  version_id: number;
-  run_id: number;
-  field_keys: string[];
-  status: string;
-}
-
-/**
- * 重新抽取：复用最近一次 parse_run，不重建锚点、不动已确认的结果。
- *
- * 这是「解析成功、抽取失败（一条结果都没有）」的唯一出口：项目级 rerun 是从已有
- * 结果行里筛候选的，一条都没有时它只返回 queued = 0（见后端 api/parsing.py 的说明）。
- */
-export async function rerunExtractionForVersion(
-  versionId: number,
-  options: { fieldKeys?: readonly string[]; hint?: string | null } = {},
-): Promise<VersionExtractResult> {
-  return postJson<VersionExtractResult>("/api/v1/versions/" + versionId + "/extract", {
-    field_keys: options.fieldKeys ?? [],
-    hint: options.hint?.trim() || null,
-  });
-}
-
-export interface ProjectRerunResult {
-  project_id: number;
-  queued: number;
-  skipped: number;
-  items: RerunResponse[];
-}
-
-/** 项目级批量重跑：只给**已有结果**补跑（onlyFailed 时只挑待复核/冲突/未找到）。 */
-export async function rerunProject(
-  projectId: number,
-  options: {
-    fieldKeys?: readonly string[];
-    onlyFailed?: boolean;
-    hint?: string | null;
-    limit?: number;
-  } = {},
-): Promise<ProjectRerunResult> {
-  return postJson<ProjectRerunResult>("/api/v1/projects/" + projectId + "/rerun", {
-    field_keys: options.fieldKeys ?? [],
-    only_failed: options.onlyFailed ?? false,
-    hint: options.hint?.trim() || null,
-    // 上限跟后端默认值一致：一次点到几百条会把队列与模型配额一起打满。
-    limit: options.limit ?? 50,
-  });
-}
-
-/** 项目复核进度（见 docs/设计/06 第 11 节的复核统计条）。 */
-export interface ProjectStats {
-  reviewed: number;
-  confirmed: number;
-  corrected: number;
-  supplemented: number;
-  pending_review: number;
-  cumulative_pass: Record<string, number>;
-  manual_fallback_rate: number;
-  by_review_mode: Record<string, number>;
-}
-
-export async function loadProjectStats(projectId: number): Promise<ProjectStats> {
-  return getJson<ProjectStats>("/api/v1/projects/" + projectId + "/stats");
-}
-
 /** 章节树：解析产出的标题层级。没有解析结果时后端回空数组，不是错误。 */
 export async function loadOutline(versionId: number): Promise<WireOutlineItem[]> {
   const data = await getJson<{ run_id: number | null; items: WireOutlineItem[] }>(
@@ -554,12 +338,7 @@ export async function loadOutline(versionId: number): Promise<WireOutlineItem[]>
   return data.items;
 }
 
-/**
- * 重新解析：锚点全部重建、已确认结果全部打回复核。
- *
- * 单独包一层而不是复用 parseVersion 的 force：这个调用的后果重得多，调用点必须
- * 一眼看出自己调的是「重新解析」，而不是顺手把 force 设成了 true。
- */
+/** 重新生成解析批次，既有报告继续绑定原批次，后续分析使用新批次。 */
 export async function reparseVersion(
   versionId: number,
   options: { tier: ParseTier; ocrMode: "auto" | "txt" | "ocr"; reason: string },

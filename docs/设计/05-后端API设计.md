@@ -1,5 +1,7 @@
 # 05 · 后端 API 设计
 
+> 2026-10-14：字段抽取及其复核、导出和金标接口已下线，当前分析协议见 [19](19-Agent检索与专题汇总.md)。
+
 ## 1. 设计原则
 
 - **REST + SSE**：读操作走 REST；长任务进度走 SSE（比 WebSocket 简单，且天然支持断线重连）。
@@ -18,18 +20,11 @@
 | `GET` | `/api/v1/versions/{vid}/file` | 获取 PDF 基座流（支持 Range） |
 | `GET` | `/api/v1/versions/{vid}/original` | 获取原始上传件流 |
 | `GET` | `/api/v1/versions/{vid}/pages` | 页面清单（尺寸、旋转、文本层；不含页图 URL） |
-| `POST` | `/api/v1/versions/{vid}/reparse` | **重新解析**（admin，二次确认；锚点全部重建，确认结果打回） |
-| `POST` | `/api/v1/versions/{vid}/extract` | **重新抽取**（复用既有 parse_run，不重建锚点；抽取失败后的第一出口） |
+| `POST` | `/api/v1/versions/{vid}/reparse` | **重新解析**（admin，二次确认；生成新的解析批次） |
 | `GET` | `/api/v1/versions/{vid}/pages/{page_no}/elements` | 该页元素（含 bbox、锚点、类型） |
 | `GET` | `/api/v1/versions/{vid}/outline` | 章节树 |
-| `GET` | `/api/v1/versions/{vid}/extractions` | 抽取结果（按 group/field/status 过滤） |
-| `GET` | `/api/v1/extractions/{id}` | 单条结果详情（含全部证据） |
-| `GET` | `/api/v1/extractions/{id}/attempts` | **尝试链**：每次尝试的 trigger、hint、值、参数快照 |
-| `POST` | `/api/v1/instances/{iid}/reviews` | **复核动作**（confirm/correct/supplement/reject，写 `review_action`） |
-| `POST` | `/api/v1/extractions/{id}/rerun` | **单字段重跑**（可带提示；产生新尝试） |
 | `GET` | `/api/v1/versions/{vid}/anchors/{anchor}?parse_run_id=` | **锚点反查**元素（**必须带 run**：锚点只在所属 `parse_run` 内唯一） |
 | `POST` | `/api/v1/versions/{vid}/anchors/resolve` | 批量锚点反查（请求体带 `parse_run_id`） |
-| `GET` | `/api/v1/versions/{vid}/evidence-map` | **按页聚合的证据索引**（前端一次性建索引） |
 | `GET` | `/api/v1/jobs/{job_id}` | 任务状态 |
 | `GET` | `/api/v1/jobs/{job_id}/events` | **SSE 进度流** |
 | `POST` | `/api/v1/jobs/{job_id}/cancel` | 取消任务 |
@@ -42,24 +37,14 @@
 | `PATCH` | `/api/v1/projects/{id}/files/{fid}` | 改元数据（重命名 / 角色 / 排序） |
 | `POST` | `/api/v1/projects/{id}/files/{fid}/replace` | **换内容**（新版本 + 替代关系，与改元数据严格区分） |
 | `DELETE` | `/api/v1/projects/{id}/files/{fid}` | 软删除文件（结果标记"来源已移除"） |
-| `GET` | `/api/v1/projects/{id}/conflicts` | 跨文件冲突列表 |
-| `POST` | `/api/v1/conflicts/{cid}/resolve` | 裁定冲突 |
-| `GET` | `/api/v1/projects/{id}/export` | 导出 Excel |
-| `POST` | `/api/v1/projects/{id}/rerun` | 项目级批量重跑（按字段类型 / 仅失败项） |
-| `GET` | `/api/v1/projects/{id}/stats` | 项目复核进度统计（**不做考核**，仅展示） |
-| `GET` | `/api/v1/config/items` | 配置项定义 + 当前生效值（按 L1/L2/L3 分组） |
+| `GET` | `/api/v1/config/items` | 配置项定义 + 当前生效值（按 L1/L2 分组） |
 | `GET` | `/api/v1/config/releases` | 配置版本列表 |
-| `POST` | `/api/v1/config/releases` | 创建配置版本（只动 L1 立即生效；含 L2/L3 落 draft） |
+| `POST` | `/api/v1/config/releases` | 创建配置版本（只动 L1 立即生效；含 L2 落 draft） |
 | `GET` | `/api/v1/config/releases/{id}` | 版本详情：全量值 + diff + 影响清单 + 门禁预览 + 审计 |
 | `POST` | `/api/v1/config/releases/{id}/acknowledge` | 变更影响清单逐条确认（谁确认了哪一条） |
-| `POST` | `/api/v1/config/releases/{id}/regression-runs` | 触发**回归回放**（低优先级队列） |
 | `POST` | `/api/v1/config/releases/{id}/activate` | 激活配置（受门禁约束） |
 | `POST` | `/api/v1/config/releases/{id}/rollback` | 回滚到该版本 |
 | `GET` | `/api/v1/config/audit` | 变更审计（谁 / 何时 / 哪个 key / 旧值 / 新值 / 理由） |
-| `GET` | `/api/v1/regression-runs/{id}` | 回归回放报告 + 变更影响清单 |
-| `GET` | `/api/v1/gold-items` | 回归集条目（可按字段过滤） |
-| `GET` | `/api/v1/stats/fields` | 字段类型级统计（首次通过率 / 第 k 次救回率 / 重跑按钮收起建议） |
-| `POST` | `/api/v1/spot-checks` | 生成随机抽检任务（从批量确认通过的实例中抽） |
 
 > 原 `/documents*` 四条已删：版本、解析状态与文件元数据都挂在项目文件下
 > （`/projects/{id}/files`），再留一套文档级入口会出现两条互相漂移的路径；版本详情走 `/versions/{vid}`。
@@ -166,54 +151,6 @@ GET /api/v1/versions/2048/pages/12/elements
 
 **为什么 `bbox` 用数组而不是对象**：前端直接展开为几何计算，少一层字段名映射，也便于与 MinerU 的原始格式对照。
 
-### 3.4 抽取结果
-
-```
-GET /api/v1/versions/2048/extractions?group_key=basic_info&status=auto,conflict
-```
-
-```json
-{
-  "items": [
-    {
-      "id": 9001,
-      "instance_id": 4102,          // 跨尝试不变的稳定身份
-      "run_id": 77,                 // 该结果所属的 parse_run（锚点的唯一范围）
-      "machine_attempt_no": 1,      // 机器解析序号：仅机器结果计数，人工修正为空
-      "attempt_no": 1,              // 时间线序号：含人工修正
-      "trigger": "first",           // first|hinted_rerun|user_rerun|param_rerun|reparse|manual_edit
-      "is_current": true,
-      "field_key": "bid_bond_amount",
-      "group_key": "basic_info",
-      "value": { "amount": 50000, "currency": "CNY" },
-      "value_text": "人民币伍万元整（¥50,000.00）",
-      "confidence": 0.96,
-      "status": "auto",
-      "strategy": "rule+llm",
-      "evidence_count": 1,
-      "evidence": [
-        {
-          "anchor": "p12b5",
-          "page_no": 12,
-          "bbox": [0.121, 0.402, 0.878, 0.437],
-          "char_start": 0,
-          "char_end": 31,
-          "quote": "投标保证金金额为人民币伍万元整（¥50,000.00）",
-          "quote_source": "native",
-          "match_type": "exact"
-        }
-      ]
-    }
-  ],
-  "total": 24
-}
-```
-
-**列表接口直接内嵌 evidence**：结果数量通常在百条以内，一次返回可让前端免于 N+1 请求，也便于"结果面板 → 原文高亮"的即时响应。
-**为什么列表要带 `attempt_no` / `trigger` / `is_current`**：结果面板要能直接告诉用户「这是第 2 次尝试的结果」「你的确认基于第 1 次」，并把"重跑"和"人工修正"做成可解释的动作。这三个字段不下发，前端只能靠猜。
-
-**服务端只返回 `is_current = true` 的尝试**，历史尝试走 `/extractions/{id}/attempts` 单独拉取——避免列表被历史版本撑爆。
-
 ### 3.5 锚点反查（反向标注）
 
 ```
@@ -242,23 +179,6 @@ POST /api/v1/instances/4102/reviews
   "evidence": [{ "anchor": "p12b5", "match_type": "manual" }]
 }
 ```
-
-### 3.6 证据索引（前端性能关键）
-
-```
-GET /api/v1/versions/2048/evidence-map
-```
-
-```json
-{
-  "by_page": {
-    "12": [ { "extraction_id": 9001, "anchor": "p12b5", "bbox": [...], "field_key": "bid_bond_amount" } ],
-    "27": [ { "extraction_id": 9013, "anchor": "p27b3", "bbox": [...], "field_key": "bid_deadline" } ]
-  }
-}
-```
-
-前端在文档打开时拉取一次，建立 `page_no → evidence[]` 的内存索引，翻页时查表即可，**避免每次切页都发请求**。这是"点击结果秒级定位"的性能基础。
 
 ### 3.7 批量上传文件到项目
 
@@ -302,227 +222,14 @@ POST   .../files/{fid}/replace    { "file": <新文件> }             # 生成�
 
 > 合并成一个接口会让用户以为改的是同一件事，导致溯源指向错误版本。
 
-### 3.8 导出 Excel
+### 3.9 配置发布与影响确认
 
-```
-GET /api/v1/projects/{id}/export?format=xlsx&include=all&lot=all
-```
+L1 保存后立即生效；L2 保存为草稿，管理员逐项确认变更影响后激活。配置版本、审计和任务快照继续保留。
 
-返回 `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`。
+### 3.11 文档重新解析
 
-**列定义**
-
-| 列 | 说明 |
-| --- | --- |
-| 字段名 / 分组 | |
-| 值（展示文本） | 多值字段展开成多行 |
-| 适用范围 | 全文 / 标段X |
-| 来源文件 | 项目内文件名（跨文件冲突时必须） |
-| 页码 | 物理页号 |
-| 原文片段 | `evidence.quote` |
-| 置信度 | |
-| 复核状态 | auto / verified / conflict / need_review |
-| 修正说明 | 人工修正时的备注 |
-
-**约定**：导出走**同步生成 + 短时效签名 URL**；大项目（>2000 行）改为异步生成并返回 `job_id`，完成后通知下载（复用 SSE 通道）。导出动作进审计日志。
-
-### 3.9 配置发布与回归门禁
-
-分层与生效语义见 [08-动态配置中心.md](../质量/08-动态配置中心.md) 第 2 节：
-L1（运行参数）改了立刻生效、不进回归；L2/L3 改了会改变结果，必须走"回归回放 + 影响清单逐条确认"。
-
-**创建语义**：`values` 是相对 `based_on`（默认当前 active）的**覆盖补丁**，
-服务端解析成完整值存进 `config_release.values`（表里存全量，保证可独立回放）；
-只改 L1 时返回 `status = "active"`（旧 active 自动归档），含 L2/L3 时返回 `status = "draft"`，
-激活前必须有人逐条确认影响清单。`GET /config/items` 给页面三层编辑用，
-`GET /config/audit` 回答"这个值什么时候被谁改的"。
-
-```
-POST /api/v1/config/releases                    # 创建 draft
-     { "values": {...}, "note": "调整保证金字段提示词", "based_on": 12 }
-
-POST /api/v1/config/releases/{id}/regression-runs   # 触发回归回放（低优先级队列）
-     → 202 { "job_id": "...", "regression_run_id": 903 }
-
-GET  /api/v1/regression-runs/903                # 报告
-     { "gold_total": 486, "pass_count": 461, "pass_rate": 0.9485,
-       "baseline_rate": 0.9413, "anchor_hit": 1.0,
-       "delta": { "pass_rate": 0.0072 },
-       "by_field": [ { "field_key": "bid_bond_amount", "total": 38, "pass": 37 } ],
-       "failures": [ { "field_key": "bid_bond_amount", "anchor": "p12b5", "expected": 50000, "got": 80000 } ],
-       "impact": [
-         { "kind": "field_def_changed", "ref": "bid_deadline", "acked": false },
-         { "kind": "regression_failure", "ref": "bid_bond_amount@p12b5", "acked": false }
-       ],
-       "gate": { "passed": false, "blockers": ["impact_not_acknowledged"] } }
-
-POST /api/v1/config/releases/{id}/acknowledge   # 变更影响清单逐条确认
-     { "items": [ { "kind": "regression_failure", "ref": "bid_bond_amount@p12b5" } ],
-       "comment": "已核对，该失败项为已知的表格识别问题" }
-
-POST /api/v1/config/releases/{id}/activate      # 激活
-     → 200 OK
-     → 422 { "error": { "code": "gate_failed", "detail": { "blockers": ["impact_not_acknowledged"] } } }
-```
-
-**门禁行为**
-
-- 硬门槛：幻觉率 = 0、证据反查 404 率 = 0、回归集通过率不低于当前 active、**影响清单全部确认**——任一不满足返回 422，**无强制绕过入口**。
-- 软门槛：首次通过率较当前 active 下降超 2 个百分点 → 需显式传 `{ "force": true, "reason": "..." }`，`reason` 必填且写入审计。
-- 回归集为空（冷启动阶段）时 `gold_total = 0`，只校验影响清单。
-- 报告与确认记录随 release 归档。
-
-**实现口径（2026-09-29）**
-
-- `POST .../regression-runs` 只接受 `draft` 版本；同一版本已有未完成回放时返回 409 `regression_in_flight`（`detail.regression_run_id` 指向在跑的那次）。
-- 回放走独立 `regression` 队列（低优先级、与交互任务隔离），复用 `sha256` 对应的原件与既有 `parse_run`，**只重跑抽取**——重跑 MinerU 属于 09 第 5.3 节"重新解析"这条要二次确认的路径，不在回放里做。
-- 门禁只认 `finished_at` 非空的报告：回放在跑时按"报告未产出"处理（冷启动口径），跑完或失败收口后同一函数自动生效。
-- 整轮回放起不来（模型网关不可用等）时报告写 `failures[].kind = replay_error`，门禁以硬门槛 `regression_run_failed` 拦住激活——"不倒退"这条不能被空报告绕过去。
-- `gold_unavailable`（文档/解析产物已清理）只进失败明细，不计入通过率分母；`extraction_failed`（单条抽取异常）计为失败但不生成影响条目。
-
-**为什么把"确认"做成独立接口，而不是 activate 请求体里的一个布尔值**：门禁事后要能回答「谁、在什么时候、确认了哪一条影响」。塞进 activate 的请求体里，就再也分不清"真看过了"和"顺手点了确定"。
-
-详见 [08-动态配置中心.md](../质量/08-动态配置中心.md) 与 [09-评测与质量门禁.md](../质量/09-评测与质量门禁.md)。
-
-### 3.10 复核动作（事实标准的生产入口）
-
-```
-POST /api/v1/instances/4102/reviews
-{
-  "attempt_id": 9001,
-  "action": "correct",              // confirm|correct|supplement|reject
-  "review_mode": "item",            // item|batch|spot_check
-  "new_value": { "amount": 80000, "currency": "CNY" },
-  "evidence": [{ "anchor": "p12b5", "match_type": "manual", "quote": "…" }],
-  "comment": "补充通知已调整保证金"
-}
-→ 201 { "review_action_id": 7710, "instance_id": 4102, "result_attempt_id": 9200, "converged": true }
-```
-
-服务端强制约束：
-
-| action | 必填 | 说明 |
-| --- | --- | --- |
-| `confirm` | `attempt_id`、`review_mode` | `review_mode=batch` 时允许不带 evidence |
-| `correct` | 以上 + `new_value` + **`evidence` ≥ 1** | 锚点必须能在当前 version 的 `element` 中查到，否则 422 `anchor_not_found` |
-| `supplement` | 同 `correct` | 原 attempt 通常为 `not_found` |
-| `reject` | `attempt_id`、`comment` | 记录原因 |
-
-**"文档中确实没有"怎么表达**：`action=confirm` + 该 attempt 的 `status=not_found`，即"确认系统判断正确"。**不允许用 `correct` 去表达"没有"**，否则会产出一条值为空的 gold，污染回归集。
-
-**为什么 `correct` 的锚点必须硬校验**：锚点是这套系统唯一不可替代的产出。允许不带锚点（或带一个查不到的锚点）的修正，等于允许 gold 集被污染，而且污染是静默的。
-
-### 3.11 重跑（三种，代价各差一个量级）
-
-**单字段重跑**
-
-```
-POST /api/v1/extractions/9001/rerun
-{
-  "hint": "该值可能出现在投标人须知前附表或评标办法章节",   // 可空；为空即 user_rerun
-  "priority": "interactive"
-}
-→ 202 { "job_id": "...", "instance_id": 4102, "next_machine_attempt_no": 2 }
-```
-
-- 服务端复用现有 `parse_run` / `element`，**不触发上游任何阶段**；
-- 新尝试以 `is_current = true` 落库，旧尝试自动置 `false`；
-- 同一实例已有进行中的重跑时返回 **409 `rerun_in_flight`**，避免用户连点刷出一堆无意义尝试。
-
-**重新抽取（版本级，复用解析产物）**
-
-```
-POST /api/v1/versions/2048/extract
-{
-  "field_keys": [],                              // 空 = 全部字段类型
-  "hint": null                                   // 非空即 hinted_rerun
-}
-→ 202 { "job_id": "...", "version_id": 2048, "run_id": 77, "field_keys": [...], "status": "pending" }
-```
-
-- 复用最近的 `parse_run` / `element`，**不重建锚点、不动页面上已确认的结果**；
-- 抽取失败（模型不可用、密钥缺失、worker 崩溃）后的第一出口：这种局面下 `parse_run` 多半已是
-  `completed`，而 `/projects/{id}/rerun` 是从**已有结果行**里筛候选的，一条都没有 → 只能走这个入口；
-- 最新 run 不是 `completed` / `partial` 时返回 **409 `parse_incomplete`**（该先走重新解析）；
-- 同版本已有在途抽取任务时返回 **409 `rerun_in_flight`**；
-- 版本不存在返回 **404 `not_found`**，版本下没有可解析文件（主文件已删或标为不可解析）返回
-  **409 `version_not_parseable`**，`field_keys` 含未知字段返回 **400 `invalid_argument`**（空数组合法，= 全部字段）。
-
-**重新解析（管理员）**
-
-```
-POST /api/v1/versions/2048/reparse
-{
-  "tier": "standard",
-  "ocr_mode": "auto",
-  "reason": "MinerU 升级到 4.1，需重建坐标系",
-  "acknowledge_invalidated_count": 318        // 必须与后端算出的数量一致
-}
-→ 202 { "job_id": "...", "invalidated_instances": 318 }
-```
-
-- 走完整链路（重新上传 → 解析 → 重抽），**锚点全部重建**；
-- 受影响实例全部打回待复核队列顶部，并在项目视图里显示"因重新解析被打回"。
-
-**`acknowledge_invalidated_count` 的设计意图**：把"你即将让 318 条已确认结果失效"变成一次**必须复述数字**的确认，而不是一路点"确定"。数量由前端先查、后端再核，对不上直接 409——防止用户在数字已经变化之后误确认。
-
-### 3.12 统计
-
-```
-GET /api/v1/projects/{id}/stats
-{
-  "reviewed": 212, "confirmed": 189, "corrected": 18, "supplemented": 5,
-  "pending_review": 64,
-  "cumulative_pass": { "1": 0.8915, "2": 0.9434, "3": 0.9623 },
-  "manual_fallback_rate": 0.1085
-}
-```
-
-```
-GET /api/v1/stats/fields?scope=all&window=90d
-{
-  "items": [
-    { "field_key": "bid_bond_amount",
-      "reviewed": 486,
-      "first_pass_rate": 0.9012,
-      "rescue_rate": { "2": 0.4583, "3": 0.1538 },
-      "cumulative_pass": { "1": 0.9012, "2": 0.9465, "3": 0.9547 },
-      "manual_fallback_rate": 0.0412,
-      "rerun_button": "show_hint" }
-  ]
-}
-```
-
-**`rerun_button` 由服务端下发，不由前端计算**：判断逻辑（样本量 ≥ 30、救回率阈值）属于业务规则，改阈值时不应要求前端跟着发版。前端只按 `show` / `show_hint` / `hide` 三种值渲染。
-
-> **样本量不足时一律返回 `show`**：宁可让用户多看到一个可能没用的按钮，也不要因为 3 条样本的噪声把按钮藏掉。
-
-**实现口径（2026-09-29）**：顶层数字只代表「逐条复核」档（`review_mode = item`），
-批量与抽检档原样放在每个字段的 `by_mode` 里——三档合并会把没人真看过的批量确认算成准确率。
-`rerun_button` 也只看逐条档的样本量与第 2 次救回率。响应额外带 `system` 块：
-`anchor_404_rate`（必须恒为 0）与 `bbox_missing_rate`（降级为页级定位的证据比例）。
-`rescue_rate` / `cumulative_pass` 的键是机器解析序号（`"2"`、`"3"`）。
-
-**项目统计不做考核**：`GET /projects/{id}/stats` 只服务于项目内的进度展示，**接口层面不提供跨项目排名**（不提供排序参数、不返回其他项目的数据）。
-
-### 3.13 随机抽检
-
-```
-POST /api/v1/spot-checks
-{ "size": 40, "window": "7d", "field_keys": ["bid_bond_amount", "bid_deadline"] }
-→ 201 { "job_id": "...", "sampled": 40 }
-```
-
-- 抽样范围：当期 `review_mode = batch` 且结果为 `confirm` 的实例；
-- 抽出的实例生成 `spot_check` 复核任务进队列，**打标区分**，不混进日常队列的排序；
-- 结论落 `review_action`（`review_mode = spot_check`），用于**校准 `batch` 档的通过率**，是唯一无偏的准确率估计（见 [09](../质量/09-评测与质量门禁.md) 第 6.1 节）。
-
-**为什么抽检对象是"批量确认通过的"**：逐条复核的实例已经有人真看过了，再抽是浪费。真正需要校准的，恰恰是"没人真看"的那一档。
-
-**实现口径（2026-09-29）**：抽样框是「最后一次复核结论为 `review_mode = batch` 且动作为 `confirm` 的尝试」
-（期间又被逐条复核过的尝试会被排掉），同一个实例在批量确认之后已被抽检过的不重复抽。
-抽样是同步完成的：一次 `ORDER BY random() LIMIT` + 插入 `review_task(reason = spot_check)`，
-所以 `job_id` 只是本次抽样批次号（关联号），明细是响应里的 `review_task_ids`。
+POST /api/v1/versions/{vid}/reparse 重新生成解析批次，沿用或显式指定档位与 OCR 模式。
+已有分析报告固定原资料快照，新报告使用最新解析。专题重试走报告的 /retry 接口。
 
 ### 3.14 本轮新增的响应字段（不是新端点）
 
@@ -531,8 +238,6 @@ POST /api/v1/spot-checks
 
 | 端点 | 新增字段 | 用途 |
 | --- | --- | --- |
-| `GET /versions/{vid}` | `latest_extraction_job` | 最近一次 `stage='extracting'` 的 job（`status` / `error_code` / `error_message` / `created_at` / `finished_at`），`null` = 从没排过抽取。工作台的「抽取失败」态要直接说出原因，而这个原因只存在于 `job` 行上 |
-| `GET /projects/{id}` 的 `files[]` | `confirmed_count` | 该版本 `is_current` 且 `status='verified'` 的条数。重新解析前的二次确认必须列出「将失效的已确认结果数量」（见 09 第 5.2 节） |
 | `GET /projects/{id}` 的 `files[]` | `parse_tier` / `parse_ocr_mode` | 最近一次 `parse_run` 的档位与 OCR 模式（后者取自 `config_snapshot ->> 'ocr_mode'`）。文件清单页的「重新解析」要沿用它们，否则 `advanced` / `ocr` 的文件会被静默降回默认档 |
 
 为什么只取「最近一条」抽取任务：界面要解释的是「这一次为什么一条结果都没有」，
@@ -611,7 +316,7 @@ data: {"status":"completed","version_id":2048}
 | `viewer` | 查看项目、页面、结果、证据。**不能下载原件** |
 | `reviewer` | viewer + **下载原件** + 复核/修正结果 + 重跑单字段 |
 | `operator` | reviewer + 上传/增删改项目文件、触发解析、取消任务、改 L1 配置 |
-| `admin` | operator + 删除项目、L2/L3 配置发布、冲突裁定、导出全量数据、**重新解析文档**、**发起抽检** |
+| `admin` | operator + 删除项目、L2 配置发布、冲突裁定、导出全量数据、**重新解析文档**、**发起抽检** |
 
 - 所有资源查询强制带 `company_id` 过滤（多租户隔离在数据层，不在应用层靠判断）。
 - 文档下载走**短时效签名 URL**（原件属于敏感资产），并记录审计日志：谁、何时、下载了哪一版。

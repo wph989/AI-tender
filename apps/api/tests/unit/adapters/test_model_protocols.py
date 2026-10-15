@@ -9,10 +9,10 @@ import pytest
 from tender.adapters.openai_chat import OpenAIChatModel
 from tender.adapters.rerank_http import HttpRerankModel
 from tender.domain.errors import (
-    ExtractionFailed,
-    ExtractionUnavailable,
     InvalidModelOutput,
+    ModelCallFailed,
     ModelRefused,
+    ModelUnavailable,
 )
 
 
@@ -96,9 +96,9 @@ def test_native_request_paths_headers_and_usage(protocol, mode, path, payload):
     "payload,error",
     [
         ({"choices": [{"message": {"refusal": "private text", "content": None}}]}, ModelRefused),
-        ({"choices": [{"message": {"content": "[]"}}]}, ExtractionFailed),
-        ({"choices": [{"message": {"content": "invalid"}}]}, ExtractionFailed),
-        (None, ExtractionFailed),
+        ({"choices": [{"message": {"content": "[]"}}]}, ModelCallFailed),
+        ({"choices": [{"message": {"content": "invalid"}}]}, ModelCallFailed),
+        (None, ModelCallFailed),
     ],
 )
 def test_invalid_or_refused_output_has_safe_error(payload, error):
@@ -120,7 +120,7 @@ def test_nonstandard_gateway_5xx_is_retryable():
             base_url="http://test/",
             transport=httpx.MockTransport(lambda _: httpx.Response(524, text="timeout")),
         ) as client:
-            with pytest.raises(ExtractionUnavailable) as caught:
+            with pytest.raises(ModelUnavailable) as caught:
                 await OpenAIChatModel("http://test", "fixture", client=client).complete("测试")
             assert caught.value.http_status == 524
 
@@ -135,7 +135,7 @@ def test_rate_limit_preserves_retry_after_without_echoing_body():
                 lambda _: httpx.Response(429, headers={"Retry-After": "2"}, text="secret-key")
             ),
         ) as client:
-            with pytest.raises(ExtractionUnavailable) as caught:
+            with pytest.raises(ModelUnavailable) as caught:
                 await OpenAIChatModel("http://test", "fixture", client=client).complete("测试")
             assert caught.value.retry_after == 2
             assert "secret-key" not in str(caught.value)
@@ -155,10 +155,10 @@ def test_empty_body_is_retryable_and_never_uses_reasoning(content):
         ) as client:
             model = OpenAIChatModel("http://test", "fixture", client=client)
             # 200+空正文是网关截断，不是模型输出：必须归类为可重试，不能直接失败或降级。
-            with pytest.raises(ExtractionUnavailable, match="空文本") as caught:
+            with pytest.raises(ModelUnavailable, match="空文本") as caught:
                 await model.complete("测试")
             assert caught.value.http_status == 200
-            with pytest.raises(ExtractionUnavailable) as plain:
+            with pytest.raises(ModelUnavailable) as plain:
                 await model.complete("测试", json_mode=False)
             assert not isinstance(plain.value, InvalidModelOutput)
 
@@ -187,7 +187,7 @@ def test_only_complete_json_fences_are_unwrapped(content, accepted):
             if accepted:
                 assert json.loads((await model.complete("测试")).content) == {"金额": "80万元"}
             else:
-                with pytest.raises(ExtractionFailed):
+                with pytest.raises(ModelCallFailed):
                     await model.complete("测试")
             # 普通文本模式须保留原响应，不能因为看起来像 JSON 就改写用户文本。
             assert (await model.complete("测试", json_mode=False)).content == content
@@ -211,7 +211,7 @@ def test_rerank_rejects_wrong_identity_and_scores(rows):
             base_url="http://test/",
             transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"results": rows})),
         ) as client:
-            with pytest.raises(ExtractionFailed):
+            with pytest.raises(ModelCallFailed):
                 await HttpRerankModel("http://test", "fixture", client=client).rerank(
                     "测试", ["甲", "乙"], 2
                 )

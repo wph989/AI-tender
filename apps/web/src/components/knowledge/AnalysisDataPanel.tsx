@@ -10,7 +10,7 @@ import type {
 
 const readinessLabels = { usable: "依据可用", partial: "有待核对事项", unavailable: "依据不足" };
 const coverageLabels: Record<string, string> = {
-  extracted: "已提取", searched_not_found: "本次检索未找到", pending: "待补读",
+  extracted: "已汇总", searched_not_found: "本次检索未找到", pending: "待补读",
   not_applicable: "已确认不适用", unchecked: "未检查",
 };
 
@@ -59,6 +59,8 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
 
   useEffect(() => {
     setSnapshot(null);
+    // 新一轮快照加载完成前不能沿用上轮标段，单标段默认值由 reload 核实后设置。
+    setLotId(undefined);
     setContext(null);
     setOpen(false);
     setPreviewError(null);
@@ -177,7 +179,8 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
           onChange={(value: number) => {
             previewAbort.current?.abort(); setBusy(false); setLotId(value); setContext(null); setPreviewError(null);
           }} /> : <Tag>项目级编制</Tag>}
-        <Button type="primary" loading={busy} disabled={Boolean(data?.lots.length && !lotId)}
+        <Button type="primary" aria-label="加载编制依据" loading={busy}
+          disabled={!snapshot || loading || Boolean(data?.lots.length && !lotId)}
           onClick={() => void preview()}>加载编制依据</Button>
       </Space>
       {previewError && <Alert className="mb-3" type="error" title={previewError} />}

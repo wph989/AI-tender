@@ -65,7 +65,6 @@ export const project = {
   status: "active",
   created_at: date,
   file_count: 1,
-  review_count: 0,
   failed_count: 1,
   files: [
     {
@@ -87,10 +86,6 @@ export const project = {
       parse_ocr_mode: "ocr",
       latest_run_id: 1,
       replaced_by_id: null,
-      extraction_count: 3,
-      review_count: 0,
-      confirmed_count: 3,
-      extraction_status: "failed",
       latest_job: null,
     },
   ],
@@ -120,10 +115,10 @@ export const releases = Array.from({ length: 12 }, (_, i) => ({
 export const calls = Array.from({ length: 30 }, (_, i) => ({
   id: i + 1,
   invocation_id: "chain-1",
-  feature_key: "extract",
+  feature_key: "analysis",
   display_name: `请求模型 ${i + 1}`,
   provider_name: "测试供应商",
-  purpose: "extract",
+  purpose: "analysis",
   status: "ok",
   latency_ms: 500,
   request_ordinal: i + 1,
@@ -160,8 +155,8 @@ export async function mockApi(page: Page) {
       body = {
         items: [
           {
-            key: "extract",
-            name: "字段抽取",
+            key: "analysis",
+            name: "招标专题解析",
             required_kind: "language",
             revision: 1,
             bindings: [],

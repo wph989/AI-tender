@@ -166,10 +166,10 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
         </div>
         <div className="ml-auto flex shrink-0 gap-2">
           <Link
-            href={"/projects/" + projectId + "?view=fields"}
+            href={"/projects/" + projectId + "?view=document"}
             className={BUTTON_CLASS}
           >
-            字段复核
+            文档预览
           </Link>
           <Link
             href={"/projects/" + projectId + "/files"}
@@ -482,7 +482,8 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
             </div>
             <div hidden={tab !== "report"}>
               {/* 放进结果滚动区，展开长清单时仍为原文和窄屏定位保留可用高度。 */}
-              {report?.data_schema_version && <AnalysisDataPanel report={report} onLocate={(ref) => void locate(ref)} />}
+              {/* 报告切换时重新挂载，避免新报告短暂沿用旧快照、标段选择或预览请求。 */}
+              {report?.data_schema_version && <AnalysisDataPanel key={report.id} report={report} onLocate={(ref) => void locate(ref)} />}
               {!report ? (
                 <div className="empty-state">
                   <span className="empty-icon">
@@ -655,7 +656,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                   {!!report.summary?.length && (
                     <details className="report-module mb-4">
                       <summary className="cursor-pointer text-sm font-medium">
-                        综合字段 · {report.summary.length} 项
+                        综合汇总 · {report.summary.length} 项
                       </summary>
                       <p className="my-3 text-xs text-slate-500">
                         合并重复事项，保留各份来源与不同结论。详细专题见下方。
@@ -804,6 +805,18 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                         </Button>
                                       </p>
                                     )}
+                                  {(current.research_summary || !!current.research_gaps?.length) && (
+                                    <details className="mb-4 text-sm text-slate-500">
+                                      <summary className="cursor-pointer">检索范围与未决事项</summary>
+                                      <p className="mt-2 whitespace-pre-wrap">{current.research_summary}</p>
+                                      {!!current.research_gaps?.length && (
+                                        <ul className="mt-2 list-disc space-y-1 pl-5">
+                                          {current.research_gaps.map((gap) =>
+                                            <li key={gap.key}>{gap.detail}</li>)}
+                                        </ul>
+                                      )}
+                                    </details>
+                                  )}
                                   {current.items.length > 0 ? (
                                     <>
                                       {current.status !== "completed" && (

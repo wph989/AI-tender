@@ -28,14 +28,12 @@ def test_every_stream_has_a_task_and_stages() -> None:
             assert stream.limit_key.endswith(".max_inflight"), stream.limit_key
 
 
-def test_streams_cover_the_three_gated_queues_and_export() -> None:
-    """三条队列各自受名下的 max_inflight 约束；导出只借道派发，不设闸门。"""
+def test_streams_only_dispatch_conversion_and_parsing() -> None:
+    """文件派发只保留转换和解析，专题分析由报告调度器执行。"""
     limits = {stream.name: stream.limit_key for stream in STREAMS}
     assert limits == {
         "convert": "convert.max_inflight",
         "parse": "parse.max_inflight",
-        "extract": "extract.max_inflight",
-        "export": None,
     }
 
 

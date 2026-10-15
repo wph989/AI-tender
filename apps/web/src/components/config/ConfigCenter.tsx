@@ -42,7 +42,7 @@ export function ConfigCenter() {
       breadcrumb={[<span>设置</span>, <span>配置中心</span>]}
       eyebrow="设置 · 配置"
       title="配置中心"
-      description="管理文件转换、解析与抽取规则。模型与分析预算请到模型管理调整。"
+      description="管理文件转换与解析规则。模型与分析预算请到模型管理调整。"
     >
       <ConfigWorkspace scope="system" />
     </PageShell>
@@ -223,7 +223,7 @@ export function ConfigWorkspace({ scope }: { scope: "system" | "models" }) {
                   ? scope === "models" ? "分析运行预算" : "运行参数"
                   : layer === "L2"
                     ? scope === "models" ? "模型辅助解析" : "解析配置"
-                    : scope === "models" ? "抽取模型策略" : "抽取配置",
+                    : "解析配置",
               forceRender: true,
               children: (
                 <LayerEditor

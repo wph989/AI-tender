@@ -9,6 +9,7 @@ from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tender.application.analysis_output import canonical_topic, record_output
 from tender.application.knowledge import dedupe_citations, fingerprint, normalized, validate_items
 
 DATA_VERSION = "1"
@@ -73,6 +74,7 @@ class BusinessRecord(DataInput):
     kind: Literal["fact", "requirement", "lot", "format_node", "relation"]
     title: str = Field(min_length=1, max_length=300)
     text: str = Field(min_length=1)
+    content: dict[str, str | list[str]] = Field(default_factory=dict)
     scope: DataScope
     citations: list[DataCitation] = Field(min_length=1)
     group: str = ""
@@ -93,12 +95,10 @@ class BusinessRecord(DataInput):
 
     @model_validator(mode="after")
     def check_kind(self):
-        if self.kind == "lot" and not (self.code and self.code.strip()):
-            raise ValueError("标段必须保留原文编号 code")
+        # 招标文件可能只给标段名称；code 只保存原文编号，不能为满足协议让模型编造。
         if self.kind == "format_node" and self.node_type is None:
             raise ValueError("格式节点必须声明 node_type")
-        if self.node_type == "group" and self.parent_key:
-            raise ValueError("逻辑标容器必须是根节点")
+        # 原文的分组可以嵌套；是否循环、父节点是否存在由完整结构检查判断。
         if self.kind == "relation" and not all(
             (self.predicate, self.subject_key, self.object_key)
         ):
@@ -108,6 +108,13 @@ class BusinessRecord(DataInput):
         if self.kind != "relation" and (self.predicate or self.subject_key or self.object_key):
             raise ValueError("仅关系记录可声明关系端点")
         return self
+
+
+class SynthesisRecord(BusinessRecord):
+    """汇总工具只需填专题内容，通用业务文本由服务端从内容确定性生成。"""
+
+    text: str = ""
+    content: dict[str, str | list[str]] = Field(min_length=1)
 
 
 class CoverageInput(DataInput):
@@ -152,9 +159,22 @@ def prepare_records(
         item["business"]["key"]: item["business"]
         for item in state.get("staged_items", []) if item.get("business")
     }
+    outputs = {}
+    if state.get("output_schema"):
+        # 同批关系可先于端点；必须先生成整批文本，避免关系复制尚未生成的空文本。
+        for entry in records:
+            output = record_output(entry, state["output_schema"])
+            entry["content"] = output["content"]
+            # 展示与业务上下文来自同一份已校验 JSON，避免另写 text 又退回原文摘录。
+            entry["text"] = "\n".join(
+                f"{name}：" + ("\n".join(value) if isinstance(value, list) else value)
+                for name, value in entry["content"].items()
+            )
+            outputs[entry["key"]] = output
     combined = existing | {entry["key"]: entry for entry in records}
     result = []
     for entry in records:
+        output = outputs.get(entry["key"])
         if entry["kind"] == "lot" and module_key != "project_basic_info_parsing":
             raise ValueError("标段目录由项目概况模块提交；其它模块填写 scope.lot_refs")
         if entry["kind"] == "format_node" and module_key != "bid_format_outline_parsing":
@@ -177,7 +197,7 @@ def prepare_records(
             for endpoint in ("subject", "object"):
                 target = combined.get(entry[endpoint + "_key"])
                 if not target or target["kind"] in {"lot", "relation"}:
-                    raise ValueError("关系端点必须先提交为本模块的事实、要求或格式节点")
+                    raise ValueError("关系端点必须是同批或已提交的本模块事实、要求或格式节点")
                 entry[endpoint + "_text"] = target["text"]
                 refs.extend(target["citations"])
         # 所有属性与本条文本共用一套证据送审；禁止先审展示文字再补入未经验证的属性。
@@ -189,6 +209,8 @@ def prepare_records(
         entry.update(id=record_identity(state, entry["key"]), module_key=module_key)
         entry["citations"] = item["values"][0]["citations"]
         item.update(id=entry["id"], business=entry)
+        if output is not None:
+            item["output"] = output
         result.append(item)
     return result
 
@@ -196,17 +218,18 @@ def prepare_records(
 def prepare_coverage(
     raw: list[CoverageInput], state: dict, seen: dict, topics: list[dict], module_key: str,
 ) -> tuple[list[dict], list[dict]]:
-    allowed = {t["key"] for t in topics}
     entries, reviews = [], []
     for value in raw:
         entry = value.model_dump()
-        if entry["topic"] not in allowed:
-            raise ValueError("覆盖主题必须来自当前 Skill 的 coverage.json")
+        entry["topic"] = canonical_topic(entry["topic"], topics)
         if entry["status"] == "extracted" and not entry["record_keys"]:
-            raise ValueError("已提取的主题必须关联 record_keys")
+            entry.update(status="pending", detail="已保留分析结果，主题与具体条目的关联待核对")
         if entry["status"] == "not_applicable":
             if not entry["citations"]:
-                raise ValueError("确认不适用必须提供原文依据")
+                # 无证明不能发布“不适用”结论，但也不应阻断其它有原文支持的分析条目。
+                entry.update(status="pending", detail="不适用说明缺少原文依据，待核对")
+                entries.append(entry)
+                continue
             item = validate_items([{
                 "field": "主题不适用：" + entry["topic"],
                 "values": [{"value": entry["detail"], "citations": entry["citations"]}],
@@ -240,7 +263,10 @@ def module_data(state: dict) -> dict:
         "coverage": copy.deepcopy(state.get("business_coverage", [])),
         "gaps": copy.deepcopy(state.get("business_gaps", [])),
         "topics": copy.deepcopy(state.get("business_topics", [])),
-        "research_summary": state.get("draft", {}).get("research_summary", ""),
+        "research_summary": state.get("draft", {}).get(
+            "research_summary", state.get("research_completed", {}).get("research_summary", "")
+        ),
+        "research": copy.deepcopy(state.get("research_completed", {})),
     }
 
 
@@ -274,6 +300,7 @@ def resolve_scope(scope: dict, lots: list[dict]) -> dict:
     for ref in scope["lot_refs"]:
         matched = [lot["lot_id"] for lot in lots if normalized(ref) in {
             normalized(s) for s in [lot["code"], lot["title"], *lot.get("aliases", [])]
+            if s
         }]
         if len(set(matched)) != 1:
             return {"kind": "unknown", "lot_ids": [], "lot_refs": scope["lot_refs"]}
@@ -385,7 +412,7 @@ def assemble_dataset(modules: list[dict], lots: list[dict]) -> dict:
                 covered_scopes = [resolve_scope(c["scope"], lots) for c in entries]
                 entries = [*entries, *[{
                     "topic": topic["key"], "status": "unchecked",
-                    "scope": {"kind": "lots", "lot_refs": [lot["code"]]},
+                    "scope": {"kind": "lots", "lot_refs": [lot["code"] or lot["title"]]},
                     "detail": "此标段的主题尚未完成核对", "record_keys": [],
                 } for lot in lots if not any(
                     matches_scope(scope, lot["lot_id"]) for scope in covered_scopes

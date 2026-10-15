@@ -9,11 +9,11 @@ from langchain_core.messages import HumanMessage, ToolMessage, message_to_dict
 
 from tender.adapters.agent_chat import AgentChat
 from tender.domain.errors import (
-    ExtractionFailed,
-    ExtractionUnavailable,
     InvalidModelOutput,
+    ModelCallFailed,
     ModelOutputTruncated,
     ModelRefused,
+    ModelUnavailable,
 )
 
 TOOL = {
@@ -192,7 +192,7 @@ def test_stream_without_finish_reason_is_not_delivered_as_submission():
 
     async def run():
         try:
-            with pytest.raises(ExtractionUnavailable, match="未完整结束"):
+            with pytest.raises(ModelUnavailable, match="未完整结束"):
                 await model.chat([message_to_dict(HumanMessage(content="检索"))], [TOOL])
         finally:
             await model.aclose()
@@ -202,8 +202,8 @@ def test_stream_without_finish_reason_is_not_delivered_as_submission():
 @pytest.mark.parametrize(
     "status,expected",
     [
-        *[(status, ExtractionUnavailable) for status in (408, 429, 500, 502, 503, 504, 524, 599)],
-        (401, ExtractionFailed),
+        *[(status, ModelUnavailable) for status in (408, 429, 500, 502, 503, 504, 524, 599)],
+        (401, ModelCallFailed),
     ],
 )
 def test_no_hidden_retries_or_sensitive_errors(status, expected):
@@ -247,7 +247,7 @@ def test_429_http_date_uses_server_clock_for_retry_after():
             )
         )
         try:
-            with pytest.raises(ExtractionUnavailable) as error:
+            with pytest.raises(ModelUnavailable) as error:
                 await model.chat([message_to_dict(HumanMessage(content="检索"))], [TOOL])
             assert error.value.retry_after == 5
         finally:

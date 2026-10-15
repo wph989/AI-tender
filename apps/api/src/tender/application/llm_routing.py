@@ -11,11 +11,11 @@ from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from tender.domain.errors import (
-    ExtractionFailed,
-    ExtractionUnavailable,
     InvalidModelOutput,
+    ModelCallFailed,
     ModelOutputTruncated,
     ModelRefused,
+    ModelUnavailable,
     TenderError,
 )
 from tender.ports.llm import ChatGateway, Completion, ModelGateway
@@ -143,7 +143,7 @@ class RoutingModel:
 
     async def _complete(self, prompt: str, chat_request: dict | None = None) -> Completion:
         if not self._candidates:
-            raise ExtractionFailed(
+            raise ModelCallFailed(
                 f"功能 {self._feature_key} 没有可用模型，请在模型管理中配置并绑定"
             )
         invocation_id = str(uuid4())
@@ -171,13 +171,13 @@ class RoutingModel:
             native_request = chat_request
             for retry in range(max(snapshot.extra_retries, 2) + 1):
                 if request_count >= self._max_total or time.monotonic() >= deadline:
-                    raise ExtractionFailed("模型调用已达到总请求次数或时间上限，请查看调用记录")
+                    raise ModelCallFailed("模型调用已达到总请求次数或时间上限，请查看调用记录")
                 delay = self._remaining(snapshot)
                 if delay and any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
                     break
                 while delay > 0:
                     if time.monotonic() + delay >= deadline:
-                        raise ExtractionFailed("模型调用时间预算不足以等待供应商限流恢复")
+                        raise ModelCallFailed("模型调用时间预算不足以等待供应商限流恢复")
                     # 短等待便于取消；跨worker新收到的429可以继续延长当前等待。
                     await asyncio.sleep(min(delay, 1))
                     delay = self._remaining(snapshot)
@@ -249,8 +249,8 @@ class RoutingModel:
                     raise
                 except (TenderError, TimeoutError) as exc:
                     if isinstance(exc, TimeoutError):
-                        exc = ExtractionUnavailable("模型请求超时，供应商执行结果未知")
-                    unavailable = isinstance(exc, ExtractionUnavailable)
+                        exc = ModelUnavailable("模型请求超时，供应商执行结果未知")
+                    unavailable = isinstance(exc, ModelUnavailable)
                     unavailable_only = unavailable_only and unavailable
                     self._on_call(
                         replace(
@@ -279,7 +279,7 @@ class RoutingModel:
                         if any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
                             break
                     if isinstance(exc, ModelRefused) or not isinstance(
-                        exc, (ExtractionFailed, ExtractionUnavailable)
+                        exc, (ModelCallFailed, ModelUnavailable)
                     ):
                         # 本地权限或业务约束错误不允许通过切换模型绕过。
                         raise exc
@@ -325,7 +325,7 @@ class RoutingModel:
                         if time.monotonic() + delay >= deadline:
                             if any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
                                 break
-                            raise ExtractionFailed("模型调用时间预算不足以再次请求") from exc
+                            raise ModelCallFailed("模型调用时间预算不足以再次请求") from exc
                         await asyncio.sleep(delay)
                         continue
                     break
@@ -342,8 +342,8 @@ class RoutingModel:
                 return replace(completion, registry_model_id=candidate.registry_model_id)
         message = str(first_error) if first_error else "当前模型均已停用或不可调用"
         if unavailable_only and first_error:
-            raise ExtractionUnavailable(message)
-        raise ExtractionFailed(message)
+            raise ModelUnavailable(message)
+        raise ModelCallFailed(message)
 
     async def aclose(self) -> None:
         for client in self._clients.values():

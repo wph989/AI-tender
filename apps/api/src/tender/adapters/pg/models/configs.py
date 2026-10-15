@@ -1,12 +1,11 @@
-"""配置中心与回归：config_* / job_config_snapshot / regression_run。"""
+"""配置中心：config_* / job_config_snapshot。"""
 
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,7 +38,6 @@ class ConfigRelease(Base):
     values: Mapped[dict[str, Any]] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(Text)
     based_on: Mapped[int | None] = mapped_column(BigInteger)
-    regression_run_id: Mapped[int | None] = mapped_column(BigInteger)
     note: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -82,22 +80,3 @@ class ConfigAck(Base):
     actor: Mapped[str] = mapped_column(Text)
     comment: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-
-
-class RegressionRun(Base):
-    """回归回放：一次参数变更的回放报告。"""
-
-    __tablename__ = "regression_run"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    release_id: Mapped[int] = mapped_column(BigInteger)
-    gold_total: Mapped[int] = mapped_column(Integer)
-    pass_count: Mapped[int] = mapped_column(Integer)
-    fail_count: Mapped[int] = mapped_column(Integer)
-    baseline_rate: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
-    anchor_hit: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
-    by_field: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    failures: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
-    impact_items: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

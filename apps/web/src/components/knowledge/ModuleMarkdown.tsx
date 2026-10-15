@@ -7,8 +7,8 @@ import { Icon } from "@/components/Icon";
 import type { AnalysisField, Citation, FieldValue } from "@/types/knowledge";
 
 /**
- * 解析结果 Markdown 表格视图：一行一个字段，列为「字段 / 解析值」。
- * - 表格形态便于横向对照同组字段，也避免旧版卡片流把同一处引用铺成整屏。
+ * 专题结果优先使用 Skill 定义的分类、列名和树结构；历史报告保留原有投影。
+ * - 定位与综合正文独立绑定，让归纳后的要求仍可回查完整原文。
  * - 定位图标跟在取值后面（不单独占一列）：图标紧贴它要证明的那个值，一眼能看出值得位置。
  *   同一个值里重复的同一处原文按“资料 + 元素 + 页 + 摘录”去重，只留一个图标。
  * - 每个值仍绑定自己的引用（经校验的真实依据），重复值提醒与未支持提示保持原样。
@@ -25,6 +25,10 @@ export function ModuleMarkdown({
 }) {
   const groups = useMemo(() => groupFields(items), [items]);
   const conflicts = useMemo(() => items.filter(needsReview), [items]);
+
+  if (items.some((item) => item.output)) {
+    return <StructuredModule items={items} onLocate={onLocate} activeId={activeId} />;
+  }
 
   return (
     <div className="module-markdown">
@@ -114,6 +118,100 @@ export function ModuleMarkdown({
           </table>
         </section>
       ))}
+    </div>
+  );
+}
+
+/** 使用专题 JSON 的真实列与条目层级；旧报告仍由上方投影展示，避免伪造历史汇总。 */
+function StructuredModule({
+  items, onLocate, activeId,
+}: {
+  items: AnalysisField[];
+  onLocate: (ref: Citation) => void;
+  activeId?: string;
+}) {
+  const groups = groupFields(items.filter((item) => item.output?.layout !== "tree"));
+  const nodes = items.filter((item) => item.output?.layout === "tree")
+    .sort((a, b) => a.sort_order - b.sort_order);
+  const nodeKeys = new Set(nodes.map((item) => item.output!.key));
+  const refs = (item: AnalysisField) => valueCitations({
+    value: "", citations: item.values.flatMap((value) => value.citations),
+  });
+  const identity = (item: AnalysisField) => ({
+    id: "report-item-" + item.id,
+    "data-report-item": item.id,
+    className: activeId === item.id ? "report-item-active" : "",
+  });
+  const content = (value: string | string[] | undefined) =>
+    Array.isArray(value)
+      ? <ol className="list-decimal space-y-1 pl-5">{value.map((line, i) =>
+          <li key={i}>{renderMarkdown(line.replace(/<br\s*\/?>/gi, "\n"))}</li>)}</ol>
+      : value ? renderMarkdown(value.replace(/<br\s*\/?>/gi, "\n\n")) : "—";
+  const tree = (parent: string | null): ReactNode => (
+    <ul className="space-y-3 border-l border-slate-200 pl-4">
+      {nodes.filter((item) => {
+        const key = item.output!.parent_key;
+        // 来源撤销后父节点可能不可见，子节点仍可读时作为独立节点展示。
+        return parent === null ? !key || !nodeKeys.has(key) : key === parent;
+      }).map((item) => (
+        <li key={item.id} {...identity(item)}>
+          <strong>{renderInline(item.field)}</strong>
+          <ValueLocates refs={refs(item)} onLocate={onLocate} />
+          <div className="module-markdown-body mt-2">{content(item.output!.content["编制要求"])}</div>
+          {nodes.some((child) => child.output!.parent_key === item.output!.key)
+            && tree(item.output!.key)}
+        </li>
+      ))}
+    </ul>
+  );
+  return (
+    <div className="module-markdown">
+      {nodes.length > 0 && tree(null)}
+      {[...groups.entries()].map(([name, rows]) => {
+        const output = rows.find((item) => item.output)?.output;
+        return (
+          <section key={name} className="module-group">
+            {name !== "未分类" && <h4 className="module-group-title">{name}</h4>}
+            {output?.layout === "table" ? (
+              <div className="overflow-x-auto">
+                <table className="module-table module-structured-table">
+                  <thead><tr>{output.columns.map((column) =>
+                    <th scope="col" key={column}>{column}</th>)}</tr></thead>
+                  <tbody>{rows.map((item) => (
+                    <tr key={item.id} {...identity(item)}>
+                      {output.columns.map((column, index) => (
+                        <td key={column} className="module-markdown-body">
+                          {content(item.output?.content[column])}
+                          {index === output.columns.length - 1 && <>
+                            <ValueLocates refs={refs(item)} onLocate={onLocate} />
+                            {!!item.note && <p className="field-note">{item.note}</p>}
+                          </>}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            ) : (
+              <ol className="space-y-5">
+                {rows.map((item, index) => (
+                  <li key={item.id} {...identity(item)}>
+                    <h5 className="mb-2 font-semibold">{index + 1}. {renderInline(item.field)}</h5>
+                    {item.output ? item.output.columns.filter((key) => key in item.output!.content).map((key) => (
+                      <div key={key} className="module-markdown-body mb-3">
+                        {key !== "背景" && <strong>{key}</strong>}
+                        {content(item.output!.content[key])}
+                      </div>
+                    )) : <p>{item.note || "来源已不可用，请更新分析。"}</p>}
+                    <ValueLocates refs={refs(item)} onLocate={onLocate} />
+                    {!!item.note && item.output && <p className="field-note">{item.note}</p>}
+                  </li>
+                ))}
+              </ol>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }

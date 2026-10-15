@@ -4,21 +4,14 @@ import { useState } from "react";
 import { Icon } from "@/components/Icon";
 import { DATA_CLASS } from "@/components/ui";
 import { useViewerStore } from "@/lib/store/viewerStore";
-import { ExportButton } from "./ExportButton";
 
 interface Props {
   pageCount: number;
-  projectId: number | null;
-  onNotice: (message: string | null) => void;
-  showExport?: boolean;
 }
 
 /** 页码草稿独立于滚动位置，避免用户输入时被当前页同步覆盖。 */
 export function Toolbar({
   pageCount,
-  projectId,
-  onNotice,
-  showExport = true,
 }: Props) {
   const [draft, setDraft] = useState("");
   const zoom = useViewerStore((state) => state.zoom);
@@ -103,7 +96,6 @@ export function Toolbar({
           适应宽度
         </Button>
       </div>
-      {showExport && <ExportButton projectId={projectId} onNotice={onNotice} />}
     </div>
   );
 }

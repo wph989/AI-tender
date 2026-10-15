@@ -84,7 +84,7 @@ def test_model_crud_binding_revision_and_history(env):
     assert result["status"] == "ok"
     assert llm.get_test(result["test_id"], request)["status"] == "ok"
     feature = llm.replace_bindings(
-        "extract",
+        "analysis",
         llm.BindingsRequest(
             model_ids=[m["id"]], revision=1, failover_limit=2, max_total_requests=4
         ),
@@ -92,9 +92,9 @@ def test_model_crud_binding_revision_and_history(env):
     )
     assert feature["revision"] == 2
     with pytest.raises(ApiProblem) as conflict:
-        llm.replace_bindings("extract", llm.BindingsRequest(model_ids=[], revision=1), request)
+        llm.replace_bindings("analysis", llm.BindingsRequest(model_ids=[], revision=1), request)
     assert conflict.value.status_code == 412
-    assert llm._feature_item(request, "extract")["bindings"][0]["model_row_id"] == m["id"]
+    assert llm._feature_item(request, "analysis")["bindings"][0]["model_row_id"] == m["id"]
     with pytest.raises(ModelInUse):
         llm.delete_model(m["id"], request)
     llm.update_model(
@@ -109,7 +109,7 @@ def test_model_crud_binding_revision_and_history(env):
     assert current["test_validity"] == "valid"
     calls = llm.list_calls(request, limit=25, offset=0)
     assert calls["items"][0]["display_name"] == "fixture"
-    llm.replace_bindings("extract", llm.BindingsRequest(model_ids=[], revision=2), request)
+    llm.replace_bindings("analysis", llm.BindingsRequest(model_ids=[], revision=2), request)
     llm.delete_provider(p["id"], request)
     assert llm.list_models(request)["items"] == []
     assert llm.list_calls(request, limit=25, offset=0)["total"] == 1
@@ -189,9 +189,9 @@ def test_import_is_disabled_deduplicated_and_requires_matching_kind(env):
     assert all(not m["enabled"] for m in models)
     with pytest.raises(ApiProblem):
         llm.replace_bindings(
-            "extract", llm.BindingsRequest(model_ids=[models[0]["id"]], revision=1), request
+            "analysis", llm.BindingsRequest(model_ids=[models[0]["id"]], revision=1), request
         )
-    assert llm._feature_item(request, "extract")["bindings"] == []
+    assert llm._feature_item(request, "analysis")["bindings"] == []
 
 
 def test_rerank_catalog_is_explicitly_unsupported_without_network(env):
@@ -416,14 +416,14 @@ def test_json_consumers_reject_language_model_without_json_and_capability_remova
     m = model(request, p["id"], capabilities=["text_input"])
     with pytest.raises(ApiProblem):
         llm.replace_bindings(
-            "extract", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request
+            "analysis", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request
         )
     m = llm.update_model(
         m["id"],
         llm.ModelPatch(capabilities=["text_input", "json_output"], revision=m["revision"]),
         request,
     )
-    llm.replace_bindings("extract", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request)
+    llm.replace_bindings("analysis", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request)
     with pytest.raises(ApiProblem) as invalid:
         llm.update_model(
             m["id"], llm.ModelPatch(capabilities=["text_input"], revision=m["revision"]), request

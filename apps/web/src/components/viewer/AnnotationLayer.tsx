@@ -35,7 +35,7 @@ export function AnnotationLayer({ pageNo, items, activeEvidence, viewport, onLoc
   return (
     <div className="pointer-events-none absolute inset-0">
       {items.map((item) => {
-        // 判定用「锚点 + 页码」而不是 extractionId：同一条结果可能有多处证据，
+        // 判定用「锚点 + 页码」而不是 evidenceId：同一条结果可能有多处证据，
         // 只有被点的那一处该亮（与 EvidenceLayer 同一口径）。
         const isActive =
           activeEvidence !== null &&
@@ -48,10 +48,10 @@ export function AnnotationLayer({ pageNo, items, activeEvidence, viewport, onLoc
         const top = Math.max(0, rect.top - 9);
         return (
           <button
-            key={`badge-${item.extractionId}-${item.anchor}`}
+            key={`badge-${item.evidenceId}-${item.anchor}`}
             type="button"
             data-annotation-badge={item.badge}
-            data-annotation-extraction={item.extractionId}
+            data-annotation-evidence={item.evidenceId}
             aria-label={"第 " + item.badge + " 处：" + item.label + "，跳到对应结果"}
             title={item.label + "：" + item.quote}
             onClick={() => onLocate(item)}

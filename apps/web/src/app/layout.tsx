@@ -7,7 +7,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "AI-Tender · 招标文件解析与溯源",
-  description: "上传招标文件，抽取结构化字段，并在原文上逐条核对出处。",
+  description: "上传招标文件，使用 Agent 汇总专题要求，并逐条定位原文证据。",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

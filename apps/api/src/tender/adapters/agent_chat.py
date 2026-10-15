@@ -10,11 +10,11 @@ from langchain_core.messages import message_chunk_to_message, message_to_dict, m
 from langsmith import tracing_context
 
 from tender.domain.errors import (
-    ExtractionFailed,
-    ExtractionUnavailable,
     InvalidModelOutput,
+    ModelCallFailed,
     ModelOutputTruncated,
     ModelRefused,
+    ModelUnavailable,
 )
 from tender.ports.llm import Completion
 
@@ -111,7 +111,7 @@ class AgentChat:
                 cause = exc
                 while cause.__cause__ is not None:
                     cause = cause.__cause__
-                error = ExtractionUnavailable(
+                error = ModelUnavailable(
                     f"Agent 模型连接失败或暂不可用（{type(cause).__name__}）", http_status=status
                 )
                 response = getattr(exc, "response", None)
@@ -121,7 +121,7 @@ class AgentChat:
                     error.retry_after = _retry_after(response)
                 raise error from exc
             # SDK 异常可能含完整请求正文或密钥，不直接回显其文本。
-            raise ExtractionFailed(
+            raise ModelCallFailed(
                 f"Agent 模型调用失败（{type(exc).__name__}）",
                 http_status=status,
             ) from exc
@@ -129,7 +129,7 @@ class AgentChat:
             self._stream_chat and not result.response_metadata.get("finish_reason")
         ):
             # 网络结束不等于模型完成；半截工具 JSON 绝不能进入提交工具。
-            raise ExtractionUnavailable("Agent 流式响应未完整结束")
+            raise ModelUnavailable("Agent 流式响应未完整结束")
         usage = result.usage_metadata or {}
 
         def invalid(error_type, message):

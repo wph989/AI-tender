@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from synthesis_fixtures import research_calls, research_done, submission, summary_record
 from test_analysis_research import block, session
 from test_deep_analysis import KEY, SKILL, ScriptedRouter, call, submitted_field
 
@@ -25,7 +26,7 @@ from tender.application.deep_analysis import (
     invoke_module,
 )
 from tender.application.knowledge import validate_items
-from tender.domain.errors import ExtractionUnavailable, InvalidModelOutput, ModelOutputTruncated
+from tender.domain.errors import InvalidModelOutput, ModelOutputTruncated, ModelUnavailable
 from tender.ports.llm import Completion
 
 
@@ -89,10 +90,10 @@ def test_skill_is_loaded_before_first_model_and_survives_checkpoint():
     async def run():
         router = ScriptedRouter(
             [
-                call("search_document", {"query": "质保"}, 1),
+                *research_calls(),
                 call(
                     "submit_analysis",
-                    {"fields": [], "relations": [], "research_summary": "已检索，本专题无新增"},
+                    submission(summary="已检索，本专题无新增"),
                     2,
                 ),
             ]
@@ -116,9 +117,9 @@ def test_skill_is_loaded_before_first_model_and_survives_checkpoint():
         assert state["loaded_skill"]["sha256"] == load_module_skill(SKILL, KEY)["sha256"]
         first_prompt = str(router.requests[0][0])
         assert "检索项目概况" in first_prompt
-        assert len(reservations) == 3
+        assert len(reservations) == 5
         await invoke_module(graph, files, thread_id="forced-skill", task="恢复")
-        assert len(reservations) == 3 and len(router.requests) == 2
+        assert len(reservations) == 5 and len(router.requests) == 4
 
     asyncio.run(run())
 
@@ -189,11 +190,16 @@ def test_success_in_other_tool_does_not_reset_failing_tool_counter():
 def test_no_progress_enters_finish_mode_and_preserves_verified_results():
     async def run():
         router = ScriptedRouter(
-            [call("search_document", {"query": f"问题{n}"}, n) for n in range(5)]
+            [call("list_documents", {}, "documents")]
+            + [call("search_document", {"query": "质保"}, "search")]
+            + [call("read_document", {"block_id": "s1r1c0", "before": n, "after": 0}, n)
+               for n in range(3)]
+            + [call("search_document", {"query": "收尾时的新检索"}, 4)]
             + [
+                call("complete_research", research_done(), "research"),
                 call(
                     "submit_analysis",
-                    {"fields": [], "relations": [], "research_summary": "未找到新增，停止检索"},
+                    submission(summary="未找到新增，停止检索"),
                     6,
                 )
             ]
@@ -202,7 +208,7 @@ def test_no_progress_enters_finish_mode_and_preserves_verified_results():
         graph, files = build(router, research, state)
         await invoke_module(graph, files, thread_id="no-progress", task="分析")
         assert state["finish_only"]
-        assert research.tool_calls == 4
+        assert research.tool_calls == 5
         assert state["tool_results"]["call_4"]["data"]["status"] == "error"
         assert "draft" in state
 
@@ -272,7 +278,7 @@ def test_shared_quote_gives_distinct_facts_their_own_review_attempts():
 
 
 @pytest.mark.parametrize(
-    "error", [ConnectionError("本地连接中断"), ExtractionUnavailable("路由已耗尽")]
+    "error", [ConnectionError("本地连接中断"), ModelUnavailable("路由已耗尽")]
 )
 def test_subagent_recovery_is_bounded_and_never_multiplies_model_retries(error):
     class BrokenGraph:
@@ -291,7 +297,7 @@ def test_subagent_recovery_is_bounded_and_never_multiplies_model_retries(error):
         async def save(value):
             saved.append(copy.deepcopy(value))
 
-        expected = RuntimeError if isinstance(error, ConnectionError) else ExtractionUnavailable
+        expected = RuntimeError if isinstance(error, ConnectionError) else ModelUnavailable
         with pytest.raises(expected):
             await invoke_module(graph, {}, thread_id="retry", task="分析", state=state, save=save)
         if isinstance(error, ConnectionError):
@@ -411,7 +417,7 @@ def test_verified_batches_choose_one_sufficient_set_without_mixing_scope():
     assert len(other_lot["values"][0]["citations"]) == 2
 
 
-def test_verified_batches_keep_evidence_for_each_note_after_merging():
+def test_same_title_summaries_keep_distinct_requirements_and_evidence():
     async def run():
         rows = [
             block() | {"content": "设备A质保三年，自验收合格之日起算。"},
@@ -420,19 +426,17 @@ def test_verified_batches_keep_evidence_for_each_note_after_merging():
                 "content": "设备B质保三年，自交货起算。",
             },
         ]
-        fields = [
-            submitted_field("质保期", "三年", quote=row["content"], block_id=row["block_id"])
-            | {"note": note}
+        records = [
+            summary_record(key=row["block_id"], text=note, citations=[
+                {"block_id": row["block_id"], "quote": row["content"]},
+            ])
             for row, note in zip(rows, ("设备A自验收起算", "设备B自交货起算"), strict=True)
         ]
         router = ScriptedRouter([
-            call("search_document", {"query": "质保期"}, 1),
+            *research_calls(query="质保期"),
             *[
-                call("submit_analysis", {
-                    "fields": [entry], "relations": [], "research_summary": "分批核对质保条件",
-                    "final": index == 1,
-                }, index + 2)
-                for index, entry in enumerate(fields)
+                call("submit_analysis", submission([entry], final=index == 1), index + 2)
+                for index, entry in enumerate(records)
             ],
         ])
         state = {}
@@ -444,11 +448,10 @@ def test_verified_batches_keep_evidence_for_each_note_after_merging():
         graph, files = build(router, session(rows), state, review_support=accept)
         await invoke_module(graph, files, thread_id="distinct-note-evidence", task="分析")
         merged = state["draft"]["fields"]
-        assert len(merged) == 1
-        assert all(field["note"] in merged[0]["note"] for field in fields)
-        assert len(merged[0]["values"]) == 1
-        # 两个条件合并展示时，各自唯一的原文和定位仍须保留。
-        refs = merged[0]["values"][0]["citations"]
+        assert len(merged) == 2
+        assert [item["output"]["content"] for item in merged] == [r["content"] for r in records]
+        # 同名事项不能抹去设备和起算条件，各自的原文定位都须保留。
+        refs = [ref for item in merged for ref in item["values"][0]["citations"]]
         assert {(ref["block_id"], ref["quote"]) for ref in refs} == {
             (row["block_id"], row["content"]) for row in rows
         }

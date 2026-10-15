@@ -46,7 +46,7 @@ _TYPE_ALIASES = {
 # 列位置上但不是列名的行首关键字（表级约束）
 _CONSTRAINT_KEYWORDS = frozenset({"constraint", "primary", "unique", "foreign", "check", "exclude"})
 # 库里的列定义总量（含 alembic_version 之外的全部业务列）；低于它就是解析器漏读了
-_MIN_EXPECTED_COLUMNS = 430
+_MIN_EXPECTED_COLUMNS = 350
 
 
 def _norm(type_text: str) -> str:
@@ -117,6 +117,13 @@ def _parse_ddl_columns() -> dict[str, dict[str, tuple[str, bool]]]:
             column, rest = add.group(1), add.group(2).strip().rstrip(",")
             tables.setdefault(table, {})[column] = _column_type(rest, f"{table}.{column}")
 
+    # 下线迁移仍保留在历史链中，但 head 的模型不再承载被移除的表和列。
+    for table, column in re.findall(r"ALTER TABLE (\w+) DROP COLUMN (\w+);", sql):
+        assert column in tables[table], f"删除了未知列：{table}.{column}"
+        del tables[table][column]
+    for table in re.findall(r"DROP TABLE (\w+);", sql):
+        assert table in tables, f"删除了未知表：{table}"
+        del tables[table]
     return tables
 
 
@@ -141,7 +148,7 @@ _ALL_TABLES = sorted(set(_DDL_COLUMNS) | set(_MODEL_COLUMNS))
 def test_ddl_parser_read_enough_tables_and_columns() -> None:
     """解析器自身的闸门：漏读必须报错，而不是让比对悄悄变成空转。"""
     total = sum(len(columns) for columns in _DDL_COLUMNS.values())
-    assert len(_DDL_COLUMNS) >= 40, f"只解析到 {len(_DDL_COLUMNS)} 张表，迁移读取或解析器已脱节"
+    assert len(_DDL_COLUMNS) >= 30, f"只解析到 {len(_DDL_COLUMNS)} 张表，迁移读取或解析器已脱节"
     assert total >= _MIN_EXPECTED_COLUMNS, f"只解析到 {total} 个列，解析器已脱节"
 
 

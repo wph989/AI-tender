@@ -14,17 +14,12 @@ from pathlib import Path
 
 from tender.api import (
     config,
-    conflicts,
-    exports,
-    extractions,
     jobs,
     knowledge,
     llm,
     parsing,
     project_files,
     projects,
-    quality,
-    reviews,
     versions,
 )
 
@@ -38,7 +33,6 @@ _PLACEHOLDER_RE = re.compile(r"\{[^}]+\}")
 _UNDOCUMENTED = {
     "GET /api/v1/versions/{}/elements": "工作台一次拉全量块建证据索引；清单只列了按页拉取",
     "GET /api/v1/projects/{}/files/{}/original": "单个上传件原件下载；05 §3.1 只写了签名 URL 原则",
-    "GET /api/v1/jobs/{}/download": "异步导出产物的下载入口，配合导出接口的 202 排队响应",
 }
 
 # 已进清单、代码还没写的接口（阶段 3 已完成，表留空以防下一阶段再加）。
@@ -62,13 +56,7 @@ def _implemented() -> set[str]:
         project_files.router,
         versions.router,
         parsing.router,
-        extractions.router,
-        reviews.router,
-        conflicts.router,
-        conflicts.conflicts_router,
-        exports.router,
         jobs.router,
-        quality.router,
         knowledge.router,
         llm.router,
     )

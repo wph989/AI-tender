@@ -17,7 +17,7 @@
  * 位置完全不同），表现为页面上同时出现好几个同形状的幽灵框。
  */
 
-import type { EvidenceItem } from "@/hooks/useEvidenceIndex";
+import type { EvidenceItem } from "@/lib/viewer/evidenceIndex";
 import type { Size } from "@/lib/coords/bbox";
 import { bboxToRect } from "@/lib/coords/bbox";
 import type { ActiveEvidence } from "@/lib/store/viewerStore";
@@ -41,7 +41,7 @@ export function EvidenceLayer({ pageNo, items, activeEvidence, pulseKey, viewpor
   return (
     <div className="pointer-events-none absolute inset-0">
       {items.map((item) => {
-        // 用「锚点 + 页码」而不是仅 extractionId：同一条结果可能有多处证据甚至跨页，
+        // 用「锚点 + 页码」而不是仅 evidenceId：同一条结果可能有多处证据甚至跨页，
         // 只有被点击的那一处该画强框（`p{page}b{block}` 是证据在 parse_run 内的唯一身份，见 03 第 2 节）
         const isActive =
           activeEvidence !== null &&
@@ -50,8 +50,8 @@ export function EvidenceLayer({ pageNo, items, activeEvidence, pulseKey, viewpor
         const rect = bboxToRect(item.bbox, viewport);
         return (
           <div
-            key={`${item.extractionId}-${item.anchor}`}
-            data-evidence-id={item.extractionId}
+            key={`${item.evidenceId}-${item.anchor}`}
+            data-evidence-id={item.evidenceId}
             data-evidence-anchor={item.anchor}
             className={
               isActive

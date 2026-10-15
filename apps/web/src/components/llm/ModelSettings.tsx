@@ -107,7 +107,7 @@ export function ModelSettings() {
       ]}
       eyebrow="设置 · 模型"
       title="模型管理"
-      description="配置模型能力、调用顺序与预算，查看抽取、综合分析和知识检索的调用记录。"
+      description="配置模型能力、调用顺序与预算，查看综合分析和知识检索的调用记录。"
       actions={
         <Button htmlType="button" onClick={refresh}>
           刷新

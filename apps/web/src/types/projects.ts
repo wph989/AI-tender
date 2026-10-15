@@ -14,10 +14,8 @@ export interface WireProject {
   created_at: string;
   /** 仅列表接口带：项目下的文件数（软删除的不算）。 */
   file_count?: number;
-  /** 仅列表接口带：项目下所有文件的待复核 + 冲突条数。 */
-  review_count?: number;
   /**
-   * 仅列表接口带：项目下「解析失败或抽取失败」的文件数。
+   * 仅列表接口带：项目下「转换或解析失败」的文件数。
    * 卷宗脊要用它报警——只有待复核数的话，坏掉的项目会伪装成「没有待办」。
    */
   failed_count?: number;
@@ -75,17 +73,6 @@ export interface WireProjectFile {
   latest_run_id: number | null;
   /** 非 null 表示这个文件已被新版本替换（换内容走的是新增一行，不是原地改）。 */
   replaced_by_id: number | null;
-  /** 抽取结果条数（只算 is_current 的尝试）。 */
-  extraction_count: number;
-  /** 其中待复核 + 冲突的条数；列表页要拿它当「还有多少要处理」的唯一口径。 */
-  review_count: number;
-  /**
-   * 其中已确认（verified）的条数。重新解析前的二次确认要列出「将失效的已确认结果数量」
-   * （见 docs/质量/09 第 5.2 节），所以列表页必须拿得到它。
-   */
-  confirmed_count: number;
-  /** 最近一次抽取任务的状态（pending/running/completed/partial/failed）；null = 还没排过队。 */
-  extraction_status: string | null;
   /** 转换、解析排队等阶段还没有结果行，页面必须依据任务状态继续刷新。 */
   latest_job: {
     id: string;

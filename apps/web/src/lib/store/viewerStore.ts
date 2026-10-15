@@ -16,7 +16,7 @@ import { create } from "zustand";
 import type { Bbox } from "@/lib/coords/bbox";
 
 export interface ActiveEvidence {
-  extractionId: number;
+  evidenceId: number;
   anchor: string;
   pageNo: number;
   /** null = 只有页级定位（bbox 缺失或非法），此时高亮整页边框（见 docs/设计/06 第 5 节）。 */

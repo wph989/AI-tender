@@ -532,7 +532,7 @@ def visible_items(
                 # 历史报告可能把同块其它事实当摘录；展示前按值回查元素原文收敛定位，
                 # 只在原文里确定性找到该值时改写，找不到就保留原引用，不伪造位置。
                 refs.append(
-                    align_citation(
+                    dict(ref) if item.get("output") else align_citation(
                         {str(ref.get("block_id")): resolved},
                         ref,
                         str(value.get("value") or ""),
@@ -570,7 +570,9 @@ def get_report(report_id: int, request: Request) -> dict:
     for module in modules:
         # 工具日志只供服务端重放，不在产品界面暴露整段中间提示词。
         module.pop("trace", None)
-        module.pop("business_data", None)
+        business = module.pop("business_data", None) or {}
+        module["research_summary"] = business.get("research_summary", "")
+        module["research_gaps"] = business.get("gaps", [])
     runs = db.report_runs(report_id)
     for module in modules:
         module["runs"] = [r for r in runs if r["module_id"] == module["id"]]
@@ -600,6 +602,17 @@ def get_report(report_id: int, request: Request) -> dict:
         run.pop("saved_items", None)
     report["summary"] = visible_items(db, report["summary"], allowed)
     current = analysis_status(report["project_id"], request)
+    live = {s["source_id"]: s for s in db.sources(allowed)}
+    if any(
+        source["source_id"] not in live
+        or any(source.get(key) != live[source["source_id"]].get(key)
+               for key in ("collection_id", "version_id", "parse_run_id"))
+        for source in report["source_snapshot"] + report["reference_snapshot"]
+    ):
+        # 检索说明也可能包含已撤销资料的内容，不能只隐藏条目正文而留下说明旁路。
+        for module in modules:
+            module["research_summary"] = ""
+            module["research_gaps"] = []
     # 旧运行时报告只读展示：前端据此隐藏补跑入口，服务端补跑也会拒绝。
     retired = report["runtime_version"] != RUNTIME_VERSION
     stale = (
