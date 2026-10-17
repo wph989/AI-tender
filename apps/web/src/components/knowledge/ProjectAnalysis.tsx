@@ -4,10 +4,13 @@ import { Alert, Button, Segmented, Select, Tabs } from "antd";
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { message as errorMessage } from "@/lib/errors";
 import { AppRail } from "@/components/AppRail";
 import { Icon } from "@/components/Icon";
 import { BUTTON_CLASS } from "@/components/ui";
-import { knowledgeRequest, loadReportRecords, resolveCitation } from "@/lib/api/knowledge";
+import {
+  knowledgeRequest, loadReportRecords, resolveCitation, supportsModuleRecords,
+} from "@/lib/api/knowledge";
 import { loadProject } from "@/lib/api/client";
 import type {
   AnalysisReport,
@@ -15,7 +18,7 @@ import type {
   Citation,
   KnowledgeCollection,
 } from "@/types/knowledge";
-import { STATE_LABELS } from "@/types/knowledge";
+import { isActive, STATE_LABELS } from "@/types/knowledge";
 import { CitationViewer } from "./CitationViewer";
 import { ModuleMarkdown } from "./ModuleMarkdown";
 import { QuestionPanel } from "./QuestionPanel";
@@ -44,12 +47,10 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const chosenReport = useRef<number | null>(null);
   const initialized = useRef(false);
   const locateAbort = useRef<AbortController | null>(null);
-  const loadSequence = useRef(0);
   const reportAbort = useRef<AbortController | null>(null);
-  const displayedReport = useRef<number | null>(null);
 
   const reload = useCallback(async () => {
-    const sequence = ++loadSequence.current;
+    // 新一轮刷新直接取消上一轮在途请求：abort 信号就是唯一的"过期"判据。
     reportAbort.current?.abort();
     const controller = new AbortController();
     reportAbort.current = controller;
@@ -58,7 +59,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
         "/projects/" + projectId + "/analysis",
         "GET", undefined, controller.signal,
       );
-      if (sequence !== loadSequence.current) return;
+      if (controller.signal.aborted) return;
       setState(next);
       if (!initialized.current) {
         setCategory(next.analysis_category ?? "");
@@ -72,18 +73,18 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
           "/analysis/reports/" + id,
           "GET", undefined, controller.signal,
         );
-        if (sequence !== loadSequence.current) return;
-        if (displayedReport.current !== loaded.id) {
-          displayedReport.current = loaded.id;
-          // 切报告时先显示新报告的加载状态，不能暂时露出报告里的旧展示投影。
-          setReport(loaded.runtime_retired || !loaded.data_schema_version ? loaded : {
+        if (controller.signal.aborted) return;
+        // 同一报告的轮询结果不重置为加载态，否则每三秒都会清空已显示正文。
+        setReport((previous) => {
+          if (previous?.id === loaded.id) return previous;
+          return supportsModuleRecords(loaded) ? {
             ...loaded, modules: loaded.modules.map((module) => ({
               ...module, items: [], records_loading: true,
             })),
-          });
-        }
+          } : loaded;
+        });
         const complete = await loadReportRecords(loaded, controller.signal);
-        if (sequence === loadSequence.current) setReport(complete);
+        if (!controller.signal.aborted) setReport(complete);
       }
     } catch (caught) {
       // 切报告或轮询替代了旧请求属于正常取消，不能弹成加载失败。
@@ -93,8 +94,14 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     }
   }, [projectId]);
 
+  // 手动刷新与轮询共用同一失败口径，避免各调用点各写一份 catch 而漏掉非 Error 兜底。
+  const refresh = useCallback(
+    () => void reload().catch((caught) => setError(errorMessage(caught, "刷新失败，请重试"))),
+    [reload],
+  );
+
   useEffect(() => {
-    void reload().catch((e: Error) => setError(e.message));
+    refresh();
     void loadProject(projectId)
       .then((p) => setName(p.name))
       .catch((e: Error) => setError(e.message));
@@ -112,7 +119,6 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       })
       .catch((e: Error) => setError(e.message));
     return () => {
-      ++loadSequence.current;
       reportAbort.current?.abort();
       locateAbort.current?.abort();
     };
@@ -120,20 +126,18 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const canceling = Boolean(report?.canceling);
   const running = canceling ||
     // 详情可能先于列表更新，逐条结果刷新不能只依赖列表里的旧终态。
-    (report ? ["waiting", "pending", "running"].includes(report.status) : false) ||
-    (state?.reports.some((r) =>
-      ["waiting", "pending", "running"].includes(r.status),
-    ) ?? false);
+    isActive(report?.status) ||
+    (state?.reports.some((r) => isActive(r.status)) ?? false);
   const processingFiles =
     state?.sources.some((source) => source.state === "processing") ?? false;
   useEffect(() => {
     if (!running && !processingFiles) return;
     const timer = setInterval(() => {
       // 慢请求完成后再刷新，避免三秒轮询不断取消仍在加载的独立结果。
-      if (!reportAbort.current) void reload().catch((e: Error) => setError(e.message));
+      if (!reportAbort.current) refresh();
     }, 3000);
     return () => clearInterval(timer);
-  }, [running, processingFiles, reload]);
+  }, [running, processingFiles, refresh]);
 
   // 接口仅发布已核实成果；模块尚未完成时同样允许定位，避免失败后已有成果无法核对。
   const refs = useMemo(
@@ -220,7 +224,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                 size="small"
                 onClick={() => {
                   setError(null);
-                  void reload().catch((e: Error) => setError(e.message));
+                  refresh();
                 }}
               >
                 刷新状态
@@ -539,9 +543,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                         setSelected(null);
                         setActiveItem(undefined);
                         setActiveModuleId(null);
-                        void reload().catch((caught: Error) =>
-                          setError(caught.message),
-                        );
+                        refresh();
                       }}
                     >
                       {state?.reports.map((r) => (
@@ -586,9 +588,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                       该报告由已下线的旧解析流程生成，仅供查看；需要最新分析请重新发起。
                     </p>
                   )}
-                  {["waiting", "pending", "running"].includes(
-                    report.status,
-                  ) && (
+                  {isActive(report.status) && (
                     <Button
                       htmlType="submit"
                       className={" mb-3"}
@@ -851,8 +851,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                   ) : current.records_error ? (
                                     <Alert type="error" showIcon title="专题结果读取失败"
                                       description={current.records_error}
-                                      action={<Button onClick={() => void reload().catch((caught: Error) =>
-                                        setError(caught.message))}>重新加载</Button>} />
+                                      action={<Button onClick={refresh}>重新加载</Button>} />
                                   ) : current.items.length > 0 ? (
                                     <>
                                       {current.status !== "completed" && (

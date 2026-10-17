@@ -1,5 +1,6 @@
 import type { AnalysisReport, Citation, ModuleRecords } from "@/types/knowledge";
 import { recordItems } from "@/lib/analysis/records";
+import { message } from "@/lib/errors";
 
 /** 新接口沿用现有错误协议；AbortSignal 用于防止快速切换时旧响应覆盖新状态。 */
 export async function knowledgeRequest<T>(path: string, method = "GET", body?: unknown, signal?: AbortSignal): Promise<T> {
@@ -20,21 +21,24 @@ export function resolveCitation(ref: Citation, signal?: AbortSignal): Promise<Ci
     .then((resolved) => ({ ...ref, ...resolved }));
 }
 
+/** 历史报告只带展示投影，没有独立记录接口；能力判断集中一处，避免调用方各写一遍。 */
+export function supportsModuleRecords(report: AnalysisReport): boolean {
+  return !report.runtime_retired && Boolean(report.data_schema_version);
+}
+
 /** 新版专题直接取独立记录；单个维度失败不阻断其它维度，也不回退旧报告条目。 */
-export async function loadReportRecords(report: AnalysisReport, signal?: AbortSignal): Promise<AnalysisReport> {
-  if (report.runtime_retired || !report.data_schema_version) return report;
-  const results = await Promise.allSettled(report.modules.map(async (module) => {
-    const data = await knowledgeRequest<ModuleRecords>(
+export function loadReportRecords(report: AnalysisReport, signal?: AbortSignal): Promise<AnalysisReport> {
+  if (!supportsModuleRecords(report)) return Promise.resolve(report);
+  const modules = report.modules.map((module) =>
+    knowledgeRequest<ModuleRecords>(
       `/analysis/reports/${report.id}/modules/${encodeURIComponent(module.module_key)}/records`,
       "GET", undefined, signal,
-    );
-    return { ...module, items: recordItems(data), records_error: undefined, records_loading: false };
-  }));
-  return { ...report, modules: report.modules.map((module, index) => {
-    const result = results[index]!;
-    return result.status === "fulfilled" ? result.value : {
-      ...module, items: [], records_loading: false,
-      records_error: result.reason instanceof Error ? result.reason.message : "专题结果读取失败，请重试",
-    };
-  }) };
+    ).then(
+      (data) => ({ ...module, items: recordItems(data), records_error: undefined, records_loading: false }),
+      (reason: unknown) => ({
+        ...module, items: [], records_loading: false,
+        records_error: message(reason, "专题结果读取失败，请重试"),
+      }),
+    ));
+  return Promise.all(modules).then((loaded) => ({ ...report, modules: loaded }));
 }

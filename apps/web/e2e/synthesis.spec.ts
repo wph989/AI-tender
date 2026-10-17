@@ -1,5 +1,7 @@
 import { test, expect } from "@playwright/test";
-import type { AnalysisField, AnalysisModule, AnalysisOutput, Citation, ModuleRecords } from "../src/types/knowledge";
+import type {
+  AnalysisField, AnalysisModule, AnalysisOutput, AnalysisReport, Citation, ModuleRecords,
+} from "../src/types/knowledge";
 import { mockApi } from "./fixtures";
 
 const citation: Citation = {
@@ -51,6 +53,19 @@ const modules: AnalysisModule[] = [
   },
 ];
 
+/**
+ * 报告投影故意与独立记录不同，证明页面真的接入新接口；
+ * 各用例只覆盖差异化字段，避免重复维护同一份骨架。
+ */
+function report(id: number, overrides: Partial<AnalysisReport> = {}): AnalysisReport {
+  return {
+    id, status: "completed", category: "goods", topics: [], coverage: {},
+    modules: modules.map((module) => ({ ...module, items: [] })), data_schema_version: "1",
+    created_at: "2026-10-14T10:00:00Z", stale: false, runtime_retired: false,
+    error_message: null, ...overrides,
+  };
+}
+
 let errors: string[];
 function records(module: AnalysisModule): ModuleRecords {
   return {
@@ -81,13 +96,8 @@ test.beforeEach(async ({ page }) => {
     analysis_category: "goods", analysis_topics: [], lots: [], sources: [],
     reports: [{ id: 1, status: "completed" }], categories: { goods: "货物" }, topics: {},
   } }));
-  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: {
-    // 报告投影故意与独立记录不同，证明页面真的接入新接口。
-    id: 1, status: "completed", category: "goods", topics: [], coverage: {},
-    modules: modules.map((module) => ({ ...module, items: [] })), data_schema_version: "1",
-    created_at: "2026-10-14T10:00:00Z", finished_at: "2026-10-14T10:05:00Z", stale: false,
-    error_message: null, runtime_retired: false,
-  } }));
+  await page.route("**/api/v1/analysis/reports/1", (route) =>
+    route.fulfill({ json: report(1, { finished_at: "2026-10-14T10:05:00Z" }) }));
   await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({
     status: 409, json: { error: { message: "快照未就绪" } },
   }));
@@ -164,11 +174,9 @@ test("独立结果读取失败只影响本专题，重新加载后恢复", async
 
 test("运行中的维度通过轮询显示新保存的记录，依据撤销后清除正文", async ({ page }) => {
   let withdrawn = false;
-  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: {
-    id: 1, status: "running", category: "goods", topics: [], coverage: {},
-    modules: modules.map((module) => ({ ...module, items: [] })), data_schema_version: "1",
-    created_at: "2026-10-16T10:00:00Z", stale: false, runtime_retired: false,
-  } }));
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({
+    json: report(1, { status: "running", created_at: "2026-10-16T10:00:00Z" }),
+  }));
   let reads = 0;
   await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => {
     const data = records(modules[0]!);
@@ -188,11 +196,9 @@ test("切换报告时延迟的旧维度结果不能覆盖新报告", async ({ pa
     reports: [{ id: 1, status: "completed" }, { id: 2, status: "completed" }],
     categories: { goods: "货物" }, topics: {},
   } }));
-  await page.route("**/api/v1/analysis/reports/2", (route) => route.fulfill({ json: {
-    id: 2, status: "completed", category: "goods", topics: [], coverage: {},
-    modules: [{ ...modules[0], items: [] }], data_schema_version: "1",
-    created_at: "2026-10-16T10:00:00Z", stale: false, runtime_retired: false,
-  } }));
+  await page.route("**/api/v1/analysis/reports/2", (route) => route.fulfill({
+    json: report(2, { modules: [{ ...modules[0]!, items: [] }] }),
+  }));
   await page.route("**/api/v1/analysis/reports/2/data", (route) => route.fulfill({ status: 409, json: {} }));
   await page.route("**/api/v1/analysis/reports/2/modules/*/records", (route) => {
     const data = records(modules[0]!);

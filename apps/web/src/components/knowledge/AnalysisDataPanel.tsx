@@ -4,6 +4,7 @@ import { Alert, Button, Collapse, Drawer, Empty, Select, Space, Spin, Table, Tab
 import type { DataNode } from "antd/es/tree";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { knowledgeRequest } from "@/lib/api/knowledge";
+import { scopeLabel } from "@/lib/analysis/scope";
 import type {
   AnalysisContext, AnalysisDataSnapshot, AnalysisReport, AnalysisScope, BusinessRecord, Citation,
 } from "@/types/knowledge";
@@ -70,10 +71,9 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
     return () => { dataAbort.current?.abort(); previewAbort.current?.abort(); };
   }, [reload, terminal, report.finished_at, report.stale]);
 
-  function scopeLabel(scope: AnalysisScope) {
-    if (scope.kind === "common") return "公共要求";
-    if (scope.kind === "unknown") return "归属待确认";
-    return scope.lot_ids.map((id) => snapshot?.data.lots.find((lot) => lot.lot_id === id)?.title ?? "标段待确认").join("、");
+  function scopeLabelFor(scope: AnalysisScope) {
+    return scopeLabel(scope, (id) =>
+      snapshot?.data.lots.find((lot) => lot.lot_id === id)?.title);
   }
 
   function citations(record: BusinessRecord) {
@@ -93,7 +93,7 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
           {row.structuring === "partial" && <Tag color="gold">部分条件待核对</Tag>}
           {Boolean(row.superseded_in?.length) && <Tag>部分范围已有修订</Tag>}
           {Boolean(row.conflicts_in?.length) && <Tag color="gold">存在待核对冲突</Tag>}</div> },
-        { title: "适用范围", width: 115, render: (_, row) => scopeLabel(row.scope) },
+        { title: "适用范围", width: 115, render: (_, row) => scopeLabelFor(row.scope) },
       ]} />;
   }
 
@@ -108,7 +108,7 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
       (children.get(parent) ?? []).filter((node) => !ancestors.has(node.id))
         .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)).map((node) => ({
         key: node.id,
-        title: <span>{node.title} <span className="text-xs text-slate-500">{scopeLabel(node.scope)}</span>{citations(node)}</span>,
+        title: <span>{node.title} <span className="text-xs text-slate-500">{scopeLabelFor(node.scope)}</span>{citations(node)}</span>,
         children: make(node.id, new Set([...ancestors, node.id])),
       }));
     return make(null, new Set());
@@ -159,12 +159,12 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
             ? <Tree showLine defaultExpandAll treeData={tree(data.format_nodes)} /> : <Empty description="暂无已核实的格式节点" /> },
           { key: "gaps", label: `待核对事项 ${data.gaps.length}`, children: data.gaps.length
             ? <ul className="space-y-2">{data.gaps.map((gap, index) => <li key={index}>
-              <Tag>{scopeLabel(gap.scope)}</Tag>{gap.detail}</li>)}</ul> : <p>当前没有已登记的待核对事项。</p> },
+              <Tag>{scopeLabelFor(gap.scope)}</Tag>{gap.detail}</li>)}</ul> : <p>当前没有已登记的待核对事项。</p> },
           { key: "coverage", label: "专题核对", children: <Table size="small" rowKey={(row) => `${row.title}-${JSON.stringify(row.scope)}`}
             dataSource={data.coverage} pagination={{ pageSize: 10, showSizeChanger: false }} columns={[
               { title: "主题", dataIndex: "title" },
               { title: "状态", render: (_, row) => coverageLabels[row.status] ?? row.status },
-              { title: "范围", render: (_, row) => scopeLabel(row.scope) },
+              { title: "范围", render: (_, row) => scopeLabelFor(row.scope) },
               { title: "说明", dataIndex: "detail" },
             ]} /> },
         ]} />

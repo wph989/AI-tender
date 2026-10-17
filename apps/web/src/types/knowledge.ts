@@ -190,6 +190,7 @@ export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"
 }
 
 export interface ModuleRecords {
+  // schema_version 与 status 仅随契约透传，前端尚无版本分支；读取方不要据此推断兼容性。
   schema_version: string;
   module_key: string;
   status: string;
@@ -278,3 +279,9 @@ export const STATE_LABELS: Record<string, string> = {
   ready: "原文已就绪", completed: "已完成", partial: "部分完成", failed: "处理失败",
   canceled: "已取消", unsupported: "格式暂不支持解析",
 };
+/** 报告与模块仍会继续变化的终态之外的状态；轮询与"进行中"按钮共用，避免各处各写一份。 */
+export const ACTIVE_STATUSES = ["waiting", "pending", "running"];
+
+export function isActive(status?: string | null): boolean {
+  return status != null && ACTIVE_STATUSES.includes(status);
+}
