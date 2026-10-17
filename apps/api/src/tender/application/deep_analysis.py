@@ -367,7 +367,7 @@ class ResearchMiddleware(AgentMiddleware):
             agent_phase="synthesis" if self.state.get("research_completed") else "research",
         ):
             logger.info(
-                "analysis_round_started", evidence_count=len(self.research.seen),
+                "agent.round", evidence_count=len(self.research.seen),
                 staged_item_count=len(self.state.get("staged_items", [])),
                 no_progress_rounds=self.state.get("no_progress_rounds", 0), budget=status,
             )
@@ -494,19 +494,19 @@ class ResearchMiddleware(AgentMiddleware):
             return await self._run_review_step()
         started = time.monotonic()
         with bind_context(agent_phase="verification"):
-            logger.info("analysis_review_started", pending_item_count=pending)
+            logger.info("review.start", pending_item_count=pending)
             try:
                 feedback = await self._run_review_step()
             except Exception as exc:
                 logger.warning(
-                    "analysis_review_failed", error_type=type(exc).__name__,
+                    "review.fail", error_type=type(exc).__name__,
                     error=error_detail(str(exc)),
                     duration_ms=int((time.monotonic() - started) * 1000),
                 )
                 raise
             log = logger.warning if feedback else logger.info
             log(
-                "analysis_review_finished", needs_correction=feedback is not None,
+                "review.end", needs_correction=feedback is not None,
                 saved_item_count=sum(i.get("verification") == "supported"
                                      for i in self.state.get("staged_items", [])),
                 duration_ms=int((time.monotonic() - started) * 1000),
@@ -619,7 +619,7 @@ class ResearchMiddleware(AgentMiddleware):
                     exhausted = True
             remaining = min(remaining, self.research.limits.max_validation_failures - failures)
             logger.warning(
-                "analysis_record_rejected", item_id=entry["id"],
+                "record.reject", item_id=entry["id"],
                 issues=issues, correction_count=failures,
                 max_corrections=self.research.limits.max_validation_failures,
             )
@@ -679,7 +679,7 @@ class ResearchMiddleware(AgentMiddleware):
                 self.state["loaded_skill"] = {k: result[k] for k in ("path", "sha256")}
                 self.state["research"] = self.research.checkpoint()
                 await self.save(self.state)
-                logger.info("analysis_skill_loaded", skill_path=result["path"],
+                logger.info("skill.load", skill_path=result["path"],
                             sha256=result["sha256"])
         feedback = await self.run_review_step()
         if "draft" in self.state:
@@ -703,7 +703,7 @@ class ResearchMiddleware(AgentMiddleware):
             )
             if idle >= self.research.limits.max_no_progress_rounds:
                 if not self.state.get("finish_only"):
-                    logger.warning("analysis_finish_only", reason="no_progress",
+                    logger.warning("agent.finish_only", reason="no_progress",
                                    no_progress_rounds=idle)
                 self.state["finish_only"] = True
             await self.save(self.state)
@@ -733,7 +733,7 @@ class ResearchMiddleware(AgentMiddleware):
             )
             await self.save(self.state)
             logger.warning(
-                "analysis_submission_missing",
+                "agent.no_submission",
                 consecutive_count=self.state["consecutive_unsubmitted_responses"],
             )
         if self.state.get("consecutive_unsubmitted_responses", 0) >= 3:
@@ -763,14 +763,14 @@ class ResearchMiddleware(AgentMiddleware):
             call_id = request.tool_call["id"]
             cached = self.state.setdefault("tool_results", {}).get(call_id)
             if cached is not None:
-                logger.debug("analysis_tool_replayed", tool_call_id=call_id,
+                logger.debug("tool.replay", tool_call_id=call_id,
                              tool=request.tool_call["name"])
                 return messages_from_dict([cached])[0]
             await self.reserve_tool()
             started = time.monotonic()
             evidence_before = len(self.research.seen)
             tool_log = logger.bind(tool_call_id=call_id, tool=request.tool_call["name"])
-            tool_log.info("analysis_tool_started")
+            tool_log.info("tool.start")
             try:
                 name = request.tool_call["name"]
                 signature = tool_key(name, request.tool_call["args"])
@@ -869,7 +869,7 @@ class ResearchMiddleware(AgentMiddleware):
                 log = tool_log.warning if failed else tool_log.info
                 # 成功工具只记数量，不复制原文、检索结果或模型提交的业务 JSON。
                 log(
-                    "analysis_tool_finished", status="error" if failed else "ok",
+                    "tool.end", status="error" if failed else "ok",
                     duration_ms=int((time.monotonic() - started) * 1000),
                     evidence_count=len(self.research.seen),
                     new_evidence_count=len(self.research.seen) - evidence_before,
@@ -899,7 +899,7 @@ class ResearchMiddleware(AgentMiddleware):
                 return result
             except Exception as exc:
                 tool_log.warning(
-                    "analysis_tool_aborted", error_type=type(exc).__name__,
+                    "tool.abort", error_type=type(exc).__name__,
                     error=error_detail(str(exc)),
                     duration_ms=int((time.monotonic() - started) * 1000),
                 )
@@ -1226,9 +1226,9 @@ async def invoke_module(
                 checkpoint = await graph.aget_state(config)
                 if checkpoint.values:
                     if not checkpoint.next:
-                        logger.debug("analysis_checkpoint_complete", thread_id=thread_id)
+                        logger.debug("checkpoint.done", thread_id=thread_id)
                         return dict(checkpoint.values)
-                    logger.info("analysis_checkpoint_resumed", thread_id=thread_id)
+                    logger.info("checkpoint.resume", thread_id=thread_id)
                     return await graph.ainvoke(None, config=config, durability="sync")
                 return await graph.ainvoke(
                     {"messages": [("user", task)], "files": files}, config=config, durability="sync"
@@ -1251,7 +1251,7 @@ async def invoke_module(
                 # 计数先持久化；连计数都无法保存时直接失败，不能无限重新获得重试机会。
                 await save(state)
                 logger.warning(
-                    "analysis_checkpoint_retry", thread_id=thread_id,
+                    "checkpoint.retry", thread_id=thread_id,
                     retry_ordinal=attempts + 1, max_retries=max_retries,
                     error_type=type(exc).__name__, error=error_detail(str(exc)),
                 )

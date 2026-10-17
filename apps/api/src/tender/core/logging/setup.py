@@ -28,6 +28,16 @@ class _DuplicateExceptionFilter(logging.Filter):
         return True
 
 
+class _ErrorDetailFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # 容错分支可能以 WARNING 继续执行，带堆栈的记录也必须进入错误文件。
+        event = record.msg if isinstance(record.msg, dict) else record.__dict__
+        return bool(
+            record.levelno >= logging.ERROR or record.exc_info or record.exc_text
+            or event.get("exc_info") or event.get("exception")
+        )
+
+
 def get_logger(name: str):
     return structlog.get_logger(name)
 
@@ -57,14 +67,23 @@ def configure_logging(service: str, options: settings.LoggingSettings | None = N
                 sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
             stream = SafeStreamHandler(sys.stdout)
             stream.setFormatter(make_formatter(
-                service, json_output=options.console_format == "json", secrets=secrets
+                json_output=options.console_format == "json", secrets=secrets,
+                # 纯 stdout 部署没有错误文件，继续保留堆栈以免丢失诊断。
+                include_exception=options.output == "stdout",
             ))
             _handlers.append(stream)
         if options.output in {"file", "both"}:
             files = DailyFileHandler(options, service)
-            files.setFormatter(make_formatter(service, json_output=True, secrets=secrets))
+            files.setFormatter(make_formatter(
+                json_output=True, secrets=secrets, include_exception=False,
+            ))
             _handlers.append(files)
             files.start()
+            errors = DailyFileHandler(options, service, errors=True)
+            errors.addFilter(_ErrorDetailFilter())
+            errors.setFormatter(make_formatter(json_output=False, secrets=secrets))
+            _handlers.append(errors)
+            errors.start()
         for handler in _handlers:
             handler.setLevel(options.level)
             root.addHandler(handler)

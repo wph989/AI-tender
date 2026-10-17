@@ -43,9 +43,12 @@ def _prerun(task_id=None, task=None, **kwargs) -> None:
         if key in CONTEXT_KEYS - {"task_id"}
         and (valid_identifier(value) or type(value) is int)
     } if isinstance(raw, dict) else {}
-    bind_contextvars(**context, task_id=task_id, task_name=task.name)
+    bind_contextvars(**context, task_id=task_id)
     log = logger.debug if task.name in _PERIODIC_DISPATCH_TASKS else logger.info
-    log("task_started", retry_count=getattr(task.request, "retries", 0))
+    # 任务名只在生命周期记录一次，业务日志用 task_id 关联，避免每条重复完整模块名。
+    retries = getattr(task.request, "retries", 0)
+    log("task.start", task=task.name.removeprefix("tender.worker."),
+        **({"retry_count": retries} if retries else {}))
 
 
 def _postrun(task=None, state=None, **kwargs) -> None:
@@ -58,10 +61,12 @@ def _postrun(task=None, state=None, **kwargs) -> None:
             if task.name in _PERIODIC_DISPATCH_TASKS and state == "SUCCESS"
             else logger.info
         )
-        log(
-            "task_finished", execution_state=state,
-            duration_ms=round((time.perf_counter() - started) * 1000, 3),
-        )
+        # 失败与重试信号已记录详情，不再跟一条 INFO 的“结束”，以免被误读为成功。
+        if state == "SUCCESS":
+            log("task.end", duration_ms=round((time.perf_counter() - started) * 1000, 3))
+        elif state not in {"FAILURE", "RETRY"}:
+            logger.warning("task.stop", status=state,
+                           duration_ms=round((time.perf_counter() - started) * 1000, 3))
     finally:
         clear_context()
         bind_contextvars(**previous)
@@ -71,26 +76,28 @@ def _postrun(task=None, state=None, **kwargs) -> None:
 def _failure(sender=None, task_id=None, exception=None, traceback=None, **kwargs) -> None:
     if sender is not None and sender.name.startswith("tender."):
         # 子进程异常退出时，此信号可能由没有执行上下文的主进程发出。
-        with bind_context(task_id=task_id, task_name=sender.name):
+        with bind_context(task_id=task_id):
             if isinstance(traceback, str):
                 # Celery 父进程传入格式化字符串，放进 exc_info 会被 structlog 丢弃。
-                # 显式异常字段仍经过统一脱敏与限长，原因单列以免长堆栈截掉末尾。
+                # 显式异常字段仍经过统一脱敏与限长，格式化器会保留长堆栈的首尾。
                 logger.error(
-                    "task_execution_failed", exception=traceback,
-                    exception_type=type(exception).__name__ if exception is not None else None,
-                    reason=str(exception) if exception is not None else None,
+                    "task.fail", exception=traceback,
+                    task=sender.name.removeprefix("tender.worker."),
                 )
             else:
                 logger.error(
-                    "task_execution_failed",
-                    exc_info=(type(exception), exception, traceback)
+                    "task.fail", task=sender.name.removeprefix("tender.worker."),
+                    exc_info=(type(exception), exception, traceback or exception.__traceback__)
                     if exception is not None else None,
                 )
 
 
-def _retry(sender=None, reason=None, **kwargs) -> None:
+def _retry(sender=None, reason=None, einfo=None, **kwargs) -> None:
     if sender is not None and sender.name.startswith("tender."):
-        logger.warning("task_retry", reason_type=type(reason).__name__)
+        # Retry 包装器的类型恒为 Retry；保留实际重试原因及 Celery 提供的堆栈。
+        logger.warning("task.retry", exception=getattr(einfo, "traceback", None),
+                       reason=str(reason) if einfo is None else None,
+                       task=sender.name.removeprefix("tender.worker."))
 
 
 def install_worker_logging() -> None:

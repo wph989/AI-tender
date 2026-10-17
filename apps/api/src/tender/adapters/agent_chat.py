@@ -252,7 +252,7 @@ class AgentChat:
         started = time.monotonic()
         response = await self.model.async_client.create(**payload)
         logger.info(
-            "model_stream_opened", http_status=response.response.status_code,
+            "stream.open", http_status=response.response.status_code,
             headers_ms=int((time.monotonic() - started) * 1000),
             upstream_request_ids={
                 header: error_detail(value, api_key=self._api_key)
@@ -272,7 +272,7 @@ class AgentChat:
                     received_chunks += 1
                     # 首块可能只有角色信息；只记一次到达时间，不逐块刷屏或打印模型正文。
                     if received_chunks == 1:
-                        logger.info("model_stream_first_chunk",
+                        logger.info("stream.first",
                                     first_chunk_ms=int((time.monotonic() - started) * 1000))
                     data = raw if isinstance(raw, dict) else raw.model_dump()
                     choices = data.get("choices") or []

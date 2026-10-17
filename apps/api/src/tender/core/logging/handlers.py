@@ -1,23 +1,62 @@
-"""每个进程独立写文件，避免 Windows 文件占用和 prefork 共享轮转句柄。"""
+"""同一天跨重启追加共享分片，用进程间锁保护整条记录和轮转决策。"""
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import re
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from tender.core.settings import LoggingSettings
 
-# 继续识别旧版随机标识文件，升级后历史日志仍需按保留天数清理。
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+# 清理继续识别旧版时间/PID 和随机标识文件，但追加只选择新的共享分片。
 _FILE_NAME = re.compile(
-    r"(\d{4}-\d{2}-\d{2})\.(?:\d{2}-\d{2}-\d{2}\.\d+|\d+-[a-f0-9]{12})"
-    r"\.\d{3,}\.jsonl\Z"
+    r"(\d{4}-\d{2}-\d{2})(?:\.(?:\d{2}-\d{2}-\d{2}\.\d+|\d+-[a-f0-9]{12}))?"
+    r"\.\d{3,}\.(jsonl|error\.log)\Z"
 )
+_SHARED_FILE_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})\.(\d{3,})\.(jsonl|error\.log)\Z")
+
+
+@contextmanager
+def _directory_lock(directory: Path):
+    # 锁文件不能随分片删除/重建，否则并行进程可能锁住不同文件而同时写入。
+    # 每次使用独立句柄，退出后关闭；进程意外退出时由操作系统释放锁。
+    with (directory / ".write.lock").open("a+b") as lock:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                lock.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("等待日志写入锁超时") from exc
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def emergency_write(text: str) -> None:
@@ -30,16 +69,15 @@ def emergency_write(text: str) -> None:
 
 
 class DailyFileHandler(logging.Handler):
-    def __init__(self, options: LoggingSettings, service: str):
+    def __init__(self, options: LoggingSettings, service: str, *, errors: bool = False):
         super().__init__()
         self.options = options
         self.directory = options.directory / service
+        self.extension = "error.log" if errors else "jsonl"
         self.timezone = ZoneInfo(options.timezone)
         self._pid = os.getpid()
         self._day: date | None = None
         self._sequence = 0
-        self._size = 0
-        self._stream = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_warning = float("-inf")
@@ -65,50 +103,47 @@ class DailyFileHandler(logging.Handler):
             self._last_warning = now
             emergency_write('{"level":"error","event":"log_file_unavailable"}')
 
-    def _close_stream(self) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.close()
-            except OSError:
-                self._warning()
-            self._stream = None
+    def _path(self, sequence: int) -> Path:
+        return self.directory / f"{self._day}.{sequence:03}.{self.extension}"
 
-    def _open(self, now: datetime) -> None:
-        self._close_stream()
-        self.directory.mkdir(parents=True, exist_ok=True)
-        day = now.date()
-        if day != self._day:
-            self._day, self._sequence = day, 0
-        while self._stream is None:
+    def _append(self, data: bytes) -> None:
+        day = self._now().date()
+        if self._day != day:
+            # 只在初始化/跨天扫描目录；数字序号保证超过 999 后仍选择真正的最新分片。
+            self._sequence = max((
+                int(match[2]) for path in self.directory.iterdir()
+                if (match := _SHARED_FILE_NAME.fullmatch(path.name))
+                and match[1] == str(day) and match[3] == self.extension
+            ), default=1)
+            self._day = day
+        # 另一个进程可能已经轮转；持有同一把锁后跟进最新分片，不能继续写旧分片。
+        while self._path(self._sequence + 1).exists():
             self._sequence += 1
-            name = f"{now:%Y-%m-%d.%H-%M-%S}.{self._pid}.{self._sequence:03}.jsonl"
-            try:
-                # 同秒重启或 PID 复用时递增序号，排他创建保证不覆盖历史文件。
-                self._stream = (self.directory / name).open("xb")
-            except FileExistsError:
-                continue
-        self._size = 0
+        while True:
+            # 不跨记录保留文件句柄，Windows 清理/重启及 fork 后均无需接管旧句柄。
+            with self._path(self._sequence).open("a+b") as stream:
+                size = os.fstat(stream.fileno()).st_size
+                if size and size + len(data) > self.options.max_file_bytes:
+                    self._sequence += 1
+                    continue
+                if size:
+                    # 写入中断可能留下半行甚至半个 UTF-8 字符；保留现场，换片隔离新记录。
+                    stream.seek(-1, os.SEEK_END)
+                    if stream.read(1) != b"\n":
+                        self._sequence += 1
+                        continue
+                stream.write(data)
+                stream.flush()
+                return
 
     def emit(self, record: logging.LogRecord) -> None:
         text = self.format(record)
         try:
-            if self._pid != os.getpid():
-                # 即使在 Celery 子进程初始化信号之前出现日志，也不能写入父进程文件。
-                self._close_stream()
-                self._pid = os.getpid()
-                self._day = None
             data = (text + "\n").encode("utf-8", errors="backslashreplace")
-            now = self._now()
-            if (
-                self._stream is None or now.date() != self._day
-                or self._size + len(data) > self.options.max_file_bytes
-            ):
-                self._open(now)
-            self._stream.write(data)
-            self._stream.flush()
-            self._size += len(data)
+            self.directory.mkdir(parents=True, exist_ok=True)
+            with _directory_lock(self.directory):
+                self._append(data)
         except OSError:
-            self._close_stream()
             self._warning()
             # 回退的是已脱敏、限长后的记录，不能让 logging 默认错误处理打印原始参数。
             emergency_write(text)
@@ -117,27 +152,30 @@ class DailyFileHandler(logging.Handler):
         with self.lock:
             today = self._now().date()
             cutoff = date.fromordinal(max(1, today.toordinal() - self.options.retention_days + 1))
-            if self._day is not None and self._day < today:
-                self._close_stream()
             try:
                 if not self.directory.exists():
                     return
-                for path in self.directory.iterdir():
-                    match = _FILE_NAME.fullmatch(path.name)
-                    if not match or path.is_symlink() or not path.is_file():
-                        continue
-                    try:
-                        expired = date.fromisoformat(match[1]) < cutoff
-                    except ValueError:
-                        continue
-                    if expired:
+                # 清理也使用写锁，避免某进程在跨天边界删除另一个进程正在追加的文件。
+                with _directory_lock(self.directory):
+                    for path in self.directory.iterdir():
+                        match = _FILE_NAME.fullmatch(path.name)
+                        if (
+                            not match or match[2] != self.extension
+                            or path.is_symlink() or not path.is_file()
+                        ):
+                            continue
                         try:
-                            # 不递归、不按 mtime 猜日期，只删除本模块命名的过期文件。
-                            path.unlink()
-                        except FileNotFoundError:
-                            pass  # 另一个进程已清理同一文件，属于正常竞争。
-                        except OSError:
-                            self._warning()
+                            expired = date.fromisoformat(match[1]) < cutoff
+                        except ValueError:
+                            continue
+                        if expired:
+                            try:
+                                # 不递归、不按 mtime 猜日期，只删除本模块命名的过期文件。
+                                path.unlink()
+                            except FileNotFoundError:
+                                pass
+                            except OSError:
+                                self._warning()
             except OSError:
                 self._warning()
 
@@ -145,8 +183,6 @@ class DailyFileHandler(logging.Handler):
         self._stop.set()
         if self._pid == os.getpid() and self._thread is not None:
             self._thread.join(timeout=1)
-        with self.lock:
-            self._close_stream()
         super().close()
 
 

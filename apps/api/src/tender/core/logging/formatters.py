@@ -6,14 +6,22 @@ import json
 import logging
 import math
 import re
-from datetime import UTC, datetime
+from datetime import datetime
 from itertools import islice
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import structlog
 
 from tender.core.redaction import redact_text
 
 MAX_RECORD_BYTES = 64 * 1024
+_BEIJING = ZoneInfo("Asia/Shanghai")
+_SOURCE_ROOT = Path(__file__).resolve().parents[3]
+_LEADING_FIELDS = (
+    "timestamp", "level", "event", "location", "request_id", "task_id", "job_id",
+    "report_id", "run_id", "module_key", "invocation_id",
+)
 _PRIVATE_KEYS = {
     "authorization", "cookie", "setcookie", "apikey", "xapikey", "xgoogapikey",
     "password", "passwd", "secret", "secretkey", "accesskey", "accesskeyid",
@@ -65,39 +73,100 @@ class SafeProcessorFormatter(structlog.stdlib.ProcessorFormatter):
             return '{"level":"error","event":"log_format_failed"}'
 
 
-def make_formatter(service: str, *, json_output: bool, secrets: tuple[str, ...] = ()):
+def format_location(pathname: str, lineno: int) -> str:
+    # 项目代码保留包内路径，既区分同名文件，也避免每条重复部署目录。
+    path = Path(pathname)
+    try:
+        path = path.relative_to(_SOURCE_ROOT)
+    except ValueError:
+        pass
+    return f"{path.as_posix()}:{lineno}"
+
+
+def make_formatter(
+    *, json_output: bool, secrets: tuple[str, ...] = (), include_exception: bool = True,
+):
     def enrich(_, __, event):
         record = event["_record"]
+        if not event["_from_structlog"]:
+            # 其他 handler 可能先格式化同一 LogRecord；这些缓存会被 ExtraAdder 重复带入。
+            event.pop("message", None)
+            event.pop("asctime", None)
         event.update(
-            timestamp=datetime.fromtimestamp(record.created, UTC).isoformat(),
-            service=service,
-            process_id=record.process,
-            logger=record.name,
+            timestamp=datetime.fromtimestamp(record.created, _BEIJING).isoformat(
+                timespec="milliseconds"
+            ),
             level=record.levelname.lower(),
         )
+        # 访问摘要可指定接口定义处；其余日志使用实际调用行，而非 logger 的名称。
+        event.setdefault("location", format_location(record.pathname, record.lineno))
         return event
 
     def scrub(_, __, event):
-        clean = sanitize(event, secrets)
-        # 总量限制覆盖「很多短字段」的情况；始终输出一条完整、可解析的 JSON。
+        if not include_exception and (trace := event.pop("exception", None)):
+            # 普通日志只显示错误摘要；完整堆栈由同目录的文本错误文件承载。
+            event.setdefault("error", str(trace).rstrip().splitlines()[-1][:500])
+        # 固定公共字段靠前，业务字段按名称排列；空值省略，0/False 仍有业务含义。
+        ordered = {
+            key: event[key]
+            for key in dict.fromkeys((*_LEADING_FIELDS, "exception", *sorted(event)))
+            if key in event and event[key] is not None and event[key] != ""
+        }
+        if isinstance(ordered.get("exception"), str):
+            trace = redact_text(ordered["exception"], secrets=secrets)
+            # 长堆栈保留首尾，异常类型和最终原因通常在末尾，不能只截取开头。
+            if len(trace) > 16000:
+                trace = trace[:7900] + "\n[堆栈中段已截断]\n" + trace[-7900:]
+            ordered["exception"] = trace
+        clean = sanitize(ordered, secrets)
+        # 先移除导致超限的业务字段；保留字段的最终字节上限由 render_limited 再校验。
         raw = json.dumps(clean, ensure_ascii=False)
         if len(raw.encode("utf-8", errors="backslashreplace")) > MAX_RECORD_BYTES - 1:
             clean = {
                 key: clean[key]
                 for key in (
-                    "timestamp", "service", "process_id", "logger", "level",
-                    "request_id", "task_id", "job_id", "report_id",
+                    *_LEADING_FIELDS, "error", "exception",
                 )
                 if key in clean
             }
-            clean.update(event="[日志记录过长，已截断]", truncated=True)
+            clean["truncated"] = True
+        # 堆栈先参与限长保障其不丢失，展示时放最后，便于先浏览摘要。
+        if "exception" in clean:
+            clean["exception"] = clean.pop("exception")
         return clean
 
     renderer = (
         structlog.processors.JSONRenderer(ensure_ascii=False)
         if json_output
-        else structlog.dev.ConsoleRenderer(colors=False)
+        else structlog.dev.ConsoleRenderer(
+            colors=False, sort_keys=False, pad_event_to=0,
+            exception_formatter=structlog.dev.plain_traceback,
+        )
     )
+
+    def render_limited(logger, name, event):
+        # 文本 renderer 会弹出字段；每次用副本渲染，按真实 UTF-8 字节数（含换行）验收。
+        rendered = renderer(logger, name, event.copy())
+        while len(rendered.encode("utf-8", errors="backslashreplace")) >= MAX_RECORD_BYTES:
+            event["truncated"] = True
+            # 保留字段也可能各自很长，不能把删掉业务字段当成总量限制已完成。
+            key = max(event, key=lambda k: len(
+                json.dumps(event[k], ensure_ascii=False).encode("utf-8", errors="backslashreplace")
+            ))
+            value = event[key]
+            if isinstance(value, str) and len(value) > 128:
+                if key == "exception":
+                    quarter = len(value) // 4
+                    event[key] = value[:quarter] + "\n[堆栈中段已截断]\n" + value[-quarter:]
+                else:
+                    event[key] = value[:len(value) // 2] + "[日志字段已截断]"
+            else:
+                event[key] = "[日志字段已截断]"
+            if "exception" in event:
+                event["exception"] = event.pop("exception")
+            rendered = renderer(logger, name, event.copy())
+        return rendered
+
     return SafeProcessorFormatter(
         foreign_pre_chain=[
             structlog.contextvars.merge_contextvars,
@@ -108,6 +177,6 @@ def make_formatter(service: str, *, json_output: bool, secrets: tuple[str, ...] 
             structlog.processors.format_exc_info,
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
             scrub,
-            renderer,
+            render_limited,
         ],
     )

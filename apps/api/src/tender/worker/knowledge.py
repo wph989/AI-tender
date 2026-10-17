@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -23,10 +24,13 @@ from tender.application.llm_routing import RoutingModel
 from tender.application.qa_agent import answer_with_agent
 from tender.core import settings
 from tender.core.di import create_embedding_gateway, create_rerank_gateway
+from tender.core.logging import get_logger
+from tender.domain.errors import TenderError
 from tender.worker.celery_app import celery_app
 from tender.worker.model_routing import _advisory_lock, _routing_model
 
 _engine = create_pg_engine()
+logger = get_logger(__name__)
 
 
 def _store() -> KnowledgeStore:
@@ -117,6 +121,11 @@ async def _build_index(index_id: int) -> None:
                 raise ValueError("向量模型在索引期间改变了维度")
         db.complete_index(index_id, chunks=chunks, vectors=vectors, config=config)
     except Exception as exc:
+        # 业务失败被收敛到数据库后 Celery 会正常返回，必须在这里保留未知错误的堆栈。
+        # 业务异常已在适配器脱敏，不回放原始异常链；未知故障仍保留完整链。
+        logger.error("index.fail", index_id=index_id, exception="".join(
+            traceback.format_exception(exc, chain=not isinstance(exc, TenderError)),
+        ))
         db.finish_task("index", index_id, "failed", str(exc)[:1000])
     finally:
         if client:
@@ -301,4 +310,8 @@ async def _answer_question(answer_id: int) -> None:
         db.save_answer(answer_id, items=items, relations=relations, snapshot=snapshot)
         db.finish_task("answer", answer_id, "completed")
     except Exception as exc:
+        # 路由可能串联带供应商凭证的 SDK 错误，只记录已脱敏的业务异常堆栈。
+        logger.error("answer.fail", answer_id=answer_id, exception="".join(
+            traceback.format_exception(exc, chain=not isinstance(exc, TenderError)),
+        ))
         db.finish_task("answer", answer_id, "failed", str(exc)[:1000])

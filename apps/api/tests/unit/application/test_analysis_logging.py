@@ -46,11 +46,11 @@ def test_routing_logs_explain_retry_failover_and_disabled_fallback(failover_limi
         asyncio.run(check())
     assert all(log["run_id"] == 99 and log["report_id"] == 18 for log in logs)
     assert len({log["invocation_id"] for log in logs}) == 1
-    finished = [log for log in logs if log["event"] == "model_request_finished"]
+    finished = [log for log in logs if log["event"] == "model.response"]
     assert len(finished) == len(records) == (2 if failover_limit == 1 else 3)
     assert [log["request_ordinal"] for log in finished] == list(range(1, len(records) + 1))
-    assert len([log for log in logs if log["event"] == "model_retry_scheduled"]) == 1
-    failovers = [log for log in logs if log["event"] == "model_failover"]
+    assert len([log for log in logs if log["event"] == "model.retry"]) == 1
+    failovers = [log for log in logs if log["event"] == "model.failover"]
     if failover_limit == 1:
         assert not failovers
         assert logs[-1]["reason"] == "candidate_limit_reached"
@@ -73,11 +73,11 @@ def test_real_agent_logs_tools_research_synthesis_and_verification_without_docum
         state, _, _ = asyncio.run(check())
     assert state["draft"]["fields"]
     events = [log["event"] for log in logs]
-    assert "analysis_skill_loaded" in events
-    assert "analysis_review_started" in events and "analysis_review_finished" in events
+    assert "skill.load" in events
+    assert "review.start" in events and "review.end" in events
     phases = {log.get("agent_phase") for log in logs}
     assert {"research", "synthesis", "verification"} <= phases
-    tools = [log for log in logs if log["event"] == "analysis_tool_finished"]
+    tools = [log for log in logs if log["event"] == "tool.end"]
     assert {"list_documents", "search_document", "complete_research", "submit_analysis"} <= {
         log["tool"] for log in tools
     }
@@ -98,7 +98,7 @@ def test_validation_rejection_logs_item_reason_and_correction_count():
             call("submit_analysis", submission([summary_record()], final=False), "bad"),
             call("submit_analysis", submission(), "finish"),
         ], review=reject))
-    rejected = next(log for log in logs if log["event"] == "analysis_record_rejected")
+    rejected = next(log for log in logs if log["event"] == "record.reject")
     assert rejected["item_id"] and rejected["correction_count"] == 1
     assert rejected["issues"] == "原文不支持该结论"
     assert rejected["log_level"] == "warning"
@@ -144,7 +144,7 @@ def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cau
     monkeypatch.setattr(deep_analysis, "AgentRuntime", Runtime)
     with capture_logs(processors=[merge_contextvars]) as logs:
         asyncio.run(deep_analysis.execute_module(None, {"id": 18}, {"id": 99}, []))
-    failure = next(log for log in logs if log["event"] == "analysis_module_failed")
-    assert failure["run_id"] == 99 and failure["error_type"] == "ModelUnavailable"
-    assert "上游断连" in failure["error"] and "claim" in failure["exception"]
+    failure = next(log for log in logs if log["event"] == "module.fail")
+    assert failure["run_id"] == 99 and "ModelUnavailable" in failure["exception"]
+    assert "上游断连" in failure["exception"] and "claim" in failure["exception"]
     assert "raw-sdk-secret" not in json.dumps(logs, ensure_ascii=False)

@@ -4,9 +4,12 @@ import asyncio
 from collections.abc import Callable
 
 from tender.application.knowledge import rank_chunks, source_state
+from tender.core.logging import get_logger
 from tender.ports.embedding import EmbeddingModel
 from tender.ports.repository.knowledge import KnowledgeStore
 from tender.ports.rerank import RerankModel
+
+logger = get_logger(__name__)
 
 
 async def retrieve_chunks(
@@ -38,6 +41,8 @@ async def retrieve_chunks(
         except TimeoutError:
             warning = "语义检索等待超时，本次已使用全文检索，可稍后重试语义检索。"
         except Exception as exc:
+            # 回退不向上抛异常，需在此记录堆栈；不采集问题和检索正文。
+            logger.warning("embedding.fail", exc_info=True)
             warning = f"语义检索暂不可用，使用全文检索：{str(exc)[:200]}"
         finally:
             if client:
@@ -79,6 +84,7 @@ async def retrieve_chunks(
             ranked = [candidates[index] for index, _ in order] + ranked[30:]
             reranked = True
         except Exception:
+            logger.warning("rerank.fail", exc_info=True)
             warning = (warning + "；" if warning else "") + "重排服务不可用，保留混合检索顺序"
         finally:
             if client:

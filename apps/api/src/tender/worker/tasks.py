@@ -49,6 +49,7 @@ from tender.adapters.s3 import S3BlobStore
 from tender.application.middle_json import NormalizedElement, normalize_middle_json
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
+from tender.core.logging import get_logger
 from tender.domain.errors import (
     ConversionFailed,
     ConversionUnavailable,
@@ -61,6 +62,7 @@ from tender.ports.blob_store import BlobNotFound, BlobStoreError
 from tender.worker.celery_app import celery_app
 
 _engine = create_pg_engine()
+logger = get_logger(__name__)
 
 
 def _store() -> S3BlobStore:
@@ -625,6 +627,8 @@ def process_file(self: Any, job_id: str) -> None:
             _set_job_failure(job_id, "content_hash_mismatch", str(exc))
             return
         except Exception as exc:
+            # 此处会吞掉异常并返回，Celery 失败信号无法代替业务入口记录堆栈。
+            logger.exception("file.fail", job_id=job_id)
             _set_job_failure(job_id, "preprocessing_failed", str(exc))
             return
     finally:
@@ -813,6 +817,7 @@ def submit_parse(self: Any, job_id: str) -> None:
             )
     except Exception as exc:
         # 远端已受理但本地未能保存引用时，不能再次提交同一内容来掩盖不一致。
+        logger.exception("parse.save_fail", job_id=job_id)
         _mark_submission_unknown(job_id, f"MinerU 已提交但任务记录写入失败：{exc}")
         return
 

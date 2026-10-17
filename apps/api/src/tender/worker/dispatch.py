@@ -124,9 +124,10 @@ def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
         for row in candidates:
             try:
                 celery_app.send_task(stream.task_name, args=[row["id"]])
-            except Exception as exc:
+            except Exception:
                 # broker 不可用时留待下一 tick；已发出去的消息不受影响。
-                logger.warning("派发 %s 任务失败，下个 tick 重试：%s", stream.name, exc)
+                logger.warning("dispatch.fail", exc_info=True,
+                               extra={"job_id": row["id"], "stream": stream.name})
                 break
             connection.execute(_mark_dispatched(row["id"]))
             sent += 1

@@ -125,10 +125,9 @@ async def expand_evidence(
             continue
         try:
             rows = await read(source)
-        except Exception as exc:
+        except Exception:
             logger.warning(
-                "analysis_evidence_read_failed", source_id=source["source_id"],
-                error_type=type(exc).__name__, error=error_detail(str(exc)),
+                "evidence.fail", source_id=source["source_id"], exc_info=True,
                 fallback="use_already_read_evidence",
             )
             continue
@@ -171,9 +170,7 @@ async def execute_module(
 ) -> None:
     # module 是运行账行，id 是 run_id；独立绑定可避免并发专题和后续任务串号。
     with bind_context(
-        report_id=report["id"], project_id=report.get("project_id"), run_id=module["id"],
-        module_key=module.get("module_key"), module_id=module.get("module_id"),
-        attempt=module.get("attempt"),
+        report_id=report["id"], run_id=module["id"], module_key=module.get("module_key"),
     ):
         await _execute_module(db, report, module, sources)
 
@@ -187,7 +184,7 @@ async def _execute_module(
     state = {}
     started = time.monotonic()
     try:
-        logger.info("analysis_module_queued")
+        logger.info("module.queued")
         while not await asyncio.to_thread(runtime.claim):
             await asyncio.sleep(1)
 
@@ -222,7 +219,8 @@ async def _execute_module(
         state = runtime.run["state"]
         limits = AgentLimits(**runtime.run["limits"])
         logger.info(
-            "analysis_module_started", resumed=module.get("started_at") is not None,
+            "module.start", resumed=module.get("started_at") is not None,
+            attempt=module.get("attempt"),
             queue_ms=int((time.monotonic() - started) * 1000), source_count=len(sources),
             thread_id=runtime.run["thread_id"], timeout_seconds=limits.timeout_seconds,
             max_model_calls=limits.max_model_calls, max_tool_calls=limits.max_tool_calls,
@@ -336,7 +334,7 @@ async def _execute_module(
             validate_project_claims(draft["fields"], report["project_id"])
             await asyncio.to_thread(runtime.finish, "completed", draft=draft)
             logger.info(
-                "analysis_module_completed", duration_ms=int((time.monotonic() - started) * 1000),
+                "module.end", duration_ms=int((time.monotonic() - started) * 1000),
                 item_count=len(draft["fields"]), evidence_count=len(research.seen),
                 gap_count=len(state.get("business_gaps", [])),
                 model_calls=runtime.run["model_calls"], tool_calls=runtime.run["tool_calls"],
@@ -357,8 +355,9 @@ async def _execute_module(
         status = "canceled" if canceled else "failed"
         log = logger.info if canceled else logger.error
         log(
-            "analysis_module_" + status, duration_ms=int((time.monotonic() - started) * 1000),
-            error_type=type(exc).__name__, error=error_detail(str(exc)),
+            "module.cancel" if canceled else "module.fail",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            reason=error_detail(str(exc)) if canceled else None,
             saved_item_count=sum(i.get("verification") == "supported"
                                  for i in state.get("staged_items", [])),
             # 适配器已对业务异常脱敏；不串联原始 SDK 异常，以免回显其请求或凭证。
@@ -375,8 +374,7 @@ async def _execute_module(
                 try:
                     await model.aclose()
                 except Exception as exc:
-                    logger.warning("analysis_client_close_failed", error_type=type(exc).__name__,
-                                   error=error_detail(str(exc)))
+                    logger.warning("client.close_fail", exc_info=True)
                     await asyncio.to_thread(
                         runtime.event, "client_close_failed", {"error_type": type(exc).__name__}
                     )
@@ -386,7 +384,7 @@ async def _execute_module(
 
 
 async def analyze_report(db: KnowledgeStore, report: dict) -> None:
-    with bind_context(report_id=report["id"], project_id=report.get("project_id")):
+    with bind_context(report_id=report["id"]):
         await _analyze_report(db, report)
 
 
@@ -399,7 +397,8 @@ async def _analyze_report(db: KnowledgeStore, report: dict) -> None:
             return
         report, sources = prepared
         modules = db.report_active_modules(report["id"])
-        logger.info("analysis_report_started", module_count=len(modules), source_count=len(sources))
+        logger.info("report.start", project_id=report.get("project_id"),
+                    module_count=len(modules), source_count=len(sources))
         tasks = [
             asyncio.create_task(execute_module(db, report, module, sources)) for module in modules
         ]
@@ -425,7 +424,7 @@ async def _analyze_report(db: KnowledgeStore, report: dict) -> None:
             error="没有模块完成，请查看各模块错误并补跑" if not completed else None,
         )
         log = logger.info if status == "completed" else logger.warning
-        log("analysis_report_finished", status=status,
+        log("report.end", status=status,
             duration_ms=int((time.monotonic() - started) * 1000),
             completed_modules=sum(r["status"] == "completed" for r in rows), module_count=len(rows))
     except (Exception, asyncio.CancelledError) as exc:
@@ -438,8 +437,7 @@ async def _analyze_report(db: KnowledgeStore, report: dict) -> None:
             else logger.error
         )
         log(
-            "analysis_report_interrupted", error_type=type(exc).__name__,
-            error=error_detail(str(exc)),
+            "report.abort",
             exception="".join(traceback.format_exception(exc, chain=False)),
         )
         db.fail_report(report["id"], str(exc)[:1000])
