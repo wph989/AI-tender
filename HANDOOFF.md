@@ -2356,3 +2356,14 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 验证：新增回归先复现缺陷（10 failed / 1 passed），修复后相关专项 **13 passed**；最终完整后端 `tests/unit tests/contract` **762 passed / 9 skipped**（45.44 秒）。Ruff、import-linter **5 kept / 0 broken**、`git diff --check` 通过；保留两条既有 structlog 异常美化提示。完整验证后只调整注释、文档和测试换行，未再改执行逻辑。
 
 未启停业务服务、未修改真实配置或数据库、未调用真实模型、未提交或推送。运行服务需重启加载修复；本轮未改前端或 SQL。
+
+### 2026-10-18 收敛模型/工具调用日志并统一短 ID
+
+用户要求模型与 Agent 工具只在完成时各记录一次；模型日志要带模型名、输入/输出 token 和耗时，工具日志要带名称、参数和耗时；Celery task_id 与 request_id 共用短 ID 生成规则。UTF-8 读取交接后沿用 karpathy-guidelines，仅修改相关运行日志、ID 生成与对应文档/既有断言。
+
+- `RoutingModel` 每次逻辑调用在 finally 输出一条 `model.call`，包含最终模型名、跨本次重试/切换累计 token、整次耗时与状态。删除模型调用开始、逐 HTTP 请求、重试、切换、冷却、停止等运行日志；逐次请求记录仍写模型调用账本，路由、重试及预算行为不变。
+- Agent 工具执行后只输出一条 `tool.call`，包括工具名、工具参数、状态、耗时及必要错误摘要；缓存重放也只记一条 `status=cached`。移除 start/end/abort 多次记录和额外证据计数。参数继续经统一脱敏与日志大小限制处理。
+- 新增 `new_short_id()`，请求 ID 与 Celery 自动 task_id 共用 `token_urlsafe(9)`，均为 12 位 URL 安全随机字符；显式提供的 ID 保留。覆盖 Celery `send_task`、`apply_async` 和同步/eager `apply`。
+- 更新工程20、本地启动指南及现有日志断言。后续审查发现 AgentChat 单测仍断言已移除的 `stream.*` 事件，已改为断言不产生独立流事件；同时清理流式适配器遗留的未使用导入、计时变量和过时注释。
+
+静态检查：初次修改后的 Ruff、`compileall`、`git diff --check` 通过；本次审查修复后的 AgentChat 源码与单测 Ruff 通过，`git diff --check` 通过。未运行测试、未调用真实模型、未启停业务服务；加载新版需重启服务。

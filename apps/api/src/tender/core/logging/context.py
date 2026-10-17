@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from contextlib import contextmanager
+from secrets import token_urlsafe
 
 from structlog.contextvars import (
     bind_contextvars,
@@ -14,6 +15,11 @@ from structlog.contextvars import (
 
 CONTEXT_KEYS = frozenset({"request_id", "task_id", "job_id", "report_id", "run_id"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
+
+
+def new_short_id() -> str:
+    """为请求与 Celery 任务生成同规格的 12 位 URL 安全 ID。"""
+    return token_urlsafe(9)
 
 
 def valid_identifier(value: object) -> bool:

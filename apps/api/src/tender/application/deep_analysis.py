@@ -763,14 +763,18 @@ class ResearchMiddleware(AgentMiddleware):
             call_id = request.tool_call["id"]
             cached = self.state.setdefault("tool_results", {}).get(call_id)
             if cached is not None:
-                logger.debug("tool.replay", tool_call_id=call_id,
-                             tool=request.tool_call["name"])
+                logger.bind(
+                    tool_call_id=call_id, tool=request.tool_call["name"],
+                ).info(
+                    "tool.call", tool_parameters=request.tool_call.get("args"),
+                    status="cached", duration_ms=0,
+                )
                 return messages_from_dict([cached])[0]
             await self.reserve_tool()
             started = time.monotonic()
-            evidence_before = len(self.research.seen)
             tool_log = logger.bind(tool_call_id=call_id, tool=request.tool_call["name"])
-            tool_log.info("tool.start")
+            tool_error: BaseException | None = None
+            result = None
             try:
                 name = request.tool_call["name"]
                 signature = tool_key(name, request.tool_call["args"])
@@ -865,18 +869,6 @@ class ResearchMiddleware(AgentMiddleware):
                         self.state["read_tool_cache"][signature] = message_to_dict(result)
                 # 先保留最后一次失败反馈，终止时也能定位具体条目，而不是只剩“三次无效”。
                 self.state["tool_results"][call_id] = message_to_dict(result)
-                failed = getattr(result, "status", None) == "error"
-                log = tool_log.warning if failed else tool_log.info
-                # 成功工具只记数量，不复制原文、检索结果或模型提交的业务 JSON。
-                log(
-                    "tool.end", status="error" if failed else "ok",
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                    evidence_count=len(self.research.seen),
-                    new_evidence_count=len(self.research.seen) - evidence_before,
-                    staged_item_count=len(self.state.get("staged_items", [])),
-                    research_completed=bool(self.state.get("research_completed")),
-                    error=error_detail(str(result.content)) if failed else None,
-                )
                 if request.tool_call["name"] == "submit_analysis":
                     if getattr(result, "status", None) == "error":
                         self.state["invalid_submissions"] = (
@@ -897,16 +889,34 @@ class ResearchMiddleware(AgentMiddleware):
                 ):
                     raise ValueError("工具连续失败已达上限：" + str(result.content))
                 return result
-            except Exception as exc:
-                tool_log.warning(
-                    "tool.abort", error_type=type(exc).__name__,
-                    error=error_detail(str(exc)),
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
+            except BaseException as exc:
+                tool_error = exc
                 raise
             finally:
-                self.state["research"] = self.research.checkpoint()
-                await self.save(self.state)
+                try:
+                    self.state["research"] = self.research.checkpoint()
+                    await self.save(self.state)
+                except BaseException as exc:
+                    tool_error = tool_error or exc
+                    raise
+                finally:
+                    result_failed = getattr(result, "status", None) == "error"
+                    failed = tool_error is not None or result_failed
+                    log = tool_log.warning if failed else tool_log.info
+                    log(
+                        "tool.call",
+                        tool_parameters=request.tool_call.get("args"),
+                        status=(
+                            "cancelled" if isinstance(tool_error, asyncio.CancelledError)
+                            else "error" if failed else "ok"
+                        ),
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        error_type=type(tool_error).__name__ if tool_error else None,
+                        error=(
+                            error_detail(str(tool_error)) if tool_error
+                            else error_detail(str(result.content)) if result_failed else None
+                        ),
+                    )
 
 
 def build_module_agent(

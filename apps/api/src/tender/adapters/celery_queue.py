@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from celery import Celery
+from celery import Celery, Task
 
 from tender.adapters.celery_logging import install_publish_logging
+from tender.core.logging.context import new_short_id
 from tender.core.settings import redis_url
 
 _TASK_ROUTES = {
@@ -35,9 +36,47 @@ _BEAT_SCHEDULE = {
 }
 
 
+class TenderTask(Task):
+    def apply_async(
+        self, args=None, kwargs=None, task_id=None, producer=None, link=None,
+        link_error=None, shadow=None, **options,
+    ):
+        # eager 模式也走同一生成规则；普通模式会把 ID 交给 TenderCelery.send_task。
+        return super().apply_async(
+            args=args, kwargs=kwargs, task_id=task_id or new_short_id(),
+            producer=producer, link=link, link_error=link_error, shadow=shadow,
+            **options,
+        )
+
+    def apply(
+        self, args=None, kwargs=None, link=None, link_error=None, task_id=None,
+        retries=None, throw=None, logfile=None, loglevel=None, headers=None, **options,
+    ):
+        # 同步 eager 执行也有短 task_id，避免日志关联字段因执行方式而改变。
+        return super().apply(
+            args=args, kwargs=kwargs, link=link, link_error=link_error,
+            task_id=task_id or new_short_id(), retries=retries, throw=throw,
+            logfile=logfile, loglevel=loglevel, headers=headers, **options,
+        )
+
+
+class TenderCelery(Celery):
+    task_cls = TenderTask
+
+    def send_task(self, name: str, *args, **kwargs):
+        if name.startswith("tender."):
+            # Celery 的 task_id 是 send_task 的第 5 个位置参数，也常以关键字传入。
+            if len(args) > 4:
+                if not args[4]:
+                    args = (*args[:4], new_short_id(), *args[5:])
+            elif not kwargs.get("task_id"):
+                kwargs["task_id"] = new_short_id()
+        return super().send_task(name, *args, **kwargs)
+
+
 def create_celery_app() -> Celery:
     install_publish_logging()
-    app = Celery("tender", broker=redis_url())
+    app = TenderCelery("tender", broker=redis_url())
     app.conf.update(
         task_default_queue="tender",
         task_routes=_TASK_ROUTES,

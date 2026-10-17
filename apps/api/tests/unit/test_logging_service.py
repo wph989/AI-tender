@@ -1129,6 +1129,7 @@ def test_celery_real_execution_and_publication_without_external_services(options
     from celery import signals
 
     from tender.adapters.celery_logging import CONTEXT_HEADER, install_publish_logging
+    from tender.adapters.celery_queue import TenderCelery
     from tender.worker import logging as worker_logging
     from tender.worker.logging import install_worker_logging
 
@@ -1136,7 +1137,7 @@ def test_celery_real_execution_and_publication_without_external_services(options
     install_worker_logging()
     install_worker_logging()
     install_publish_logging()
-    app = Celery("tender", broker="memory://")
+    app = TenderCelery("tender", broker="memory://")
     app.conf.task_default_queue = "test_logging"
     monkeypatch.setattr(
         worker_logging, "configure_logging", lambda service: configure_logging(service, options)
@@ -1152,7 +1153,8 @@ def test_celery_real_execution_and_publication_without_external_services(options
 
     try:
         with bind_context(request_id="published-request", job_id=12):
-            app.send_task(job.name, args=[])
+            published = app.send_task(job.name, args=[])
+            assert len(published.id) == 12
         with app.connection() as connection:
             queue = connection.SimpleQueue("test_logging")
             message = queue.get(block=False)

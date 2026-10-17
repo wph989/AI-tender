@@ -19,7 +19,7 @@ from tender.worker import deep_analysis
 
 
 @pytest.mark.parametrize("failover_limit", [1, 2])
-def test_routing_logs_explain_retry_failover_and_disabled_fallback(failover_limit):
+def test_routing_logs_once_with_final_model_and_aggregated_usage(failover_limit):
     records = []
     router = RoutingModel(
         "analysis", "analysis:18:personnel:4",
@@ -46,22 +46,27 @@ def test_routing_logs_explain_retry_failover_and_disabled_fallback(failover_limi
         asyncio.run(check())
     assert all(log["run_id"] == 99 and log["report_id"] == 18 for log in logs)
     assert len({log["invocation_id"] for log in logs}) == 1
-    finished = [log for log in logs if log["event"] == "model.response"]
-    assert len(finished) == len(records) == (2 if failover_limit == 1 else 3)
-    assert [log["request_ordinal"] for log in finished] == list(range(1, len(records) + 1))
-    assert len([log for log in logs if log["event"] == "model.retry"]) == 1
-    failovers = [log for log in logs if log["event"] == "model.failover"]
+    finished = [log for log in logs if log["event"] == "model.call"]
+    assert len(finished) == 1
+    assert len(records) == (2 if failover_limit == 1 else 3)
+    assert finished[0]["status"] == ("error" if failover_limit == 1 else "ok")
+    assert finished[0]["model_name"] == records[-1].model_key_snapshot
+    assert finished[0]["duration_ms"] >= 0
+    assert not any(
+        log["event"].startswith("model.") and log["event"] != "model.call"
+        for log in logs
+    )
     if failover_limit == 1:
-        assert not failovers
-        assert logs[-1]["reason"] == "candidate_limit_reached"
-        assert logs[-1]["failover_limit"] == 1
+        assert finished[0]["input_tokens"] is None
+        assert finished[0]["output_tokens"] is None
     else:
-        assert failovers[0]["from_model_id"] == 1 and failovers[0]["to_model_id"] == 2
+        assert finished[0]["input_tokens"] == 3
+        assert finished[0]["output_tokens"] == 5
     assert "fixture-key" not in json.dumps(logs, ensure_ascii=False)
     assert "私密模型请求正文" not in json.dumps(logs, ensure_ascii=False)
 
 
-def test_real_agent_logs_tools_research_synthesis_and_verification_without_document_text():
+def test_real_agent_logs_tool_parameters_once_with_research_synthesis_and_verification():
     async def check():
         with bind_context(report_id=18, run_id=99):
             return await execute([
@@ -77,14 +82,17 @@ def test_real_agent_logs_tools_research_synthesis_and_verification_without_docum
     assert "review.start" in events and "review.end" in events
     phases = {log.get("agent_phase") for log in logs}
     assert {"research", "synthesis", "verification"} <= phases
-    tools = [log for log in logs if log["event"] == "tool.end"]
+    tools = [log for log in logs if log["event"] == "tool.call"]
     assert {"list_documents", "search_document", "complete_research", "submit_analysis"} <= {
         log["tool"] for log in tools
     }
-    assert any(log["new_evidence_count"] > 0 for log in tools)
     assert all(log["run_id"] == 99 and log["report_id"] == 18 for log in logs)
     assert all(log["duration_ms"] >= 0 for log in tools)
-    assert "质保三年" not in json.dumps(logs, ensure_ascii=False)
+    assert all("tool_parameters" in log for log in tools)
+    assert any(
+        log["tool"] == "search_document" and log["tool_parameters"] == {"query": "质保"}
+        for log in tools
+    )
 
 
 def test_validation_rejection_logs_item_reason_and_correction_count():

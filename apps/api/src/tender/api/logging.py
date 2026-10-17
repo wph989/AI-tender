@@ -6,13 +6,12 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from inspect import unwrap
-from secrets import token_urlsafe
 from threading import Lock
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from tender.core.logging import bind_context, get_logger
-from tender.core.logging.context import valid_identifier
+from tender.core.logging.context import new_short_id, valid_identifier
 from tender.core.logging.formatters import format_location
 
 logger = get_logger(__name__)
@@ -82,8 +81,8 @@ class RequestLoggingMiddleware:
             (value.decode("latin-1") for key, value in scope["headers"] if key == b"x-request-id"),
             None,
         )
-        # 72 位随机值编码为 12 字符；外部合法 ID 保持原样，避免切断跨服务关联。
-        request_id = incoming if valid_identifier(incoming) else token_urlsafe(9)
+        # 请求与任务共用短 ID 生成逻辑；外部合法 ID 保持原样以延续跨服务关联。
+        request_id = incoming if valid_identifier(incoming) else new_short_id()
         scope.setdefault("state", {})["log_request_id"] = request_id
         started = time.perf_counter()
         status = 500

@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import inspect
 import json
-import time
 from typing import Any
 
 import httpx
 from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
-from tender.core.error_details import error_detail, quota_window, retry_after, upstream_error
-from tender.core.logging import get_logger
+from tender.core.error_details import quota_window, retry_after, upstream_error
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -21,8 +19,6 @@ from tender.domain.errors import (
     ModelUnavailable,
 )
 from tender.ports.llm import Completion
-
-logger = get_logger(__name__)
 
 
 class AgentChat:
@@ -249,17 +245,7 @@ class AgentChat:
         payload["stream"] = True
         if self.model._should_stream_usage(None):
             payload["stream_options"] = {"include_usage": True}
-        started = time.monotonic()
         response = await self.model.async_client.create(**payload)
-        logger.info(
-            "stream.open", http_status=response.response.status_code,
-            headers_ms=int((time.monotonic() - started) * 1000),
-            upstream_request_ids={
-                header: error_detail(value, api_key=self._api_key)
-                for header in ("x-request-id", "request-id", "x-amzn-requestid", "cf-ray")
-                if (value := response.response.headers.get(header))
-            },
-        )
         merged = None
         refusal = None
         default_class = AIMessageChunk
@@ -270,10 +256,7 @@ class AgentChat:
                     stream, self.model.stream_chunk_timeout, model_name=self.model.model_name
                 ):
                     received_chunks += 1
-                    # 首块可能只有角色信息；只记一次到达时间，不逐块刷屏或打印模型正文。
-                    if received_chunks == 1:
-                        logger.info("stream.first",
-                                    first_chunk_ms=int((time.monotonic() - started) * 1000))
+                    # 首块可能只有角色信息，仍需聚合完整流后校验；不记录正文以免泄露请求内容。
                     data = raw if isinstance(raw, dict) else raw.model_dump()
                     choices = data.get("choices") or []
                     delta = (choices[0].get("delta") or {}) if choices else {}

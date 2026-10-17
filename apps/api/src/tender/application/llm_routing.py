@@ -151,32 +151,55 @@ class RoutingModel:
 
     async def _complete(self, prompt: str, chat_request: dict | None = None) -> Completion:
         invocation_id = str(uuid4())
+        records: list[CallRecord] = []
+        started = time.monotonic()
+        status = "error"
+        failure: BaseException | None = None
         # 上下文随协程和 to_thread 传播，重试与备用请求共享一次调用身份，退出后恢复。
         with bind_context(invocation_id=invocation_id):
-            logger.info(
-                "model.start", candidate_count=len(self._candidates),
-                feature_key=self._feature_key, purpose=self._purpose,
-                failover_limit=self._failover_limit, max_total_requests=self._max_total,
-                deadline_seconds=self._deadline_seconds,
-            )
-            return await self._invoke(prompt, chat_request, invocation_id)
+            try:
+                completion = await self._invoke(prompt, chat_request, invocation_id, records)
+                status = "ok"
+                return completion
+            except asyncio.CancelledError as exc:
+                status = "cancelled"
+                failure = exc
+                raise
+            except Exception as exc:
+                status = "error"
+                failure = exc
+                raise
+            finally:
+                last = records[-1] if records else None
+                input_tokens = [record.prompt_tokens for record in records
+                                if record.prompt_tokens is not None]
+                output_tokens = [record.completion_tokens for record in records
+                                 if record.completion_tokens is not None]
+                log = logger.info if status == "ok" else logger.warning
+                log(
+                    "model.call",
+                    model_name=last.model_key_snapshot if last else None,
+                    status=status,
+                    input_tokens=sum(input_tokens) if input_tokens else None,
+                    output_tokens=sum(output_tokens) if output_tokens else None,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    error_type=type(failure).__name__ if failure else None,
+                    error=(
+                        last.error_message if last and last.error_message
+                        else error_detail(str(failure)) if failure else None
+                    ),
+                )
 
-    def _record_call(self, record: CallRecord) -> None:
-        # 先记文件再落账，数据库写入失败时仍能查到已经发生的请求；正文已按候选密钥脱敏。
-        log = logger.info if record.status == "ok" else logger.warning
-        # 运行日志只保留排错摘要，模型/供应商展示名等完整快照仍由账本保存。
-        log("model.response", invocation_id=record.invocation_id,
-            request_ordinal=record.request_ordinal, model_id=record.model_id,
-            provider_id=record.provider_id, status=record.status, http_status=record.http_status,
-            duration_ms=record.latency_ms, prompt_tokens=record.prompt_tokens,
-            completion_tokens=record.completion_tokens, error=record.error_message)
+    def _record_call(self, record: CallRecord, records: list[CallRecord]) -> None:
+        # 逐次请求继续写调用账本；运行日志由外层在整次路由调用结束时汇总一次。
+        records.append(record)
         self._on_call(record)
 
     async def _invoke(
         self, prompt: str, chat_request: dict | None, invocation_id: str,
+        records: list[CallRecord],
     ) -> Completion:
         if not self._candidates:
-            logger.warning("model.stop", reason="no_candidates")
             raise ModelCallFailed(
                 f"功能 {self._feature_key} 没有可用模型，请在模型管理中配置并绑定"
             )
@@ -187,7 +210,6 @@ class RoutingModel:
         request_count = candidate_count = 0
         first_error: TenderError | None = None
         unavailable_only = True
-        last_candidate = None
         candidates = self._candidates
         if self._failover_limit == 1:
             # 禁止降级时先固定最高优先级的启用模型；限流排序和429重试不能偷换成后备模型。
@@ -208,18 +230,10 @@ class RoutingModel:
             retry = 0
             while retry <= max(snapshot.extra_retries, 2):
                 if request_count >= self._max_total or time.monotonic() >= deadline:
-                    logger.warning(
-                        "model.stop", reason="request_or_time_budget_exhausted",
-                        request_count=request_count, candidate_count=candidate_count,
-                    )
                     raise ModelCallFailed("模型调用已达到总请求次数或时间上限，请查看调用记录")
                 delay = self._remaining(snapshot)
                 if delay and any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
                     break
-                if delay > 0:
-                    # 冷却检查每秒执行，等待日志只在进入循环时输出一次。
-                    logger.info("model.wait", provider_id=snapshot.provider_id,
-                                wait_seconds=round(delay, 3))
                 while delay > 0:
                     if time.monotonic() + delay >= deadline:
                         raise ModelCallFailed("模型调用时间预算不足以等待供应商限流恢复")
@@ -229,23 +243,13 @@ class RoutingModel:
                 # 每次发送重新检查启用和凭证；配置读取失败会停止，不能绕过管理页面。
                 candidate = self._recheck(snapshot) if self._recheck else snapshot
                 if candidate is None:
-                    logger.info("model.skip", model_id=snapshot.registry_model_id,
-                                reason="disabled_or_changed")
                     break
                 # 每个实际请求（含换源、格式纠正、摘要）都先预占模块持久预算。
                 if self._before_request:
                     await self._before_request()
                 if not attempted:
-                    if last_candidate is not None:
-                        logger.warning(
-                            "model.failover", from_model_id=last_candidate.registry_model_id,
-                            from_provider_id=last_candidate.provider_id,
-                            to_model_id=candidate.registry_model_id,
-                            to_provider_id=candidate.provider_id,
-                        )
                     candidate_count += 1
                     attempted = True
-                    last_candidate = candidate
                 request_count += 1
                 record = CallRecord(
                     candidate.provider_id,
@@ -262,9 +266,9 @@ class RoutingModel:
                     candidate_count,
                     retry,
                     request_count,
-                    snapshot.display_name,
-                    snapshot.provider_name,
-                    snapshot.model,
+                    candidate.display_name,
+                    candidate.provider_name,
+                    candidate.model,
                 )
                 # 先登记实际请求身份，数据库失败时不发送收费请求。
                 if self._reserve:
@@ -285,13 +289,6 @@ class RoutingModel:
                     max(0, deadline - time.monotonic())
                     / (1 if self._remaining_seconds else planned_requests),
                 )
-                logger.info(
-                    "model.request", model_id=candidate.registry_model_id,
-                    provider_id=candidate.provider_id, model=candidate.model,
-                    candidate_ordinal=candidate_count, retry_ordinal=retry,
-                    request_ordinal=request_count, extra_retries=snapshot.extra_retries,
-                    timeout_seconds=round(request_timeout, 3),
-                )
                 try:
                     with bind_context(
                         request_ordinal=request_count, model_id=candidate.registry_model_id,
@@ -309,7 +306,7 @@ class RoutingModel:
                             status="unknown",
                             latency_ms=int((time.monotonic() - started) * 1000),
                             error_message="本地任务已取消，供应商执行结果未知",
-                        )
+                        ), records,
                     )
                     raise
                 except (TenderError, TimeoutError) as exc:
@@ -328,7 +325,7 @@ class RoutingModel:
                             prompt_tokens=getattr(exc, "prompt_tokens", None),
                             completion_tokens=getattr(exc, "completion_tokens", None),
                             error_message=error_detail(str(exc), api_key=candidate.api_key),
-                        )
+                        ), records,
                     )
                     first_error = first_error or exc
                     if exc.http_status == 429:
@@ -342,8 +339,6 @@ class RoutingModel:
                         delay = hint if rate_round == 0 and hint else max(hint, escalated)
                         remaining_wait = self._rate_max_wait - rate_waited
                         if remaining_wait <= 0:
-                            logger.warning("model.wait_exhausted",
-                                           provider_id=candidate.provider_id)
                             # 等待额度用完就停止重发，落回原有不可用收尾以保留上游详情；
                             # 调用方按「可补跑」处理，不会把已核实成果丢掉。
                             break
@@ -354,10 +349,6 @@ class RoutingModel:
                                 "模型调用时间预算不足以等待供应商限流恢复"
                             ) from exc
                         delay = min(delay, remaining_wait)
-                        logger.warning(
-                            "model.cooldown", provider_id=candidate.provider_id,
-                            wait_seconds=round(delay, 3), reason="http_429",
-                        )
                         rate_waited += delay
                         rate_round += 1
                         key = (
@@ -408,10 +399,6 @@ class RoutingModel:
                                 ]
                             }
                         retry += 1
-                        logger.warning(
-                            "model.retry", model_id=candidate.registry_model_id,
-                            retry_ordinal=retry, wait_seconds=0, reason="invalid_output",
-                        )
                         continue
                     if (
                         unavailable
@@ -426,11 +413,6 @@ class RoutingModel:
                             if any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
                                 break
                             raise ModelCallFailed("模型调用时间预算不足以再次请求") from exc
-                        logger.warning(
-                            "model.retry", model_id=candidate.registry_model_id,
-                            retry_ordinal=retry + 1, wait_seconds=round(delay, 3),
-                            reason="model_unavailable",
-                        )
                         await asyncio.sleep(delay)
                         retry += 1
                         continue
@@ -443,17 +425,10 @@ class RoutingModel:
                         latency_ms=int((time.monotonic() - started) * 1000),
                         prompt_tokens=completion.prompt_tokens,
                         completion_tokens=completion.completion_tokens,
-                    )
+                    ), records,
                 )
                 return replace(completion, registry_model_id=candidate.registry_model_id)
         message = str(first_error) if first_error else "当前模型均已停用或不可调用"
-        logger.warning(
-            "model.stop",
-            reason="candidate_limit_reached" if candidate_count >= self._failover_limit
-            else "candidates_exhausted",
-            candidate_count=candidate_count, failover_limit=self._failover_limit,
-            request_count=request_count,
-        )
         if unavailable_only and first_error:
             raise ModelUnavailable(message)
         raise ModelCallFailed(message)
