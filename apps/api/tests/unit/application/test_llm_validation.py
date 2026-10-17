@@ -14,10 +14,10 @@ from tender.api.llm import (
     ModelCreate,
     ModelPatch,
     _api_key_for,
-    _error_summary,
     router,
 )
 from tender.application.model_profiles import validate_model
+from tender.core.error_details import error_detail
 from tender.core.secrets import SecretKeyUnavailable
 
 
@@ -85,9 +85,9 @@ def test_validation_error_never_echoes_provider_secret():
 
 def test_gateway_error_summary_preserves_details_and_redacts_credentials():
     body = "网关失败 HTTP 504\n<html>网关超时 request_id=upstream-123</html>"
-    assert _error_summary(body) == body
-    assert "private-key" not in _error_summary(body + "\napi_key=private-key")
-    assert _error_summary(None) is None
+    assert error_detail(body) == body
+    assert "private-key" not in error_detail(body + "\napi_key=private-key")
+    assert error_detail(None) is None
 
 
 @pytest.mark.parametrize("model_class", [ModelCreate, ModelPatch])

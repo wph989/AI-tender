@@ -253,7 +253,8 @@ def module_records(data: dict) -> list[dict]:
     evidence = data.get("evidence", {})
     for record in result:
         if "evidence_ids" in record:
-            record["citations"] = [copy.deepcopy(evidence[key])
+            # 证据表写入后只读消费，回填引用不需要再次深拷贝。
+            record["citations"] = [dict(evidence[key])
                                    for key in record["evidence_ids"] if key in evidence]
             if not record["evidence_ids"] or any(key not in evidence
                                                  for key in record["evidence_ids"]):
@@ -383,8 +384,13 @@ def format_tree_issues(records: list[dict]) -> dict[str, tuple[str, str]]:
     return issues
 
 
-def assemble_dataset(modules: list[dict], lots: list[dict]) -> dict:
-    """仅编译通过校验的业务记录；模块执行完成不替代主题覆盖和适用范围。"""
+def assemble_dataset(
+    modules: list[dict], lots: list[dict], hydrated: dict[str, list[dict]] | None = None,
+) -> dict:
+    """仅编译通过校验的业务记录；模块执行完成不替代主题覆盖和适用范围。
+
+    `hydrated` 供同一调用方已完成投影的模块复用，避免同一次发布重复解析业务 JSON。
+    """
     result = {
         "schema_version": DATA_VERSION,
         "lots": [{**lot, "scope": resolve_scope(lot["scope"], lots)}
@@ -396,17 +402,19 @@ def assemble_dataset(modules: list[dict], lots: list[dict]) -> dict:
     for module in modules:
         data = module.get("business_data") or {}
         key = module["module_key"]
-        hydrated = module_records(data)
-        for record in hydrated:
+        available = []
+        for record in (hydrated or {}).get(key) or module_records(data):
+            # 必要证据缺失的记录整条不可用，只登记缺口，不能让剩余引用冒充完整依据。
             if record.get("verification") == "unavailable":
                 result["gaps"].append(data_gap(
                     "source_unavailable", "记录的必要证据缺失", record_id=record["id"],
                     module_key=key,
                 ))
-        hydrated = [r for r in hydrated if r.get("verification") != "unavailable"]
-        accepted = {r["key"]: r for r in hydrated if r["kind"] != "coverage"}
+                continue
+            available.append(record)
+        accepted = {r["key"]: r for r in available if r["kind"] != "coverage"}
         # 旧检查点的证明 key 可能相同；覆盖条目固定 review_id，不按业务 key 合并证明。
-        proofs = {r["id"]: r for r in hydrated if r["kind"] == "coverage"}
+        proofs = {r["id"]: r for r in available if r["kind"] == "coverage"}
         structure_issues = format_tree_issues(list(accepted.values()))
         for raw in accepted.values():
             if raw.get("kind") in {"lot", "coverage"}:

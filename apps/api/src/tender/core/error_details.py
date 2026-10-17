@@ -2,9 +2,34 @@
 
 from __future__ import annotations
 
+import math
 import re
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+
+from tender.domain.errors import ModelCallFailed, ModelUnavailable
 
 MAX_ERROR_LENGTH = 16000
+
+
+def retry_after(response: object) -> float:
+    """仅采纳合法秒数或 HTTP 日期；不把供应商正文或凭证写进异常。"""
+    headers = response.headers
+    value = headers.get("Retry-After", "")
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            until = parsedate_to_datetime(value)
+            now = (
+                parsedate_to_datetime(headers["Date"])
+                if "Date" in headers
+                else datetime.now(UTC)
+            )
+            seconds = (until - now).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return 0
+    return seconds if math.isfinite(seconds) and seconds > 0 else 0
 
 
 def error_detail(value: str | None, *, api_key: str | None = None) -> str | None:
@@ -30,3 +55,26 @@ def error_detail(value: str | None, *, api_key: str | None = None) -> str | None
 def upstream_error(summary: str, body: str | None, *, api_key: str | None = None) -> str:
     value = summary + ("\n上游响应：\n" + body if body else "")
     return error_detail(value, api_key=api_key) or summary
+
+
+def raise_for_status(
+    response: object,
+    *,
+    name: str,
+    api_key: str | None = None,
+    retry_statuses: frozenset[int] = frozenset({408, 429}),
+) -> None:
+    """上游失败统一落账正文与状态码；凭证只在调用方传入一次，避免各适配器漏传。"""
+    status_code = response.status_code
+    if status_code in retry_statuses or status_code >= 500:
+        error = ModelUnavailable(
+            upstream_error(f"{name}暂不可用：HTTP {status_code}", response.text, api_key=api_key),
+            http_status=status_code,
+        )
+        error.retry_after = retry_after(response)
+        raise error
+    if not response.is_success:
+        raise ModelCallFailed(
+            upstream_error(f"{name}拒绝请求：HTTP {status_code}", response.text, api_key=api_key),
+            http_status=status_code,
+        )

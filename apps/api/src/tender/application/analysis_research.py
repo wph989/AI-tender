@@ -88,19 +88,25 @@ class ResearchSession:
         blocks, duplicates = [], []
         omitted = 0
         remembered = dict(self.seen)
+        # 同元素才可能内容相同；按元素分桶后每批只需比较桶内已读块，避免每次检索全账扫描。
+        by_element: dict[tuple, list[dict]] = {}
+        for old in remembered.values():
+            by_element.setdefault(
+                (old["source_id"], old["parse_run_id"], old["element_id"]), []
+            ).append(old)
         for row in rows:
             if (row["source_id"], row["parse_run_id"], row["version_id"]) not in allowed:
                 raise PermissionError("检索返回了范围外或错误版本的证据")
             key = str(row["block_id"])
+            element = (row["source_id"], row["parse_run_id"], row["element_id"])
             # 不跨文件按文字去重：同文异版、补充通知和历史资料必须保留各自证据身份。
+            content = normalized(row["content"])
             identical = next(
                 (
-                    old
-                    for old in remembered.values()
-                    if old["source_id"] == row["source_id"]
-                    and old["parse_run_id"] == row["parse_run_id"]
-                    and old["element_id"] == row["element_id"]
-                    and normalized(old["content"]) == normalized(row["content"])
+                    old for old in by_element.get(element, [])
+                    # 预算丢弃或被覆盖的旧块不再代表已读内容。
+                    if remembered.get(str(old["block_id"])) is old
+                    and normalized(old["content"]) == content
                 ),
                 None,
             )
@@ -113,6 +119,7 @@ class ResearchSession:
                 omitted += 1
                 continue
             remembered[key] = dict(row)
+            by_element.setdefault(element, []).append(remembered[key])
             blocks.append(
                 {"id": key, "text": row["content"]}
                 if self.compact_results

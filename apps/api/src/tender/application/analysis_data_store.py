@@ -67,12 +67,16 @@ def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
         existing = session.snapshot_by_manifest(report_id, digest)
         if existing:
             return existing
+        # 同一次发布里标段提取与装配共用一份记录投影，不重复解析业务 JSON。
+        records_by_module = {
+            module["module_key"]: module_records(module["business_data"]) for module in modules
+        }
         lots = []
         derived = set(locked["derived_lot_ids"])
         for module in modules:
             if module["module_key"] != "project_basic_info_parsing":
                 continue
-            for record in module_records(module["business_data"]):
+            for record in records_by_module[module["module_key"]]:
                 if record["kind"] != "lot" or record.get("verification") != "supported":
                     continue
                 # 项目目录需要稳定查找键；无原文编号时用已核实名称，分析记录中的 code 仍留空。
@@ -93,7 +97,7 @@ def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
                 else:
                     lots.append(item)
         session.set_derived_lots(report_id, sorted(derived))
-        data = assemble_dataset(modules, lots)
+        data = assemble_dataset(modules, lots, records_by_module)
         catalog = [c for c in data["coverage"]
                    if c["module_key"] == "project_basic_info_parsing" and c["topic"] == "lots"]
         missing_lots = {lot["id"] for lot in locked["lot_settings"]} - {

@@ -2084,3 +2084,27 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 - 本轮只改后端状态逻辑与文档，不重跑前端或数据库验收。测试使用脚本化模型和真实Agent图，没有调用真实供应商。
 
 未重启业务API/worker、未修改.env、未迁移或改写业务数据库、未提交或推送。沿用此前推迟业务启用的要求；生效须业务服务加载新版代码。
+
+### 2026-10-17 后端质量审查（/simplify）：复用与效率收口
+
+用户要求审查后端代码并修复质量问题。读取根目录交接，按复用/简化/效率/抽象层级四个角度并行审查，只改质量不改行为。
+
+修复：
+
+- records 端点不再自行生成证据 ID，直接引用 business_data.evidence，与写入时口径一致；所有记录一次调 visible_items，visible_items 在 output=True 时以 with_content=False 解析，避免渲染随即丢弃的 plain_text。
+- 新增 core/error_details.raise_for_status 与 retry_after，5 个模型适配器共用失败分支与重试等待，openai_chat._retry_after 删除；agent_chat 不再延迟导入适配器函数。
+- deep_analysis 抽出 rejected_record_gaps()，build_draft 与 complete_research 共用；analysis_data 装配不可用记录改为单趟登记缺口。
+- rank_chunks 命中数与相似度各算一次，阈值过滤后按原索引重映射；analysis_data_store 一次发布只投影一次记录，assemble_dataset 增加可选 hydrated 复用；_remember 去重按元素分桶。
+- analysis_policy 品类白名单改用 CATEGORIES；api/llm 删除与 error_detail 等价的 _error_summary。
+
+跳过：
+
+- analysis_output 的"总分构成"字面量尝试在 output_schema 落 allow_name_only，会扩大到所有评分标准节并导致 4 项测试失败，已回退；真正修法需要在 Skill 输出格式加声明位。
+- Skill 参考文件改 manifest 声明涉及 13 个 Skill 目录打包格式；verification 三份列表合并会改检查点字段名；records 端点改仓储单行查询需动 ports 与 pg 适配器。均超出本次范围。
+
+验证：
+
+- 后端全量 tests/unit tests/contract：673 passed / 9 skipped，25.97秒，退出码0。
+- Ruff 通过；import-linter 5 kept / 0 broken；git diff --check 通过。
+- 本轮未跑 PostgreSQL 集成测试（只调整投影与查询次数，未改 SQL）；未重启业务API/worker、未调用真实模型、未迁移业务库。
+

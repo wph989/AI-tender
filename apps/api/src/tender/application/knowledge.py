@@ -486,26 +486,36 @@ def rank_chunks(
     min_similarity: float | None = None,
 ) -> list[dict]:
     tokens = keywords(query)
+    # 相关度阈值与词法排序共用同一份命中数，避免对同一批块重复做全文扫描。
+    hits = [sum(t in str(r["content"]).lower() for t in tokens) for r in rows]
+    similarities: dict[int, float] = {}
+
+    def similarity(index: int) -> float:
+        if index not in similarities:
+            embedding = rows[index].get("embedding")
+            similarities[index] = (
+                cosine(vector, embedding)
+                if vector is not None and embedding is not None
+                else hits[index] / max(1, len(tokens))
+            )
+        return similarities[index]
+
     if min_similarity is not None:
         # RRF 是排名融合值而非相似度，必须先按原始相关度过滤，再融合排名和限量。
         # 缺向量的资料仍有确定的全文回退口径，不能让低分向量靠关键词命中绕过阈值。
-        rows = [
-            r for r in rows
-            if (
-                cosine(vector, r["embedding"])
-                if vector is not None and r.get("embedding") is not None
-                else sum(t in str(r["content"]).lower() for t in tokens) / max(1, len(tokens))
-            ) >= min_similarity
-        ]
+        keep = [i for i in range(len(rows)) if similarity(i) >= min_similarity]
+        rows = [rows[i] for i in keep]
+        hits = [hits[i] for i in keep]
+        similarities = {new: similarities[old] for new, old in enumerate(keep)}
     lexical = sorted(
-        ((sum(t in str(r["content"]).lower() for t in tokens), i) for i, r in enumerate(rows)),
+        ((score, i) for i, score in enumerate(hits)),
         reverse=True,
     )
     lists = [[i for score, i in lexical if score > 0]]
     if vector is not None:
         semantic = sorted(
             (
-                (cosine(vector, r["embedding"]), i)
+                (similarity(i), i)
                 for i, r in enumerate(rows)
                 if r.get("embedding") is not None
             ),

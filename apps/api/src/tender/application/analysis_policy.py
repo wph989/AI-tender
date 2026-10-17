@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from hashlib import sha256
 
 from tender.application.analysis_data import semantic_payload
-from tender.application.knowledge import fingerprint, normalized
+from tender.application.knowledge import CATEGORIES, fingerprint, normalized
 
 
 def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = ()) -> dict:
@@ -19,21 +19,24 @@ def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = (
     resources = {p: v for p, v in snapshot.items() if p.startswith(key + "/")}
     digest = sha256(json.dumps(resources, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     # 核心细则在首次推理前加载，避免模型仅凭通用协议分析；示例仍按需读取。
-    output_path = key + "/references/output_format.md"
+    ref_dir = key + "/references/"
+    output_path = ref_dir + "output_format.md"
     instructions = content
     references = [output_path] if output_path in resources else []
     required = (
         ["locate_rules.md", "outline_extract_rules.md", "toc_filter_rules.md"]
         if key == "bid_format_outline_parsing" else ["extraction_rules.md"]
     )
-    references.extend(key + "/references/" + name for name in required
-                      if key + "/references/" + name in resources)
-    references.extend(key + "/references/" + category + "/extraction_rules.md"
-                      for category in dict.fromkeys(categories)
-                      if category in {"service", "goods", "engineering"}
-                      # 技术 Skill 只引用方案模板；旧参数参考不能覆盖其明确排除纯参数的边界。
-                      and key != "tech_requirement_parsing"
-                      and key + "/references/" + category + "/extraction_rules.md" in resources)
+    references.extend(ref_dir + name for name in required if ref_dir + name in resources)
+    # 品类细则按项目/标段实际品类加载，覆盖混合品类；品类清单与知识库口径共用一份。
+    references.extend(
+        ref_dir + category + "/extraction_rules.md"
+        for category in dict.fromkeys(categories)
+        # 技术 Skill 只引用方案模板；旧参数参考不能覆盖其明确排除纯参数的边界。
+        if category in CATEGORIES
+        and key != "tech_requirement_parsing"
+        and ref_dir + category + "/extraction_rules.md" in resources
+    )
     for reference in references:
         instructions += "\n\n" + resources[reference]
     coverage_path = key + "/references/coverage.json"

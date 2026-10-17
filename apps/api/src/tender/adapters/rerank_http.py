@@ -4,7 +4,7 @@ import math
 
 import httpx
 
-from tender.core.error_details import upstream_error
+from tender.core.error_details import raise_for_status
 from tender.domain.errors import ModelCallFailed, ModelUnavailable
 
 
@@ -37,15 +37,7 @@ class HttpRerankModel:
             )
         except httpx.HTTPError as exc:
             raise ModelUnavailable("重排服务连接失败或超时") from exc
-        if not response.is_success:
-            raise ModelCallFailed(
-                upstream_error(
-                    f"重排服务返回 HTTP {response.status_code}",
-                    response.text,
-                    api_key=self._api_key,
-                ),
-                http_status=response.status_code,
-            )
+        raise_for_status(response, name="重排服务", api_key=self._api_key)
         try:
             rows = response.json()["results"]
             if not isinstance(rows, list) or len(rows) != min(top_n, len(documents)):

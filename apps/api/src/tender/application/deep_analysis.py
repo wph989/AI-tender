@@ -231,6 +231,15 @@ def field_label(entry: dict) -> str:
     return str(entry.get("group", "")) + ":" + str(entry.get("field", "未知字段"))
 
 
+def rejected_record_gaps(state: dict) -> dict[str, dict]:
+    """纠正耗尽的事项仍是未解决缺口；最终清单与再次检索确认都不能把它清除。"""
+    rejected = state.get("rejected_records", {})
+    return {
+        g["key"]: g for g in state.get("business_gaps", [])
+        if g["key"].removeprefix("record:") in rejected
+    }
+
+
 def validate_project_claims(fields: list[dict], project_id: int) -> None:
     """拒绝可确定的证据范围错误，不能把模型的 supported 当成权限或缺失证明。"""
     for field in fields:
@@ -445,9 +454,7 @@ class ResearchMiddleware(AgentMiddleware):
                         if g["key"].startswith("coverage:")}
                 gaps.update({g["key"]: g for g in request["business_gaps"]})
                 # 纠正耗尽的事项仍是未解决缺口，空最终清单不能把它悄悄清除。
-                gaps.update({g["key"]: g for g in self.state.get("business_gaps", [])
-                             if g["key"].removeprefix("record:")
-                             in self.state.get("rejected_records", {})})
+                gaps.update(rejected_record_gaps(self.state))
                 if checkpoint := self.state.get("research_completed"):
                     gaps.update({g["key"]: g for g in research_gaps(checkpoint)})
                 self.state["business_gaps"] = list(gaps.values())
@@ -931,9 +938,7 @@ def build_module_agent(
             )
             state["research_completed"] = checkpoint
             # 同一批证据再次确认只更新检索缺口；拒绝事项仍需保留到真正补入新证据。
-            rejected_gaps = {g["key"]: g for g in state.get("business_gaps", [])
-                             if g["key"].removeprefix("record:")
-                             in state.get("rejected_records", {})}
+            rejected_gaps = rejected_record_gaps(state)
             state["business_gaps"] = list({
                 **{g["key"]: g for g in research_gaps(checkpoint)}, **rejected_gaps,
             }.values())

@@ -57,7 +57,6 @@ from tender.application.knowledge import (
     TOPICS,
     align_citation,
     dedupe_citations,
-    fingerprint,
     merge_field_entries,
     source_signature,
     source_state,
@@ -527,7 +526,8 @@ def visible_items(
                     )
                     resolved = resolved_elements.get(element_key)
                     if resolved is None:
-                        resolved = db.resolve(ref, with_content=True)
+                        # 只判可见性时不需要正文，避免为被丢弃的 plain_text 渲染全文。
+                        resolved = db.resolve(ref, with_content=not item.get("output"))
                         resolved_elements[element_key] = resolved
                 except LookupError:
                     accessible = False
@@ -674,24 +674,28 @@ def get_module_records(report_id: int, module_key: str, request: Request) -> dic
         raise ApiProblem(404, "not_found", "分析维度不存在")
     business = module.get("business_data") or {}
     allowed = db.collections_for_project(report["project_id"])
+    stored_evidence = business.get("evidence", {})
+    # records 可直接引用落盘证据；生成规则与写入时保持一致，避免两套指纹口径漂移。
+    candidates = [
+        record for record in module_records(business)
+        if record.get("kind") != "coverage"
+        and record.get("evidence_ids")
+        and all(key in stored_evidence for key in record["evidence_ids"])
+    ]
+    # 一次判定全部记录的实时可见性，避免逐条解析同一批原文。
+    visible = visible_items(db, [{
+        "id": record["id"], "field": record.get("title", ""),
+        "output": True,
+        "values": [{"value": "", "citations": record["citations"]}],
+    } for record in candidates], allowed)
     records, evidence = [], {}
-    for record in module_records(business):
-        if record.get("kind") == "coverage":
-            continue
-        refs = record.get("citations", [])
-        visible = visible_items(db, [{
-            "id": record["id"], "field": record.get("title", ""),
-            "output": True, "values": [{"value": "", "citations": refs}],
-        }], allowed)[0]
+    for record, result in zip(candidates, visible, strict=True):
         # 任一必要依据撤销时整条隐藏，不能用独立 JSON 绕过报告的实时权限检查。
-        if not refs or visible.get("verification") == "unavailable":
+        if result.get("verification") == "unavailable":
             continue
         data = {k: v for k, v in record.items() if k not in {"citations", "evidence_ids"}}
-        data["evidence_ids"] = []
-        for ref in refs:
-            evidence_id = fingerprint(ref)
-            evidence[evidence_id] = ref
-            data["evidence_ids"].append(evidence_id)
+        data["evidence_ids"] = list(record["evidence_ids"])
+        evidence.update({key: stored_evidence[key] for key in data["evidence_ids"]})
         records.append(data)
     return {"schema_version": DATA_VERSION, "module_key": module_key,
             "status": module["status"], "records": records, "evidence": evidence,

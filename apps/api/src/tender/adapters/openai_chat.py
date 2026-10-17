@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import json
-import math
 import re
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from tender.core.error_details import upstream_error
+from tender.core.error_details import raise_for_status
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -22,25 +19,6 @@ from tender.domain.errors import (
 )
 from tender.ports.llm import Completion
 from tender.ports.model_media import ModelImage
-
-
-def _retry_after(response: httpx.Response) -> float:
-    """仅采纳合法秒数或 HTTP 日期；不把供应商正文或凭证写进异常。"""
-    value = response.headers.get("Retry-After", "")
-    try:
-        seconds = float(value)
-    except ValueError:
-        try:
-            until = parsedate_to_datetime(value)
-            now = (
-                parsedate_to_datetime(response.headers["Date"])
-                if "Date" in response.headers
-                else datetime.now(UTC)
-            )
-            seconds = (until - now).total_seconds()
-        except (ValueError, TypeError, OverflowError):
-            return 0
-    return seconds if math.isfinite(seconds) and seconds > 0 else 0
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -291,26 +269,7 @@ class OpenAIChatModel:
             # 仅保留异常类型，区分应用超时和上游断连；原异常文本可能含密钥或请求正文。
             raise ModelUnavailable(f"模型连接失败或请求超时（{type(exc).__name__}）") from exc
         # 网关可能在供应商超时后返回非标准 5xx（如 Cloudflare 524）；一律按可重试处理。
-        if response.status_code in {408, 429} or response.status_code >= 500:
-            error = ModelUnavailable(
-                upstream_error(
-                    f"LLM 网关暂不可用：HTTP {response.status_code}",
-                    response.text,
-                    api_key=self._api_key,
-                ),
-                http_status=response.status_code,
-            )
-            error.retry_after = _retry_after(response)
-            raise error
-        if not response.is_success:
-            raise ModelCallFailed(
-                upstream_error(
-                    f"LLM 网关拒绝请求：HTTP {response.status_code}",
-                    response.text,
-                    api_key=self._api_key,
-                ),
-                http_status=response.status_code,
-            )
+        raise_for_status(response, name="LLM 网关", api_key=self._api_key)
         try:
             payload: Any = response.json()
             if self._api_mode == "responses":
@@ -404,24 +363,10 @@ class OpenAIChatModel:
             response = await self._client.get("models", headers=self._headers())
         except httpx.HTTPError as exc:
             raise ModelUnavailable("模型目录连接失败或请求超时") from exc
-        if response.status_code == 429 or response.status_code >= 500:
-            raise ModelUnavailable(
-                upstream_error(
-                    f"LLM 网关暂不可用：HTTP {response.status_code}",
-                    response.text,
-                    api_key=self._api_key,
-                ),
-                http_status=response.status_code,
-            )
-        if not response.is_success:
-            raise ModelCallFailed(
-                upstream_error(
-                    f"LLM 网关拒绝请求：HTTP {response.status_code}",
-                    response.text,
-                    api_key=self._api_key,
-                ),
-                http_status=response.status_code,
-            )
+        raise_for_status(
+            response, name="LLM 网关", api_key=self._api_key,
+            retry_statuses=frozenset({429}),
+        )
         try:
             payload: Any = response.json()
             data = payload["models"] if self._protocol == "gemini" else payload["data"]

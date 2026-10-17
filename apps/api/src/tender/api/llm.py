@@ -73,13 +73,6 @@ from tender.ports.model_media import EmbeddingInput
 router = APIRouter(prefix="/api/v1/llm", tags=["llm"])
 
 
-def _error_summary(value: str | None) -> str | None:
-    if not value:
-        return None
-    # 详情已由适配器处理已知密钥；读取时保留正文，并兼顾历史记录中的常见凭证字段。
-    return error_detail(value)
-
-
 class ProviderCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -291,7 +284,7 @@ def _provider_out(row: Mapping[str, Any]) -> dict[str, Any]:
         "enabled": row["enabled"],
         "last_test_status": row["last_test_status"],
         "last_test_at": row["last_test_at"],
-        "last_test_error": _error_summary(row["last_test_error"]),
+        "last_test_error": error_detail(row["last_test_error"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -338,7 +331,7 @@ def _model_out(row: Mapping[str, Any]) -> dict[str, Any]:
         "enabled": row["enabled"],
         "last_test_status": row["last_test_status"],
         "last_test_at": row["last_test_at"],
-        "last_test_error": _error_summary(row["last_test_error"]),
+        "last_test_error": error_detail(row["last_test_error"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -614,7 +607,7 @@ def _test_view(row: Mapping[str, Any]) -> dict:
         else "valid"
     )
     return item | {
-        "error_message": _error_summary(row["error_message"]),
+        "error_message": error_detail(row["error_message"]),
         "validity": validity,
         "expires_at": expiry,
         "capability": "text" if row["capability"] == "language" else row["capability"],
@@ -1585,6 +1578,6 @@ def list_calls(
     return {
         "total": int(total),
         "items": [
-            dict(row) | {"error_message": _error_summary(row["error_message"])} for row in rows
+            dict(row) | {"error_message": error_detail(row["error_message"])} for row in rows
         ],
     }

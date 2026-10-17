@@ -10,7 +10,7 @@ import httpx
 from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
-from tender.core.error_details import upstream_error
+from tender.core.error_details import retry_after, upstream_error
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -139,9 +139,7 @@ class AgentChat:
                     http_status=status,
                 )
                 if response is not None:
-                    from tender.adapters.openai_chat import _retry_after
-
-                    error.retry_after = _retry_after(response)
+                    error.retry_after = retry_after(response)
                 raise error from exc
             raise ModelCallFailed(
                 upstream_error(
