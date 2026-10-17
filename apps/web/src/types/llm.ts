@@ -105,6 +105,12 @@ export interface LlmProvider {
   last_test_status: string | null;
   last_test_at: string | null;
   last_test_error: string | null;
+  /**
+   * 上游 429 后的冷却剩余秒数，后端按数据库时钟计算；0 表示当前没有冷却。
+   *
+   * 不换成绝对时间：浏览器与服务器时钟不一致时，会把刚恢复的供应商显示成仍在限流。
+   */
+  rate_limit_remaining_seconds: number;
   created_at: string;
   updated_at: string;
 }

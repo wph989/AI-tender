@@ -11,6 +11,10 @@ from tender.domain.errors import ModelCallFailed, ModelUnavailable
 
 MAX_ERROR_LENGTH = 16000
 
+_WINDOW_PATTERN = re.compile(
+    r"\b(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b", re.IGNORECASE
+)
+
 
 def retry_after(response: object) -> float:
     """仅采纳合法秒数或 HTTP 日期；不把供应商正文或凭证写进异常。"""
@@ -57,6 +61,20 @@ def upstream_error(summary: str, body: str | None, *, api_key: str | None = None
     return error_detail(value, api_key=api_key) or summary
 
 
+def quota_window(body: str | None) -> float:
+    """从限流正文里识别配额窗口（如「maximum 25 requests in 5 minutes」）。
+
+    网关普遍不回 Retry-After；固定等待撑不过分钟级窗口，只能按正文给出的恢复周期等。
+    """
+    if not body:
+        return 0
+    seconds = 0.0
+    for value, unit in _WINDOW_PATTERN.findall(body):
+        scale = 3600 if unit[0] in "hH" else 60 if unit[0] in "mM" else 1
+        seconds = max(seconds, float(value) * scale)
+    return seconds
+
+
 def raise_for_status(
     response: object,
     *,
@@ -71,7 +89,9 @@ def raise_for_status(
             upstream_error(f"{name}暂不可用：HTTP {status_code}", response.text, api_key=api_key),
             http_status=status_code,
         )
-        error.retry_after = retry_after(response)
+        # Retry-After 是供应商的明确承诺；缺失时按正文的配额窗口估算恢复时间。
+        # 头部是承诺、正文窗口是估算，取较大值；任一都不给时才交给指数退避。
+        error.retry_after = max(retry_after(response), quota_window(response.text))
         raise error
     if not response.is_success:
         raise ModelCallFailed(

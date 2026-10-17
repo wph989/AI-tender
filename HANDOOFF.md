@@ -2108,3 +2108,21 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 - Ruff 通过；import-linter 5 kept / 0 broken；git diff --check 通过。
 - 本轮未跑 PostgreSQL 集成测试（只调整投影与查询次数，未改 SQL）；未重启业务API/worker、未调用真实模型、未迁移业务库。
 
+
+### 2026-10-17 上游 429 降级的前端可见性
+
+用户要求前端补上对应的限流界面。配置页本身按后端元数据渲染，两个新参数无需改界面；缺口在于冷却状态后端从未对外返回。
+
+改动：
+
+- api/llm.py：供应商查询附加 `rate_limit_remaining_seconds`（数据库时钟计算，`greatest(0, epoch(rate_limited_until - clock_timestamp()))`），`_provider_out` 输出到列表/新增/更新三处；模型输出不含该字段。
+- 前端 types/llm.ts 增加该字段并说明为何用剩余秒数而非绝对时间；lib/llm/format.ts 新增 `countdownLabel`。
+- ProvidersPanel 状态列在启用/停用标签下追加“限流冷却 X 分 Y 秒”，只读展示，不提供手动解除。
+- CallLogsPanel：`http_status === 429` 的行标为“上游限流”（warning 色），详情同口径，避免把配额等待误读成请求失败。
+
+验证：
+
+- 后端 tests/unit tests/contract：683 passed / 9 skipped；Ruff 通过。
+- 前端 pnpm typecheck 通过；pnpm test 48 passed / 8 files。
+
+未部署：业务 API/worker 未重启，迁移 0016 仍未执行业务库，前端未构建发布；两个新参数在配置页出现依赖 0016 落库。

@@ -214,6 +214,8 @@ async def execute_module(
             before_request=reserve_model,
             output_limit=limits.max_output_tokens,
             extra_retries_limit=2,
+            rate_limit_backoff_seconds=limits.rate_limit_backoff_seconds,
+            rate_limit_max_wait_seconds=limits.rate_limit_max_wait_seconds,
             on_call=runtime.record_call,
             remaining_seconds=lambda: max(
                 0, (runtime.run["deadline_at"] - datetime.now(UTC)).total_seconds()

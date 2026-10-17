@@ -153,6 +153,8 @@ def _routing_model(
     on_call=None,
     remaining_seconds=None,
     extra_retries_limit: int | None = None,
+    rate_limit_backoff_seconds: float = 30,
+    rate_limit_max_wait_seconds: float = 600,
 ) -> RoutingModel:
     from tender.adapters.pg.repositories.provider_cooldown import ProviderCooldown
 
@@ -206,4 +208,6 @@ def _routing_model(
         cooldown_remaining=cooldown.remaining,
         defer_provider=cooldown.defer,
         remaining_seconds=remaining_seconds,
+        rate_limit_backoff_seconds=rate_limit_backoff_seconds,
+        rate_limit_max_wait_seconds=rate_limit_max_wait_seconds,
     )

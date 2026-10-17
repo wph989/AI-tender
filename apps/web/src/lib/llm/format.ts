@@ -68,3 +68,12 @@ export function withinNumericRule(
     (rule?.min === undefined || value >= rule.min) &&
     (rule?.max === undefined || value <= rule.max);
 }
+
+/** 限流冷却剩余时间：秒级数字对运维没有意义，按分秒给出可读的等待长度。 */
+export function countdownLabel(seconds: number): string {
+  const total = Math.max(0, Math.ceil(seconds));
+  if (total < 60) return `${total} 秒`;
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`;
+}

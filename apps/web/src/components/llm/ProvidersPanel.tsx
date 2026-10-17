@@ -26,6 +26,7 @@ import {
   updateProvider,
 } from "@/lib/api/llm";
 import {
+  countdownLabel,
   formatTime,
   message,
   validityLabel,
@@ -220,11 +221,21 @@ export function ProvidersPanel({
           {
             title: "状态",
             key: "state",
-            width: 90,
+            width: 150,
             render: (_, p) => (
-              <Tag color={p.enabled ? "success" : "default"}>
-                {p.enabled ? "启用" : "停用"}
-              </Tag>
+              <>
+                <Tag color={p.enabled ? "success" : "default"}>
+                  {p.enabled ? "启用" : "停用"}
+                </Tag>
+                {p.rate_limit_remaining_seconds > 0 && (
+                  // 429 后本页只读展示冷却，不提供手动解除：计时来自后端共享截止时间。
+                  <div className="mt-1">
+                    <Tag color="warning">
+                      限流冷却 {countdownLabel(p.rate_limit_remaining_seconds)}
+                    </Tag>
+                  </div>
+                )}
+              </>
             ),
           },
           {

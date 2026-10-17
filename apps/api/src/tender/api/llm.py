@@ -218,13 +218,25 @@ class FeaturePatch(BaseModel):
     revision: int = Field(ge=1)
 
 
+def _cooldown_seconds() -> Any:
+    """限流冷却剩余秒数按数据库时钟计算，前端不需要信任本机时间。
+
+    写入方是 ProviderCooldown，这里只读；跨实例的 429 也只能靠这一列共享。
+    """
+    return func.greatest(
+        0,
+        func.extract(
+            "epoch", LlmProvider.rate_limited_until - func.clock_timestamp()
+        ),
+    ).label("rate_limit_remaining_seconds")
+
+
 def _provider_row(db: Engine, provider_id: int) -> dict[str, Any]:
     with db.connect() as connection:
         row = (
             connection.execute(
-                select(LlmProvider).where(
-                    LlmProvider.id == provider_id, LlmProvider.deleted_at.is_(None)
-                )
+                select(LlmProvider, _cooldown_seconds())
+                .where(LlmProvider.id == provider_id, LlmProvider.deleted_at.is_(None))
             )
             .mappings()
             .first()
@@ -285,6 +297,10 @@ def _provider_out(row: Mapping[str, Any]) -> dict[str, Any]:
         "last_test_status": row["last_test_status"],
         "last_test_at": row["last_test_at"],
         "last_test_error": error_detail(row["last_test_error"]),
+        # 上游 429 后，本轮请求会等到这里归零再重发；0 表示当前没有冷却。
+        "rate_limit_remaining_seconds": round(
+            float(row.get("rate_limit_remaining_seconds") or 0), 1
+        ),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -712,7 +728,7 @@ def list_providers(request: Request) -> dict[str, Any]:
     with engine(request).connect() as connection:
         rows = (
             connection.execute(
-                select(LlmProvider)
+                select(LlmProvider, _cooldown_seconds())
                 .where(LlmProvider.deleted_at.is_(None))
                 .order_by(LlmProvider.name)
             )

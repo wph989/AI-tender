@@ -14,6 +14,11 @@ const statusNames: Record<string, string> = {
   unsupported: "不支持",
 };
 
+/** 429 是“暂时没有配额”，不是请求本身失败；单列出来才看得出降级在等谁。 */
+function callStatusLabel(call: LlmCall): string {
+  return call.http_status === 429 ? "上游限流" : (statusNames[call.status] ?? call.status);
+}
+
 export function CallLogsPanel({
   active,
   features,
@@ -222,18 +227,20 @@ export function CallLogsPanel({
           {
             title: "状态",
             dataIndex: "status",
-            width: 100,
-            render: (value: string) => (
+            width: 110,
+            render: (_value: string, call: LlmCall) => (
               <Tag
                 color={
-                  value === "ok"
-                    ? "success"
-                    : value === "error"
-                      ? "error"
-                      : "default"
+                  call.http_status === 429
+                    ? "warning"
+                    : call.status === "ok"
+                      ? "success"
+                      : call.status === "error"
+                        ? "error"
+                        : "default"
                 }
               >
-                {statusNames[value] ?? value}
+                {callStatusLabel(call)}
               </Tag>
             ),
           },
@@ -321,7 +328,7 @@ function CallItem({
           {call.display_name ?? "供应商目录"} ·{" "}
           {call.provider_name ?? "未知供应商"}
         </strong>
-        <span>{statusNames[call.status] ?? call.status}</span>
+        <span>{callStatusLabel(call)}</span>
       </div>
       <p className="mt-2 text-xs text-slate-500">
         {feature ?? call.feature_key ?? "管理测试"} ·{" "}

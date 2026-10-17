@@ -41,6 +41,8 @@ class AgentLimits:
     max_tool_failures: int = 3
     max_no_progress_rounds: int = 3
     max_finish_corrections: int = 2
+    rate_limit_backoff_seconds: int = 30
+    rate_limit_max_wait_seconds: int = 600
     max_identical_tool_calls: int = 3
     max_validation_failures: int = 3
     max_subagent_retries: int = 2

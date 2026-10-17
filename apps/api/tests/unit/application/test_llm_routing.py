@@ -134,6 +134,8 @@ def test_call_record_preserves_long_upstream_details_and_hides_candidate_key():
     model = RoutingModel(
         "analysis", "analysis", [replace(_candidate("a", 1), api_key="fixture-key")],
         gateway, records.append,
+        # 本用例只核对落账正文；等待额度设为 0，不重发也不真等 30 秒。
+        rate_limit_backoff_seconds=0, rate_limit_max_wait_seconds=0,
     )
     try:
         with pytest.raises(ModelUnavailable):
@@ -316,6 +318,75 @@ def test_retry_after_larger_than_deadline_stops_without_retry():
     with pytest.raises(ModelCallFailed, match="时间预算"):
         asyncio.run(router.complete("测试"))
     assert len(records) == 1
+
+
+def test_rate_limit_wait_does_not_consume_retry_allowance():
+    """限流是暂时没有配额，不是请求失败：等待后必须仍然可以重试。"""
+
+    async def run():
+        records: list[CallRecord] = []
+        limit = ModelUnavailable("限流", http_status=429)
+        limit.retry_after = 0.01
+        gateway = _ScriptedGateway({"a": [limit, True]})
+        model = RoutingModel(
+            "analysis", "analysis", [replace(_candidate("a", 1), extra_retries=0)],
+            gateway, records.append,
+            rate_limit_backoff_seconds=0.01, rate_limit_max_wait_seconds=0.05,
+        )
+        try:
+            # extra_retries=0 时旧实现只允许一次请求，这里必须能在等待后成功。
+            completion = await model.complete("分析")
+        finally:
+            await model.aclose()
+        assert completion.model == "a"
+        assert [record.http_status for record in records] == [429, 200]
+
+    asyncio.run(run())
+
+
+def test_rate_limit_wait_stops_after_the_configured_budget():
+    """等待额度用尽时按不可用收尾，保留上游详情供补跑定位。"""
+
+    async def run():
+        records: list[CallRecord] = []
+        limit = ModelUnavailable("限流配额耗尽", http_status=429)
+        limit.retry_after = 0.5
+        model = RoutingModel(
+            "analysis", "analysis", [replace(_candidate("a", 1), extra_retries=2)],
+            _ScriptedGateway({"a": [limit] * 5}), records.append,
+            rate_limit_backoff_seconds=0.01, rate_limit_max_wait_seconds=0.02,
+        )
+        try:
+            with pytest.raises(ModelUnavailable, match="限流配额耗尽"):
+                await model.complete("分析")
+        finally:
+            await model.aclose()
+        # 额度用尽后不再重发；记录数等于实际发送次数减去被拒的那次之外的重试。
+        assert len(records) <= 2
+
+    asyncio.run(run())
+
+
+def test_rate_limit_backoff_grows_when_the_supplier_gives_no_reset_time():
+    """没有 Retry-After 时按倍数递增，避免 30 秒固定冷却反复撞同一窗口。"""
+
+    async def run():
+        records: list[CallRecord] = []
+        first = ModelUnavailable("限流", http_status=429)
+        second = ModelUnavailable("限流", http_status=429)
+        gateway = _ScriptedGateway({"a": [first, second, True]})
+        model = RoutingModel(
+            "analysis", "analysis", [replace(_candidate("a", 1), extra_retries=0)],
+            gateway, records.append,
+            rate_limit_backoff_seconds=0.01, rate_limit_max_wait_seconds=5,
+        )
+        try:
+            await model.complete("分析")
+        finally:
+            await model.aclose()
+        assert [record.http_status for record in records] == [429, 429, 200]
+
+    asyncio.run(run())
 
 
 def test_rate_limit_cooldown_avoids_repeated_requests_and_invalid_usage_is_recorded():

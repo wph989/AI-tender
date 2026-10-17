@@ -70,6 +70,14 @@ ITEMS: tuple[ConfigItem, ...] = (
         "analysis.max_finish_corrections", L1, "int", 2,
         "进入收尾后允许的连续无进展纠正轮数，耗尽时保留已核实成果并终止",
     ),
+    _item(
+        "analysis.rate_limit_backoff_seconds", L1, "int", 30,
+        "上游429未给出恢复时间时的首次等待秒数，后续按倍数递增",
+    ),
+    _item(
+        "analysis.rate_limit_max_wait_seconds", L1, "int", 600,
+        "单个模块内为上游限流累计等待的上限秒数，超出后按可补跑失败收尾",
+    ),
     _item("analysis.max_identical_tool_calls", L1, "int", 3, "同一工具与参数的累计调用上限"),
     _item("analysis.max_validation_failures", L1, "int", 3, "同一事实校验失败上限，含首次失败"),
     _item("analysis.max_subagent_retries", L1, "int", 2, "子Agent本地执行故障的自动恢复上限"),

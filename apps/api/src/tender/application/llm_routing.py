@@ -82,6 +82,8 @@ class RoutingModel:
         cooldown_remaining: Callable[[ModelCandidate], float] | None = None,
         defer_provider: Callable[[ModelCandidate, float], None] | None = None,
         remaining_seconds: Callable[[], float] | None = None,
+        rate_limit_backoff_seconds: float = 30,
+        rate_limit_max_wait_seconds: float = 600,
     ):
         self._feature_key, self._purpose = feature_key, purpose
         self._candidates = tuple(candidates)
@@ -96,6 +98,8 @@ class RoutingModel:
         self._rate_limited_until: dict[int | str, float] = {}
         self._cooldown_remaining, self._defer_provider = cooldown_remaining, defer_provider
         self._remaining_seconds = remaining_seconds
+        self._rate_backoff = rate_limit_backoff_seconds
+        self._rate_max_wait = rate_limit_max_wait_seconds
 
     def _remaining(self, candidate: ModelCandidate) -> float:
         key = candidate.provider_id if candidate.provider_id is not None else candidate.base_url
@@ -170,7 +174,10 @@ class RoutingModel:
             attempted = False
             request_prompt = prompt
             native_request = chat_request
-            for retry in range(max(snapshot.extra_retries, 2) + 1):
+            rate_waited = 0.0
+            rate_round = 0
+            retry = 0
+            while retry <= max(snapshot.extra_retries, 2):
                 if request_count >= self._max_total or time.monotonic() >= deadline:
                     raise ModelCallFailed("模型调用已达到总请求次数或时间上限，请查看调用记录")
                 delay = self._remaining(snapshot)
@@ -268,7 +275,28 @@ class RoutingModel:
                     )
                     first_error = first_error or exc
                     if exc.http_status == 429:
-                        delay = getattr(exc, "retry_after", 0) or 30
+                        # 限流是「暂时没有配额」，不是「这次请求失败」：等待不消耗重试次数，
+                        # 否则三四十秒的默认冷却永远撑不过供应商分钟级窗口，整模块白跑。
+                        hint = float(getattr(exc, "retry_after", 0) or 0)
+                        # 首次信任供应商给的恢复时间；重复限流说明它偏小，按倍数递增。
+                        escalated = min(
+                            self._rate_backoff * 2**min(rate_round, 5), self._rate_max_wait
+                        )
+                        delay = hint if rate_round == 0 and hint else max(hint, escalated)
+                        remaining_wait = self._rate_max_wait - rate_waited
+                        if remaining_wait <= 0:
+                            # 等待额度用完就停止重发，落回原有不可用收尾以保留上游详情；
+                            # 调用方按「可补跑」处理，不会把已核实成果丢掉。
+                            break
+                        if time.monotonic() + min(delay, remaining_wait) >= deadline:
+                            if any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
+                                break
+                            raise ModelCallFailed(
+                                "模型调用时间预算不足以等待供应商限流恢复"
+                            ) from exc
+                        delay = min(delay, remaining_wait)
+                        rate_waited += delay
+                        rate_round += 1
                         key = (
                             candidate.provider_id
                             if candidate.provider_id is not None
@@ -279,6 +307,9 @@ class RoutingModel:
                             self._defer_provider(candidate, delay)
                         if any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
                             break
+                        # 429 不计入总请求预算：本次没有产生模型输出。
+                        request_count -= 1
+                        continue
                     if isinstance(exc, ModelRefused) or not isinstance(
                         exc, (ModelCallFailed, ModelUnavailable)
                     ):
@@ -313,6 +344,7 @@ class RoutingModel:
                                     },
                                 ]
                             }
+                        retry += 1
                         continue
                     if (
                         unavailable
@@ -328,6 +360,7 @@ class RoutingModel:
                                 break
                             raise ModelCallFailed("模型调用时间预算不足以再次请求") from exc
                         await asyncio.sleep(delay)
+                        retry += 1
                         continue
                     break
                 self._on_call(

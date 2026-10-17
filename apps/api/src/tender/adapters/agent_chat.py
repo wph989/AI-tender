@@ -10,7 +10,7 @@ import httpx
 from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
-from tender.core.error_details import retry_after, upstream_error
+from tender.core.error_details import quota_window, retry_after, upstream_error
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -138,8 +138,11 @@ class AgentChat:
                     ),
                     http_status=status,
                 )
-                if response is not None:
-                    error.retry_after = retry_after(response)
+                # SDK 的 429 同样可能不带 Retry-After，按正文窗口估算恢复时间。
+                error.retry_after = max(
+                    retry_after(response) if response is not None else 0,
+                    quota_window(body),
+                )
                 raise error from exc
             raise ModelCallFailed(
                 upstream_error(

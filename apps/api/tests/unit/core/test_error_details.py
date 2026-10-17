@@ -2,7 +2,7 @@
 
 import pytest
 
-from tender.core.error_details import MAX_ERROR_LENGTH, error_detail
+from tender.core.error_details import MAX_ERROR_LENGTH, error_detail, quota_window
 
 
 @pytest.mark.parametrize("body", [
@@ -31,3 +31,19 @@ def test_long_body_keeps_more_than_500_characters_and_marks_truncation():
     assert len(result) == MAX_ERROR_LENGTH
     assert result.endswith("[上游响应过长，已截断]")
     assert error_detail(result) == result
+
+
+@pytest.mark.parametrize(("body", "seconds"), [
+    (
+        '{"error":{"message":"You have reached the request limit: maximum 25 requests '
+        'in 5 minutes (request id: abc)","type":"new_api_error"}}',
+        300,
+    ),
+    ("rate limited: 30 requests per 1 minute", 60),
+    ("quota resets in 90 seconds", 90),
+    ("too many requests", 0),
+    (None, 0),
+])
+def test_quota_window_reads_the_supplier_reset_period(body, seconds):
+    # 网关普遍不回 Retry-After，只能从正文给出的窗口估算恢复时间。
+    assert quota_window(body) == seconds
