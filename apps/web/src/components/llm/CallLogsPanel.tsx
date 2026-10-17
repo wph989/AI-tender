@@ -97,7 +97,7 @@ export function CallLogsPanel({
         <div>
           <h2 className="font-display text-[19px] font-semibold">调用记录</h2>
           <p className="mt-1 text-sm text-slate-500">
-            查看实际请求与失败链。未返回的用量显示为“—”，不保存提示词和响应正文。
+            查看实际请求与失败链，失败详情包含上游响应。未返回的用量显示为“—”。
           </p>
         </div>
         <Button
@@ -326,6 +326,7 @@ function CallItem({
       <p className="mt-2 text-xs text-slate-500">
         {feature ?? call.feature_key ?? "管理测试"} ·{" "}
         {formatTime(call.created_at)} · {call.latency_ms} ms
+        {call.http_status != null && ` · HTTP ${call.http_status}`}
       </p>
       {call.request_ordinal !== null && (
         <p className="mt-2">
@@ -346,7 +347,10 @@ function CallItem({
         </p>
       )}
       {call.error_message && (
-        <p className="mt-2 break-words text-rose-700">{call.error_message}</p>
+        // 保留网关正文换行，长 JSON/HTML 按文本换行展示，便于定位实际失败原因。
+        <p className="mt-2 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-rose-700">
+          {call.error_message}
+        </p>
       )}
       {onChain && call.invocation_id && (
         <Button

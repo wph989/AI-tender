@@ -57,9 +57,18 @@ ITEMS: tuple[ConfigItem, ...] = (
     ),
     _item("analysis.max_tool_calls", L1, "int", 48, "每模块每次运行的工具调用上限"),
     _item("analysis.max_evidence_blocks", L1, "int", 160, "每模块保留的原文证据块上限"),
+    _item(
+        "analysis.similarity_threshold", L1, "number", 0.6,
+        "专题检索最低相关度（0到1），有向量时用余弦相似度，否则用检索词命中比例",
+    ),
+    _item("analysis.max_search_results", L1, "int", 6, "每次专题检索通过阈值后返回的证据块上限"),
     _item("analysis.max_tool_failures", L1, "int", 3, "工具连续失败上限，按工具及全局分别计数"),
     _item(
         "analysis.max_no_progress_rounds", L1, "int", 3, "无新增证据或有效成果的轮数，达到后收尾"
+    ),
+    _item(
+        "analysis.max_finish_corrections", L1, "int", 2,
+        "进入收尾后允许的连续无进展纠正轮数，耗尽时保留已核实成果并终止",
     ),
     _item("analysis.max_identical_tool_calls", L1, "int", 3, "同一工具与参数的累计调用上限"),
     _item("analysis.max_validation_failures", L1, "int", 3, "同一事实校验失败上限，含首次失败"),
@@ -148,6 +157,8 @@ def value_rules(key: str) -> dict[str, Any]:
         return {"choices": ["flash", "basic", "standard", "advanced"]}
     if key == "mineru.ocr_mode":
         return {"choices": ["auto", "txt", "ocr"]}
+    if key == "analysis.similarity_threshold":
+        return {"minimum": 0, "maximum": 1}
     if entry.value_type == "int":
         nonnegative = {
             "analysis.max_subagent_retries", "convert.max_inflight", "parse.max_inflight",

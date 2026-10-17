@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 import httpx
 
+from tender.core.error_details import upstream_error
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -292,14 +293,22 @@ class OpenAIChatModel:
         # 网关可能在供应商超时后返回非标准 5xx（如 Cloudflare 524）；一律按可重试处理。
         if response.status_code in {408, 429} or response.status_code >= 500:
             error = ModelUnavailable(
-                f"LLM 网关暂不可用：HTTP {response.status_code}",
+                upstream_error(
+                    f"LLM 网关暂不可用：HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
                 http_status=response.status_code,
             )
             error.retry_after = _retry_after(response)
             raise error
         if not response.is_success:
             raise ModelCallFailed(
-                f"LLM 网关拒绝请求：HTTP {response.status_code}",
+                upstream_error(
+                    f"LLM 网关拒绝请求：HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
                 http_status=response.status_code,
             )
         try:
@@ -397,12 +406,20 @@ class OpenAIChatModel:
             raise ModelUnavailable("模型目录连接失败或请求超时") from exc
         if response.status_code == 429 or response.status_code >= 500:
             raise ModelUnavailable(
-                f"LLM 网关暂不可用：HTTP {response.status_code}",
+                upstream_error(
+                    f"LLM 网关暂不可用：HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
                 http_status=response.status_code,
             )
         if not response.is_success:
             raise ModelCallFailed(
-                f"LLM 网关拒绝请求：HTTP {response.status_code}",
+                upstream_error(
+                    f"LLM 网关拒绝请求：HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
                 http_status=response.status_code,
             )
         try:

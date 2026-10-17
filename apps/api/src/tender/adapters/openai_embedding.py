@@ -5,6 +5,7 @@ from urllib.parse import quote
 
 import httpx
 
+from tender.core.error_details import upstream_error
 from tender.domain.errors import ModelCallFailed, ModelUnavailable
 from tender.ports.model_media import EmbeddingInput
 
@@ -27,6 +28,7 @@ class OpenAIEmbeddingModel:
         )
         self._owns_client = client is None
         self._model = model
+        self._api_key = api_key
         self._protocol = protocol
         self._parameters = parameters or {}
         self._allow_images = allow_images
@@ -83,11 +85,21 @@ class OpenAIEmbeddingModel:
             raise ModelUnavailable("向量服务连接失败或超时") from exc
         if response.status_code in {408, 429, 500, 502, 503, 504}:
             raise ModelUnavailable(
-                f"向量服务暂不可用：HTTP {response.status_code}", http_status=response.status_code
+                upstream_error(
+                    f"向量服务暂不可用：HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
+                http_status=response.status_code,
             )
         if not response.is_success:
             raise ModelCallFailed(
-                f"向量服务拒绝请求：HTTP {response.status_code}", http_status=response.status_code
+                upstream_error(
+                    f"向量服务拒绝请求：HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
+                http_status=response.status_code,
             )
         try:
             if self._protocol == "gemini":

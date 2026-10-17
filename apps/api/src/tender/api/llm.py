@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
@@ -60,6 +59,7 @@ from tender.application.model_profiles import (
     validate_model,
 )
 from tender.core.di import create_embedding_gateway, create_image_gateway
+from tender.core.error_details import error_detail
 from tender.core.secrets import (
     SecretKeyUnavailable,
     decrypt_secret,
@@ -76,9 +76,8 @@ router = APIRouter(prefix="/api/v1/llm", tags=["llm"])
 def _error_summary(value: str | None) -> str | None:
     if not value:
         return None
-    # 旧适配器曾把网关 HTML/JSON 正文拼在状态码后；读取历史时也截掉这些回显。
-    status = re.search(r"HTTP\s+[1-5]\d{2}", value)
-    return value[: status.end()] if status else value[:500]
+    # 详情已由适配器处理已知密钥；读取时保留正文，并兼顾历史记录中的常见凭证字段。
+    return error_detail(value)
 
 
 class ProviderCreate(BaseModel):
@@ -433,7 +432,7 @@ def _record_call(
                     latency_ms=latency_ms,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    error_message=error[:500] if error else None,
+                    error_message=error_detail(error),
                     vector_count=vector_count,
                     document_count=document_count,
                     image_count=image_count,
@@ -451,7 +450,7 @@ def _record_call(
                     latency_ms=latency_ms,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    error_message=error[:500] if error else None,
+                    error_message=error_detail(error),
                     provider_name_snapshot=snapshot.get("provider_name", snapshot.get("name")),
                     model_name_snapshot=snapshot.get("display_name"),
                     model_key_snapshot=snapshot.get("model_id"),

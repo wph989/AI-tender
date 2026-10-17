@@ -111,7 +111,7 @@ def test_tool_schema_requires_content_and_has_no_legacy_submission_fields():
         params = tools["submit_analysis"]["parameters"]
         assert params["required"] == ["records"]
         assert "fields" not in params["properties"] and "outline_nodes" not in params["properties"]
-        assert params["properties"]["records"]["maxItems"] == 24
+        assert params["properties"]["records"]["maxItems"] == 1
         assert "content" in json.dumps(params)
 
     asyncio.run(run())
@@ -341,7 +341,8 @@ def test_new_evidence_invalidates_old_batches_and_requires_a_new_synthesis(tool)
         assert "complete_research" in state["tool_results"]["call_early"]["data"]["content"]
         records = state["draft"]["business_data"]["records"]
         assert len(records) == 1 and records[0]["content"] == combined["content"]
-        assert len(records[0]["citations"]) == 2
+        assert "citations" not in records[0] and len(records[0]["evidence_ids"]) == 2
+        assert len(state["draft"]["business_data"]["evidence"]) == 2
 
     asyncio.run(run())
 

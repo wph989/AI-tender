@@ -33,11 +33,14 @@ class AgentLimits:
     max_model_calls: int = 40
     max_tool_calls: int = 48
     max_evidence_blocks: int = 160
+    similarity_threshold: float = 0.6
+    max_search_results: int = 6
     timeout_seconds: int = 1800
     context_tokens: int = 24000
     max_output_tokens: int = 8192
     max_tool_failures: int = 3
     max_no_progress_rounds: int = 3
+    max_finish_corrections: int = 2
     max_identical_tool_calls: int = 3
     max_validation_failures: int = 3
     max_subagent_retries: int = 2
@@ -176,13 +179,18 @@ class ResearchSession:
         if not sources:
             return {"blocks": [], "already_read": [], "warning": "当前没有关联参考资料"}
         rows, info = await self.retrieve(sources, query.strip())
-        rows, relations = rows[:12], []
+        # 专题使用运行快照里的数量上限；问答沿用原协议，避免串改其它消费入口。
+        result_limit = self.limits.max_search_results if self.compact_results else 12
+        rows, relations = rows[:result_limit], []
         if self.expand:
             # 扩展必须处于同一次检索工具内，让 Agent 真正读到关联原文；范围仍是本次所选资料。
             rows, relations = await self.expand(sources, rows)
         selected_sources = {s["source_id"] for s in sources}
         if any(r["source_id"] not in selected_sources for r in rows):
             raise PermissionError("检索返回了所选范围以外的资料，不能将参考资料混入本项目")
+        if self.compact_results:
+            # 扩展也不能绕过专题单次输出上限；未返回的关系证据不会登记进证据账。
+            rows = rows[:result_limit]
         # 查询等待期间可能撤销关联，结果进入模型上下文前再次检查。
         await self.authorize()
         async with self._lock:

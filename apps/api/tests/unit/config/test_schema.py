@@ -111,12 +111,23 @@ def test_gated_keys_only_keeps_l2() -> None:
 
 
 @pytest.mark.parametrize("key", [
-    entry.key for entry in schema.ITEMS if entry.key.startswith("analysis.")
+    entry.key for entry in schema.ITEMS
+    if entry.key.startswith("analysis.") and entry.value_type == "int"
 ])
 def test_analysis_budgets_have_no_artificial_maximum(key: str) -> None:
     assert schema.validate_value(key, 1000000) is None
     assert schema.validate_value(key, 1) is None
     assert schema.validate_value(key, -1) is not None
+
+
+@pytest.mark.parametrize("value", [0, 0.6, 1])
+def test_similarity_threshold_accepts_closed_unit_interval(value: float) -> None:
+    assert schema.validate_value("analysis.similarity_threshold", value) is None
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, True, "0.6", float("nan"), float("inf")])
+def test_similarity_threshold_rejects_invalid_values(value: object) -> None:
+    assert schema.validate_value("analysis.similarity_threshold", value) is not None
 
 
 def test_nonnegative_budgets_keep_pause_and_no_retry_semantics() -> None:

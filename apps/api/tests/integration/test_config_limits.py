@@ -12,8 +12,10 @@ from test_knowledge_flow import add_source
 from test_llm_management import env as env
 from test_llm_management import model, provider
 
-from tender.api import config, llm, parsing, project_files, projects
+from tender.api import config, knowledge, llm, parsing, project_files, projects
 from tender.api.errors import ApiProblem
+from tender.application.analysis_research import AgentLimits, ResearchSession
+from tender.application.knowledge_retrieval import retrieve_chunks
 from tender.application.model_profiles import FEATURE_FIELDS, MODEL_FIELDS
 from tender.config.registry import ConfigRegistry
 from tender.domain.errors import ParseUnavailable
@@ -66,6 +68,89 @@ def test_numeric_rules_drive_api_metadata_and_database_limits(runtime):
     assert connection.execute(text(
         "SELECT default_value FROM config_item WHERE key='analysis.max_evidence_blocks'"
     )).scalar_one() == 160
+
+
+def test_retrieval_config_metadata_bounds_and_migration_seed(runtime):
+    request, connection, _ = runtime
+    entries = {entry["key"]: entry for entry in config.list_items(request)["items"]}
+    threshold = entries["analysis.similarity_threshold"]
+    maximum = entries["analysis.max_search_results"]
+    assert threshold["value"] == threshold["default"] == 0.6
+    assert threshold["minimum"] == 0 and threshold["maximum"] == 1 and threshold["writable"]
+    assert maximum["value"] == maximum["default"] == 6 and maximum["minimum"] == 1
+    seeded = dict(connection.execute(text("""SELECT key, default_value FROM config_item
+        WHERE key IN ('analysis.similarity_threshold','analysis.max_search_results')""")).all())
+    assert seeded == {
+        "analysis.similarity_threshold": 0.6, "analysis.max_search_results": 6,
+    }
+    for patch in ({"analysis.similarity_threshold": 1.01},
+                  {"analysis.similarity_threshold": -0.1}, {"analysis.max_search_results": 0}):
+        with pytest.raises(ApiProblem):
+            release(request, patch)
+
+
+def test_finish_correction_config_is_editable_seeded_and_frozen_for_new_reports(runtime):
+    request, connection, pid = runtime
+    entry = next(item for item in config.list_items(request)["items"]
+                 if item["key"] == "analysis.max_finish_corrections")
+    assert entry["value"] == entry["default"] == 2 and entry["minimum"] == 1
+    assert entry["writable"] and "maximum" not in entry
+    assert connection.execute(text("""SELECT default_value FROM config_item
+        WHERE key='analysis.max_finish_corrections'""")).scalar_one() == 2
+    with pytest.raises(ApiProblem):
+        release(request, {"analysis.max_finish_corrections": 0})
+    release(request, {"analysis.max_finish_corrections": 5})
+    add_source(connection, pid, "质保三年")
+    knowledge.save_settings(pid, knowledge.AnalysisSettings(category="goods"), request)
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    frozen = connection.execute(text("SELECT runtime_settings FROM analysis_report WHERE id=:id"),
+                                {"id": report["id"]}).scalar_one()
+    assert frozen["max_finish_corrections"] == 5
+    release(request, {"analysis.max_finish_corrections": 8})
+    assert connection.execute(text("SELECT runtime_settings FROM analysis_report WHERE id=:id"),
+                              {"id": report["id"]}).scalar_one()["max_finish_corrections"] == 5
+
+
+def test_saved_retrieval_config_freezes_report_and_filters_real_document_chunks(runtime):
+    request, connection, pid = runtime
+    for content in ["alpha beta gamma"] * 8 + ["alpha", "无关内容"]:
+        add_source(connection, pid, content)
+    release(request, {"analysis.similarity_threshold": 0.8, "analysis.max_search_results": 3})
+    knowledge.save_settings(pid, knowledge.AnalysisSettings(category="goods"), request)
+    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    frozen = connection.execute(text("SELECT runtime_settings FROM analysis_report WHERE id=:id"),
+                                {"id": report["id"]}).scalar_one()
+    assert frozen["similarity_threshold"] == 0.8 and frozen["max_search_results"] == 3
+    # 发布后改配置不能改变已有报告的检索口径；真实仓储仍按该报告冻结参数检索。
+    release(request, {"analysis.similarity_threshold": 0.2, "analysis.max_search_results": 20})
+    db = knowledge.store(request)
+    sources = db.sources(db.collections_for_project(pid))
+    limits = AgentLimits(**frozen)
+
+    async def run():
+        async def retrieve(selected, query):
+            return await retrieve_chunks(
+                db, selected, query, lambda: None,
+                lambda _: pytest.fail("本用例未绑定向量模型，不得调用真实服务"),
+                min_similarity=limits.similarity_threshold, max_results=limits.max_search_results,
+            )
+
+        async def read(source):
+            return db.readable_chunks(source)
+
+        async def authorize():
+            pass
+
+        research = ResearchSession(sources, pid, retrieve, read, authorize, limits,
+                                   compact_results=True)
+        result = await research.search("alpha beta gamma", "project")
+        assert len(result["blocks"]) == len(research.seen) == 3
+        assert all(set(row) == {"id", "text"} and row["text"] == "alpha beta gamma"
+                   for row in result["blocks"])
+        # 高阈值不允许拿一次关键词命中冒充相似资料，也不能以空结果推断全文没有要求。
+        assert (await research.search("alpha delta epsilon", "project"))["blocks"] == []
+
+    asyncio.run(run())
 
 
 def test_upload_and_reparse_freeze_configured_defaults_with_explicit_override(runtime):

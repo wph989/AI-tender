@@ -589,6 +589,11 @@ async def verify_items(
         for index, (item, flag) in enumerate(zip(batch, flags, strict=True)):
             item["verification"] = "supported" if flag else "unsupported"
             if explain:
+                # 内容错误与未展开转引分开保存，修复时才能决定改写还是补检索。
+                item["verification_claim_issues"] = list(reviews[index]["unsupported_claims"])
+                item["verification_references"] = (
+                    list(reviews[index]["unresolved_references"]) if select_evidence else []
+                )
                 item["verification_issues"] = list(reviews[index]["unsupported_claims"])
                 if select_evidence:
                     item["verification_issues"].extend(

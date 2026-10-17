@@ -72,6 +72,8 @@ export interface LlmSettings {
   max_bindings?: number;
 }
 export interface LlmCall extends LlmCallUsage {
+  /** 上游 HTTP 状态用于区分限流、鉴权和网关失败。 */
+  http_status: number | null;
   id: number;
   invocation_id: string | null;
   feature_key: string | null;

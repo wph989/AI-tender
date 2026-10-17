@@ -76,7 +76,7 @@ from tender.domain.errors import (
     ModelUnavailable,
 )
 
-RUNTIME_VERSION = "deepagents-0.7.22-v4-synthesis"
+RUNTIME_VERSION = "deepagents-0.7.22-v5-records"
 
 CONTRACT = """你是当前专题的独立分析 Agent。先完成模块检索，再综合生成符合 Skill 的 JSON。
 运行时已加载冻结的 Skill 与输出格式；品类细则按需 read_file。Skill 中 Markdown 表示展示
@@ -116,11 +116,14 @@ lots 用 lot_refs 填原文编号或名称，未知不能当公共。conditions 
 不能可靠结构化的条目用 structuring=partial，不推测未知值。
 lot 仅由项目概况模块提交；format_node 仅由格式模块提交，node_type=group/section，
 code 仅填原文标段编号，无编号时省略；parent_key 引用父节点 key，保留原文全部层级和独立材料。
-relation 的 subject_key/object_key 引用本模块已提交或同批提供的端点，同批顺序不限；
+格式节点先保存父节点再保存子节点；relation 的 subject_key/object_key 引用本模块已保存端点；
 修订或冲突保留双方原文及适用范围。
 coverage.topic 可用 coverage.json 的 key 或中文名称；extracted 的 record_keys 应
 指向本次已通过校验的记录；searched_not_found 仅指本次未找到；not_applicable 需要原文。
-研究完成后可按完整事项分批提交（每批最多24条），final=false仅暂存汇总，最后final=true。
+研究完成后每次只提交一个完整事项的 JSON（records 最多一条），final=false保存该结果。
+同一评分项的档次、同一任务的关键要求放在该事项内，不为缩小 JSON 拆散业务含义。
+各事项由当前子 Agent 直接分析产出；父级只调度、校验和保存，不二次生成结论。
+全部事项保存后使用 records=[]、final=true确认本维度完成，无需重发已保存结果。
 final=true 显式提供 gaps 时替换剩余内容缺口清单，省略时沿用已登记缺口；
 已登记但未解决的检索/转引缺口由服务端保留。
 """
@@ -169,6 +172,7 @@ def context_size(messages: Sequence[BaseMessage]) -> int:
 
 
 ABSENCE_TERMS = (
+    "未载明",
     "未约定",
     "未见",
     "未检索到",
@@ -288,7 +292,7 @@ class ResearchMiddleware(AgentMiddleware):
             "当前阶段：" + phase + "。证据账保留" + str(len(self.research.seen)) + "块原文。"
             "剩余预算：" + json.dumps(status, ensure_ascii=False)
             + "。按当前 Skill 的全部主题完成检索与转引追踪后，调用 complete_research。"
-            "之后再用全部原文综合生成 content JSON；每批按完整事项提交，不能逐命中保存摘录。"
+            "之后再用全部原文综合生成 content JSON；每次只提交一个完整事项，不能逐命中保存摘录。"
             "金额、单位、条件和范围必须完整；每条结果的引用支持其全部内容。"
         )
         if not self.state.get("output_schema"):
@@ -305,7 +309,18 @@ class ResearchMiddleware(AgentMiddleware):
                 research_context(self.state["business_topics"], self.research), ensure_ascii=False,
             )
         if self.state.get("finish_only"):
-            hint += "\n已因连续无进展进入收尾，只能提交或补读已有依据，不得继续扩展检索。"
+            used = max(0, self.state.get("no_progress_rounds", 0)
+                       - self.research.limits.max_no_progress_rounds)
+            remaining = max(0, self.research.limits.max_finish_corrections - used)
+            hint += (
+                "\n已因连续无进展进入收尾，只能提交或补读已有依据，不得继续扩展检索。"
+                f"收尾连续无进展纠正剩余{remaining}轮，上限"
+                f"{self.research.limits.max_finish_corrections}轮。"
+            )
+            hint += (
+                "先完成complete_research，再逐条提交已有可靠成果，最后用空records和final=true结束。"
+                if self.state.get("output_schema") else "请按工具schema提交已有可靠结果。"
+            )
         if self.state.get("staged_items"):
             hint += (
                 f"已有{len(self.state['staged_items'])}个汇总条目通过校验并暂存，"
@@ -367,6 +382,18 @@ class ResearchMiddleware(AgentMiddleware):
             if previous and not any(i["id"] == item_id for i in self.state["staged_items"]):
                 self.state["staged_items"].append(previous)
 
+    def record_gap(self, entry: dict, detail: str, code: str) -> None:
+        """单条无依据不能让整个维度丢失可靠成果；以业务身份保存明确缺口。"""
+        business = entry["business"]
+        # 覆盖证明只有主题，没有业务事项标题；失败仍需以原证明身份保存缺口。
+        topic = business["topic"] if business["kind"] == "coverage" else business["title"]
+        gap = {"key": "record:" + entry["id"], "topic": topic,
+               "scope": business["scope"], "code": code, "detail": detail[:2000]}
+        self.state["business_gaps"] = [
+            g for g in self.state.get("business_gaps", []) if g["key"] != gap["key"]
+        ] + [gap]
+        self.state.setdefault("gap_notes", []).append(topic + "：" + detail)
+
     def build_draft(self, request: dict, fields: list[dict]) -> dict | None:
         """校验全部通过后才由运行时生成 draft；缺口只进检索总结。"""
         if self.state.get("business_protocol"):
@@ -417,6 +444,10 @@ class ResearchMiddleware(AgentMiddleware):
                 gaps = {g["key"]: g for g in self.state.get("business_gaps", [])
                         if g["key"].startswith("coverage:")}
                 gaps.update({g["key"]: g for g in request["business_gaps"]})
+                # 纠正耗尽的事项仍是未解决缺口，空最终清单不能把它悄悄清除。
+                gaps.update({g["key"]: g for g in self.state.get("business_gaps", [])
+                             if g["key"].removeprefix("record:")
+                             in self.state.get("rejected_records", {})})
                 if checkpoint := self.state.get("research_completed"):
                     gaps.update({g["key"]: g for g in research_gaps(checkpoint)})
                 self.state["business_gaps"] = list(gaps.values())
@@ -517,8 +548,28 @@ class ResearchMiddleware(AgentMiddleware):
                 kept.append(previous)
             issues = "；".join(entry.get("verification_issues") or []) or "引用未支持该字段的断言"
             label = field_label(entry)
-            failures = correction_count(self.state, entry)
-            exhausted |= failures >= self.research.limits.max_validation_failures
+            reference_only = (entry.get("verification_references")
+                              and not entry.get("verification_claim_issues"))
+            if reference_only and entry.get("business"):
+                ledger = self.state.setdefault("reference_failures", {})
+                failures = ledger.get(entry["id"], 0) + 1
+                ledger[entry["id"]] = failures
+            else:
+                failures = correction_count(self.state, entry)
+            if failures >= self.research.limits.max_validation_failures:
+                if entry.get("business"):
+                    self.state.setdefault("rejected_records", {})[entry["id"]] = True
+                    if entry["business"]["kind"] == "coverage":
+                        # 证明已被拒绝，不能继续将主题标成“不适用”，但保留其它可靠成果。
+                        for coverage in self.state.get("business_coverage", []):
+                            if coverage.get("review_id") == entry["id"]:
+                                coverage.update(status="pending", detail=issues)
+                    self.record_gap(
+                        entry, issues,
+                        "unresolved_reference" if reference_only else "unknown_condition",
+                    )
+                else:
+                    exhausted = True
             remaining = min(remaining, self.research.limits.max_validation_failures - failures)
             errors.append(f"{label}（第{failures}次）：{issues}")
         # 同一字段的多个版本在这里并成一行：值取并集去重、引用去重，
@@ -599,8 +650,14 @@ class ResearchMiddleware(AgentMiddleware):
             if idle >= self.research.limits.max_no_progress_rounds:
                 self.state["finish_only"] = True
             await self.save(self.state)
-            if idle >= self.research.limits.max_no_progress_rounds + 2:
-                raise RuntimeError("连续无进展且收尾纠正两次仍未完成，已保存通过校验的成果")
+            # 收尾额度与事实校验失败额度分开；使用运行快照，恢复不能重置机会。
+            if idle >= (self.research.limits.max_no_progress_rounds
+                        + self.research.limits.max_finish_corrections):
+                raise RuntimeError(
+                    "连续无进展且收尾纠正已达"
+                    f"{self.research.limits.max_finish_corrections}次上限仍未完成，"
+                    "已保存通过校验的成果"
+                )
         return feedback
 
     @hook_config(can_jump_to=["model"])
@@ -630,7 +687,7 @@ class ResearchMiddleware(AgentMiddleware):
                             if self.state.get("output_schema") else ""
                         )
                         + "请按 submit_analysis 的 schema 提交带原文引用的 JSON；"
-                        "每个条目携带原文引用，可分批暂存，最后final=true结束。"
+                        "每次只提交一个完整事项并携带原文引用，最后用空records和final=true结束。"
                         "缺口写入检索总结与 gaps，不把刚才的总结当作原文证据。"
                     )
                 )
@@ -778,10 +835,11 @@ def build_module_agent(
     save: Callable[[dict], Awaitable[None]],
     budget_status: Callable[[], dict] | None = None,
     review_support: Callable[[list[dict]], Awaitable[None]] | None = None,
+    categories: Sequence[str] = (),
 ):
     if key not in MODULES:
         raise ValueError("未注册的分析模块")
-    skill = load_module_skill(snapshot, key)
+    skill = load_module_skill(snapshot, key, categories=categories)
     state["business_protocol"] = True
     state["business_topics"] = json.loads(snapshot.get(key + "/references/coverage.json", "[]"))
     state["output_schema"] = output_schema(snapshot, key)
@@ -809,7 +867,8 @@ def build_module_agent(
         if not state.pop("research_completed", None):
             return
         # 新证据可能改变分类、冲突或任务边界，必须重新综合，不能拼接旧批次的局部结论。
-        for name in ("draft", "pending_final", "business_previous"):
+        for name in ("draft", "pending_final", "business_previous", "rejected_records",
+                     "gap_notes"):
             state.pop(name, None)
         for name in ("staged_items", "staged_relations", "business_coverage", "business_gaps"):
             state[name] = []
@@ -871,7 +930,13 @@ def build_module_agent(
                 expected_topics=state["business_topics"], research=research,
             )
             state["research_completed"] = checkpoint
-            state["business_gaps"] = research_gaps(checkpoint)
+            # 同一批证据再次确认只更新检索缺口；拒绝事项仍需保留到真正补入新证据。
+            rejected_gaps = {g["key"]: g for g in state.get("business_gaps", [])
+                             if g["key"].removeprefix("record:")
+                             in state.get("rejected_records", {})}
+            state["business_gaps"] = list({
+                **{g["key"]: g for g in research_gaps(checkpoint)}, **rejected_gaps,
+            }.values())
             await save(state)
             return {
                 "phase": "synthesis", "output_schema": state["output_schema"],
@@ -899,6 +964,17 @@ def build_module_agent(
         for entry in (previous | {entry["id"]: entry for entry in items}).values():
             entry = dict(entry)
             old = previous.get(entry["id"], {})
+            if state.get("rejected_records", {}).get(entry["id"]):
+                if old.get("verification") == "supported":
+                    staged.append(old)
+                continue
+            if is_absence_claim(entry):
+                # “未规定”等占位不是业务数据，检索范围说明无需再送模型反复判错。
+                middleware.record_gap(entry, "本次未核对到明确依据", "unknown_condition")
+                # 无依据的改写不应删除同一事项已经通过校验的版本。
+                if old.get("verification") == "supported":
+                    staged.append(old)
+                continue
             try:
                 validate_project_claims([entry], research.project_id)
             except ValueError as exc:
@@ -938,7 +1014,7 @@ def build_module_agent(
         }
 
     async def submit_business(
-        records: Annotated[list[SynthesisRecord], Field(max_length=24)],
+        records: Annotated[list[SynthesisRecord], Field(max_length=1)],
         coverage: Annotated[list[CoverageInput] | None, Field(max_length=20)] = None,
         gaps: Annotated[list[GapInput] | None, Field(max_length=20)] = None,
         research_summary: str = "",
@@ -962,6 +1038,9 @@ def build_module_agent(
             }
             for value in checked_coverage:
                 identity = (value["topic"], json.dumps(value["scope"], sort_keys=True))
+                if state.get("rejected_records", {}).get(value.get("review_id")):
+                    # 原样重提交耗尽的证明不能恢复“不适用”；实际补入新证据会清除拒绝账。
+                    value.update(status="pending", detail=coverage_by_key[identity]["detail"])
                 coverage_by_key[identity] = value
             state["business_coverage"] = list(coverage_by_key.values())
             gap_by_key = {v["key"]: v for v in state.get("business_gaps", [])}
@@ -978,7 +1057,7 @@ def build_module_agent(
     def validation_feedback(error):
         # 默认错误包含完整kwargs，会把整份坏草稿重复塞回上下文并浪费摘要/纠正预算。
         fields = ", ".join(".".join(map(str, e["loc"])) for e in error.errors())[:400]
-        required = "records（每批最多24条，条目包含 content 和原文 citations）"
+        required = "records（每次最多一条完整事项，条目包含 content 和原文 citations）"
         return (
             "工具参数缺失或类型不符：" + fields + "。请按当前工具schema修正。"
             "若调用submit_analysis，必须提供 " + required + "；辅助覆盖与缺口清单可省略。"
@@ -1003,6 +1082,10 @@ def build_module_agent(
         )
     )
     limits = research.limits
+    middleware = ResearchMiddleware(
+        research, state, reserve_tool, save, budget_status, review_support,
+        is_outline=key == "bid_format_outline_parsing", skill=skill,
+    )
     graph = create_deep_agent(
         model=model,
         name=key,
@@ -1027,16 +1110,7 @@ def build_module_agent(
                 token_counter=context_size,
                 trim_tokens_to_summarize=limits.context_tokens,
             ),
-            ResearchMiddleware(
-                research,
-                state,
-                reserve_tool,
-                save,
-                budget_status,
-                review_support,
-                is_outline=key == "bid_format_outline_parsing",
-                skill=skill,
-            ),
+            middleware,
         ],
     )
     files = {

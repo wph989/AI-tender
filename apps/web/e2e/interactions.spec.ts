@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { mockApi, models, profile } from "./fixtures";
+import { calls, mockApi, models, profile } from "./fixtures";
 
 let pageErrors: string[];
 test.beforeEach(async ({ page }) => {
@@ -357,6 +357,33 @@ test("调用链抽屉读取全部分页，超过 25 次请求不会截断", asyn
   await expect(
     dialog.getByText("请求模型 30 · 测试供应商", { exact: true }),
   ).toBeAttached();
+});
+
+test("失败请求在记录详情和调用链中展示完整上游响应", async ({ page }) => {
+  const body = JSON.stringify({ error: {
+    message: "账户余额不足" + "x".repeat(700),
+    code: "insufficient_quota", request_id: "upstream-123",
+    detail: "<script>window.upstreamExecuted=true</script>",
+  } }, null, 2);
+  const errorMessage = `Agent 模型连接失败或暂不可用（RateLimitError）：HTTP 429\n上游响应：\n${body}`;
+  await page.route("**/api/v1/llm/calls**", (route) => route.fulfill({ json: {
+    total: 1, items: [{ ...calls[0], status: "error", http_status: 429, error_message: errorMessage }],
+  } }));
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: "调用记录" }).click();
+  await page.locator(".ant-table-row-expand-icon").first().click();
+  const detail = page.locator(".ant-table-expanded-row article");
+  await expect(detail).toContainText("HTTP 429");
+  await expect(detail.getByText(errorMessage, { exact: true })).toBeVisible();
+  await expect(detail).toContainText("upstream-123");
+  await page.getByRole("button", { name: "查看调用链" }).first().click();
+  const dialog = page.getByRole("dialog", { name: "完整调用链" });
+  await expect(dialog.getByText(errorMessage, { exact: true })).toBeVisible();
+  // 上游可能返回 HTML；只能作为可读文本展示，不能执行供应商返回的脚本。
+  expect(await page.evaluate(() => "upstreamExecuted" in window)).toBe(false);
+  const error = dialog.locator("article p").filter({ hasText: "上游响应：" });
+  expect(await error.evaluate((node) => getComputedStyle(node).whiteSpace)).toBe("pre-wrap");
+  expect(await dialog.evaluate((node) => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
 });
 
 test("主要页面和长表单不撑破窄屏", async ({ page }) => {

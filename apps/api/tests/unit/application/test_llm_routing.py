@@ -127,6 +127,25 @@ def test_all_unavailable_raises_unavailable_for_job_level_retry() -> None:
         )
 
 
+def test_call_record_preserves_long_upstream_details_and_hides_candidate_key():
+    records: list[CallRecord] = []
+    detail = "网关返回 HTTP 429\n" + "x" * 1000 + "\n额度不足 request_id=upstream-123"
+    gateway = _ScriptedGateway({"a": [ModelUnavailable(detail + " fixture-key", http_status=429)]})
+    model = RoutingModel(
+        "analysis", "analysis", [replace(_candidate("a", 1), api_key="fixture-key")],
+        gateway, records.append,
+    )
+    try:
+        with pytest.raises(ModelUnavailable):
+            asyncio.run(model.complete("分析"))
+    finally:
+        asyncio.run(model.aclose())
+    assert len(records) == 1
+    assert records[0].http_status == 429
+    assert detail in records[0].error_message
+    assert "fixture-key" not in records[0].error_message
+
+
 def test_invalid_json_is_corrected_before_trying_an_unavailable_fallback():
     completion, records, gateway = _run(
         [_candidate("a", 1), _candidate("b", 2)],

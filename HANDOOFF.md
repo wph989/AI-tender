@@ -1944,3 +1944,143 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 - 用户明确要求提交代码；提交范围包含字段抽取退役、Agent 综合输出重构、检索门禁修正、三项审查问题修复及对应测试、迁移、部署入口和文档。
 - 采用中文提交信息，不添加作者说明或协作署名；沿用已完成的618项离线测试及前端、架构和浏览器定位入口验证，不重复运行同一验收。
 - 本次仅提交到本地 Git，业务服务启用、真实业务库迁移和推送仍未执行。
+
+### 2026-10-16 按解析 Skill 改为维度检索后逐条产出独立 JSON
+
+用户明确要求：每个业务 subagent 是一个分析维度，先完成该维度检索，再统一分析；一条完整结果一个 JSON，避免模型一次生成大 JSON。父级只调度与保存，结果由 subagent 直接产出。读过根目录交接，使用 skill-creator 与 karpathy-guidelines；未启用开发子代理，未自动提交。
+
+最终实现：
+
+- submit_analysis.records 从最多24条改为最多1条，保留现有工具名；final=false 保存当前完整事项，所有事项完成后 records=[]、final=true 收尾。同一评分项档次、技术任务关键要求保留在该事项内，可综合多处引用；服务端 schema 拒绝大数组。13个运行时 Skill、格式输出参考和设计19均同步逐条协议。父节点和关系端点先逐条保存。
+- 独立业务 JSON 存在 analysis_module.business_data.records，删除内嵌 citations，只保留 evidence_ids；原文及定位放在 business_data.evidence。module_records 仅在下游消费时回填，兼容历史内嵌引用；任何必要证据缺失时整条不可用，不用剩余引用冒充完整依据。现有报告显示与编制快照继续使用确定性投影，无父级模型重写结论。
+- 新增 GET /api/v1/analysis/reports/{report_id}/modules/{module_key}/records，直接返回记录与独立证据集合，不从展示文本解析；检查公司/报告归属及实时原文权限，来源删除后 records/evidence 都为空，覆盖证明不会混入业务结果。设计05同步接口。
+- load_module_skill 首次推理前加载冻结的输出格式、核心规则和项目/标段明确品类规则，覆盖混合品类，不默认当服务类。技术主 Skill 的领域边界恢复参考目录设计：项目背景、技术方案要求，排除纯参数清单；coverage 主题同步方案范围，旧参数参考不自动覆盖主规则。其余标准专题的领域知识与识别规则核对一致；工具、位置载体与逐条输出按用户要求适配，不机械搬回旧DOCX专属工具或Markdown整体输出。
+- 无依据“未载明/未规定”等占位移入检索缺口，单条支持性纠正达到上限登记 rejected_records 与不可清空的缺口，保留其他已核实结果，收尾仍需显式 final。内容错误与未展开转引分开记账；新证据进入后清除旧汇总及旧拒绝状态，再研究与综合。
+- 运行时更新为 deepagents-0.7.22-v5-records，旧报告只读，不混用旧线程协议。没有新增DDL迁移。
+
+验证：
+
+- 最终全量 tests/unit tests/contract：632 passed / 9 skipped，26.37秒。新增test_dimension_json_records覆盖先完整检索、多证据归并、逐条输出、大数组拒绝、独立引用、技术边界与缺证据不可用；工作树开始时已有未跟踪test_scoring_repair_flow保留并补完，未删除用户工作。
+- 最终隔离PostgreSQL18.3全量tests/integration：72 passed，56.03秒。覆盖实际JSONB保存、独立JSON的HTTP读取与权限、快照修订和定位；测试数据运行在临时schema/表，不改写业务库。
+- 最后格式Skill文案修正后补验相关护栏和新结果测试27 passed；Ruff全源码/测试、5项架构约束、git diff --check通过。本轮没有改前端代码，不重跑界面验收。没有使用真实模型，脚本化模型+真实Agent图和数据库验收不能称为真实供应商验收。
+- 日志：.tmp/dimension-json-unit-final.log、.tmp/dimension-json-db-final.log。复用临时数据库127.0.0.1:55433，角色synthesis_test、库postgres，既有0013基线；实例已正常停止，端口释放。未修改.env或业务环境参数。
+
+业务状态：
+
+- 未重启业务API/worker、未迁移或改写业务数据库、未调用真实模型、未提交或推送。沿用交接里的推迟业务启用要求；本轮代码完成不表示业务服务已经加载v5。
+- 后续若要求现场启用：检查依赖与在途任务，加载新版服务后新建报告验收逐条JSON；旧版本报告不直接混跑新版线程。
+### 2026-10-16 前端接入独立专题 records：实现与验收完成
+
+用户明确授权让前端接入新 records 接口。承接上一节逐条 JSON 后端实现，读取根目录交接并使用 karpathy-guidelines；保留所有已有未提交更改，没有启用开发子代理。
+
+最终行为：
+
+- 新版专题正文、成果计数及正反向原文定位直接读取 GET /api/v1/analysis/reports/{report_id}/modules/{module_key}/records，不再使用报告接口里的展示条目。报告状态、运行记录和研究缺口仍由报告接口提供；runtime_retired 或无数据版本的历史报告保留原展示。
+- records 接口新增 output_schema，来自报告冻结的 Skill，前端按其分类、布局和列名组装现有 ModuleMarkdown 展示。独立记录保留 key、parent_key、node_type、sort_order，支持人员及格式的通配分类；证据经 evidence_ids 解引用，必要依据缺失时整条隐藏。
+- 各维度并发请求，某个专题失败独立显示错误及重试入口，不回退报告旧条目，也不阻断其他专题。切换报告取消旧请求并清空新专题加载占位；序号保护防止延迟响应覆盖。运行中每三秒刷新，存在在途请求时等待其完成，详情状态和列表状态均参与运行判断。
+- 复用原 Skill 展示组件，技术摘要与关键要求、评分档次和列名、格式父子树及 PDF 定位均已覆盖；未做界面风格重构。设计05和设计19同步接口字段及消费方式。
+- Playwright 默认端口仍为4400，新增 PLAYWRIGHT_PORT 可覆盖。Windows 对4400返回 listen EACCES，本轮临时测试使用14400，不改业务配置。
+
+本轮验证：
+
+- pnpm --dir apps/web typecheck、build 通过；test：48 passed（8 files）。新增3项单元测试覆盖独立数据转换、证据缺失、冻结列顺序、历史兼容和单维度失败。
+- 完整 pnpm --dir apps/web test:e2e：桌面及390px共60 passed，3.6分钟，退出码0。夹具报告 items 故意为空，正文仅来自 records，新增失败重试、运行刷新及依据撤销、报告切换延迟响应场景。浏览器验收使用拦截API与合成PDF，不代表真实模型或业务端到端验收。
+- 后端 tests/unit/api tests/contract：150 passed / 9 skipped；隔离PostgreSQL tests/integration/test_analysis_data_flow.py：15 passed，包含冻结 output_schema 的实际HTTP读取断言。Ruff相关Python文件通过；import-linter 5 kept / 0 broken。
+- 前一轮后端全量632 passed / 9 skipped和72集成通过已记于上一节，本轮未重复全量；最终 git diff --check 通过。
+- 完整页面日志 .tmp/frontend-records-e2e.log；测试数据库日志 .tmp/synthesis-postgres/frontend-records-server.log。临时PostgreSQL127.0.0.1:55433已正常停止，14400测试Web服务已退出，端口无监听。
+
+业务状态：
+
+- 前端接入代码及隔离验收完成；未重启业务API/worker，未迁移或改写业务库，未调用真实模型，未修改.env，未提交或推送。代码完成不表示现场服务已加载新版本，沿用此前推迟业务启用的约定。
+
+### 2026-10-16 专题检索增加相关度阈值与单次结果数量：实现与验收完成
+
+用户要求相似度阈值和每次检索结果数量取交集，随后明确默认阈值0.6、默认最多6块。读取根目录交接，使用karpathy-guidelines，保留既有未提交更改，未启用开发子代理。
+
+最终实现：
+
+- 新增 analysis.similarity_threshold（number，默认0.6，允许0..1）与 analysis.max_search_results（int，默认6，正整数）。两项复用模型管理的“分析参数”动态编辑器、服务端范围元数据及发布链，不额外维护前端配置清单。
+- AgentLimits增加对应字段，由既有limits_snapshot在新建或补跑时冻结；worker实际检索调用明确传入运行快照的阈值与数量，不读取执行途中发布的新值。
+- rank_chunks先按相关度过滤，再融合排名；有与查询匹配的可用向量时使用原始余弦相似度，缺向量/索引不匹配/向量服务不可用时使用命中检索词数量除以检索词总数。沿用中文二字词的全文分词口径。RRF与供应商重排分数只是排序，不能当相似度；已有低分向量不能靠关键词命中绕过阈值。
+- 过滤后保留足够候选用于可选重排，再限量；无足够达标结果时返回实际数量或空列表，不用低分补齐。自定义数量大于16时不会被原来的候选16块或工具12块截断；专题扩展也遵守单次数量，并先检查来源范围。
+- 模型证据仍仅id/text，检索参数和过程保留服务端事件账。显式按已读ID补读邻近原文沿用默认5块/单次最多12块，不套用相似度阈值，以保留表头和跨块条件；专题累计证据默认160。知识库页面搜索及问答调用保留原行为，本轮配置仅作用于专题的项目/参考检索。
+- 新迁移0014_analysis_retrieval仅登记两项配置，不修改业务表结构、历史配置版本或已有报告。设计19及质量08同步口径和配置入口。未修改13个Skill领域规则。
+
+验证：
+
+- 后端全量tests/unit tests/contract：652 passed / 9 skipped，18.27秒，exit0。新增test_analysis_retrieval_limits覆盖阈值边界、低分向量不能关键词旁路、中文/英文全文回退、100条命中最多6块、达标不足不补齐、自定义20块、重排低尺度分数与服务失败、工具输出仅id/text、扩展上限与权限；新增阈值配置边界9项测试。
+- 隔离PostgreSQL18.3 tests/integration/test_config_limits.py：8 passed，8.67秒，exit0（原6项+本轮2项）。在独立事务schema执行全部迁移，核对配置种子与API范围、错误参数拒绝、实际文档仓储检索限量与阈值、报告参数快照不随新发布改变；不调用任何真实模型。
+- 相关Python文件Ruff通过；import-linter 5 kept / 0 broken；alembic upgrade head --sql离线渲染至0014通过；前端现有配置类型/范围处理不改，pnpm test为48 passed（8 files）。界面组件未修改，本轮未重复生产构建或浏览器全页验收。
+- 最终git diff --check通过。日志为.tmp/retrieval-limits-unit.log、.tmp/retrieval-limits-db.log、.tmp/retrieval-limits-migration.sql。
+- 临时PostgreSQL127.0.0.1:55433在测试schema执行0014后回滚，public版本仍0013_retire_extraction，无llm_test_*残留；已用pg_ctl正常停止并释放端口。服务日志.tmp/synthesis-postgres/retrieval-limits-server.log。
+
+业务状态：
+
+- 未重启业务API/worker，未应用0014到业务库，未迁移或改写业务库，未修改.env，未调用真实模型，未提交或推送。沿用此前推迟业务启用要求；后续现场启用须加载新服务，并按既有迁移约定处理到0014，再新建或补跑验证。
+
+### 2026-10-16 收尾纠正次数可配置：实现与验收完成
+
+用户已找到检索参数，随后反馈第5次运行在8/80次模型请求、20/100次工具调用时失败，错误为“连续无进展且收尾纠正两次仍未完成，已保存通过校验的成果”，要求最大纠正次数可配置。读取根目录交接，使用karpathy-guidelines，并读取skill-creator同步一处Skill重试参考；保留既有未提交修改，未启用开发子代理。
+
+定位与实现：
+
+- ResearchMiddleware.abefore_model 原来在 no_progress_rounds >= max_no_progress_rounds + 2 时抛RuntimeError；额外两轮写死，并非请求预算耗尽。analysis.max_no_progress_rounds控制进入收尾，analysis.max_validation_failures控制同一事实校验，两者都不控制这两轮。
+- 新增analysis.max_finish_corrections，int，默认2、允许正整数、无人工上限，中文说明“进入收尾后允许的连续无进展纠正轮数，耗尽时保留已核实成果并终止”。复用模型管理→分析参数动态编辑器，AgentLimits及既有limits_snapshot冻结，新建或用户补跑时生效。
+- 停止条件改为运行快照的max_no_progress_rounds + max_finish_corrections；错误包含实际配置次数。每轮收尾系统提示显示剩余轮数与上限，并明确先完成检索确认、逐条提交可靠成果、空records+final=true收尾。
+- 不新增另一套计数：继续复用幂等progress_message_id/no_progress_rounds及业务进展签名。同线程断点恢复不重置次数；新核实成果等有效进展重置连续无进展计数，finish_only仍限制扩展检索。用户补跑沿用既有新attempt清理逻辑并读取新配置。
+- 仍须显式final=true完成模块；额度耗尽时保留可靠成果并报告未完成，没有自动将部分成果伪装为完成，也没有取消支持性或权限校验。未检查用户此次真实模型的完整工具反馈，不能声称频繁失败全部解决；本次解除的是固定两轮限制。
+- 新迁移0015_finish_corrections仅登记配置项，不改历史配置/运行记录。设计19同步三个配置的职责、计数和生效语义；general_module_parsing/references/retry_policy.md不再将3/2轮写成不可调规则，以运行快照和剩余提示为准，其他领域Skill未修改。
+
+验证：
+
+- 后端全量tests/unit tests/contract：660 passed / 9 skipped，19.27秒，exit0。新增test_finish_corrections共7项，涵盖默认值/正整数范围、1/2/5轮耗尽边界及已核实成果保存、消息ID重放不重复扣额度、新核实事实重置连续计数；真实Agent图同一脚本在2轮下复现失败、5轮下显式final成功。
+- 最后收尾提示文案整理后上述7项补验通过；相关Python文件Ruff通过，import-linter 5 kept / 0 broken，alembic upgrade head --sql离线渲染到0015通过；git diff --check通过。
+- 隔离PostgreSQL18.3：tests/integration/test_config_limits.py及test_retry_uses_live_config_and_keeps_report_snapshot_untouched共10 passed，9.30秒，exit0。验证配置种子/页面元数据、0轮拒绝、配置发布、新报告冻结5轮不随8轮新发布改变、已有报告补跑从2轮切为5轮并保留旧记录。
+- 临时数据库127.0.0.1:55433仅在独立测试schema执行0015，public版本仍0013_retire_extraction，无llm_test_*或test_agents_*残留；已pg_ctl正常停止，端口释放。日志.tmp/finish-corrections-unit.log、.tmp/finish-corrections-db.log、.tmp/finish-corrections-migration.sql、.tmp/synthesis-postgres/finish-corrections-server.log。
+- 本轮前端组件未修改，未重复界面构建和浏览器验收；沿用动态配置通用显示/范围逻辑。
+
+业务状态：
+
+- 未重启业务API/worker，未应用0015到业务库，未迁移或改写业务库，未修改.env，未调用真实模型，未提交或推送。此前推迟业务启用要求保留。现场使用新参数须加载本轮代码并按既有迁移约定更新配置登记，再新建或补跑；用户现有在途任务未修改。
+
+### 2026-10-17 失败调用显示上游详细响应：实现与验收完成
+
+用户要求截图中的失败调用显示上游详细响应。开始时使用UTF-8读取交接，使用karpathy-guidelines；保留此前未提交改动，未使用子代理。
+
+最终行为：
+
+- Agent适配器从SDK实际HTTP响应正文或已解析body提取上游详情，HTTP 429等失败包含具体message/code/request_id及HTTP状态，不再只显示RateLimitError。JSON、普通文本和HTML均保留；没有响应的网络异常仍按类型展示，不把带请求的异常文本写入记录。补齐httpx.TransportError的可重试分类。
+- 普通语言调用、模型目录、向量、重排、生图HTTP失败同步保留响应；新增core/error_details.py统一隐藏已知API Key和常见凭证字段。最长16000字符，超长明确标记截断。
+- 路由落账、管理测试落账去掉原500字符截断；API读取去掉HTTP状态后截断，兼容已有带正文记录。复用现有TEXT列，无DDL迁移。历史记录未保存的正文不能恢复。
+- 调用列表展开与完整调用链显示HTTP状态、响应换行及长文本自动换行。HTML始终作为文本显示，不执行上游脚本。同步设计12。
+
+验证：
+
+- 后端全量tests/unit tests/contract：669 passed / 9 skipped，18.64秒，退出码0。新增9项回归，并更新旧有不展示正文的断言，覆盖限流/鉴权/5xx具体响应及分类、单次HTTP无隐式重试、Retry-After、长正文落账、凭证隐藏、HTML/文本、无响应连接失败。
+- 前端pnpm typecheck、test（48 passed / 8 files）与生产build通过。
+- Playwright定向检查：桌面及390px共4 passed，49.8秒，覆盖完整调用链分页、列表和抽屉详细正文、700字符后request_id可见、换行、不执行HTML和窄屏容器无横向溢出。使用拦截API，不修改业务数据、不调用真实模型。
+- 相关Python Ruff通过，import-linter 5 kept / 0 broken，git diff --check通过。临时测试端口14400的Web服务已由Playwright退出。
+
+业务状态：
+
+- 未重启业务API/worker，沿用此前推迟业务启用的要求；服务需加载新版后，新失败请求才会记录完整上游详情。未修改.env、未迁移或改写业务数据库、未调用真实模型、未提交或推送。
+
+### 2026-10-17 修复审查发现的三处分析状态问题
+
+用户要求修复未提交更改审查中的三个问题。开始时UTF-8读取本交接，继续使用karpathy-guidelines，保留既有工作区改动，未使用子代理。
+
+修复：
+
+- 覆盖证明kind=coverage没有title，record_gap改为使用topic；支持性或转引纠正耗尽时把对应覆盖状态改为pending，保留其它可靠成果。原样重提交已耗尽证明继续pending，不恢复“不适用”，不重复校验。
+- 同key缺席性改写（如“质保期限未载明”）登记缺口的同时保留旧supported版本，避免已核实成果被continue分支删除。
+- 重复complete_research合并保留rejected_records关联的缺口，不因刷新检索清单而丢失结构化诊断；真正新证据仍沿用invalidate_summary清理及重新综合。
+- 新增test_analysis_review_repairs.py共4项真实Agent图回归，覆盖辅助证明内容/转引失败、重复检索确认及重提交、旧版本回退、拒绝事项缺口持久保留。同步设计19。
+
+验证：
+
+- 修复前新增回归4 failed；修复后相关59 passed。
+- 加强覆盖证明重复确认场景后，全量tests/unit tests/contract：673 passed / 9 skipped，18.77秒，退出码0。
+- 相关Python Ruff通过；import-linter 5 kept / 0 broken；git diff --check通过。
+- 本轮只改后端状态逻辑与文档，不重跑前端或数据库验收。测试使用脚本化模型和真实Agent图，没有调用真实供应商。
+
+未重启业务API/worker、未修改.env、未迁移或改写业务数据库、未提交或推送。沿用此前推迟业务启用的要求；生效须业务服务加载新版代码。

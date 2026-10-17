@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppRail } from "@/components/AppRail";
 import { Icon } from "@/components/Icon";
 import { BUTTON_CLASS } from "@/components/ui";
-import { knowledgeRequest, resolveCitation } from "@/lib/api/knowledge";
+import { knowledgeRequest, loadReportRecords, resolveCitation } from "@/lib/api/knowledge";
 import { loadProject } from "@/lib/api/client";
 import type {
   AnalysisReport,
@@ -45,26 +45,51 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const initialized = useRef(false);
   const locateAbort = useRef<AbortController | null>(null);
   const loadSequence = useRef(0);
+  const reportAbort = useRef<AbortController | null>(null);
+  const displayedReport = useRef<number | null>(null);
 
   const reload = useCallback(async () => {
     const sequence = ++loadSequence.current;
-    const next = await knowledgeRequest<AnalysisStatus>(
-      "/projects/" + projectId + "/analysis",
-    );
-    if (sequence !== loadSequence.current) return;
-    setState(next);
-    if (!initialized.current) {
-      setCategory(next.analysis_category ?? "");
-      setTopics(next.analysis_topics);
-      setLots(next.lots);
-      initialized.current = true;
-    }
-    const id = chosenReport.current ?? next.reports[0]?.id;
-    if (id) {
-      const loaded = await knowledgeRequest<AnalysisReport>(
-        "/analysis/reports/" + id,
+    reportAbort.current?.abort();
+    const controller = new AbortController();
+    reportAbort.current = controller;
+    try {
+      const next = await knowledgeRequest<AnalysisStatus>(
+        "/projects/" + projectId + "/analysis",
+        "GET", undefined, controller.signal,
       );
-      if (sequence === loadSequence.current) setReport(loaded);
+      if (sequence !== loadSequence.current) return;
+      setState(next);
+      if (!initialized.current) {
+        setCategory(next.analysis_category ?? "");
+        setTopics(next.analysis_topics);
+        setLots(next.lots);
+        initialized.current = true;
+      }
+      const id = chosenReport.current ?? next.reports[0]?.id;
+      if (id) {
+        const loaded = await knowledgeRequest<AnalysisReport>(
+          "/analysis/reports/" + id,
+          "GET", undefined, controller.signal,
+        );
+        if (sequence !== loadSequence.current) return;
+        if (displayedReport.current !== loaded.id) {
+          displayedReport.current = loaded.id;
+          // 切报告时先显示新报告的加载状态，不能暂时露出报告里的旧展示投影。
+          setReport(loaded.runtime_retired || !loaded.data_schema_version ? loaded : {
+            ...loaded, modules: loaded.modules.map((module) => ({
+              ...module, items: [], records_loading: true,
+            })),
+          });
+        }
+        const complete = await loadReportRecords(loaded, controller.signal);
+        if (sequence === loadSequence.current) setReport(complete);
+      }
+    } catch (caught) {
+      // 切报告或轮询替代了旧请求属于正常取消，不能弹成加载失败。
+      if (!controller.signal.aborted) throw caught;
+    } finally {
+      if (reportAbort.current === controller) reportAbort.current = null;
     }
   }, [projectId]);
 
@@ -88,11 +113,14 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       .catch((e: Error) => setError(e.message));
     return () => {
       ++loadSequence.current;
+      reportAbort.current?.abort();
       locateAbort.current?.abort();
     };
   }, [projectId, reload]);
   const canceling = Boolean(report?.canceling);
   const running = canceling ||
+    // 详情可能先于列表更新，逐条结果刷新不能只依赖列表里的旧终态。
+    (report ? ["waiting", "pending", "running"].includes(report.status) : false) ||
     (state?.reports.some((r) =>
       ["waiting", "pending", "running"].includes(r.status),
     ) ?? false);
@@ -101,7 +129,8 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
   useEffect(() => {
     if (!running && !processingFiles) return;
     const timer = setInterval(() => {
-      void reload().catch((e: Error) => setError(e.message));
+      // 慢请求完成后再刷新，避免三秒轮询不断取消仍在加载的独立结果。
+      if (!reportAbort.current) void reload().catch((e: Error) => setError(e.message));
     }, 3000);
     return () => clearInterval(timer);
   }, [running, processingFiles, reload]);
@@ -817,7 +846,14 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                       )}
                                     </details>
                                   )}
-                                  {current.items.length > 0 ? (
+                                  {current.records_loading ? (
+                                    <p role="status" className="py-3 text-sm text-slate-500">正在加载专题结果…</p>
+                                  ) : current.records_error ? (
+                                    <Alert type="error" showIcon title="专题结果读取失败"
+                                      description={current.records_error}
+                                      action={<Button onClick={() => void reload().catch((caught: Error) =>
+                                        setError(caught.message))}>重新加载</Button>} />
+                                  ) : current.items.length > 0 ? (
                                     <>
                                       {current.status !== "completed" && (
                                         <p

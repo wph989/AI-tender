@@ -186,6 +186,8 @@ async def execute_module(
                 create_embedding_gateway,
                 create_rerank_gateway,
                 embedding_timeout=15,
+                min_similarity=limits.similarity_threshold,
+                max_results=limits.max_search_results,
             )
 
         async def read(source):
@@ -265,6 +267,11 @@ async def execute_module(
                         "tool_calls_remaining": limits.max_tool_calls - runtime.run["tool_calls"],
                     },
                     review_support=review_support,
+                    # 项目和标段品类可能不同，首次推理前加载全部已明确品类的细则。
+                    categories=[report["category"], *[
+                        lot.get("category") for lot in report["lot_settings"]
+                        if lot.get("category")
+                    ]],
                 )
                 await invoke_module(
                     graph,

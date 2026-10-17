@@ -379,11 +379,12 @@ def test_partial_format_rollback_requires_repair_before_final_submission():
     moved_a = a.model_copy(update={"parent_key": "b"})
     moved_b = record("b", text="材料B错误条件", kind="format_node", node_type="section")
     state, saved, router = asyncio.run(run_business_batches(key, [
-        business_submission([a, b]), business_submission([moved_a, moved_b]),
+        business_submission([a]), business_submission([b]),
+        business_submission([moved_a]), business_submission([moved_b]),
         business_submission(final=True), business_submission([a], final=True),
     ], rejected_text=moved_b.text))
     # 空 final 不能发布部分回退产生的环，必须让模型收到结构反馈并修正后再完成。
-    assert len(router.requests) == 7
+    assert len(router.requests) == 8
     assert any("循环" in str(messages) for messages, _ in router.requests)
     records = state["draft"]["business_data"]["records"]
     assert {r["key"]: r["parent_key"] for r in records} == {"a": None, "b": "a"}

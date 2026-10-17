@@ -84,6 +84,8 @@ export interface AnalysisModule {
   runs?: AgentRun[];
   research_summary?: string;
   research_gaps?: { key: string; detail: string }[];
+  records_loading?: boolean;
+  records_error?: string;
 }
 
 export interface AgentRun {
@@ -179,6 +181,24 @@ export interface BusinessRecord {
   effective_status?: "active" | "unknown";
   superseded_in?: AnalysisScope[];
   conflicts_in?: AnalysisScope[];
+}
+
+/** 维度原始业务记录未解析标段目录，引用通过独立证据集合关联。 */
+export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"> {
+  evidence_ids: string[];
+  scope: Omit<AnalysisScope, "lot_ids">;
+}
+
+export interface ModuleRecords {
+  schema_version: string;
+  module_key: string;
+  status: string;
+  records: ModuleRecord[];
+  evidence: Record<string, Citation>;
+  output_schema: {
+    version: string;
+    sections: { title: string; layout: AnalysisOutput["layout"]; columns: string[] }[];
+  };
 }
 
 export interface AnalysisGap {

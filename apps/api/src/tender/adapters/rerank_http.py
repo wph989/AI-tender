@@ -4,6 +4,7 @@ import math
 
 import httpx
 
+from tender.core.error_details import upstream_error
 from tender.domain.errors import ModelCallFailed, ModelUnavailable
 
 
@@ -38,7 +39,12 @@ class HttpRerankModel:
             raise ModelUnavailable("重排服务连接失败或超时") from exc
         if not response.is_success:
             raise ModelCallFailed(
-                f"重排服务返回 HTTP {response.status_code}", http_status=response.status_code
+                upstream_error(
+                    f"重排服务返回 HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
+                http_status=response.status_code,
             )
         try:
             rows = response.json()["results"]

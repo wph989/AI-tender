@@ -80,7 +80,8 @@ def record_output(record: dict, schema: dict) -> dict:
         elif isinstance(content["关键要求"], str):
             content["关键要求"] = [content["关键要求"]]
         content.setdefault("要求摘要", "；".join(content["关键要求"]))
-    elif len(section["columns"]) > 1 and not set(content) - {section["columns"][0]}:
+    elif (len(section["columns"]) > 1 and not set(content) - {section["columns"][0]}
+          and record["group"] != "总分构成"):
         raise ValueError("结果只有事项名称，缺少有依据的分析内容")
     # 原文可能只提供部分列，不能要求模型为了凑齐首末列而编造信息。
     return {

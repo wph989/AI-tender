@@ -247,19 +247,42 @@ def prepare_coverage(
     return entries, reviews
 
 
+def module_records(data: dict) -> list[dict]:
+    """内部消费时回填引用；持久化业务 JSON 与证据分开，兼容历史内嵌引用。"""
+    result = copy.deepcopy(data.get("records", []))
+    evidence = data.get("evidence", {})
+    for record in result:
+        if "evidence_ids" in record:
+            record["citations"] = [copy.deepcopy(evidence[key])
+                                   for key in record["evidence_ids"] if key in evidence]
+            if not record["evidence_ids"] or any(key not in evidence
+                                                 for key in record["evidence_ids"]):
+                # 少一处证据就可能丢失修订或条件，不能拿剩余引用冒充完整依据。
+                record.update(citations=[], verification="unavailable")
+    return result
+
+
 def module_data(state: dict) -> dict:
     records = []
+    evidence = {}
     for item in state.get("staged_items", []):
         if item.get("verification") != "supported" or not item.get("business"):
             continue
         record = copy.deepcopy(item["business"])
         record["verification"] = "supported"
-        record["citations"] = dedupe_citations([
+        refs = dedupe_citations([
             ref for value in item["values"] for ref in value["citations"]
         ])
+        # 分析内容可以独立用于下游；位置和原文只保存在证据表，通过稳定 ID 关联。
+        record.pop("citations", None)
+        record["evidence_ids"] = []
+        for ref in refs:
+            evidence_id = fingerprint(ref)
+            evidence[evidence_id] = copy.deepcopy(ref)
+            record["evidence_ids"].append(evidence_id)
         records.append(record)
     return {
-        "schema_version": DATA_VERSION, "records": records,
+        "schema_version": DATA_VERSION, "records": records, "evidence": evidence,
         "coverage": copy.deepcopy(state.get("business_coverage", [])),
         "gaps": copy.deepcopy(state.get("business_gaps", [])),
         "topics": copy.deepcopy(state.get("business_topics", [])),
@@ -373,9 +396,17 @@ def assemble_dataset(modules: list[dict], lots: list[dict]) -> dict:
     for module in modules:
         data = module.get("business_data") or {}
         key = module["module_key"]
-        accepted = {r["key"]: r for r in data.get("records", []) if r["kind"] != "coverage"}
+        hydrated = module_records(data)
+        for record in hydrated:
+            if record.get("verification") == "unavailable":
+                result["gaps"].append(data_gap(
+                    "source_unavailable", "记录的必要证据缺失", record_id=record["id"],
+                    module_key=key,
+                ))
+        hydrated = [r for r in hydrated if r.get("verification") != "unavailable"]
+        accepted = {r["key"]: r for r in hydrated if r["kind"] != "coverage"}
         # 旧检查点的证明 key 可能相同；覆盖条目固定 review_id，不按业务 key 合并证明。
-        proofs = {r["id"]: r for r in data.get("records", []) if r["kind"] == "coverage"}
+        proofs = {r["id"]: r for r in hydrated if r["kind"] == "coverage"}
         structure_issues = format_tree_issues(list(accepted.values()))
         for raw in accepted.values():
             if raw.get("kind") in {"lot", "coverage"}:

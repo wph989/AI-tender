@@ -127,17 +127,23 @@ def test_nonstandard_gateway_5xx_is_retryable():
     asyncio.run(run())
 
 
-def test_rate_limit_preserves_retry_after_without_echoing_body():
+def test_rate_limit_preserves_retry_after_and_upstream_body():
     async def run():
         async with httpx.AsyncClient(
             base_url="http://test/",
             transport=httpx.MockTransport(
-                lambda _: httpx.Response(429, headers={"Retry-After": "2"}, text="secret-key")
+                lambda _: httpx.Response(
+                    429, headers={"Retry-After": "2"},
+                    text="账户余额不足；凭证 secret-key",
+                )
             ),
         ) as client:
             with pytest.raises(ModelUnavailable) as caught:
-                await OpenAIChatModel("http://test", "fixture", client=client).complete("测试")
+                await OpenAIChatModel(
+                    "http://test", "fixture", api_key="secret-key", client=client,
+                ).complete("测试")
             assert caught.value.retry_after == 2
+            assert "账户余额不足" in str(caught.value)
             assert "secret-key" not in str(caught.value)
 
     asyncio.run(run())

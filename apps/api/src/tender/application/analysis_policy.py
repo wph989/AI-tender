@@ -10,7 +10,7 @@ from tender.application.analysis_data import semantic_payload
 from tender.application.knowledge import fingerprint, normalized
 
 
-def load_module_skill(snapshot: dict, key: str) -> dict:
+def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = ()) -> dict:
     """只加载报告冻结的当前模块，不从磁盘热读，保证重跑能解释使用了哪套规则。"""
     path = key + "/SKILL.md"
     content = snapshot.get(path)
@@ -18,11 +18,24 @@ def load_module_skill(snapshot: dict, key: str) -> dict:
         raise ValueError("报告缺少模块 Skill 快照")
     resources = {p: v for p, v in snapshot.items() if p.startswith(key + "/")}
     digest = sha256(json.dumps(resources, ensure_ascii=False, sort_keys=True).encode("utf-8"))
-    # 输出清单是每个专题的必要规则；品类细则和示例仍通过 read_file 按需读取。
+    # 核心细则在首次推理前加载，避免模型仅凭通用协议分析；示例仍按需读取。
     output_path = key + "/references/output_format.md"
     instructions = content
-    if output_path in resources:
-        instructions += "\n\n" + resources[output_path]
+    references = [output_path] if output_path in resources else []
+    required = (
+        ["locate_rules.md", "outline_extract_rules.md", "toc_filter_rules.md"]
+        if key == "bid_format_outline_parsing" else ["extraction_rules.md"]
+    )
+    references.extend(key + "/references/" + name for name in required
+                      if key + "/references/" + name in resources)
+    references.extend(key + "/references/" + category + "/extraction_rules.md"
+                      for category in dict.fromkeys(categories)
+                      if category in {"service", "goods", "engineering"}
+                      # 技术 Skill 只引用方案模板；旧参数参考不能覆盖其明确排除纯参数的边界。
+                      and key != "tech_requirement_parsing"
+                      and key + "/references/" + category + "/extraction_rules.md" in resources)
+    for reference in references:
+        instructions += "\n\n" + resources[reference]
     coverage_path = key + "/references/coverage.json"
     if coverage_path in resources:
         instructions += "\n\n必须登记状态的主题（coverage.json）：\n" + resources[coverage_path]
@@ -30,6 +43,7 @@ def load_module_skill(snapshot: dict, key: str) -> dict:
         "path": "/skills/" + key.replace("_", "-") + "/SKILL.md",
         "sha256": digest.hexdigest(),
         "instructions": instructions,
+        "references": references,
     }
 
 

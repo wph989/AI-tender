@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import copy
 
-from tender.application.analysis_data import DATA_VERSION, assemble_dataset, data_gap
+from tender.application.analysis_data import (
+    DATA_VERSION,
+    assemble_dataset,
+    data_gap,
+    module_records,
+)
 from tender.application.deep_analysis import RUNTIME_VERSION
 from tender.application.knowledge import fingerprint, source_state
 from tender.ports.repository.knowledge import KnowledgeStore
@@ -67,7 +72,7 @@ def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
         for module in modules:
             if module["module_key"] != "project_basic_info_parsing":
                 continue
-            for record in module["business_data"].get("records", []):
+            for record in module_records(module["business_data"]):
                 if record["kind"] != "lot" or record.get("verification") != "supported":
                     continue
                 # 项目目录需要稳定查找键；无原文编号时用已核实名称，分析记录中的 code 仍留空。

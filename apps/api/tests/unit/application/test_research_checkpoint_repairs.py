@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from itertools import permutations
 
 import pytest
 from synthesis_fixtures import COMMON, research_done, submission, summary_record
@@ -287,7 +286,7 @@ def test_partial_columns_are_allowed_when_analysis_body_has_evidence():
     assert state["draft"]["fields"][0]["output"]["content"] == {"内容": "质保三年"}
 
 
-def test_nested_format_groups_allow_children_before_parents_in_same_batch():
+def test_nested_format_groups_are_saved_one_node_at_a_time():
     key = "bid_format_outline_parsing"
     records = [summary_record(
         key=node, title=node, kind="format_node", group="", node_type="group",
@@ -296,9 +295,11 @@ def test_nested_format_groups_allow_children_before_parents_in_same_batch():
     state, _, _ = asyncio.run(execute([
         call("search_document", {"query": "质保"}, "search"),
         call("complete_research", {}, "research"),
-        call("submit_analysis", {"records": records, "final": True}, "final"),
+        call("submit_analysis", {"records": [records[1]], "final": False}, "parent"),
+        call("submit_analysis", {"records": [records[0]], "final": False}, "child"),
+        call("submit_analysis", {"records": [], "final": True}, "final"),
     ], snapshot={key + "/SKILL.md": "核对格式树"}, key=key))
-    child = state["draft"]["business_data"]["records"][0]
+    child = next(r for r in state["draft"]["business_data"]["records"] if r["key"] == "child")
     assert child["parent_key"] == "parent" and child["parent_path"] == ["parent"]
 
 
@@ -335,8 +336,8 @@ def test_missing_process_proofs_and_long_summary_do_not_block_cited_analysis():
     }
 
 
-@pytest.mark.parametrize("order", list(permutations(("revision", "old", "new"))))
-def test_same_batch_revision_is_published_regardless_of_endpoint_order(order):
+@pytest.mark.parametrize("order", [("old", "new"), ("new", "old")])
+def test_revision_is_published_after_individually_saved_endpoints(order):
     records = {
         "old": summary_record(key="old", text="质保三年", title="原质保要求"),
         "new": summary_record(key="new", text="质保四年", quote="质保四年", title="新质保要求"),
@@ -356,10 +357,12 @@ def test_same_batch_revision_is_published_regardless_of_endpoint_order(order):
             [
                 call("search_document", {"query": "质保"}, "search"),
                 call("complete_research", research_done([topic()]), "research"),
+                *[call("submit_analysis", {"records": [records[key]], "final": False}, key)
+                  for key in order],
                 call(
                     "submit_analysis",
                     {
-                        "records": [records[key] for key in order],
+                        "records": [records["revision"]],
                         "final": True,
                         "coverage": [COVERAGE[0] | {"record_keys": ["old", "new"]}],
                     },

@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from uuid import uuid4
 
+from tender.core.error_details import error_detail
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -262,7 +263,7 @@ class RoutingModel:
                             latency_ms=int((time.monotonic() - started) * 1000),
                             prompt_tokens=getattr(exc, "prompt_tokens", None),
                             completion_tokens=getattr(exc, "completion_tokens", None),
-                            error_message=str(exc)[:500],
+                            error_message=error_detail(str(exc), api_key=candidate.api_key),
                         )
                     )
                     first_error = first_error or exc

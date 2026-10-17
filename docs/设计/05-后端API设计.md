@@ -366,6 +366,7 @@ data: {"status":"completed","version_id":2048}
 | `PUT` | `/api/v1/projects/{project_id}/analysis/settings` | 知识库与项目综合分析，见设计/14 |
 | `POST` | `/api/v1/projects/{project_id}/analysis` | 知识库与项目综合分析，见设计/14 |
 | `GET` | `/api/v1/analysis/reports/{report_id}` | 知识库与项目综合分析，见设计/14 |
+| `GET` | `/api/v1/analysis/reports/{report_id}/modules/{module_key}/records` | 返回 records、evidence 与冻结 Skill 的 output_schema，实时核对资料权限 |
 | `GET` | `/api/v1/analysis/reports/{report_id}/data` | 读取最新或指定的业务数据快照，按实时资料权限过滤 |
 | `POST` | `/api/v1/analysis/reports/{report_id}/context` | 按单个标段获取大纲、正文或检查的编制依据 |
 | `POST` | `/api/v1/analysis/reports/{report_id}/cancel` | 知识库与项目综合分析，见设计/14 |

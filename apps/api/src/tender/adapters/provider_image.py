@@ -8,6 +8,7 @@ from urllib.parse import quote
 import httpx
 from PIL import Image, UnidentifiedImageError
 
+from tender.core.error_details import upstream_error
 from tender.domain.errors import ModelCallFailed, ModelRefused, ModelUnavailable
 from tender.ports.model_media import ModelImage
 
@@ -30,6 +31,7 @@ class ProviderImageModel:
         )
         self._owns_client = client is None
         self._model, self._protocol = model, protocol
+        self._api_key = api_key
         self._parameters, self._allow_images = parameters or {}, allow_images
         self._headers = (
             (
@@ -66,11 +68,21 @@ class ProviderImageModel:
             raise ModelUnavailable("生图服务连接失败或超时") from exc
         if response.status_code in {408, 429, 500, 502, 503, 504}:
             raise ModelUnavailable(
-                f"生图服务暂不可用：HTTP {response.status_code}", http_status=response.status_code
+                upstream_error(
+                    f"生图服务暂不可用：HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
+                http_status=response.status_code,
             )
         if not response.is_success:
             raise ModelCallFailed(
-                f"生图服务拒绝请求：HTTP {response.status_code}", http_status=response.status_code
+                upstream_error(
+                    f"生图服务拒绝请求：HTTP {response.status_code}",
+                    response.text,
+                    api_key=self._api_key,
+                ),
+                http_status=response.status_code,
             )
         try:
             payload = response.json()

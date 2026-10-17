@@ -83,8 +83,10 @@ def test_validation_error_never_echoes_provider_secret():
     assert '"input"' not in response.text
 
 
-def test_legacy_gateway_body_is_removed_from_error_summary():
-    assert _error_summary("网关失败 HTTP 504 <html>private-key</html>") == "网关失败 HTTP 504"
+def test_gateway_error_summary_preserves_details_and_redacts_credentials():
+    body = "网关失败 HTTP 504\n<html>网关超时 request_id=upstream-123</html>"
+    assert _error_summary(body) == body
+    assert "private-key" not in _error_summary(body + "\napi_key=private-key")
     assert _error_summary(None) is None
 
 

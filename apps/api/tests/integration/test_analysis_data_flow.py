@@ -122,6 +122,27 @@ def test_lot_without_original_code_publishes_and_resolves_by_verified_name(basis
     assert requirement["citations"][0]["element_id"] == basis.block["element_id"]
 
 
+def test_independent_module_json_uses_separate_evidence_and_live_permissions(basis):
+    path = basis.path + "/modules/project_basic_info_parsing/records"
+    response = basis.client.get(path)
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["records"]) == 5
+    assert result["output_schema"]["sections"][2] == {
+        "title": "项目基本信息", "layout": "table", "columns": ["字段", "内容"],
+    }
+    assert all("citations" not in r for r in result["records"])
+    record = next(r for r in result["records"] if r["key"] == "a")
+    refs = [result["evidence"][key] for key in record["evidence_ids"]]
+    assert refs[0]["quote"] == "A标段质保三年"
+    assert refs[0]["element_id"] == basis.block["element_id"]
+    # 独立数据入口同样检查实时依据，删除来源后不能绕过报告权限读取正文。
+    basis.db.execute("DELETE FROM knowledge_source WHERE id=:id", {"id": basis.source["source_id"]})
+    hidden = basis.client.get(path).json()
+    assert hidden["records"] == [] and hidden["evidence"] == {}
+    assert basis.client.get(basis.path + "/modules/unknown/records").status_code == 404
+
+
 def test_terminal_snapshot_is_idempotent_and_context_is_single_lot(basis):
     assert basis.client.get(basis.path + "/data").status_code == 409
     basis.db.execute("UPDATE analysis_report SET status='running' WHERE id=:id",
@@ -181,7 +202,7 @@ def test_new_revision_preserves_history_and_rejects_old_or_foreign_snapshot(basi
     business = copy.deepcopy(basis.business)
     corrected = next(r for r in business["records"] if r["key"] == "a")
     corrected["text"] = "A标段质保四年"
-    corrected["citations"][0]["quote"] = corrected["text"]
+    business["evidence"][corrected["evidence_ids"][0]]["quote"] = corrected["text"]
     basis.db.execute("UPDATE analysis_module SET business_data=CAST(:data AS JSONB) WHERE id=:id",
                      {"data": encode(business), "id": basis.module_id})
     second = publish_data_snapshot(basis.db, basis.report_id)

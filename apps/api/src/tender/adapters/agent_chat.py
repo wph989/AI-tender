@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import json
 from typing import Any
 
 import httpx
 from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
+from tender.core.error_details import upstream_error
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -34,6 +36,7 @@ class AgentChat:
         parameters: dict,
         http_async_client: Any = None,
     ) -> None:
+        self._api_key = api_key
         self._max_tokens = max_tokens
         self._stream_chat = (
             protocol in {"openai", "openai_compatible"} and api_mode == "chat_completions"
@@ -101,28 +104,52 @@ class AgentChat:
                     result = await runnable.ainvoke(messages_from_dict(messages))
         except Exception as exc:
             status = getattr(exc, "status_code", None)
+            response = getattr(exc, "response", None)
+            body = None
+            if isinstance(response, httpx.Response):
+                # SDK 的流式失败响应可能还未读取；只提取上游正文，不回显含请求的异常文本。
+                try:
+                    await response.aread()
+                    body = response.text
+                except (httpx.HTTPError, httpx.StreamError):
+                    # 响应已关闭时仍保留原错误分类，继续尝试 SDK 已解析的错误正文。
+                    pass
+            if not body and (payload := getattr(exc, "body", None)) is not None:
+                body = (
+                    payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+                )
             # 524 等非标准 5xx 同样是上游超时，必须可重试，不能直接判失败。
             if (
                 status in {408, 429}
                 or (status is not None and status >= 500)
+                or isinstance(exc, httpx.TransportError)
                 or any(token in type(exc).__name__ for token in ("Timeout", "Connection"))
             ):
-                # SDK 会包装传输异常；保留原因类型便于区分超时与断连，不暴露原异常内容。
+                # SDK 会包装传输异常；类型用于区分超时与断连，详情只取实际上游响应。
                 cause = exc
                 while cause.__cause__ is not None:
                     cause = cause.__cause__
                 error = ModelUnavailable(
-                    f"Agent 模型连接失败或暂不可用（{type(cause).__name__}）", http_status=status
+                    upstream_error(
+                        f"Agent 模型连接失败或暂不可用（{type(cause).__name__}）"
+                        + (f"：HTTP {status}" if status is not None else ""),
+                        body,
+                        api_key=self._api_key,
+                    ),
+                    http_status=status,
                 )
-                response = getattr(exc, "response", None)
                 if response is not None:
                     from tender.adapters.openai_chat import _retry_after
 
                     error.retry_after = _retry_after(response)
                 raise error from exc
-            # SDK 异常可能含完整请求正文或密钥，不直接回显其文本。
             raise ModelCallFailed(
-                f"Agent 模型调用失败（{type(exc).__name__}）",
+                upstream_error(
+                    f"Agent 模型调用失败（{type(exc).__name__}）"
+                    + (f"：HTTP {status}" if status is not None else ""),
+                    body,
+                    api_key=self._api_key,
+                ),
                 http_status=status,
             ) from exc
         if result is None or (

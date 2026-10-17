@@ -1,6 +1,6 @@
 ---
 name: tech-requirement-parsing
-description: "技术要求解析专家。从招标文件及技术附件中提取项目背景、产品参数、功能性能、标准接口，以及技术方案的任务、架构、实施、服务保障、安全和风险控制要求。"
+description: "技术要求解析专家。从招标文件及技术附件中提取项目背景，以及技术方案的任务、架构、实施、服务保障、安全和风险控制要求。"
 ---
 
 # 技术要求解析 Skill
@@ -12,12 +12,11 @@ description: "技术要求解析专家。从招标文件及技术附件中提取
 
 ## 领域知识
 
-本模块为技术响应核对和技术方案编写提供依据，按项目背景、技术要求组织内容。
+本模块服务下游“技术方案怎么写”，只输出两类内容：项目背景、技术方案要求。
 
 技术方案要求优先提取招标方明确划分的研究课题、专项任务、子项目或工作包，其次提取总体架构、关键技术、功能模块、接口集成、实施交付、迁移切换、运维保障、安全技术措施和风险控制。独立任务单元必须逐一保留。
 
-商务合同、资格业绩、评分废标、格式应答、人员组织和知识产权程序条款由其他模块处理。
-明确的产品参数、功能、性能、标准、接口和检测试验要求均须保留；货物类参数表本身就是技术响应依据，不能因其不是方案叙述而排除。精确保留数值、单位、上下限、否定和星号标记，星号本身不代表否决。
+商务合同、资格业绩、评分废标、格式应答、管理考核、纯承诺、人员组织、纯参数清单和知识产权程序条款必须排除。参数、功能、性能和标准只有能直接指导技术方案编写时才提取。
 
 ## 识别规则
 
@@ -25,14 +24,13 @@ description: "技术要求解析专家。从招标文件及技术附件中提取
 - "技术方案"、"技术标"、"技术建议书"、"技术规范书"
 - "研究课题"、"专项任务"、"工作内容"、"子项目"、"工作包"
 - "总体架构"、"关键技术"、"实施方案"、"迁移"、"运维"、"安全方案"
-- "技术参数"、"性能指标"、"规格"、"接口"、"检测"、"标准"、"★"、"▲"
 
 ## 执行流程
 
 1. **识别项目类型**：判断软件建设、工程、服务、科研或综合项目的核心技术任务
 2. **定位核心章节**：检索项目背景、技术方案、技术规范、工作内容和独立任务单元
 3. **扩展上下文**：读取命中章节的完整层级及相邻条款
-4. **核对技术响应**：保留参数表和方案要求，排除属于其他模块的条款；附表、脚注和参数条件一起阅读
+4. **过滤边缘内容**：只保留直接指导技术方案编写的要求；排除纯参数清单和其他维度的条款
 5. **按主题归并**：独立任务逐项保留，一般要求按架构、实施、保障、安全等主题归并
 6. **输出结果**：按本 Skill 的输出协议调用 submit_analysis；没有依据的条目省略。
 
@@ -51,16 +49,16 @@ queries 仅为可选检索意图说明；遗漏主题自动记为待核对，重
 同一事项先归并、核对适用范围与冲突，再形成完整条目。摘要允许概括，门槛、公式、档次和例外必须完整。
 `text` 由服务端从 content 生成，无需另填。缺少依据的内容省略，不能用“未提及/无”冒充事实。
 
-通过 `submit_analysis(records, coverage, gaps, research_summary, final=false)` 按完整事项分批提交，
-每批最多24条，最后明确 `final=true`。记录 `key` 是模块内稳定标识，纠正同一记录时沿用。
+通过 `submit_analysis(records, coverage, gaps, research_summary, final=false)` 逐条提交完整事项，
+每次最多一条完整事项，最后明确 `final=true`。记录 `key` 是模块内稳定标识，纠正同一记录时沿用。
 `kind` 为 fact/requirement/lot/format_node/relation；`scope.kind` 为 common/lots/unknown，
 lots 的 `lot_refs` 填原文标段编号或名称。公共范围同样需要依据，未知不能推断为公共。
 每条 `citations` 提供实际已读 block_id 与连续原文 quote，支持全部 content 及业务属性。
 `conditions` 保留表达式、且/或、数值、单位、起算点及例外；`materials` 保留证明材料要求；
 `scoring` 保留满分、公式、全部档次和扣分。不能可靠结构化时声明 `structuring=partial`。
 只有项目概况模块提交 lot；code 只填原文编号，无编号时省略，title 保留原文名称。
-格式模块用 format_node 与 node_type=group/section，分组可嵌套；用 parent_key 保留原文层级，同批不限制父子顺序。
-关系端点可在同批提供，再填 subject_key/object_key 与 predicate。
+格式模块用 format_node 与 node_type=group/section，分组可嵌套；用 parent_key 保留原文层级，先保存父节点再保存子节点。
+关系端点先逐条保存，再用 subject_key/object_key 与 predicate 提交关系。
 supersedes 表示 subject 替代 object；修订和冲突须引用双方并明确适用范围，不按上传时间裁定。
 
 coverage、gaps 和 research_summary 可省略，由服务端沿用检索账并补齐待核对清单。
@@ -75,14 +73,14 @@ pending 表示尚未解决，not_applicable 必须有原文引用并校验。可
 
 ## 工具与证据
 
-- 运行时先调用 `load_skill` 加载本文件及 `references/output_format.md`，无需重复读取；其余细则按需读取。
+- 运行时先调用 `load_skill` 加载本文件及 `references/output_format.md`，无需重复读取；已明确品类和核心细则也在首次推理前加载；示例按需读取。
 - `list_documents()`：返回授权资料的 id 和说明文本；资料 id 可填入检索的 source_id。
 - `search_document(query, source_id?)`：检索本项目；`search_knowledge(query, source_id?)`：检索关联参考库。
 - 检索证据只含 `id`、`text`。把证据 id 填入引用的 `block_id`；quote 必须是该 text 的连续原文。
 - `read_document(block_id, before=2, after=2)`：围绕已读证据补读；before/after 合计最多11，均为0时只补读本块。不得猜测ID或扫描全文。
 - `read_file(file_path)`：只读 `/skills/tech-requirement-parsing/references/` 下当前任务需要的细则，或压缩历史；不能读取招标文件磁盘路径。
 - `complete_research`：登记全部主题检索与转引，进入综合阶段。
-- `submit_analysis`：综合全部证据后按完整事项提交，每批最多24条；`final=false` 暂存，核对完成后 `final=true`。
+- `submit_analysis`：综合全部证据后按完整事项提交，每次最多一条完整事项；`final=false` 保存当前事项，全部事项完成后用空 records 和 `final=true`。
 
 ## 证据选择与纠错
 

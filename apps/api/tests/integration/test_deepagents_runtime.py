@@ -368,7 +368,8 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
     business = module["business_data"]["records"][0]
     assert business["id"] == module["items"][0]["record_id"]
     assert business["verification"] == "supported"
-    assert business["citations"] == refs
+    assert "citations" not in business
+    assert [module["business_data"]["evidence"][key] for key in business["evidence_ids"]] == refs
 
 
 def test_guard_migration_seeds_isolated_config_catalog(env):
@@ -829,6 +830,7 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
         "SELECT limits FROM agent_module_run WHERE id=:id", {"id": runtime.run["id"]}
     )[0]["limits"]
     assert old["max_model_calls"] == 40 and old["context_tokens"] == 24000
+    assert old["max_finish_corrections"] == 2
     assert runtime.claim()
     runtime.finish("failed", "故障注入")
     runtime.release()
@@ -839,7 +841,8 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
     env.db.execute(
         """INSERT INTO config_release (company_id, version_no, values, status, created_by)
         VALUES (1, 1, CAST(:values AS JSONB), 'active', '测试')""",
-        {"values": json.dumps({"analysis.max_model_calls": 80, "analysis.context_tokens": 200000})},
+        {"values": json.dumps({"analysis.max_model_calls": 80, "analysis.context_tokens": 200000,
+                               "analysis.max_finish_corrections": 5})},
     )
     knowledge.retry_report(runtime.report["id"], knowledge.RetryInput(), env.request)
     runs = env.db.rows(
@@ -849,6 +852,8 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
     assert runs[-1]["attempt"] == 2
     assert runs[-1]["limits"]["max_model_calls"] == 80
     assert runs[-1]["limits"]["context_tokens"] == 200000
+    assert runs[0]["limits"]["max_finish_corrections"] == 2
+    assert runs[-1]["limits"]["max_finish_corrections"] == 5
     # 未在配置中心显式调整的键回落默认值，同样不沿用旧快照。
     assert runs[-1]["limits"]["max_tool_calls"] == 48
     # 报告创建时的快照保持原值，只作为历史记录，不被补跑改写。

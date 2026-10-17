@@ -482,8 +482,21 @@ def rank_chunks(
     query: str,
     vector: Sequence[float] | None = None,
     limit: int = 16,
+    *,
+    min_similarity: float | None = None,
 ) -> list[dict]:
     tokens = keywords(query)
+    if min_similarity is not None:
+        # RRF 是排名融合值而非相似度，必须先按原始相关度过滤，再融合排名和限量。
+        # 缺向量的资料仍有确定的全文回退口径，不能让低分向量靠关键词命中绕过阈值。
+        rows = [
+            r for r in rows
+            if (
+                cosine(vector, r["embedding"])
+                if vector is not None and r.get("embedding") is not None
+                else sum(t in str(r["content"]).lower() for t in tokens) / max(1, len(tokens))
+            ) >= min_similarity
+        ]
     lexical = sorted(
         ((sum(t in str(r["content"]).lower() for t in tokens), i) for i, r in enumerate(rows)),
         reverse=True,

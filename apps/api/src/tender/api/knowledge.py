@@ -42,12 +42,14 @@ from tender.application.analysis_data import (
     ContextInput,
     build_context,
     display_items,
+    module_records,
 )
 from tender.application.analysis_data_store import (
     accessible_data,
     publish_data_snapshot,
     snapshot_matches_report,
 )
+from tender.application.analysis_output import output_schema
 from tender.application.analysis_skills import MODULES, skill_snapshot, skill_version
 from tender.application.deep_analysis import CONTRACT, RUNTIME_VERSION, validate_project_claims
 from tender.application.knowledge import (
@@ -55,6 +57,7 @@ from tender.application.knowledge import (
     TOPICS,
     align_citation,
     dedupe_citations,
+    fingerprint,
     merge_field_entries,
     source_signature,
     source_state,
@@ -659,6 +662,41 @@ def data_snapshot(request: Request, report_id: int, snapshot_id: int | None = No
     if snapshot is None:
         raise ApiProblem(409, "data_not_ready", "正式业务数据快照尚未就绪")
     return snapshot
+
+
+@router.get("/analysis/reports/{report_id}/modules/{module_key}/records")
+def get_module_records(report_id: int, module_key: str, request: Request) -> dict:
+    """直接读取子 Agent 逐条产出的 JSON，证据单独返回，不从报告文本反向解析。"""
+    report = report_row(request, report_id)
+    db = store(request)
+    module = next((m for m in db.report_modules(report_id) if m["module_key"] == module_key), None)
+    if module is None:
+        raise ApiProblem(404, "not_found", "分析维度不存在")
+    business = module.get("business_data") or {}
+    allowed = db.collections_for_project(report["project_id"])
+    records, evidence = [], {}
+    for record in module_records(business):
+        if record.get("kind") == "coverage":
+            continue
+        refs = record.get("citations", [])
+        visible = visible_items(db, [{
+            "id": record["id"], "field": record.get("title", ""),
+            "output": True, "values": [{"value": "", "citations": refs}],
+        }], allowed)[0]
+        # 任一必要依据撤销时整条隐藏，不能用独立 JSON 绕过报告的实时权限检查。
+        if not refs or visible.get("verification") == "unavailable":
+            continue
+        data = {k: v for k, v in record.items() if k not in {"citations", "evidence_ids"}}
+        data["evidence_ids"] = []
+        for ref in refs:
+            evidence_id = fingerprint(ref)
+            evidence[evidence_id] = ref
+            data["evidence_ids"].append(evidence_id)
+        records.append(data)
+    return {"schema_version": DATA_VERSION, "module_key": module_key,
+            "status": module["status"], "records": records, "evidence": evidence,
+            # 布局取报告冻结的 Skill，前端不再抄写一套分类和列名规则。
+            "output_schema": output_schema(report["skill_snapshot"], module_key)}
 
 
 @router.get("/analysis/reports/{report_id}/data")

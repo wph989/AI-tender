@@ -206,13 +206,15 @@ def test_stream_without_finish_reason_is_not_delivered_as_submission():
         (401, ModelCallFailed),
     ],
 )
-def test_no_hidden_retries_or_sensitive_errors(status, expected):
+def test_no_hidden_retries_and_upstream_error_is_preserved(status, expected):
     requests = []
 
     def handle(request):
         requests.append(request)
         return httpx.Response(
-            status, headers={"Retry-After": "2"}, json={"error": {"message": "密钥和标书机密正文"}}
+            status,
+            headers={"Retry-After": "2"},
+            json={"error": {"message": "供应商额度不足，fixture-key", "code": "quota_exceeded"}},
         )
 
     async def run():
@@ -220,7 +222,11 @@ def test_no_hidden_retries_or_sensitive_errors(status, expected):
         try:
             with pytest.raises(expected) as error:
                 await model.chat([message_to_dict(HumanMessage(content="分析"))], [TOOL])
-            assert "机密" not in str(error.value)
+            assert "供应商额度不足" in str(error.value)
+            assert "quota_exceeded" in str(error.value)
+            assert f"HTTP {status}" in str(error.value)
+            assert error.value.http_status == status
+            assert "fixture-key" not in str(error.value)
             if status == 429:
                 assert error.value.retry_after == 2
         finally:
@@ -228,6 +234,42 @@ def test_no_hidden_retries_or_sensitive_errors(status, expected):
 
     asyncio.run(run())
     assert len(requests) == 1
+
+
+def test_plain_text_gateway_error_preserves_multiline_body():
+    async def run():
+        body = "<html>\n网关超时\nrequest_id=upstream-123\n</html>"
+        model = agent(httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(524, text=body),
+        )))
+        try:
+            with pytest.raises(ModelUnavailable) as error:
+                await model.chat([message_to_dict(HumanMessage(content="分析"))], [TOOL])
+            assert body in str(error.value)
+        finally:
+            await model.aclose()
+
+    asyncio.run(run())
+
+
+def test_transport_failure_without_response_does_not_echo_request(monkeypatch):
+    async def run():
+        model = agent(None)
+
+        async def fail(*args):
+            raise httpx.ConnectError("fixture-key 请求正文", request=httpx.Request("POST", "http://test"))
+
+        monkeypatch.setattr(model, "_aggregate_chat_stream", fail)
+        try:
+            with pytest.raises(ModelUnavailable) as error:
+                await model.chat([message_to_dict(HumanMessage(content="分析"))], [TOOL])
+            assert "ConnectError" in str(error.value)
+            assert "fixture-key" not in str(error.value)
+            assert "请求正文" not in str(error.value)
+        finally:
+            await model.aclose()
+
+    asyncio.run(run())
 
 
 def test_429_http_date_uses_server_clock_for_retry_after():
