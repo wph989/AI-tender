@@ -23,6 +23,8 @@ import { CitationViewer } from "./CitationViewer";
 import { ModuleMarkdown } from "./ModuleMarkdown";
 import { QuestionPanel } from "./QuestionPanel";
 import { AnalysisDataPanel } from "./AnalysisDataPanel";
+import { ResearchGaps } from "./ResearchGaps";
+import { AnalysisFailureNotice } from "./AnalysisFailureNotice";
 
 export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const [name, setName] = useState("项目分析");
@@ -130,6 +132,11 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     (state?.reports.some((r) => isActive(r.status)) ?? false);
   const processingFiles =
     state?.sources.some((source) => source.state === "processing") ?? false;
+  // 来源已按项目文件顺序返回；有预览版本即可打开，不必等待解析完成或点击报告引用。
+  const firstDocument = state?.sources.find((source) => source.version_id !== null);
+  const preview = selected ?? (firstDocument?.version_id ? {
+    version_id: firstDocument.version_id, file_name: firstDocument.file_name,
+  } : null);
   useEffect(() => {
     if (!running && !processingFiles) return;
     const timer = setInterval(() => {
@@ -276,7 +283,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
               })
             }
           >
-            {running ? "分析任务进行中" : report ? "更新分析" : "开始分析"}
+            {running ? "分析任务进行中" : report ? "生成新报告" : "开始分析"}
           </Button>
         </div>
         <details className="analysis-options" open={!report || undefined}>
@@ -485,7 +492,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
         </details>
         {report?.stale && (
           <p className="notice my-2">
-            项目材料或分析设置已变化。这份报告保留原版本依据，请更新分析。
+            项目材料或分析设置已变化。这份报告保留原版本依据，请生成新报告。
           </p>
         )}
         <div className="analysis-mobile-switch">
@@ -497,10 +504,10 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
           </button>
           <button
             aria-pressed={mobileDocument}
-            disabled={!selected}
+            disabled={!preview}
             onClick={() => setMobileDocument(true)}
           >
-            引用原文
+            {selected ? "引用原文" : "文档预览"}
           </button>
         </div>
         <div className="analysis-split" data-document={mobileDocument}>
@@ -570,7 +577,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                   )}
                   {report.coverage.partial && (
                     <p className="notice mb-3">
-                      本报告覆盖不完整，请在范围设置中核对缺失或部分解析的文件。
+                      部分文件尚未完整读取，请在「分析范围与设置」中查看。
                     </p>
                   )}
                   {report.status === "waiting" && (
@@ -579,9 +586,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                     </p>
                   )}
                   {report.error_message && (
-                    <p role="alert" className="notice mb-3">
-                      {report.error_message}
-                    </p>
+                    <AnalysisFailureNotice message={report.error_message} canceled={report.status === "canceled"} />
                   )}
                   {report.runtime_retired && (
                     <p className="notice mb-3">
@@ -625,7 +630,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                           )
                         }
                       >
-                        补跑未完成模块
+                        继续未完成专题
                       </Button>
                     )}
                   {canceling && (
@@ -633,7 +638,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                       className="mb-3"
                       type="info"
                       showIcon
-                      title="正在停止任务，模块退出后即可重新解析。状态将自动刷新。"
+                      title="正在停止分析，结束后可继续未完成的专题。"
                     />
                   )}
                   {["failed", "canceled"].includes(report.status) &&
@@ -679,7 +684,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                           )
                         }
                       >
-                        重新解析全部专题
+                        重新分析全部专题
                       </Button>
                     )}
                   {!!report.summary?.length && (
@@ -781,9 +786,9 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                     </details>
                                   )}
                                   {["failed", "canceled"].includes(current.status) && (
-                                    <div className="notice">
-                                      <span>{current.error_message}</span>
-                                      {!report.runtime_retired && (
+                                    <AnalysisFailureNotice message={current.error_message}
+                                      canceled={current.status === "canceled"}
+                                      action={!report.runtime_retired && (
                                         <Button
                                           htmlType="submit"
                                           disabled={busy || running}
@@ -803,10 +808,9 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                             )
                                           }
                                         >
-                                          补跑本模块
+                                          继续本专题
                                         </Button>
-                                      )}
-                                    </div>
+                                      )} />
                                   )}
                                   {current.status === "completed" &&
                                     !report.runtime_retired && (
@@ -830,22 +834,11 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                             )
                                           }
                                         >
-                                          重新解析本专题
+                                          重新分析本专题
                                         </Button>
                                       </p>
                                     )}
-                                  {(current.research_summary || !!current.research_gaps?.length) && (
-                                    <details className="mb-4 text-sm text-slate-500">
-                                      <summary className="cursor-pointer">检索范围与未决事项</summary>
-                                      <p className="mt-2 whitespace-pre-wrap">{current.research_summary}</p>
-                                      {!!current.research_gaps?.length && (
-                                        <ul className="mt-2 list-disc space-y-1 pl-5">
-                                          {current.research_gaps.map((gap) =>
-                                            <li key={gap.key}>{gap.detail}</li>)}
-                                        </ul>
-                                      )}
-                                    </details>
-                                  )}
+                                  <ResearchGaps key={report.id + ":" + current.id} gaps={current.research_gaps} />
                                   {current.records_loading ? (
                                     <p role="status" className="py-3 text-sm text-slate-500">正在加载专题结果…</p>
                                   ) : current.records_error ? (
@@ -860,7 +853,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                           role="status"
                                         >
                                           已保存 {current.items.length}{" "}
-                                          项核实成果。本专题尚未完成，以下内容不代表完整分析；补跑会保留这些成果。
+                                          项已核实结果，分析尚未完成。继续分析会保留已有结果。
                                         </p>
                                       )}
                                       <ModuleMarkdown
@@ -876,11 +869,17 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                         : current.status === "pending"
                                           ? "排队等待分析…"
                                           : current.status === "canceled"
-                                            ? "本模块已停止，暂无已核实成果。"
+                                            ? "本专题已停止，暂无已核实成果。"
                                             : current.status === "failed"
-                                              ? "本次尚无通过校验的成果。"
+                                              ? "本次还没有可用的分析结果。"
                                               : "正在检索与核对原文…"}
                                     </p>
+                                  )}
+                                  {current.research_summary && (
+                                    <details className="research-process" key={"process:" + report.id + ":" + current.id}>
+                                      <summary>查看分析过程</summary>
+                                      <p>{current.research_summary}</p>
+                                    </details>
                                   )}
                                 </section>
                               ) : null,
@@ -894,11 +893,11 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
             </div>
           </section>
           <aside className="analysis-document">
-            {selected ? (
+            {preview ? (
               <CitationViewer
-                key={selected.version_id + ":" + selected.parse_run_id}
-                selected={selected}
-                citations={refs.includes(selected) ? refs : [...refs, selected]}
+                key={preview.version_id + ":" + (selected?.parse_run_id ?? "preview")}
+                selected={preview}
+                citations={selected && !refs.includes(selected) ? [...refs, selected] : refs}
                 onReverse={(ref) => {
                   const item = report?.modules
                     .flatMap((m) =>
@@ -931,8 +930,8 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
             ) : (
               <div className="empty-state">
                 <Icon name="book" size={32} />
-                <h3>原文就在结论旁边</h3>
-                <p>点击报告或回答中的引用，查看对应文件、页码和高亮位置。</p>
+                <h3>{state ? "暂无可预览的文档" : "正在加载项目文档…"}</h3>
+                <p>{processingFiles ? "文件准备完成后会自动显示预览。" : "请先在文件管理中上传或检查文档。"}</p>
               </div>
             )}
           </aside>

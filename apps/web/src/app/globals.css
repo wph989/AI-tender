@@ -57,6 +57,37 @@
 .report-module-heading { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e5e3ed; padding-bottom: 10px; }
 .report-module-heading h3 { font-size: 17px; font-weight: 600; }
 .report-module-heading span { color: #85859b; font-size: 12px; }
+/* 待核对事项只突出数量和用途；长说明按需展开，让已核实结果保持可见。 */
+.research-gaps { margin: 12px 0 16px; border: 1px solid var(--color-amber-200); border-radius: 10px; background: var(--color-amber-50); }
+.research-gaps > summary { display: flex; align-items: flex-start; gap: 9px; padding: 12px; cursor: pointer; list-style: none; color: var(--color-amber-800); }
+.research-gaps > summary::-webkit-details-marker { display: none; }
+.research-gaps > summary > svg { flex-shrink: 0; margin-top: 2px; }
+.research-gaps-heading { flex: 1; min-width: 0; }
+.research-gaps-heading strong { display: block; font-size: 13px; font-weight: 600; }
+.research-gaps-heading > span { display: block; margin-top: 3px; font-size: 12px; line-height: 1.7; }
+.research-gaps-toggle { display: flex; align-items: center; gap: 4px; flex-shrink: 0; padding-top: 2px; font-size: 12px; }
+.research-gaps-hide, .research-gaps[open] .research-gaps-show { display: none; }
+.research-gaps[open] .research-gaps-hide { display: inline; }
+.research-gaps[open] .research-gaps-toggle svg { transform: rotate(90deg); }
+.research-gap-list { margin: 0 12px 12px; padding: 0 12px 0 28px; list-style: disc; border-radius: 7px; background: white; }
+.research-gap-list > li { padding: 10px 0; }
+.research-gap-list > li + li { border-top: 1px solid var(--color-slate-100); }
+.research-gap-list > li::marker { color: var(--color-amber-600); }
+.research-gap-scope { margin-bottom: 3px; color: var(--color-slate-500); font-size: 12px; }
+.research-gap-list .ant-typography { margin-bottom: 0; color: var(--color-slate-700); font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; white-space: pre-wrap; }
+.research-process { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--color-slate-100); font-size: 12px; color: var(--color-slate-500); }
+.research-process > summary { cursor: pointer; width: fit-content; }
+.research-process > p { margin-top: 10px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.research-gaps > summary:focus-visible, .research-process > summary:focus-visible { outline: 2px solid var(--color-sky-600); outline-offset: 3px; border-radius: 6px; }
+.analysis-failure-detail { margin-top: 8px; font-size: 12px; }
+.analysis-failure-detail > summary { width: fit-content; cursor: pointer; color: var(--color-slate-500); }
+.analysis-failure-detail > p { margin-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* 窄屏把重试动作放到说明下方，避免按钮挤窄原因文字。 */
+@media (max-width: 600px) {
+  .analysis-failure.ant-alert { display: grid; grid-template-columns: auto minmax(0, 1fr); }
+  .analysis-failure .ant-alert-section { min-width: 0; }
+  .analysis-failure .ant-alert-actions { grid-column: 2; margin: 10px 0 0; }
+}
 .report-item-active { background: #f5f1fc; outline: 2px solid #b9a5ee; outline-offset: 3px; border-radius: 8px; }
 .report-citations { display: grid; gap: 6px; margin-top: 10px; }
 .report-citations button { display: flex; gap: 8px; align-items: center; background: #f7f5fc; border-radius: 8px; padding: 8px 10px; color: #7156ce; text-align: left; font-size: 11px; }

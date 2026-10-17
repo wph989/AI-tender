@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any
 
@@ -69,6 +70,8 @@ from tender.application.analysis_research import (
 )
 from tender.application.analysis_skills import MODULES
 from tender.application.knowledge import fingerprint, merge_field_entries
+from tender.core.error_details import error_detail
+from tender.core.logging import bind_context, get_logger
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -77,6 +80,7 @@ from tender.domain.errors import (
 )
 
 RUNTIME_VERSION = "deepagents-0.7.22-v5-records"
+logger = get_logger(__name__)
 
 CONTRACT = """你是当前专题的独立分析 Agent。先完成模块检索，再综合生成符合 Skill 的 JSON。
 运行时已加载冻结的 Skill 与输出格式；品类细则按需 read_file。Skill 中 Markdown 表示展示
@@ -359,7 +363,15 @@ class ResearchMiddleware(AgentMiddleware):
             if isinstance(content, str)
             else [*content, {"type": "text", "text": hint}]
         )
-        return await handler(request.override(system_message=SystemMessage(content=content)))
+        with bind_context(
+            agent_phase="synthesis" if self.state.get("research_completed") else "research",
+        ):
+            logger.info(
+                "analysis_round_started", evidence_count=len(self.research.seen),
+                staged_item_count=len(self.state.get("staged_items", [])),
+                no_progress_rounds=self.state.get("no_progress_rounds", 0), budget=status,
+            )
+            return await handler(request.override(system_message=SystemMessage(content=content)))
 
     def feedback(self, text: str, remaining: int = 2) -> dict:
         """把校验结论作为运行时反馈交回主 Agent，由它决定如何修正。"""
@@ -474,6 +486,34 @@ class ResearchMiddleware(AgentMiddleware):
         return None
 
     async def run_review_step(self) -> dict | None:
+        pending = sum(entry.get("verification") == "pending"
+                      for entry in self.state.get("staged_items", []))
+        if self.review_support is None or not (
+            pending or (self.state.get("pending_final") and self.state.get("staged_relations"))
+        ):
+            return await self._run_review_step()
+        started = time.monotonic()
+        with bind_context(agent_phase="verification"):
+            logger.info("analysis_review_started", pending_item_count=pending)
+            try:
+                feedback = await self._run_review_step()
+            except Exception as exc:
+                logger.warning(
+                    "analysis_review_failed", error_type=type(exc).__name__,
+                    error=error_detail(str(exc)),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+                raise
+            log = logger.warning if feedback else logger.info
+            log(
+                "analysis_review_finished", needs_correction=feedback is not None,
+                saved_item_count=sum(i.get("verification") == "supported"
+                                     for i in self.state.get("staged_items", [])),
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            return feedback
+
+    async def _run_review_step(self) -> dict | None:
         """Agent 图的校验节点：本批待校验条目一次送审，结论写回条目并反馈给主 Agent。
 
         支持性判定必须由独立模型请求完成（提交者自证不可靠），但它属于 Agent 图自己的
@@ -578,6 +618,11 @@ class ResearchMiddleware(AgentMiddleware):
                 else:
                     exhausted = True
             remaining = min(remaining, self.research.limits.max_validation_failures - failures)
+            logger.warning(
+                "analysis_record_rejected", item_id=entry["id"],
+                issues=issues, correction_count=failures,
+                max_corrections=self.research.limits.max_validation_failures,
+            )
             errors.append(f"{label}（第{failures}次）：{issues}")
         # 同一字段的多个版本在这里并成一行：值取并集去重、引用去重，
         # 既避免同一事实铺成多行，也不会像“新版覆盖旧版”那样丢掉分批补交的取值。
@@ -634,6 +679,8 @@ class ResearchMiddleware(AgentMiddleware):
                 self.state["loaded_skill"] = {k: result[k] for k in ("path", "sha256")}
                 self.state["research"] = self.research.checkpoint()
                 await self.save(self.state)
+                logger.info("analysis_skill_loaded", skill_path=result["path"],
+                            sha256=result["sha256"])
         feedback = await self.run_review_step()
         if "draft" in self.state:
             return {"jump_to": "end"}
@@ -655,6 +702,9 @@ class ResearchMiddleware(AgentMiddleware):
                 no_progress_rounds=idle,
             )
             if idle >= self.research.limits.max_no_progress_rounds:
+                if not self.state.get("finish_only"):
+                    logger.warning("analysis_finish_only", reason="no_progress",
+                                   no_progress_rounds=idle)
                 self.state["finish_only"] = True
             await self.save(self.state)
             # 收尾额度与事实校验失败额度分开；使用运行快照，恢复不能重置机会。
@@ -682,6 +732,10 @@ class ResearchMiddleware(AgentMiddleware):
                 self.state.get("consecutive_unsubmitted_responses", 0) + 1
             )
             await self.save(self.state)
+            logger.warning(
+                "analysis_submission_missing",
+                consecutive_count=self.state["consecutive_unsubmitted_responses"],
+            )
         if self.state.get("consecutive_unsubmitted_responses", 0) >= 3:
             raise ValueError("模型连续三次未调用分析工具，无法获得通过校验的提交")
         return {
@@ -709,8 +763,14 @@ class ResearchMiddleware(AgentMiddleware):
             call_id = request.tool_call["id"]
             cached = self.state.setdefault("tool_results", {}).get(call_id)
             if cached is not None:
+                logger.debug("analysis_tool_replayed", tool_call_id=call_id,
+                             tool=request.tool_call["name"])
                 return messages_from_dict([cached])[0]
             await self.reserve_tool()
+            started = time.monotonic()
+            evidence_before = len(self.research.seen)
+            tool_log = logger.bind(tool_call_id=call_id, tool=request.tool_call["name"])
+            tool_log.info("analysis_tool_started")
             try:
                 name = request.tool_call["name"]
                 signature = tool_key(name, request.tool_call["args"])
@@ -805,6 +865,18 @@ class ResearchMiddleware(AgentMiddleware):
                         self.state["read_tool_cache"][signature] = message_to_dict(result)
                 # 先保留最后一次失败反馈，终止时也能定位具体条目，而不是只剩“三次无效”。
                 self.state["tool_results"][call_id] = message_to_dict(result)
+                failed = getattr(result, "status", None) == "error"
+                log = tool_log.warning if failed else tool_log.info
+                # 成功工具只记数量，不复制原文、检索结果或模型提交的业务 JSON。
+                log(
+                    "analysis_tool_finished", status="error" if failed else "ok",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    evidence_count=len(self.research.seen),
+                    new_evidence_count=len(self.research.seen) - evidence_before,
+                    staged_item_count=len(self.state.get("staged_items", [])),
+                    research_completed=bool(self.state.get("research_completed")),
+                    error=error_detail(str(result.content)) if failed else None,
+                )
                 if request.tool_call["name"] == "submit_analysis":
                     if getattr(result, "status", None) == "error":
                         self.state["invalid_submissions"] = (
@@ -825,6 +897,13 @@ class ResearchMiddleware(AgentMiddleware):
                 ):
                     raise ValueError("工具连续失败已达上限：" + str(result.content))
                 return result
+            except Exception as exc:
+                tool_log.warning(
+                    "analysis_tool_aborted", error_type=type(exc).__name__,
+                    error=error_detail(str(exc)),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+                raise
             finally:
                 self.state["research"] = self.research.checkpoint()
                 await self.save(self.state)
@@ -1147,7 +1226,9 @@ async def invoke_module(
                 checkpoint = await graph.aget_state(config)
                 if checkpoint.values:
                     if not checkpoint.next:
+                        logger.debug("analysis_checkpoint_complete", thread_id=thread_id)
                         return dict(checkpoint.values)
+                    logger.info("analysis_checkpoint_resumed", thread_id=thread_id)
                     return await graph.ainvoke(None, config=config, durability="sync")
                 return await graph.ainvoke(
                     {"messages": [("user", task)], "files": files}, config=config, durability="sync"
@@ -1169,4 +1250,9 @@ async def invoke_module(
                 state["subagent_retries"] = attempts + 1
                 # 计数先持久化；连计数都无法保存时直接失败，不能无限重新获得重试机会。
                 await save(state)
+                logger.warning(
+                    "analysis_checkpoint_retry", thread_id=thread_id,
+                    retry_ordinal=attempts + 1, max_retries=max_retries,
+                    error_type=type(exc).__name__, error=error_detail(str(exc)),
+                )
                 await asyncio.sleep(min(0.5 * (attempts + 1), 2))

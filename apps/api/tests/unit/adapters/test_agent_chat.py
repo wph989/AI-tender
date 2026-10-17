@@ -6,8 +6,10 @@ import json
 import httpx
 import pytest
 from langchain_core.messages import HumanMessage, ToolMessage, message_to_dict
+from structlog.testing import capture_logs
 
 from tender.adapters.agent_chat import AgentChat
+from tender.application.llm_routing import ModelCandidate, RoutingModel
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -252,24 +254,129 @@ def test_plain_text_gateway_error_preserves_multiline_body():
     asyncio.run(run())
 
 
-def test_transport_failure_without_response_does_not_echo_request(monkeypatch):
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.RemoteProtocolError])
+def test_transport_failure_preserves_reason_without_serializing_request(error_type):
     async def run():
-        model = agent(None)
+        def fail(request):
+            raise error_type(
+                "Server disconnected without sending a response. password=fixture-key",
+                request=request,
+            )
 
-        async def fail(*args):
-            raise httpx.ConnectError("fixture-key 请求正文", request=httpx.Request("POST", "http://test"))
-
-        monkeypatch.setattr(model, "_aggregate_chat_stream", fail)
+        model = agent(httpx.AsyncClient(transport=httpx.MockTransport(fail)))
         try:
             with pytest.raises(ModelUnavailable) as error:
-                await model.chat([message_to_dict(HumanMessage(content="分析"))], [TOOL])
-            assert "ConnectError" in str(error.value)
+                await model.chat([message_to_dict(HumanMessage(content="私密请求正文"))], [TOOL])
+            assert error_type.__name__ in str(error.value)
+            assert "Server disconnected without sending a response" in str(error.value)
+            assert "未收到上游 HTTP 响应" in str(error.value)
+            assert error.value.http_status is None
             assert "fixture-key" not in str(error.value)
-            assert "请求正文" not in str(error.value)
+            assert "私密请求正文" not in str(error.value)
         finally:
             await model.aclose()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("chunks", [0, 1])
+def test_interrupted_stream_preserves_response_metadata_without_partial_content(chunks):
+    class InterruptedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            if chunks:
+                yield b'data: {"choices":[{"index":0,"delta":{"content":"partial-secret"}}]}\n\n'
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body "
+                "(incomplete chunked read)"
+            )
+
+    async def run():
+        model = agent(httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, stream=InterruptedStream(),
+                headers={"content-type": "text/event-stream", "x-request-id": "upstream-123",
+                         "set-cookie": "private-cookie"},
+            ),
+        )))
+        try:
+            with pytest.raises(ModelUnavailable) as error:
+                await model.chat([message_to_dict(HumanMessage(content="私密请求正文"))], [TOOL])
+            detail = str(error.value)
+            assert "incomplete chunked read" in detail
+            assert "HTTP 200 响应头" in detail
+            assert f"已收到 {chunks} 个数据块" in detail
+            assert "x-request-id：upstream-123" in detail
+            assert "未收到上游 HTTP 响应" not in detail
+            assert error.value.http_status is None, "流开始的 200 不能将未知完成状态改判为成功"
+            for secret in ("fixture-key", "partial-secret", "private-cookie", "私密请求正文"):
+                assert secret not in detail
+        finally:
+            await model.aclose()
+
+    with capture_logs() as logs:
+        asyncio.run(run())
+    opened = [log for log in logs if log["event"] == "model_stream_opened"]
+    first = [log for log in logs if log["event"] == "model_stream_first_chunk"]
+    assert len(opened) == 1 and len(first) == chunks
+    assert opened[0]["http_status"] == 200
+    assert opened[0]["upstream_request_ids"] == {"x-request-id": "upstream-123"}
+    assert opened[0]["headers_ms"] >= 0
+    for secret in ("fixture-key", "partial-secret", "private-cookie", "私密请求正文"):
+        assert secret not in json.dumps(logs, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(("temporary", "retries", "failover", "expected"), [
+    (True, 1, 2, ["primary", "primary"]),
+    (False, 1, 2, ["primary", "primary", "backup"]),
+    (False, 1, 1, ["primary", "primary"]),
+    (False, 0, 2, ["primary", "backup"]),
+])
+def test_remote_protocol_error_uses_configured_retries_and_failover(
+    temporary, retries, failover, expected,
+):
+    requests = []
+    records = []
+
+    def handle(request):
+        model = json.loads(request.content)["model"]
+        requests.append(model)
+        if model == "primary" and (not temporary or len(requests) == 1):
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return stream_response(response({"role": "assistant", "content": "恢复成功"}))
+
+    def gateway(base_url, model, **kwargs):
+        return AgentChat(
+            base_url=base_url, model=model, **kwargs, protocol="openai_compatible",
+            api_mode="chat_completions", parameters={},
+            http_async_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+        )
+
+    async def run():
+        router = RoutingModel(
+            "analysis", "analysis", [
+                ModelCandidate(i, i, name, name, "http://test/v1", "fixture-key", 5, None, 128,
+                               extra_retries=retries)
+                for i, name in enumerate(("primary", "backup"), 1)
+            ], gateway, records.append, failover_limit=failover, retry_base_seconds=0,
+        )
+        try:
+            call = router.chat([message_to_dict(HumanMessage(content="分析"))], [TOOL])
+            if not temporary and failover == 1:
+                with pytest.raises(ModelUnavailable, match="Server disconnected"):
+                    await call
+            else:
+                assert (await call).content == "恢复成功"
+        finally:
+            await router.aclose()
+
+    asyncio.run(run())
+    assert requests == expected
+    assert len(records) == len(expected), "每个实际 HTTP 请求必须落账，SDK 不得隐式倍增重试"
+    assert len({record.invocation_id for record in records}) == 1
+    assert [record.request_ordinal for record in records] == list(range(1, len(expected) + 1))
+    assert records[0].status == "unknown"
+    assert "Server disconnected" in records[0].error_message
+    assert records[1].retry_ordinal == (1 if retries else 0)
 
 
 def test_429_http_date_uses_server_clock_for_retry_after():

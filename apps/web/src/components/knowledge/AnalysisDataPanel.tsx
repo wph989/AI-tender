@@ -5,13 +5,14 @@ import type { DataNode } from "antd/es/tree";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { knowledgeRequest } from "@/lib/api/knowledge";
 import { scopeLabel } from "@/lib/analysis/scope";
+import { ResearchGaps } from "./ResearchGaps";
 import type {
   AnalysisContext, AnalysisDataSnapshot, AnalysisReport, AnalysisScope, BusinessRecord, Citation,
 } from "@/types/knowledge";
 
 const readinessLabels = { usable: "依据可用", partial: "有待核对事项", unavailable: "依据不足" };
 const coverageLabels: Record<string, string> = {
-  extracted: "已汇总", searched_not_found: "本次检索未找到", pending: "待补读",
+  extracted: "已汇总", searched_not_found: "本次检索未找到", pending: "尚未核对完整",
   not_applicable: "已确认不适用", unchecked: "未检查",
 };
 
@@ -52,7 +53,7 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
         setLotId(data.data.lots.length === 1 && !unresolvedLots ? data.data.lots[0]?.lot_id : undefined);
       }
     } catch (reason) {
-      if (!abort.signal.aborted) setError(reason instanceof Error ? reason.message : "依据加载失败");
+      if (!abort.signal.aborted) setError(reason instanceof Error ? reason.message : "投标要求加载失败");
     } finally {
       if (!abort.signal.aborted) setLoading(false);
     }
@@ -72,6 +73,7 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
   }, [reload, terminal, report.finished_at, report.stale]);
 
   function scopeLabelFor(scope: AnalysisScope) {
+    if (scope.kind === "unknown") return "适用标段待核对";
     return scopeLabel(scope, (id) =>
       snapshot?.data.lots.find((lot) => lot.lot_id === id)?.title);
   }
@@ -129,38 +131,40 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
       if (!abort.signal.aborted) setContext((old) => append && old
         ? { ...next, requirements: [...old.requirements, ...next.requirements] } : next);
     } catch (reason) {
-      if (!abort.signal.aborted) setPreviewError(reason instanceof Error ? reason.message : "编制依据加载失败");
+      if (!abort.signal.aborted) setPreviewError(reason instanceof Error ? reason.message : "投标要求加载失败");
     } finally {
       if (!abort.signal.aborted) setBusy(false);
     }
   }
 
-  if (!terminal) return <Alert className="my-3" type="info" title="分析结束后可查看本轮编制依据，已核实成果会持续保存。" />;
+  if (!terminal) return <Alert className="my-3" type="info" title="分析结束后可查看投标要求汇总，已有结果会持续保存。" />;
   const data = snapshot?.data;
-  return <section className="my-3" aria-label="编制依据与待核对事项">
-    {loading && <Spin size="small" description="正在加载编制依据" />}
+  return <section className="my-3" aria-label="投标要求汇总">
+    {loading && <Spin size="small" description="正在加载投标要求" />}
     {error && <Alert type="warning" title={error} action={<Button onClick={() => void reload()}>重试</Button>} />}
     {data && <Collapse items={[{
-      key: "data", label: <Space wrap><strong>编制依据与待核对事项</strong>
+      key: "data", label: <Space wrap><strong>投标要求汇总</strong>
         <Tag color={data.readiness === "usable" ? "green" : "gold"}>{readinessLabels[data.readiness]}</Tag>
         <span>{data.requirements.length} 项要求 · {data.gaps.length} 项待核对</span></Space>,
       children: <>
+        <p className="mb-3 text-sm text-slate-500">汇总各专题已核实的要求，供编写投标文件时参考。</p>
         <Space className="mb-3" wrap>
           <Button type="primary" disabled={report.stale || snapshot.stale || data.readiness === "unavailable"}
             onClick={() => {
               previewAbort.current?.abort(); setBusy(false);
               setContext(null); setPreviewError(null); setOpen(true);
-            }}>编制依据预览</Button>
-          <span className="text-sm text-slate-500">此处浏览全部标段；编制时仅使用选定的一个标段。</span>
+            }}>按标段查看要求</Button>
+          <span className="text-sm text-slate-500">下方显示全部标段，可选择一个标段查看适用要求。</span>
         </Space>
         <Tabs items={[
-          { key: "requirements", label: "要求与项目事实", children: recordsTable([...data.requirements, ...data.facts]) },
+          { key: "requirements", label: "要求与项目信息", children: recordsTable([...data.requirements, ...data.facts]) },
           { key: "format", label: "格式与材料", children: data.format_nodes.length
-            ? <Tree showLine defaultExpandAll treeData={tree(data.format_nodes)} /> : <Empty description="暂无已核实的格式节点" /> },
+            ? <Tree showLine defaultExpandAll treeData={tree(data.format_nodes)} /> : <Empty description="暂无已核实的投标文件格式要求" /> },
           { key: "gaps", label: `待核对事项 ${data.gaps.length}`, children: data.gaps.length
-            ? <ul className="space-y-2">{data.gaps.map((gap, index) => <li key={index}>
-              <Tag>{scopeLabelFor(gap.scope)}</Tag>{gap.detail}</li>)}</ul> : <p>当前没有已登记的待核对事项。</p> },
-          { key: "coverage", label: "专题核对", children: <Table size="small" rowKey={(row) => `${row.title}-${JSON.stringify(row.scope)}`}
+            ? <ResearchGaps gaps={data.gaps.map((gap, index) => ({
+              key: String(index), detail: gap.detail, scopeLabel: scopeLabelFor(gap.scope),
+            }))} /> : <p>当前没有已登记的待核对事项。</p> },
+          { key: "coverage", label: "专题检查进度", children: <Table size="small" rowKey={(row) => `${row.title}-${JSON.stringify(row.scope)}`}
             dataSource={data.coverage} pagination={{ pageSize: 10, showSizeChanger: false }} columns={[
               { title: "主题", dataIndex: "title" },
               { title: "状态", render: (_, row) => coverageLabels[row.status] ?? row.status },
@@ -170,31 +174,32 @@ export function AnalysisDataPanel({ report, onLocate }: Props) {
         ]} />
       </>,
     }]} />}
-    <Drawer title="编制依据预览" open={open} size={760} onClose={() => {
+    <Drawer title="按标段查看投标要求" open={open} size={760} onClose={() => {
       previewAbort.current?.abort(); setBusy(false); setOpen(false);
     }}>
       <Space className="mb-4" wrap>
-        {data && data.lots.length > 0 ? <Select aria-label="编制标段" placeholder="请选择一个编制标段"
+        {data && data.lots.length > 0 ? <Select aria-label="投标标段" placeholder="请选择一个投标标段"
           value={lotId} style={{ minWidth: 240 }} options={data.lots.map((lot) => ({ value: lot.lot_id, label: lot.title }))}
           onChange={(value: number) => {
             previewAbort.current?.abort(); setBusy(false); setLotId(value); setContext(null); setPreviewError(null);
-          }} /> : <Tag>项目级编制</Tag>}
-        <Button type="primary" aria-label="加载编制依据" loading={busy}
+          }} /> : <Tag>当前项目</Tag>}
+        <Button type="primary" aria-label="查看要求" loading={busy}
           disabled={!snapshot || loading || Boolean(data?.lots.length && !lotId)}
-          onClick={() => void preview()}>加载编制依据</Button>
+          onClick={() => void preview()}>查看要求</Button>
       </Space>
       {previewError && <Alert className="mb-3" type="error" title={previewError} />}
       {context && <>
         <Alert className="mb-3" type={context.readiness === "usable" ? "success" : "warning"}
-          title={readinessLabels[context.readiness]} description={`共 ${context.total_requirements} 项适用要求。部分可用的依据可辅助编制草稿，不能视为完整检查结论。`} />
-        {context.facts.length > 0 && <><h3 className="my-3 font-medium">项目事实</h3>{recordsTable(context.facts)}</>}
+          title={readinessLabels[context.readiness]} description={`共 ${context.total_requirements} 项适用要求。${context.readiness === "usable" ? "" : "仍有内容待核对，请结合原文使用。"}`} />
+        {context.facts.length > 0 && <><h3 className="my-3 font-medium">项目信息</h3>{recordsTable(context.facts)}</>}
         <h3 className="my-3 font-medium">适用要求</h3>
         {recordsTable(context.requirements)}
         {context.next_offset !== null && <Button className="my-3" loading={busy} onClick={() => void preview(true)}>加载更多要求</Button>}
         {context.format_nodes.length > 0 && <Tree className="my-3" showLine defaultExpandAll treeData={tree(context.format_nodes)} />}
-        {context.unresolved.length > 0 && <><h3 className="my-3 font-medium">归属或效力待确认</h3>{recordsTable(context.unresolved)}</>}
-        {context.gaps.length > 0 && <><h3 className="my-3 font-medium">当前范围的待核对事项</h3>
-          <ul className="space-y-2">{context.gaps.map((gap, index) => <li key={index}>{gap.detail}</li>)}</ul></>}
+        {context.unresolved.length > 0 && <><h3 className="my-3 font-medium">适用标段或条款版本待核对</h3>{recordsTable(context.unresolved)}</>}
+        <ResearchGaps gaps={context.gaps.map((gap, index) => ({
+          key: String(index), detail: gap.detail, scopeLabel: scopeLabelFor(gap.scope),
+        }))} />
       </>}
     </Drawer>
   </section>;

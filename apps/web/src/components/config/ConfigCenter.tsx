@@ -23,6 +23,7 @@ import {
   rollbackRelease,
 } from "@/lib/api/config";
 import { LAYERS, isModelConfig, itemsOfLayer } from "@/lib/config/draft";
+import { configLabel } from "@/lib/config/presentation";
 import { message } from "@/lib/errors";
 import type {
   ConfigItem,
@@ -156,7 +157,7 @@ export function ConfigWorkspace({ scope }: { scope: "system" | "models" }) {
         <span className="text-[13px] text-slate-500">
           角色{" "}
           <span className={DATA_CLASS + " text-slate-700"}>
-            {role === "" ? "—" : role}
+            {({ admin: "管理员", operator: "操作员", reviewer: "复核员", viewer: "查看者" } as Record<string, string>)[role] ?? (role || "—")}
           </span>
         </span>
         <span className="text-[13px] text-slate-500">
@@ -177,8 +178,8 @@ export function ConfigWorkspace({ scope }: { scope: "system" | "models" }) {
       </div>
       {scope === "models" && (
         <p className="mb-4 text-sm text-slate-500">
-          分析预算用于新建与补跑的模块；模型自身的输出上限仍同时生效。
-          配置版本与配置中心共用，发布和回滚会作用于整个版本。
+          并发设置立即生效，其他分析参数从下次运行起使用；模型自身的输出上限也同时生效。
+          版本与配置中心共用，发布或恢复历史版本会影响其中的全部设置。
         </p>
       )}
       {state === "loading" && (
@@ -220,7 +221,7 @@ export function ConfigWorkspace({ scope }: { scope: "system" | "models" }) {
               key: layer,
               label:
                 layer === "L1"
-                  ? scope === "models" ? "分析运行预算" : "运行参数"
+                  ? scope === "models" ? "分析运行限制" : "运行参数"
                   : layer === "L2"
                     ? scope === "models" ? "模型辅助解析" : "解析配置"
                     : "解析配置",
@@ -260,11 +261,11 @@ export function ConfigWorkspace({ scope }: { scope: "system" | "models" }) {
                         [entry],
                         comment || undefined,
                       );
-                      setInfo("已记录确认：" + entry.ref);
+                      setInfo("已确认：" + configLabel(entry.ref));
                     })
                   }
                   onActivate={(force: boolean, reason: string) =>
-                    run("激活失败", async () => {
+                    run("发布失败", async () => {
                       if (detail === null) return;
                       await activateRelease(detail.id, {
                         force,

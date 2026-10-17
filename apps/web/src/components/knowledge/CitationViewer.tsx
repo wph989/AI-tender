@@ -15,13 +15,15 @@ import type { Citation } from "@/types/knowledge";
 import type { WirePageMeta } from "@/types/workbench";
 
 interface Props {
-  selected: Citation;
+  selected: Citation | Pick<Citation, "version_id" | "file_name">;
   citations: Citation[];
   onReverse?: (ref: Citation) => void;
 }
 
 /** 复用同一 PDF.js、虚拟页和定位 Hook；父级用版本及批次作为 key 隔离旧定位。 */
 export function CitationViewer({ selected, citations, onReverse }: Props) {
+  // 默认预览只需要文件身份，不伪造引用、页码锚点或高亮区域。
+  const citation = "source_id" in selected ? selected : null;
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [pages, setPages] = useState<WirePageMeta[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -29,15 +31,17 @@ export function CitationViewer({ selected, citations, onReverse }: Props) {
   const registry = usePageRegistry();
   const { locate } = useLocate(registry);
   const notice = useViewerStore((state) => state.notice);
+  const currentPage = useViewerStore((state) => state.currentPage);
   const refs = useMemo(() => {
+    if (!citation) return [];
     // 多条结论可引用同一原文块；画一次框即可，重复叠色会遮住正文。
     const blocks = new Map<number, Citation>();
     for (const ref of citations) {
-      if (ref.source_id === selected.source_id && ref.version_id === selected.version_id && ref.parse_run_id === selected.parse_run_id) blocks.set(ref.element_id, ref);
+      if (ref.source_id === citation.source_id && ref.version_id === citation.version_id && ref.parse_run_id === citation.parse_run_id) blocks.set(ref.element_id, ref);
     }
-    blocks.set(selected.element_id, selected);
+    blocks.set(citation.element_id, citation);
     return [...blocks.values()];
-  }, [citations, selected]);
+  }, [citations, citation]);
   const index = useMemo<EvidenceIndex>(() => {
     const byPage = new Map<number, EvidenceItem[]>();
     const byEvidence = new Map<number, EvidenceTarget[]>();
@@ -69,21 +73,21 @@ export function CitationViewer({ selected, citations, onReverse }: Props) {
   }, [selected.version_id]);
 
   useEffect(() => {
-    if (!pdf || !pages.length) return;
+    if (!citation || !pdf || !pages.length) return;
     // 报告轮询只更新角标集合，不应把正在阅读的用户重新滚回旧引用。
-    if (lastLocated.current === selected) return;
-    lastLocated.current = selected;
-    void locate({ evidenceId: Math.max(1, refs.findIndex((r) => r.element_id === selected.element_id && r.quote === selected.quote) + 1),
-      anchor: selected.anchor, pageNo: selected.page_no, bbox: toBbox(selected.bbox), label: selected.file_name });
-  }, [pdf, pages, selected, locate, refs]);
+    if (lastLocated.current === citation) return;
+    lastLocated.current = citation;
+    void locate({ evidenceId: Math.max(1, refs.findIndex((r) => r.element_id === citation.element_id && r.quote === citation.quote) + 1),
+      anchor: citation.anchor, pageNo: citation.page_no, bbox: toBbox(citation.bbox), label: citation.file_name });
+  }, [pdf, pages, citation, locate, refs]);
 
-  return <section className="citation-viewer" aria-label="引用原文">
-    <div className="citation-heading"><strong className="truncate">{selected.file_name}</strong><span>第 {selected.page_no} 页</span></div>
+  return <section className="citation-viewer" aria-label={citation ? "引用原文" : "文档预览"}>
+    <div className="citation-heading"><strong className="truncate">{selected.file_name}</strong><span>第 {citation?.page_no ?? currentPage} 页</span></div>
     <Toolbar pageCount={pages.length} />
     {(error || notice) && <p role="status" className="notice m-2">{error ?? notice}</p>}
     <div className="min-h-0 flex-1">{pdf && pages.length ? <DocumentViewer pdf={pdf} pages={pages} index={index} registry={registry} onError={setError}
       onLocate={(item) => { const ref = refs[item.evidenceId - 1]; if (ref) onReverse?.(ref); }} />
-      : <p className="p-8 text-slate-500">正在打开引用原文…</p>}</div>
-    <blockquote className="citation-excerpt">{selected.quote}</blockquote>
+      : <p className="p-8 text-slate-500">正在打开文档…</p>}</div>
+    {citation && <blockquote className="citation-excerpt">{citation.quote}</blockquote>}
   </section>;
 }

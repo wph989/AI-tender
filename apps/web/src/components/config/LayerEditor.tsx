@@ -20,6 +20,7 @@ import {
   formatValue,
 } from "@/lib/config/draft";
 import { message } from "@/lib/errors";
+import { configChoiceLabel, configHint, configLabel, configValueLabel } from "@/lib/config/presentation";
 import type { ConfigItem, ConfigLayer } from "@/types/config";
 
 interface Props {
@@ -68,10 +69,10 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
       await Promise.resolve(
         onSaved(
           result.status === "active"
-            ? "已保存并立即生效（L1 不需要回归门禁）"
+            ? "配置已保存。各项设置按上方说明生效。"
             : "已生成草稿 v" +
                 result.version_no +
-                "，请到「版本与发布」逐条确认影响后激活",
+                "，请到「版本与发布」确认变更影响后发布",
         ),
       ).catch(() => setError("配置已保存，但刷新失败，请刷新页面查看版本。"));
     } catch (caught) {
@@ -97,7 +98,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
 
       {!writable && (
         <p className="mt-3 border border-amber-200 bg-amber-50 px-2 py-1 text-[13px] text-amber-800">
-          该层当前没有可修改项；未接入配置的原因见下方说明。
+          当前没有可修改项，原因见各项说明。
         </p>
       )}
 
@@ -109,10 +110,10 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
             <div key={item.key} className="config-field">
               <div className="config-field-label">
                 <div className="flex items-center gap-2">
-                  <code className="text-[13px] text-slate-700">{item.key}</code>
+                  <strong className="text-[13px] font-medium text-slate-700">{configLabel(item.key, item.description)}</strong>
                   {item.overridden && (
                     <span className="rounded-lg bg-sky-50 px-1 text-[11px] text-sky-700">
-                      已覆盖默认值
+                      已自定义
                     </span>
                   )}
                   {changed && (
@@ -122,8 +123,13 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                   )}
                 </div>
                 <p className="mt-0.5 text-[13px] text-slate-500">
-                  {item.description}
+                  {configHint(item.key)}
                 </p>
+                <details className="mt-1 text-xs text-slate-400">
+                  <summary className="w-fit cursor-pointer">参数详情</summary>
+                  <code className="block break-all pt-1">{item.key}</code>
+                  <p className="mt-1">{item.description}</p>
+                </details>
                 {item.readonly_reason && (
                   <p className="mt-1 text-xs text-slate-500">只读：{item.readonly_reason}</p>
                 )}
@@ -135,7 +141,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
               </div>
               {item.value_type === "bool" ? (
                 <Select<string>
-                  aria-label={item.description || item.key}
+                  aria-label={configLabel(item.key, item.description)}
                   className={" w-full"}
                   value={String(value)}
                   disabled={!item.writable || busy}
@@ -146,16 +152,16 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                     }))
                   }
                 >
-                  <Select.Option value="true">true</Select.Option>
-                  <Select.Option value="false">false</Select.Option>
+                  <Select.Option value="true">开启</Select.Option>
+                  <Select.Option value="false">关闭</Select.Option>
                 </Select>
               ) : item.choices ? (
                 <Select<string>
-                  aria-label={item.description || item.key}
+                  aria-label={configLabel(item.key, item.description)}
                   className="w-full"
                   value={value}
                   disabled={!item.writable || busy}
-                  options={item.choices.map((choice) => ({ value: choice, label: choice }))}
+                  options={item.choices.map((choice) => ({ value: choice, label: configChoiceLabel(item.key, choice) }))}
                   onChange={(selectedValue) => setDrafts((current) => ({
                     ...current, [item.key]: selectedValue,
                   }))}
@@ -167,7 +173,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                     " w-full" +
                     (item.value_type === "secret" ? " font-mono" : "")
                   }
-                  aria-label={item.description || item.key}
+                  aria-label={configLabel(item.key, item.description)}
                   type={
                     item.value_type === "int" || item.value_type === "number"
                       ? "number"
@@ -187,7 +193,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                 />
               )}
               <span className="config-field-default text-[11px] text-slate-400">
-                默认 {formatValue(item.default)}
+                默认 {configValueLabel(item.key, item.default)}
               </span>
             </div>
           );
@@ -204,7 +210,7 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
         <Input
           aria-label="配置变更说明"
           className={" min-w-0 flex-1"}
-          placeholder="变更说明（会写进审计，例如：调整保证金字段提示词）"
+          placeholder="变更说明（可选，例如：延长分析等待时间）"
           disabled={busy}
           value={note}
           onChange={(event) => setNote(event.target.value)}

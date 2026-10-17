@@ -13,6 +13,7 @@ from sqlalchemy import func, select, update
 from tender.adapters.pg.models import Job
 from tender.api.common import engine
 from tender.api.errors import ApiProblem
+from tender.api.logging import throttle_access_log
 from tender.core import settings
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
@@ -44,6 +45,8 @@ def _payload(request: Request, job_id: str) -> dict[str, object] | None:
 
 
 @router.get("/{job_id}")
+# 前端等待解析时每秒查询，只压缩重复访问摘要。
+@throttle_access_log()
 def get_job(job_id: str, request: Request) -> dict[str, object]:
     payload = _payload(request, job_id)
     if payload is None:

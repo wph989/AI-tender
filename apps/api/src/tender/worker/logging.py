@@ -16,6 +16,11 @@ from tender.core.logging.context import CONTEXT_KEYS, valid_identifier
 
 logger = get_logger(__name__)
 _stack: ContextVar[tuple] = ContextVar("tender_task_log_stack", default=())
+# 周期派发即使无业务任务也持续执行，常规生命周期降为 DEBUG，避免淹没业务日志。
+_PERIODIC_DISPATCH_TASKS = {
+    "tender.worker.dispatch.dispatch_pending",
+    "tender.worker.knowledge.dispatch_knowledge",
+}
 
 
 def _setup(**kwargs) -> None:
@@ -39,7 +44,8 @@ def _prerun(task_id=None, task=None, **kwargs) -> None:
         and (valid_identifier(value) or type(value) is int)
     } if isinstance(raw, dict) else {}
     bind_contextvars(**context, task_id=task_id, task_name=task.name)
-    logger.info("task_started", retry_count=getattr(task.request, "retries", 0))
+    log = logger.debug if task.name in _PERIODIC_DISPATCH_TASKS else logger.info
+    log("task_started", retry_count=getattr(task.request, "retries", 0))
 
 
 def _postrun(task=None, state=None, **kwargs) -> None:
@@ -47,7 +53,12 @@ def _postrun(task=None, state=None, **kwargs) -> None:
         return
     *parents, (previous, started) = _stack.get()
     try:
-        logger.info(
+        log = (
+            logger.debug
+            if task.name in _PERIODIC_DISPATCH_TASKS and state == "SUCCESS"
+            else logger.info
+        )
+        log(
             "task_finished", execution_state=state,
             duration_ms=round((time.perf_counter() - started) * 1000, 3),
         )

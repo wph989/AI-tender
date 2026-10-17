@@ -9,12 +9,15 @@ import sys
 import threading
 import time
 from datetime import date, datetime
-from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from tender.core.settings import LoggingSettings
 
-_FILE_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})\.\d+-[a-f0-9]{12}\.\d{3,}\.jsonl\Z")
+# 继续识别旧版随机标识文件，升级后历史日志仍需按保留天数清理。
+_FILE_NAME = re.compile(
+    r"(\d{4}-\d{2}-\d{2})\.(?:\d{2}-\d{2}-\d{2}\.\d+|\d+-[a-f0-9]{12})"
+    r"\.\d{3,}\.jsonl\Z"
+)
 
 
 def emergency_write(text: str) -> None:
@@ -33,7 +36,6 @@ class DailyFileHandler(logging.Handler):
         self.directory = options.directory / service
         self.timezone = ZoneInfo(options.timezone)
         self._pid = os.getpid()
-        self._instance = f"{self._pid}-{uuid4().hex[:12]}"
         self._day: date | None = None
         self._sequence = 0
         self._size = 0
@@ -71,16 +73,17 @@ class DailyFileHandler(logging.Handler):
                 self._warning()
             self._stream = None
 
-    def _open(self, day: date) -> None:
+    def _open(self, now: datetime) -> None:
         self._close_stream()
         self.directory.mkdir(parents=True, exist_ok=True)
+        day = now.date()
         if day != self._day:
             self._day, self._sequence = day, 0
         while self._stream is None:
             self._sequence += 1
-            name = f"{day.isoformat()}.{self._instance}.{self._sequence:03}.jsonl"
+            name = f"{now:%Y-%m-%d.%H-%M-%S}.{self._pid}.{self._sequence:03}.jsonl"
             try:
-                # 排他创建保证重启、PID 复用与意外同名时都不覆盖已有历史。
+                # 同秒重启或 PID 复用时递增序号，排他创建保证不覆盖历史文件。
                 self._stream = (self.directory / name).open("xb")
             except FileExistsError:
                 continue
@@ -93,15 +96,14 @@ class DailyFileHandler(logging.Handler):
                 # 即使在 Celery 子进程初始化信号之前出现日志，也不能写入父进程文件。
                 self._close_stream()
                 self._pid = os.getpid()
-                self._instance = f"{self._pid}-{uuid4().hex[:12]}"
                 self._day = None
             data = (text + "\n").encode("utf-8", errors="backslashreplace")
-            day = self._now().date()
+            now = self._now()
             if (
-                self._stream is None or day != self._day
+                self._stream is None or now.date() != self._day
                 or self._size + len(data) > self.options.max_file_bytes
             ):
-                self._open(day)
+                self._open(now)
             self._stream.write(data)
             self._stream.flush()
             self._size += len(data)

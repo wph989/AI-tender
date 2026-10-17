@@ -17,7 +17,7 @@ test("配置范围由服务端下发，大预算可保存且未接入项只读",
     active: { release_id: 1, version_no: 1 },
     items: [
       { key: "analysis.max_output_tokens", layer: "L1", value_type: "int",
-        description: "模块输出预算", default: 8192, value: 8192, writable: true,
+        description: "单次模型输出上限（Token）", default: 8192, value: 8192, writable: true,
         minimum: 1, overridden: false, requires_gate: false },
       { key: "preprocess.denoise", layer: "L2", value_type: "bool",
         description: "扫描件去噪", default: true, value: true, writable: false,
@@ -33,14 +33,14 @@ test("配置范围由服务端下发，大预算可保存且未接入项只读",
   // 窄屏标签会自动滚动；键盘激活避免在滚动过程中点击到旧坐标。
   await page.getByRole("tab", { name: "分析参数", exact: true }).focus();
   await page.keyboard.press("Enter");
-  const budget = page.getByLabel("模块输出预算", { exact: true });
+  const budget = page.getByLabel("单次模型输出上限（Token）", { exact: true });
   await expect(budget).toHaveAttribute("min", "1");
   await expect(budget).not.toHaveAttribute("max");
   await budget.fill("262144");
   await page.getByRole("button", { name: "保存并立即生效", exact: true }).click();
   await expect.poll(() => saved).toMatchObject({ values: { "analysis.max_output_tokens": 262144 } });
   await page.goto("/settings/config");
-  await expect(page.getByLabel("模块输出预算", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("单次模型输出上限（Token）", { exact: true })).toHaveCount(0);
   await page.getByRole("tab", { name: "解析配置", exact: true }).click();
   await expect(page.getByText("只读：当前执行流程尚未接入该配置")).toBeVisible();
   await expect(page.getByLabel("扫描件去噪", { exact: true })).toBeDisabled();
@@ -164,9 +164,9 @@ test("执行中取消持续刷新，退出后只补跑选中的已取消模块",
   });
   await page.goto("/projects/1");
   await page.getByRole("button", { name: "取消任务", exact: true }).click();
-  await expect(page.getByText("正在停止任务，模块退出后即可重新解析。状态将自动刷新。")).toBeVisible();
+  await expect(page.getByText("正在停止分析，结束后可继续未完成的专题。")).toBeVisible();
   await page.getByRole("tab", { name: /保证金要求/ }).click();
-  const retry = page.getByRole("button", { name: "补跑本模块", exact: true });
+  const retry = page.getByRole("button", { name: "继续本专题", exact: true });
   await expect(retry).toBeDisabled();
   phase = "stopped";
   await expect(retry).toBeEnabled({ timeout: 10000 });
@@ -183,7 +183,7 @@ test("上传默认省略解析参数，让配置中心决定任务默认值", as
   });
   await page.goto("/projects/1/files");
   await page.getByText("解析选项与上传限制", { exact: false }).click();
-  await expect(page.getByLabel("解析档位", { exact: true }).locator("xpath=..")).toContainText("使用配置中心默认值");
+  await expect(page.getByLabel("解析方式", { exact: true }).locator("xpath=..")).toContainText("使用配置中心默认值");
   await page.locator('input[type="file"]').setInputFiles({
     name: "预算测试.pdf", mimeType: "application/pdf", buffer: Buffer.from("%PDF-fixture"),
   });

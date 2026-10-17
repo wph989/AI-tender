@@ -98,7 +98,7 @@ describe("buildPatch", () => {
   it("只读项不能进入提交补丁", () => {
     expect(buildPatch([item({ key: "reserved", writable: false })], {
       reserved: "1",
-    })).toEqual({ patch: {}, errors: ["reserved 当前只读"] });
+    })).toEqual({ patch: {}, errors: ["reserved 当前不可修改"] });
   });
 
   it("清空数值不能变成零并发或零阈值", () => {
@@ -108,7 +108,7 @@ describe("buildPatch", () => {
     });
     expect(result.patch).toEqual({});
     expect(result.errors).toEqual([
-      "convert.max_inflight 不能为空",
+      "同时转换的文件数 不能为空",
       "sample.ratio 不能为空",
     ]);
   });
@@ -140,8 +140,8 @@ describe("buildPatch", () => {
     });
     expect(result.patch).toEqual({});
     expect(result.errors).toEqual([
-      "convert.max_inflight 需要整数",
-      "mineru.output_formats 不是合法 JSON",
+      "同时转换的文件数 需要整数",
+      "解析结果格式 不是合法 JSON",
     ]);
   });
 

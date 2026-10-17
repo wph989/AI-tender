@@ -6,6 +6,7 @@
  */
 
 import type { ConfigItem, ConfigLayer, ConfigValueType } from "@/types/config";
+import { configLabel } from "./presentation";
 
 export const LAYERS: readonly ConfigLayer[] = ["L1", "L2"] as const;
 
@@ -15,13 +16,13 @@ export function isModelConfig(key: string): boolean {
 }
 
 export const LAYER_LABELS: Record<ConfigLayer, string> = {
-  L1: "L1 运行参数",
-  L2: "L2 解析配置",
+  L1: "运行设置",
+  L2: "文件解析设置",
 };
 
 export const LAYER_HINTS: Record<ConfigLayer, string> = {
-  L1: "保存后激活：并发与调度读取当前值；分析预算在新建或补跑时生效，已有运行保留快照。",
-  L2: "新任务生效：会改变解析产物，保存后是草稿，需逐条确认变更影响。",
+  L1: "并发与调度设置立即生效；其他分析参数在新建报告或继续分析时使用。",
+  L2: "先保存草稿，再到「版本与发布」确认影响并发布，新解析任务将使用新设置。",
 };
 
 export const RELEASE_STATUS_LABELS: Record<string, string> = {
@@ -84,7 +85,7 @@ function parseValue(
   }
   if (valueType === "bool") {
     if (raw !== "true" && raw !== "false")
-      return { error: key + " 只能是 true / false" };
+      return { error: key + " 请选择开启或关闭" };
     return { value: raw === "true" };
   }
   if (valueType === "int") {
@@ -129,13 +130,14 @@ export function buildPatch(
   const patch: Record<string, unknown> = {};
   const errors: string[] = [];
   for (const item of items) {
+    const label = configLabel(item.key, item.description);
     if (!(item.key in drafts)) continue;
     if (!item.writable) {
-      errors.push(item.key + " 当前只读");
+      errors.push(label + " 当前不可修改");
       continue;
     }
     const parsed = parseValue(
-      item.key,
+      label,
       item.value_type,
       drafts[item.key] ?? "",
     );
@@ -148,11 +150,11 @@ export function buildPatch(
       (item.minimum !== undefined && parsed.value < item.minimum) ||
       (item.maximum !== undefined && parsed.value > item.maximum)
     )) {
-      errors.push(item.key + " 超出允许范围");
+      errors.push(label + " 超出允许范围");
       continue;
     }
     if (item.choices && !item.choices.includes(String(parsed.value))) {
-      errors.push(item.key + " 请选择支持的值");
+      errors.push(label + " 请选择支持的值");
       continue;
     }
     if (sameValue(parsed.value, item.value)) continue;

@@ -33,6 +33,7 @@ from tender.adapters.pg.repositories.agent_runtime import (
 from tender.adapters.pg.repositories.knowledge import KnowledgeStore
 from tender.api.common import engine, project_row
 from tender.api.errors import ApiProblem
+from tender.api.logging import throttle_access_log
 from tender.api.parsing import ParseRequest, _create_parse_job
 from tender.api.project_files import _role_is_parseable
 from tender.application.agent_runtime import limits_snapshot
@@ -191,6 +192,8 @@ def create_collection(payload: CollectionInput, request: Request) -> dict:
 
 
 @router.get("/knowledge/collections/{collection_id}")
+# 知识库页面持续查询来源处理和索引状态。
+@throttle_access_log()
 def get_collection(collection_id: int, request: Request) -> dict:
     collection = collection_or_404(request, collection_id)
     embedding = store(request).embedding_config()
@@ -390,6 +393,8 @@ def link_collections(project_id: int, payload: LinkedCollections, request: Reque
 
 
 @router.get("/projects/{project_id}/analysis")
+# 分析页每三秒刷新状态、报告和专题记录。
+@throttle_access_log()
 def analysis_status(project_id: int, request: Request) -> dict:
     own_id = project_collection(request, project_id)
     db = store(request)
@@ -564,6 +569,7 @@ def visible_items(
 
 
 @router.get("/analysis/reports/{report_id}")
+@throttle_access_log()
 def get_report(report_id: int, request: Request) -> dict:
     report = report_row(request, report_id)
     report.pop("skill_snapshot", None)
@@ -665,6 +671,7 @@ def data_snapshot(request: Request, report_id: int, snapshot_id: int | None = No
 
 
 @router.get("/analysis/reports/{report_id}/modules/{module_key}/records")
+@throttle_access_log()
 def get_module_records(report_id: int, module_key: str, request: Request) -> dict:
     """直接读取子 Agent 逐条产出的 JSON，证据单独返回，不从报告文本反向解析。"""
     report = report_row(request, report_id)
@@ -1083,6 +1090,8 @@ def ask_project(project_id: int, payload: AskInput, request: Request) -> dict:
 
 
 @router.get("/knowledge/answers/{answer_id}")
+# 问答执行期间前端每 2.5 秒查询进度和回答。
+@throttle_access_log()
 def get_answer(answer_id: int, request: Request) -> dict:
     db = store(request)
     answer = db.answer(answer_id)

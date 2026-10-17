@@ -10,6 +10,7 @@ import { Icon } from "@/components/Icon";
 import { UploadRejectedError } from "@/lib/api/client";
 import { formatBytes } from "@/lib/format";
 import { outcomeOf, type UploadOutcome } from "@/lib/projects/upload";
+import { OCR_MODES, PARSE_TIERS } from "@/lib/projects/parseOptions";
 import {
   FILE_ROLE_LABELS,
   type FileRole,
@@ -32,13 +33,6 @@ const LIMITS = [
 ];
 
 const ROLE_RULE = "电子表格自动归类为清单，CAD 与 Visio 文件归类为图纸，";
-
-const TIER_OPTIONS: { value: ParseTier; label: string }[] = [
-  { value: "flash", label: "flash · 最快" },
-  { value: "basic", label: "basic" },
-  { value: "standard", label: "standard · 默认" },
-  { value: "advanced", label: "advanced · 最准" },
-];
 
 export interface UploadOptionsState {
   tier: ParseTier | "";
@@ -211,14 +205,14 @@ export function UploadPanel({ busy, onUpload }: Props) {
         <summary>
           解析选项与上传限制{" "}
           <span className="ml-2 text-slate-400">
-            默认自动识别，上传后开始解析
+            {options.autoParse ? "上传后自动解析，可按文件情况调整" : "仅上传文件，稍后手动解析"}
           </span>
         </summary>
         <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <label className="flex flex-col gap-2 text-[12px] text-slate-500">
-            解析档位
+            解析方式
             <Select<string>
-              aria-label="解析档位"
+              aria-label="解析方式"
               disabled={busy}
               value={String(options.tier)}
               onChange={(selectedValue) =>
@@ -226,12 +220,13 @@ export function UploadPanel({ busy, onUpload }: Props) {
               }
             >
               <Select.Option value="">使用配置中心默认值</Select.Option>
-              {TIER_OPTIONS.map((item) => (
+              {PARSE_TIERS.map((item) => (
                 <Select.Option key={item.value} value={String(item.value)}>
                   {item.label}
                 </Select.Option>
               ))}
             </Select>
+            <span>{PARSE_TIERS.find((item) => item.value === options.tier)?.description ?? "不确定时保持默认；疑难扫描件可尝试增强解析。"}</span>
           </label>
           <label className="flex flex-col gap-2 text-[12px] text-slate-500">
             文字识别
@@ -247,10 +242,9 @@ export function UploadPanel({ busy, onUpload }: Props) {
               }
             >
               <Select.Option value="">使用配置中心默认值</Select.Option>
-              <Select.Option value="auto">自动判断</Select.Option>
-              <Select.Option value="txt">使用文本层</Select.Option>
-              <Select.Option value="ocr">强制 OCR 识别</Select.Option>
+              {OCR_MODES.map((item) => <Select.Option key={item.value} value={item.value}>{item.label}</Select.Option>)}
             </Select>
+            <span>{OCR_MODES.find((item) => item.value === options.ocrMode)?.description ?? "不确定时保持默认，由系统判断如何读取文字。"}</span>
           </label>
           <label className="flex flex-col gap-2 text-[12px] text-slate-500">
             文件角色

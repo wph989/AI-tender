@@ -19,6 +19,7 @@ from tender.adapters.pg.models import (
 from tender.adapters.pg.repositories.knowledge import ensure_project_collection
 from tender.api.common import engine, project_row
 from tender.api.errors import ApiProblem
+from tender.api.logging import throttle_access_log
 from tender.core import settings
 
 router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
@@ -190,6 +191,8 @@ def list_projects(
 
 
 @router.get("/{project_id}")
+# 文件管理和文档预览会轮询项目详情，跟进转换与解析进度。
+@throttle_access_log()
 def get_project(project_id: int, request: Request) -> dict[str, object]:
     db = engine(request)
     project = dict(project_row(db, project_id))

@@ -14,17 +14,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 import structlog
 from celery import Celery
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, Request
 from starlette.responses import StreamingResponse
 
 from tender.api.errors import install_error_handlers
-from tender.api.logging import RequestLoggingMiddleware
+from tender.api.logging import RequestLoggingMiddleware, _AccessLogWindow, throttle_access_log
 from tender.core import logging as runtime
 from tender.core import settings
 from tender.core.logging import bind_context, configure_logging, get_context, get_logger
@@ -94,13 +95,17 @@ def test_daily_and_size_rotation_preserve_whole_utf8_records(options, monkeypatc
     paths = sorted((options.directory / "worker").glob("*.jsonl"))
     assert len(paths) > 2
     assert all(path.stat().st_size <= 500 for path in paths)
-    assert any(path.name.startswith("2026-10-18.") for path in paths)
+    assert paths[-1].name == f"2026-10-18.00-00-00.{os.getpid()}.001.jsonl"
+    assert all(
+        path.name.startswith(f"2026-10-17.23-59-00.{os.getpid()}.") for path in paths[:-1]
+    )
     logs = read_logs(options.directory)
     assert len(logs) == 7
     assert logs[-1]["event"] == "跨天"
 
 
-def test_retention_counts_days_not_files_and_skips_unmanaged_files(options, monkeypatch):
+@pytest.mark.parametrize("identity", ["42-abcdef123456", "21-42-03.42"])
+def test_retention_counts_days_not_files_and_skips_unmanaged_files(options, monkeypatch, identity):
     handler = DailyFileHandler(options, "api")
     monkeypatch.setattr(
         handler, "_now", lambda: datetime(2026, 10, 17, tzinfo=ZoneInfo("Asia/Singapore"))
@@ -110,7 +115,7 @@ def test_retention_counts_days_not_files_and_skips_unmanaged_files(options, monk
     # 30 天包含当天：9 月 18 日仍保留；9 月 17 日所有分片都已过期。
     for day in ("2026-09-17", "2026-09-18", "2026-10-17"):
         for part in range(1, 40):
-            (directory / f"{day}.42-abcdef123456.{part:03}.jsonl").write_text(
+            (directory / f"{day}.{identity}.{part:03}.jsonl").write_text(
                 "{}\n", encoding="utf-8"
             )
     unrelated = directory / "2020-01-01.backup.jsonl"
@@ -174,7 +179,10 @@ def test_cleanup_retries_locked_files_and_ignores_concurrent_deletion(options, m
     handler.close()
 
 
-def test_restarts_do_not_overwrite_and_initialization_is_idempotent(options):
+def test_restarts_do_not_overwrite_and_initialization_is_idempotent(options, monkeypatch):
+    # 固定同一秒和同一 PID，验证新命名发生冲突时仍能保留两次初始化产生的记录。
+    now = datetime(2026, 10, 17, 21, 42, 3, tzinfo=ZoneInfo("Asia/Singapore"))
+    monkeypatch.setattr(DailyFileHandler, "_now", lambda self: now)
     configure_logging("api", options)
     configure_logging("api", options)
     logging.getLogger("tender.standard").info("标准 logging", extra={"job_id": 123})
@@ -183,7 +191,9 @@ def test_restarts_do_not_overwrite_and_initialization_is_idempotent(options):
     get_logger("tender.structured").info("structured_event", report_id=456)
     logs = read_logs(options.directory)
     assert len(logs) == 2
-    assert len(list((options.directory / "api").glob("*.jsonl"))) == 2
+    assert {path.name for path in (options.directory / "api").glob("*.jsonl")} == {
+        f"2026-10-17.21-42-03.{os.getpid()}.{part:03}.jsonl" for part in (1, 2)
+    }
     assert logs[0]["service"] == logs[1]["service"] == "api"
     assert {log["event"] for log in logs} == {"标准 logging", "structured_event"}
     assert any(log.get("job_id") == 123 for log in logs)
@@ -405,6 +415,254 @@ def test_asgi_requests_failures_streaming_and_concurrency(options):
     assert "not-in-logs" not in json.dumps(logs)
 
 
+@pytest.mark.parametrize("interval", [None, 15])
+def test_access_logs_sample_successes_but_keep_errors_and_request_context(
+    options, monkeypatch, interval,
+):
+    from tender.api import logging as access_logging
+
+    configure_logging("api", options)
+    clock = [100.0]
+    monkeypatch.setattr(access_logging, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], perf_counter=lambda: clock[0],
+    ))
+    app = FastAPI()
+    install_error_handlers(app)
+    app.add_middleware(RequestLoggingMiddleware)
+    limit = throttle_access_log() if interval is None else throttle_access_log(interval)
+    interval = 60 if interval is None else interval
+
+    @app.api_route("/poll/{item_id}", methods=["GET", "POST"])
+    @limit
+    async def poll(item_id: int, status: int = 200):
+        from fastapi.responses import JSONResponse
+
+        await asyncio.sleep(0)
+        get_logger("tender.test").info("poll_business_event")
+        return JSONResponse({"id": item_id}, status_code=status)
+
+    @app.get("/failed")
+    @throttle_access_log()
+    async def failed():
+        raise RuntimeError("password=access-hidden-secret")
+
+    async def check():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app, raise_app_exceptions=False), base_url="http://test",
+        ) as client:
+            responses = await asyncio.gather(*(
+                client.get(f"/poll/1?tick={i}", headers={"X-Request-ID": f"poll-{i}"})
+                for i in range(10)
+            ))
+            assert [r.headers["x-request-id"] for r in responses] == [
+                f"poll-{i}" for i in range(10)
+            ]
+            clock[0] += interval - 1
+            await client.get("/poll/1", headers={"X-Request-ID": "before-boundary"})
+            clock[0] += 1
+            await client.get("/poll/1", headers={"X-Request-ID": "at-boundary"})
+            await client.get("/poll/2")  # 不同资源、方法及状态不能被上一种访问吞掉。
+            await client.post("/poll/1")
+            for status in (201, 302, 304, 400, 404, 429, 500, 503):
+                for _ in range(2):
+                    await client.get(f"/poll/1?status={status}")
+            for _ in range(2):
+                assert (await client.get("/failed")).status_code == 500
+            # 错误不应刷新或清空成功分组的窗口。
+            await client.get("/poll/1", headers={"X-Request-ID": "after-error"})
+        assert get_context() == {}
+
+    asyncio.run(check())
+    logs = read_logs(options.directory)
+    summaries = [log for log in logs if log["event"] == "http_request_finished"]
+    assert len(summaries) == 19
+    assert summaries[0]["suppressed_count"] == 0
+    assert summaries[1]["request_id"] == "at-boundary"
+    assert summaries[1]["suppressed_count"] == 10
+    assert [log["status_code"] for log in summaries[7:]] == [
+        400, 400, 404, 404, 429, 429, 500, 500, 503, 503, 500, 500,
+    ]
+    assert all(log["level"] == "warning" for log in summaries[7:13])
+    assert all(log["level"] == "error" for log in summaries[13:])
+    assert len([log for log in logs if log["event"] == "poll_business_event"]) == 31
+    assert len([log for log in logs if "exception" in log]) == 2
+    assert "access-hidden-secret" not in json.dumps(logs)
+    assert "tick=" not in json.dumps(logs)
+
+
+def test_access_log_decorator_preserves_sync_parameters_and_leaves_other_routes_unsampled(options):
+    configure_logging("api", options)
+    app = FastAPI()
+    app.add_middleware(RequestLoggingMiddleware)
+
+    @app.get("/poll/{item_id}")
+    @throttle_access_log()
+    def poll(item_id: int, request: Request, value: int = Query(ge=1)):
+        get_logger("tender.test").info("sync_poll", item_id=item_id)
+        return {"id": item_id, "value": value, "request_id": request.state.log_request_id}
+
+    @app.post("/poll/{item_id}")
+    def write(item_id: int):
+        return {"id": item_id}
+
+    @app.get("/manual")
+    def manual():
+        return {"ok": True}
+
+    @app.get("/disabled")
+    @throttle_access_log(0)
+    async def disabled():
+        return {"ok": True}
+
+    async def check():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://test",
+        ) as client:
+            for index in range(3):
+                response = await client.get(
+                    f"/poll/7?value={index + 1}", headers={"X-Request-ID": f"sync-{index}"},
+                )
+                assert response.json() == {"id": 7, "value": index + 1,
+                                           "request_id": f"sync-{index}"}
+                assert (await client.post("/poll/7")).status_code == 200
+                assert (await client.get("/manual")).status_code == 200
+                assert (await client.get("/disabled")).status_code == 200
+            for _ in range(2):
+                assert (await client.get("/poll/7?value=0")).status_code == 422
+        assert get_context() == {}
+
+    asyncio.run(check())
+    logs = read_logs(options.directory)
+    summaries = [log for log in logs if log["event"] == "http_request_finished"]
+    assert len(summaries) == 12
+    assert len([log for log in summaries if log["route"] == "/manual"]) == 3
+    assert len([log for log in summaries if log["route"] == "/disabled"]) == 3
+    assert len([log for log in summaries if log["method"] == "POST"]) == 3
+    assert len([log for log in summaries if log["status_code"] == 422]) == 2
+    assert {log["request_id"] for log in logs if log["event"] == "sync_poll"} == {
+        "sync-0", "sync-1", "sync-2",
+    }
+
+
+def test_access_log_decorators_use_independent_windows(options, monkeypatch):
+    from tender.api import logging as access_logging
+
+    configure_logging("api", options)
+    clock = [0.0]
+    monkeypatch.setattr(access_logging, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], perf_counter=lambda: clock[0],
+    ))
+    app = FastAPI()
+    app.add_middleware(RequestLoggingMiddleware)
+
+    @app.get("/short")
+    @throttle_access_log(15)
+    def short():
+        return {}
+
+    @app.get("/long")
+    @throttle_access_log()
+    def long():
+        return {}
+
+    async def check():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://test",
+        ) as client:
+            for seconds in (0, 14, 15, 59, 60):
+                clock[0] = seconds
+                await client.get("/short")
+                await client.get("/long")
+
+    asyncio.run(check())
+    logs = read_logs(options.directory)
+    assert len([log for log in logs if log["route"] == "/short"]) == 3
+    assert len([log for log in logs if log["route"] == "/long"]) == 2
+
+
+def test_only_frontend_polling_routes_enable_access_log_throttling():
+    from tender.api import config, jobs, knowledge, llm, parsing, project_files, projects, versions
+
+    selected = {
+        (method, route.path)
+        for module in (config, jobs, knowledge, llm, parsing, project_files, projects, versions)
+        for route in module.router.routes
+        if getattr(route.endpoint, "_tender_access_log_interval", 0) > 0
+        for method in route.methods
+    }
+    # 与已确认的前端定时查询链路对应，防止扩成全局 GET 或误吞写接口的日志。
+    assert selected == {("GET", "/api/v1" + path) for path in (
+        "/jobs/{job_id}", "/projects/{project_id}",
+        "/knowledge/collections/{collection_id}", "/knowledge/answers/{answer_id}",
+        "/projects/{project_id}/analysis", "/analysis/reports/{report_id}",
+        "/analysis/reports/{report_id}/modules/{module_key}/records",
+        "/llm/settings", "/llm/providers", "/llm/models", "/llm/features",
+    )}
+
+
+def test_access_log_window_survives_many_distinct_paths_and_cleans_expired_keys(
+    options, monkeypatch,
+):
+    from tender.api import logging as access_logging
+
+    clock = [100.0]
+    monkeypatch.setattr(access_logging, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    window = _AccessLogWindow(15)
+    keys = [("GET", f"/poll/{number}", 200) for number in range(5000)]
+    # 一轮含有很多不同资源时，也不能靠淘汰未过期分组重新放行重复日志。
+    assert all(window.sample(key) == 0 for key in keys)
+    clock[0] += 14
+    assert all(window.sample(key) is None for key in keys)
+    clock[0] += 1
+    assert window.sample(keys[0]) == 1
+    assert len(window._recent) == 1
+
+
+def test_access_log_window_is_atomic_across_threads(options):
+    window = _AccessLogWindow(60)
+    barrier = threading.Barrier(8)
+
+    def sample():
+        barrier.wait(timeout=5)
+        return window.sample(("GET", "/poll/1", 200))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: sample(), range(8)))
+    assert results.count(0) == 1
+    assert results.count(None) == 7
+
+
+@pytest.mark.parametrize("path", ["/stream", "/api/v1/healthz"])
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+def test_interrupted_successful_stream_is_never_sampled(options, path, error_type):
+    configure_logging("api", options)
+
+    @throttle_access_log()
+    async def app(scope, receive, send):
+        scope["route"] = SimpleNamespace(path=path)
+        scope["endpoint"] = app
+        await send({"type": "http.response.start", "status": 200})
+        raise error_type("stream interrupted")
+
+    middleware = RequestLoggingMiddleware(app)
+
+    async def noop(*args):
+        pass
+
+    async def check():
+        for _ in range(3):
+            scope = {"type": "http", "method": "GET", "path": path, "headers": []}
+            with pytest.raises(error_type, match="stream interrupted"):
+                await middleware(scope, noop, noop)
+        assert get_context() == {}
+
+    asyncio.run(check())
+    logs = read_logs(options.directory)
+    assert len(logs) == 3
+    assert all(log["outcome"] == "interrupted" for log in logs)
+    assert all(log["status_code"] == 200 and log["level"] == "error" for log in logs)
+
+
 def test_celery_real_execution_and_publication_without_external_services(options, monkeypatch):
     from celery import signals
 
@@ -456,6 +714,87 @@ def test_celery_real_execution_and_publication_without_external_services(options
     assert len([log for log in logs if log["event"] == "task_execution_failed"]) == 1
     assert "private-result" not in json.dumps(logs)
     assert "task-secret" not in json.dumps(logs)
+
+
+@pytest.mark.parametrize("level", ["INFO", "DEBUG"])
+@pytest.mark.parametrize("task_name", [
+    "tender.worker.dispatch.dispatch_pending",
+    "tender.worker.knowledge.dispatch_knowledge",
+])
+def test_periodic_dispatch_is_quiet_but_keeps_warnings_failures_and_retries(
+    options, monkeypatch, level, task_name,
+):
+    from celery import Task, signals
+
+    from tender.worker import logging as worker_logging
+
+    worker_logging.install_worker_logging()
+    monkeypatch.setattr(
+        worker_logging, "configure_logging",
+        lambda service: configure_logging(service, replace(options, level=level)),
+    )
+    # 使用相同任务名的独立探针，覆盖真实 Celery 信号，但不执行业务派发或访问数据库。
+    app = Celery("tender_logging_probe", broker="memory://", set_as_current=False)
+    signals.setup_logging.send(sender=app)
+
+    class DispatchProbe(Task):
+        name = task_name
+
+        def run(self, outcome="success"):
+            get_logger("tender.test").warning("dispatch_probe_warning")
+            if outcome == "failure":
+                raise RuntimeError("dispatch failed; password=periodic-secret")
+            if outcome == "retry" and self.request.retries == 0:
+                raise self.retry(countdown=0)
+            return None
+
+    probe = app.register_task(DispatchProbe())
+    try:
+        with bind_context(request_id="outer-request"):
+            success = probe.apply()
+            failure = probe.apply(args=["failure"])
+            retry = probe.apply(args=["retry"])
+            assert success.successful() and failure.failed() and retry.successful()
+            assert get_context() == {"request_id": "outer-request"}
+        assert get_context() == {}
+    finally:
+        app.close()
+    logs = read_logs(options.directory)
+    successful_lifecycle = [
+        log for log in logs
+        if log.get("task_id") == success.id
+        and log["event"] in {"task_started", "task_finished"}
+    ]
+    if level == "INFO":
+        assert successful_lifecycle == []
+        assert not any(log["event"] == "task_started" for log in logs)
+        assert not any(
+            log["event"] == "task_finished" and log.get("execution_state") == "SUCCESS"
+            for log in logs
+        )
+    else:
+        assert {log["event"] for log in successful_lifecycle} == {"task_started", "task_finished"}
+        assert all(log["level"] == "debug" for log in successful_lifecycle)
+    assert any(
+        log["event"] == "dispatch_probe_warning" and log["task_id"] == success.id
+        and log["task_name"] == task_name and log["level"] == "warning"
+        for log in logs
+    )
+    assert any(
+        log["event"] == "task_execution_failed" and log["task_id"] == failure.id
+        and log["level"] == "error" and "dispatch failed" in log["exception"]
+        for log in logs
+    )
+    assert any(
+        log["event"] == "task_finished" and log["task_id"] == failure.id
+        and log["execution_state"] == "FAILURE" and log["level"] == "info"
+        for log in logs
+    )
+    assert any(
+        log["event"] == "task_retry" and log["task_id"] == retry.id and log["level"] == "warning"
+        for log in logs
+    )
+    assert "periodic-secret" not in json.dumps(logs)
 
 
 @pytest.mark.parametrize("traceback_kind", ["text", "object", "none"])

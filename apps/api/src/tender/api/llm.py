@@ -36,6 +36,7 @@ from tender.adapters.pg.models import (
 from tender.adapters.pg.repositories.model_test import maintain_model_tests
 from tender.api.common import engine
 from tender.api.errors import ApiProblem
+from tender.api.logging import throttle_access_log
 from tender.application.llm_registry import (
     DEFAULT_FAILOVER_LIMIT,
     FEATURE_DESCRIPTIONS,
@@ -573,6 +574,8 @@ def _finish_test(
 
 
 @router.get("/settings")
+# 模型测试期间 ModelSettings 每两秒一起刷新设置、供应商、模型和功能列表。
+@throttle_access_log()
 def llm_settings() -> dict[str, Any]:
     return {
         "secret_key_ready": secret_key_ready(),
@@ -724,6 +727,7 @@ def test_preview(test_id: int, request: Request) -> Response:
 
 
 @router.get("/providers")
+@throttle_access_log()
 def list_providers(request: Request) -> dict[str, Any]:
     with engine(request).connect() as connection:
         rows = (
@@ -1013,6 +1017,7 @@ def _validate(protocol: str, model: dict) -> None:
 
 
 @router.get("/models")
+@throttle_access_log()
 def list_models(request: Request, provider_id: int | None = None) -> dict[str, Any]:
     statement = (
         select(
@@ -1366,6 +1371,7 @@ async def _run_model_test(request: Request, row: dict, test_id: int, capability:
 
 
 @router.get("/features")
+@throttle_access_log()
 def list_features(request: Request) -> dict[str, Any]:
     with engine(request).connect() as connection:
         rows = (

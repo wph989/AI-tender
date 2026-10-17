@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from typing import Any
 
 import httpx
 from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
-from tender.core.error_details import quota_window, retry_after, upstream_error
+from tender.core.error_details import error_detail, quota_window, retry_after, upstream_error
+from tender.core.logging import get_logger
 from tender.domain.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -19,6 +21,8 @@ from tender.domain.errors import (
     ModelUnavailable,
 )
 from tender.ports.llm import Completion
+
+logger = get_logger(__name__)
 
 
 class AgentChat:
@@ -104,9 +108,10 @@ class AgentChat:
                     result = await runnable.ainvoke(messages_from_dict(messages))
         except Exception as exc:
             status = getattr(exc, "status_code", None)
-            response = getattr(exc, "response", None)
+            stream_response = getattr(exc, "_tender_stream_response", None)
+            response = getattr(exc, "response", None) or stream_response
             body = None
-            if isinstance(response, httpx.Response):
+            if isinstance(response, httpx.Response) and stream_response is None:
                 # SDK 的流式失败响应可能还未读取；只提取上游正文，不回显含请求的异常文本。
                 try:
                     await response.aread()
@@ -118,23 +123,43 @@ class AgentChat:
                 body = (
                     payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
                 )
+            transport_failure = isinstance(exc, httpx.TransportError) or any(
+                token in type(exc).__name__ for token in ("Timeout", "Connection")
+            )
             # 524 等非标准 5xx 同样是上游超时，必须可重试，不能直接判失败。
             if (
                 status in {408, 429}
                 or (status is not None and status >= 500)
-                or isinstance(exc, httpx.TransportError)
-                or any(token in type(exc).__name__ for token in ("Timeout", "Connection"))
+                or transport_failure
             ):
-                # SDK 会包装传输异常；类型用于区分超时与断连，详情只取实际上游响应。
+                # SDK 会包装传输异常；保留最底层原因，HTTP 错误仍优先记录实际上游正文。
                 cause = exc
                 while cause.__cause__ is not None:
                     cause = cause.__cause__
+                summary = (
+                    f"Agent 模型连接失败或暂不可用（{type(cause).__name__}）"
+                    + (f"：HTTP {status}" if status is not None else "")
+                )
+                if transport_failure:
+                    # 只取底层传输异常的消息，不序列化 request、消息正文或鉴权头。
+                    # 文本仍统一脱敏；只留异常类型会丢失断连、协议错误等关键诊断。
+                    summary += "\n底层异常：" + (str(cause) or "未提供具体消息")
+                    if stream_response is not None:
+                        # 流开始的 200 不代表完整响应，不能把请求结果改判为成功。
+                        summary += (
+                            f"\n响应情况：已收到 HTTP {stream_response.status_code} 响应头，"
+                            f"流式接收中断；已收到 {exc._tender_stream_chunks} 个数据块。"
+                        )
+                    elif response is None:
+                        summary += "\n响应情况：未收到上游 HTTP 响应，无响应正文可记录。"
+                if isinstance(response, httpx.Response):
+                    # 只保留便于供应商排查的请求标识，避免整份响应头携带 Cookie 等凭证。
+                    for header in ("x-request-id", "request-id", "x-amzn-requestid", "cf-ray"):
+                        if value := response.headers.get(header):
+                            summary += f"\n{header}：{value}"
                 error = ModelUnavailable(
                     upstream_error(
-                        f"Agent 模型连接失败或暂不可用（{type(cause).__name__}）"
-                        + (f"：HTTP {status}" if status is not None else ""),
-                        body,
-                        api_key=self._api_key,
+                        summary, body, api_key=self._api_key,
                     ),
                     http_status=status,
                 )
@@ -224,27 +249,52 @@ class AgentChat:
         payload["stream"] = True
         if self.model._should_stream_usage(None):
             payload["stream_options"] = {"include_usage": True}
+        started = time.monotonic()
         response = await self.model.async_client.create(**payload)
+        logger.info(
+            "model_stream_opened", http_status=response.response.status_code,
+            headers_ms=int((time.monotonic() - started) * 1000),
+            upstream_request_ids={
+                header: error_detail(value, api_key=self._api_key)
+                for header in ("x-request-id", "request-id", "x-amzn-requestid", "cf-ray")
+                if (value := response.response.headers.get(header))
+            },
+        )
         merged = None
         refusal = None
         default_class = AIMessageChunk
-        async with response as stream:
-            async for raw in _astream_with_chunk_timeout(
-                stream, self.model.stream_chunk_timeout, model_name=self.model.model_name
-            ):
-                data = raw if isinstance(raw, dict) else raw.model_dump()
-                choices = data.get("choices") or []
-                delta = (choices[0].get("delta") or {}) if choices else {}
-                refusal = delta.get("refusal") or refusal
-                chunk = self.model._convert_chunk_to_generation_chunk(data, default_class, {})
-                if chunk is None:
-                    continue
-                default_class = chunk.message.__class__
-                # 与 LangChain 自身聚合一致：generation_info 合并进 response_metadata，
-                # 供上层读取 finish_reason，判断流是否完整结束。
-                if info := chunk.generation_info:
-                    chunk.message.response_metadata = {**info, **chunk.message.response_metadata}
-                merged = chunk.message if merged is None else merged + chunk.message
+        received_chunks = 0
+        try:
+            async with response as stream:
+                async for raw in _astream_with_chunk_timeout(
+                    stream, self.model.stream_chunk_timeout, model_name=self.model.model_name
+                ):
+                    received_chunks += 1
+                    # 首块可能只有角色信息；只记一次到达时间，不逐块刷屏或打印模型正文。
+                    if received_chunks == 1:
+                        logger.info("model_stream_first_chunk",
+                                    first_chunk_ms=int((time.monotonic() - started) * 1000))
+                    data = raw if isinstance(raw, dict) else raw.model_dump()
+                    choices = data.get("choices") or []
+                    delta = (choices[0].get("delta") or {}) if choices else {}
+                    refusal = delta.get("refusal") or refusal
+                    chunk = self.model._convert_chunk_to_generation_chunk(data, default_class, {})
+                    if chunk is None:
+                        continue
+                    default_class = chunk.message.__class__
+                    # 与 LangChain 自身聚合一致：generation_info 合并进 response_metadata，
+                    # 供上层读取 finish_reason，判断流是否完整结束。
+                    if info := chunk.generation_info:
+                        chunk.message.response_metadata = {
+                            **info, **chunk.message.response_metadata,
+                        }
+                    merged = chunk.message if merged is None else merged + chunk.message
+        except Exception as exc:
+            # SDK 在流中断时不会附带已经收到的响应头；保留元数据供外层统一落账。
+            # 不保存半截模型正文，也不把未完成的工具参数交给 Agent 执行。
+            exc._tender_stream_response = response.response
+            exc._tender_stream_chunks = received_chunks
+            raise
         if merged is not None and refusal:
             # 与静态响应的字段位置保持一致，复用同一处拒绝判断。
             merged.additional_kwargs["refusal"] = refusal

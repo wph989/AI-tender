@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type {
-  AnalysisField, AnalysisModule, AnalysisOutput, AnalysisReport, Citation, ModuleRecords,
+  AnalysisField, AnalysisModule, AnalysisOutput, AnalysisReport, Citation, KnowledgeSource, ModuleRecords,
 } from "../src/types/knowledge";
 import { mockApi } from "./fixtures";
 
@@ -116,6 +116,75 @@ test.beforeEach(async ({ page }) => {
 });
 test.afterEach(() => expect(errors).toEqual([]));
 
+function source(versionId: number | null, name: string): KnowledgeSource {
+  return {
+    source_id: 2, collection_id: 1, project_id: 1, project_file_id: 2,
+    version_id: versionId, parse_run_id: null, file_name: name, purpose: "tender",
+    state: "processing", index_status: null, index_error: null, error_message: null,
+    embedding_model_id: null,
+  };
+}
+
+test("默认预览首个文档，点击引用后轮询不抢回默认文件", async ({ page }, info) => {
+  await page.route("**/api/v1/projects/1/analysis", (route) => route.fulfill({ json: {
+    analysis_category: "goods", analysis_topics: [], lots: [],
+    // 第一个文件尚未解析，预览仍应打开它；报告引用指向第二个文件。
+    sources: [source(2, "第一份文档.pdf"), { ...source(1, citation.file_name), source_id: 1 }],
+    reports: [{ id: 1, status: "completed" }], categories: { goods: "货物" }, topics: {},
+  } }));
+  await page.route("**/api/v1/versions/2/pages", (route) => route.fulfill({ json: { pages: [
+    { page_no: 1, width_pt: 595, height_pt: 842, rotation: 0, has_text_layer: true },
+  ] } }));
+  await page.route("**/api/v1/versions/2/file", (route) => route.fulfill({
+    path: "public/samples/sample-tender.pdf", contentType: "application/pdf",
+  }));
+  await page.reload();
+  if (info.project.name === "mobile") {
+    await page.getByRole("button", { name: "文档预览", exact: true }).click();
+  }
+  const preview = page.getByRole("region", { name: "文档预览", exact: true });
+  await expect(preview).toBeVisible();
+  await expect(preview).toContainText("第一份文档.pdf");
+  await expect(preview.locator("canvas").first()).toBeVisible();
+  await expect(preview.locator(".citation-excerpt")).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath("default-document-preview.png"), fullPage: true });
+  if (info.project.name === "mobile") {
+    await page.getByRole("button", { name: "分析内容", exact: true }).click();
+  }
+  await page.getByRole("tabpanel", { name: "技术要求 2 项", exact: true })
+    .getByRole("button", { name: /^定位：/ }).first().click();
+  const cited = page.getByRole("region", { name: "引用原文", exact: true });
+  await expect(cited).toBeVisible();
+  await expect(cited).toContainText(citation.file_name);
+  await expect(cited.locator("canvas").first()).toBeVisible();
+  await page.waitForResponse("**/api/v1/projects/1/analysis");
+  await expect(cited).toContainText(citation.file_name);
+  await expect(preview).toHaveCount(0);
+});
+
+test("没有报告时也能在文件准备完成后自动展示预览", async ({ page }, info) => {
+  let prepared = false;
+  await page.route("**/api/v1/projects/1/analysis", (route) => route.fulfill({ json: {
+    analysis_category: "goods", analysis_topics: [], lots: [],
+    sources: [source(prepared ? 1 : null, "等待转换的文档.docx")], reports: [],
+    categories: { goods: "货物" }, topics: {},
+  } }));
+  await page.reload();
+  await expect(page.getByRole("region", { name: "文档预览", exact: true })).toHaveCount(0);
+  if (info.project.name === "desktop") {
+    await expect(page.getByText("文件准备完成后会自动显示预览。", { exact: true })).toBeVisible();
+  } else {
+    await expect(page.getByRole("button", { name: "文档预览", exact: true })).toBeDisabled();
+  }
+  prepared = true;
+  if (info.project.name === "mobile") {
+    await page.getByRole("button", { name: "文档预览", exact: true }).click();
+  }
+  const preview = page.getByRole("region", { name: "文档预览", exact: true });
+  await expect(preview.locator("canvas").first()).toBeVisible({ timeout: 12000 });
+  await expect(preview).toContainText("等待转换的文档.docx");
+});
+
 test("技术专题展示综合摘要、独立任务和逐条要求，并能打开原文", async ({ page }, info) => {
   // 按语义定位当前专题，避免依赖组件库的内部活动面板类名。
   const body = page.getByRole("tabpanel", { name: "技术要求 2 项", exact: true })
@@ -125,8 +194,13 @@ test("技术专题展示综合摘要、独立任务和逐条要求，并能打�
   await expect(body.getByText("必须提供可执行的回退方案。", { exact: true })).toBeVisible();
   await expect(body).not.toContainText("内部业务投影");
   await expect(body).not.toContainText("原始段落：");
-  await page.getByText("检索范围与未决事项", { exact: true }).click();
+  await page.screenshot({ path: info.outputPath("synthesis-review-collapsed.png"), fullPage: true });
+  await expect(page.getByText("附件B未提供，兼容性细则待核对。", { exact: true })).not.toBeVisible();
+  await page.getByText("有 1 项内容待核对", { exact: true }).click();
   await expect(page.getByText("附件B未提供，兼容性细则待核对。", { exact: true })).toBeVisible();
+  await expect(page.getByText(modules[0]!.research_summary!, { exact: true })).not.toBeVisible();
+  await page.getByText("查看分析过程", { exact: true }).click();
+  await expect(page.getByText(modules[0]!.research_summary!, { exact: true })).toBeVisible();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
   await page.screenshot({ path: info.outputPath("synthesis-technical.png"), fullPage: true });
   const resolved = page.waitForRequest("**/knowledge/citations/resolve");

@@ -13,10 +13,10 @@ import { useState } from "react";
 import {
   blockerLabel,
   diffRows,
-  formatValue,
   impactKindLabel,
   releaseStatusLabel,
 } from "@/lib/config/draft";
+import { configLabel, configValueLabel } from "@/lib/config/presentation";
 import { formatTime } from "@/lib/llm/format";
 import type {
   ConfigRelease,
@@ -80,7 +80,7 @@ export function ReleasePanel({
           配置版本
         </h2>
         <p className="mt-1 text-[13px] leading-5 text-slate-500">
-          回滚是把历史版本直接置回生效，不重建配置（避免遗漏）。
+          查看每次配置变更，或恢复某个历史版本的设置。
         </p>
         <Table<ConfigRelease>
           className="mt-4"
@@ -164,7 +164,7 @@ export function ReleasePanel({
           />
         )}
         {busy && !detail && (
-          <Spin tip="正在读取版本详情">
+          <Spin description="正在读取版本详情">
             <div className="h-32" />
           </Spin>
         )}
@@ -222,13 +222,13 @@ export function ReleasePanel({
                     {rows.map((row) => (
                       <tr key={row.key} className="border-t border-slate-100">
                         <td className="border-b border-slate-100 py-1 pr-2">
-                          <code>{row.key}</code>
+                          <span title={row.key}>{configLabel(row.key)}</span>
                         </td>
                         <td className="py-1 pr-2 text-slate-500">
-                          {formatValue(row.old)}
+                          {configValueLabel(row.key, row.old)}
                         </td>
                         <td className="py-1 text-slate-800">
-                          {formatValue(row.new)}
+                          {configValueLabel(row.key, row.new)}
                         </td>
                       </tr>
                     ))}
@@ -241,7 +241,7 @@ export function ReleasePanel({
               变更影响清单
             </h3>
             <p className="mt-1 text-[13px] leading-5 text-slate-500">
-              必须逐条确认"已知悉"，每条单独落一行确认记录（谁、何时、确认了哪一条）。
+              发布前请逐条确认变更影响，系统会记录确认人和时间。
             </p>
             <ul className="mt-2 flex flex-col gap-1">
               {detail.impact.map((entry) => (
@@ -252,9 +252,9 @@ export function ReleasePanel({
                   <span className="w-24 text-[11px] text-slate-500">
                     {impactKindLabel(entry.kind)}
                   </span>
-                  <code className="min-w-0 flex-1 truncate text-[13px]">
-                    {entry.ref}
-                  </code>
+                  <span className="min-w-0 flex-1 text-[13px]" title={entry.ref}>
+                    {configLabel(entry.ref)}
+                  </span>
                   {entry.acked ? (
                     <span className="text-[11px] text-emerald-700">已确认</span>
                   ) : (
@@ -279,24 +279,24 @@ export function ReleasePanel({
               <Input
                 className={" mt-2 w-full"}
                 aria-label="确认备注"
-                placeholder="确认备注（可选，会写进审计）"
+                placeholder="确认备注（可选）"
                 value={comment}
                 onChange={(event) => setComment(event.target.value)}
               />
             )}
 
             <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">
-              门禁
+              发布前检查
             </h3>
             {detail.gate.passed ? (
               <p className="mt-1 text-[13px] text-emerald-700">
-                当前满足激活条件。
+                检查通过，可以发布。
               </p>
             ) : (
               <ul className="mt-1 flex flex-col gap-0.5 text-[13px]">
                 {detail.gate.blockers.map((code) => (
                   <li key={code} className="text-rose-700">
-                    阻断：{blockerLabel(code)}
+                    暂不能发布：{blockerLabel(code)}
                   </li>
                 ))}
                 {softBreaches.map((code) => (
@@ -311,11 +311,11 @@ export function ReleasePanel({
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 <Input
                   className={" min-w-0 flex-1"}
-                  aria-label="激活理由"
+                  aria-label="发布理由"
                   placeholder={
                     softBreaches.length > 0
-                      ? "强制激活必须填写理由"
-                      : "激活理由（可选）"
+                      ? "强制发布必须填写理由"
+                      : "发布理由（可选）"
                   }
                   value={reason}
                   onChange={(event) => setReason(event.target.value)}
@@ -332,15 +332,15 @@ export function ReleasePanel({
                   onClick={() =>
                     modal.confirm({
                       title: softBreaches.length
-                        ? "确认强制激活？"
-                        : "确认激活该版本？",
+                        ? "确认强制发布？"
+                        : "确认发布该版本？",
                       content: "生效后，新任务将使用本次配置。",
-                      okText: "确认激活",
+                      okText: "确认发布",
                       onOk: () => onActivate(softBreaches.length > 0, reason),
                     })
                   }
                 >
-                  {softBreaches.length > 0 ? "强制激活" : "激活"}
+                  {softBreaches.length > 0 ? "强制发布" : "发布"}
                 </Button>
               </div>
             )}
@@ -375,20 +375,20 @@ export function ReleasePanel({
             )}
 
             <h3 className="mt-4 font-display font-semibold text-[14px] text-slate-800">
-              审计
+              操作记录
             </h3>
             <ul className="mt-1 flex flex-col gap-0.5 text-[13px] text-slate-600">
               {detail.audit.map((entry) => (
                 <li key={entry.id}>
                   {formatTime(entry.created_at)} · {entry.actor} ·{" "}
-                  {entry.action}
+                  {({ create: "创建版本", acknowledge: "确认影响", activate: "发布版本", force_activate: "强制发布", rollback: "恢复历史版本" } as Record<string, string>)[entry.action] ?? entry.action}
                   {entry.reason !== null && entry.reason !== ""
                     ? " · " + entry.reason
                     : ""}
                 </li>
               ))}
               {detail.audit.length === 0 && (
-                <li className="text-slate-500">暂无审计记录。</li>
+                <li className="text-slate-500">暂无操作记录。</li>
               )}
             </ul>
           </section>

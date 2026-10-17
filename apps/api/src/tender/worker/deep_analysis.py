@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import time
+import traceback
 from contextlib import suppress
 from datetime import UTC, datetime
 
@@ -24,8 +26,12 @@ from tender.application.deep_analysis import (
 from tender.application.knowledge import encode, normalized, source_state
 from tender.application.knowledge_retrieval import retrieve_chunks
 from tender.core.di import create_embedding_gateway, create_rerank_gateway
+from tender.core.error_details import error_detail
+from tender.core.logging import bind_context, get_logger
 from tender.ports.repository.knowledge import KnowledgeStore
 from tender.worker.model_routing import _routing_model
+
+logger = get_logger(__name__)
 
 
 def prepare_report(db: KnowledgeStore, report: dict) -> tuple[dict, list[dict]] | None:
@@ -119,7 +125,12 @@ async def expand_evidence(
             continue
         try:
             rows = await read(source)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "analysis_evidence_read_failed", source_id=source["source_id"],
+                error_type=type(exc).__name__, error=error_detail(str(exc)),
+                fallback="use_already_read_evidence",
+            )
             continue
         for row in rows:
             evidence.setdefault(str(row["block_id"]), row)
@@ -158,10 +169,25 @@ def summarize(modules: list[dict]) -> list[dict]:
 async def execute_module(
     db: KnowledgeStore, report: dict, module: dict, sources: list[dict]
 ) -> None:
+    # module 是运行账行，id 是 run_id；独立绑定可避免并发专题和后续任务串号。
+    with bind_context(
+        report_id=report["id"], project_id=report.get("project_id"), run_id=module["id"],
+        module_key=module.get("module_key"), module_id=module.get("module_id"),
+        attempt=module.get("attempt"),
+    ):
+        await _execute_module(db, report, module, sources)
+
+
+async def _execute_module(
+    db: KnowledgeStore, report: dict, module: dict, sources: list[dict]
+) -> None:
     runtime = AgentRuntime(db, report, module, sources)
     model = None
     task = None
+    state = {}
+    started = time.monotonic()
     try:
+        logger.info("analysis_module_queued")
         while not await asyncio.to_thread(runtime.claim):
             await asyncio.sleep(1)
 
@@ -195,6 +221,12 @@ async def execute_module(
 
         state = runtime.run["state"]
         limits = AgentLimits(**runtime.run["limits"])
+        logger.info(
+            "analysis_module_started", resumed=module.get("started_at") is not None,
+            queue_ms=int((time.monotonic() - started) * 1000), source_count=len(sources),
+            thread_id=runtime.run["thread_id"], timeout_seconds=limits.timeout_seconds,
+            max_model_calls=limits.max_model_calls, max_tool_calls=limits.max_tool_calls,
+        )
         prior = state.get("research", {})
         research = ResearchSession(
             sources,
@@ -303,6 +335,12 @@ async def execute_module(
             # 字段与关系的支持性校验都在子 Agent 的提交工具内完成，此处只做最终权限复核。
             validate_project_claims(draft["fields"], report["project_id"])
             await asyncio.to_thread(runtime.finish, "completed", draft=draft)
+            logger.info(
+                "analysis_module_completed", duration_ms=int((time.monotonic() - started) * 1000),
+                item_count=len(draft["fields"]), evidence_count=len(research.seen),
+                gap_count=len(state.get("business_gaps", [])),
+                model_calls=runtime.run["model_calls"], tool_calls=runtime.run["tool_calls"],
+            )
 
         task = asyncio.create_task(work())
         while not task.done():
@@ -317,6 +355,15 @@ async def execute_module(
                 await task
         canceled = isinstance(exc, (InterruptedError, asyncio.CancelledError))
         status = "canceled" if canceled else "failed"
+        log = logger.info if canceled else logger.error
+        log(
+            "analysis_module_" + status, duration_ms=int((time.monotonic() - started) * 1000),
+            error_type=type(exc).__name__, error=error_detail(str(exc)),
+            saved_item_count=sum(i.get("verification") == "supported"
+                                 for i in state.get("staged_items", [])),
+            # 适配器已对业务异常脱敏；不串联原始 SDK 异常，以免回显其请求或凭证。
+            exception=None if canceled else "".join(traceback.format_exception(exc, chain=False)),
+        )
         # 尚在排队的任务也必须形成终态，避免被取消后仍显示等待配额。
         await asyncio.to_thread(runtime.abandon, status, str(exc)[:1000])
         if isinstance(exc, asyncio.CancelledError):
@@ -328,6 +375,8 @@ async def execute_module(
                 try:
                     await model.aclose()
                 except Exception as exc:
+                    logger.warning("analysis_client_close_failed", error_type=type(exc).__name__,
+                                   error=error_detail(str(exc)))
                     await asyncio.to_thread(
                         runtime.event, "client_close_failed", {"error_type": type(exc).__name__}
                     )
@@ -337,13 +386,20 @@ async def execute_module(
 
 
 async def analyze_report(db: KnowledgeStore, report: dict) -> None:
+    with bind_context(report_id=report["id"], project_id=report.get("project_id")):
+        await _analyze_report(db, report)
+
+
+async def _analyze_report(db: KnowledgeStore, report: dict) -> None:
     tasks = []
+    started = time.monotonic()
     try:
         prepared = await asyncio.to_thread(prepare_report, db, report)
         if prepared is None:
             return
         report, sources = prepared
         modules = db.report_active_modules(report["id"])
+        logger.info("analysis_report_started", module_count=len(modules), source_count=len(sources))
         tasks = [
             asyncio.create_task(execute_module(db, report, module, sources)) for module in modules
         ]
@@ -368,11 +424,24 @@ async def analyze_report(db: KnowledgeStore, report: dict) -> None:
             summary=summarize(rows),
             error="没有模块完成，请查看各模块错误并补跑" if not completed else None,
         )
+        log = logger.info if status == "completed" else logger.warning
+        log("analysis_report_finished", status=status,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            completed_modules=sum(r["status"] == "completed" for r in rows), module_count=len(rows))
     except (Exception, asyncio.CancelledError) as exc:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        log = (
+            logger.info if isinstance(exc, (InterruptedError, asyncio.CancelledError))
+            else logger.error
+        )
+        log(
+            "analysis_report_interrupted", error_type=type(exc).__name__,
+            error=error_detail(str(exc)),
+            exception="".join(traceback.format_exception(exc, chain=False)),
+        )
         db.fail_report(report["id"], str(exc)[:1000])
         if isinstance(exc, asyncio.CancelledError):
             raise
