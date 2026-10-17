@@ -19,6 +19,9 @@ dependencies = [
     "httpx>=0.28",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    # 统一项目与第三方日志；tzdata 让 Windows 也能按 IANA 时区切分文件。
+    "structlog>=25,<26",
+    "tzdata>=2025.1",
     "python-multipart>=0.0.9",
     "boto3>=1.35",
     "pypdfium2>=4.30",
@@ -111,7 +114,7 @@ forbidden_modules = [
 [[tool.importlinter.contracts]]
 name = "core 只能被依赖：不反向引用任何业务分层"
 type = "forbidden"
-source_modules = ["tender.core.settings"]
+source_modules = ["tender.core.settings", "tender.core.logging", "tender.core.redaction"]
 forbidden_modules = [
     "tender.ports",
     "tender.application",

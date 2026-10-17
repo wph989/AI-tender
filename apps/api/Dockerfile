@@ -34,6 +34,7 @@ RUN uv sync --frozen --no-dev
 
 # 非 root 运行；只 chown 应用目录，不动系统路径
 RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/logs \
     && chown -R appuser:appuser /app
 USER appuser
 

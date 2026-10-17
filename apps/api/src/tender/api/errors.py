@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from tender.core.logging import bind_context
 from tender.core.secrets import SecretKeyUnavailable
 from tender.domain.errors import (
     ConversionFailed,
@@ -114,9 +115,16 @@ def install_error_handlers(app: FastAPI) -> None:
         return error_response(503, "storage_unavailable", "对象存储暂时不可用", True)
 
     @app.exception_handler(Exception)
-    async def unexpected_handler(_: Request, exc: Exception) -> JSONResponse:
-        logger.exception("API 未处理异常", exc_info=exc)
-        return error_response(500, "internal_error", "服务暂时无法处理请求")
+    async def unexpected_handler(request: Request, exc: Exception) -> JSONResponse:
+        # Starlette 的兜底处理位于用户中间件外侧，需要恢复关联 ID，并补上 500 响应头。
+        request_id = getattr(request.state, "log_request_id", None)
+        with bind_context(request_id=request_id):
+            logger.exception("API 未处理异常", exc_info=exc)
+        exc._tender_logged = True
+        response = error_response(500, "internal_error", "服务暂时无法处理请求")
+        if request_id:
+            response.headers["X-Request-ID"] = request_id
+        return response
 
 
 def error_response(

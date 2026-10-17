@@ -101,3 +101,63 @@ $script:state = [pscustomobject]@{ services = @($legacy) }
 Invoke-BackendStop | Out-Null
 Assert-True ($script:killed.Count -eq 1) '旧记录中的合法服务未通过现场扫描恢复管理'
 Write-Host "$script:passed 项进程身份回归检查通过（未终止真实进程）"
+
+# 执行真实的启动前主流程以约束检查顺序；所有进程、端口和文件操作仍由替身接管。
+$statements = $ast.EndBlock.Statements
+$begin = $statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $_.Left.Extent.Text -eq '$runningServices'
+} | Select-Object -First 1
+$end = $statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $_.Left.Extent.Text -eq '$started'
+} | Select-Object -First 1
+if (-not $begin -or -not $end) { throw '找不到启动前检查的边界' }
+$preflightScript = [scriptblock]::Create((($statements | Where-Object {
+    $_.Extent.StartOffset -ge $begin.Extent.StartOffset -and
+    $_.Extent.StartOffset -lt $end.Extent.StartOffset
+}).Extent.Text -join "`n"))
+
+function Invoke-PreflightScenario {
+    param([string]$OutputMode = 'file', [int]$ConfigExitCode = 0, [bool]$DirectoryFails = $false)
+    $events = New-Object System.Collections.Generic.List[string]
+    $PythonExe = 'Invoke-FakePython'
+    $Force = $true
+    $ApiPort = 8300
+    function Get-TrackedState { return $null }
+    function Get-StrayProcesses { return [pscustomobject]@{ ProcessId = 1234 } }
+    function Invoke-FakePython {
+        $events.Add('config')
+        $global:LASTEXITCODE = $ConfigExitCode
+        return (@{ directory = 'test-only-logs'; output = $OutputMode } | ConvertTo-Json)
+    }
+    function New-Item {
+        $events.Add('directory')
+        if ($DirectoryFails) { throw '模拟日志目录不可创建' }
+    }
+    function Invoke-BackendStop { $events.Add('stop') }
+    function Wait-PortFree { return $true }
+    function Get-NetTCPConnection { return $null }
+    $failure = $null
+    try { & $preflightScript } catch { $failure = $_ }
+    return [pscustomobject]@{ Events = @($events.ToArray()); Failure = $failure }
+}
+
+foreach ($scenario in @(
+    @{ OutputMode = 'stdout'; Expected = '隐藏窗口启动需要' },
+    @{ ConfigExitCode = 1; Expected = '日志配置无效' },
+    @{ DirectoryFails = $true; Expected = '模拟日志目录不可创建' }
+)) {
+    $expected = $scenario.Expected
+    $scenario.Remove('Expected')
+    $result = Invoke-PreflightScenario @scenario
+    Assert-True ($null -ne $result.Failure) '无效的日志配置或目录必须阻止启动'
+    Assert-True ($result.Failure.ToString().Contains($expected)) '应报告对应的预检失败原因'
+    Assert-True ($result.Events -notcontains 'stop') '日志预检失败时 -Force 不能停止现有服务'
+}
+foreach ($mode in @('file', 'both')) {
+    $result = Invoke-PreflightScenario -OutputMode $mode
+    Assert-True ($null -eq $result.Failure) "$mode 模式预检不应失败"
+    Assert-True (($result.Events -join ',') -eq 'config,directory,stop') '必须预检成功后才停止服务'
+}
+Write-Host "$script:passed 项进程身份与启动预检回归检查通过（未启停真实服务）"

@@ -18,10 +18,13 @@ from tender.api import (
     versions,
 )
 from tender.api.errors import install_error_handlers
+from tender.api.logging import RequestLoggingMiddleware
 from tender.core.di import ApiComponents, create_api_components
+from tender.core.logging import configure_logging, get_logger
 
 
 def create_app(components: ApiComponents | None = None) -> FastAPI:
+    configure_logging("api")
     runtime = components or create_api_components()
 
     @asynccontextmanager
@@ -31,6 +34,7 @@ def create_app(components: ApiComponents | None = None) -> FastAPI:
 
     app = FastAPI(title="AI-Tender API", version="0.1.0", lifespan=lifespan)
     app.state.components = runtime
+    app.add_middleware(RequestLoggingMiddleware)
     install_error_handlers(app)
     router = APIRouter(prefix="/api/v1")
 
@@ -50,4 +54,9 @@ def create_app(components: ApiComponents | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+try:
+    app = create_app()
+except Exception:
+    # 后台隐藏窗口无法查看 stderr；装配失败需先落入统一日志，再让进程失败退出。
+    get_logger(__name__).exception("api_initialization_failed")
+    raise

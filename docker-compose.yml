@@ -60,6 +60,14 @@ x-api-env: &api-env
   LLM_API_KEY: ${LLM_API_KEY:-}
   LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-90}
   LLM_SECRET_KEYS: ${LLM_SECRET_KEYS:-}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_OUTPUT: ${LOG_OUTPUT:-stdout}
+  LOG_CONSOLE_FORMAT: ${LOG_CONSOLE_FORMAT:-json}
+  LOG_DIR: /app/logs
+  LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-30}
+  LOG_TIMEZONE: ${LOG_TIMEZONE:-Asia/Singapore}
+  LOG_MAX_FILE_BYTES: ${LOG_MAX_FILE_BYTES:-104857600}
+  LOG_CLEANUP_INTERVAL_SECONDS: ${LOG_CLEANUP_INTERVAL_SECONDS:-3600}
 
 # 四个服务跑同一个后端镜像：写同一个 build 块，`up --build` 会构建一次、其余命中缓存。
 # 单独跑 api 时不必先手动 build；接了内部 registry 就换成 image 指向已发布镜像。
@@ -71,6 +79,14 @@ x-api-base: &api-base
   image: ai-tender-api:${IMAGE_TAG:-dev}
   extra_hosts:
     - "host.docker.internal:host-gateway"
+  # stdout 的限制由 Docker 负责；按自然日留存需将 LOG_OUTPUT 设为 file 或 both。
+  logging:
+    driver: local
+    options:
+      max-size: "100m"
+      max-file: "5"
+  volumes:
+    - backendlogs:/app/logs
 
 services:
   postgres:
@@ -255,6 +271,7 @@ services:
       - celery
       - -A
       - tender.worker.celery_app
+      - --quiet
       - worker
       - -Q
       - tender,convert,parse,analysis
@@ -283,6 +300,7 @@ services:
       - celery
       - -A
       - tender.worker.celery_app
+      - --quiet
       - beat
       - -l
       - info
@@ -316,6 +334,7 @@ services:
         condition: service_healthy
 
 volumes:
+  backendlogs:
   pgdata:
   redisdata:
   miniodata:

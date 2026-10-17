@@ -6,6 +6,7 @@ from typing import Any
 
 from celery import Celery
 
+from tender.adapters.celery_logging import install_publish_logging
 from tender.core.settings import redis_url
 
 _TASK_ROUTES = {
@@ -35,6 +36,7 @@ _BEAT_SCHEDULE = {
 
 
 def create_celery_app() -> Celery:
+    install_publish_logging()
     app = Celery("tender", broker=redis_url())
     app.conf.update(
         task_default_queue="tender",
@@ -42,6 +44,8 @@ def create_celery_app() -> Celery:
         task_acks_late=True,
         worker_prefetch_multiplier=1,
         beat_schedule=_BEAT_SCHEDULE,
+        worker_hijack_root_logger=False,
+        worker_redirect_stdouts=False,
     )
     return app
 

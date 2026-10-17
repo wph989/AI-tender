@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # 本文件在 apps/api/src/tender/core/settings.py，向上四级即 apps/api，.env 与 pyproject 同级。
 # 用「源码相对路径」而不是 Path.cwd()：alembic、uvicorn、celery 三种启动方式的 cwd 不同，
@@ -193,3 +195,59 @@ def mineru_bbox_rotation() -> str | None:
     if value not in {"unknown", "visual", "unrotated"}:
         raise ValueError("MINERU_BBOX_ROTATION 必须是 unknown、visual 或 unrotated")
     return None if value == "unknown" else value
+
+
+@dataclass(frozen=True)
+class LoggingSettings:
+    level: str = "INFO"
+    output: str = "both"
+    console_format: str = "text"
+    directory: Path = Path("logs")
+    retention_days: int = 30
+    max_file_bytes: int = 100 * 1024 * 1024
+    timezone: str = "Asia/Singapore"
+    cleanup_interval_seconds: int = 3600
+
+
+def logging_settings() -> LoggingSettings:
+    """日志不依赖数据库；相对目录按部署根目录解析，避免三种入口各写一份。"""
+    api_dir = _ENV_FILE.parent
+    base = api_dir.parent.parent if api_dir.parent.name == "apps" else api_dir
+    directory = Path(_setting("LOG_DIR") or "logs").expanduser()
+    if not directory.is_absolute():
+        directory = base / directory
+
+    def positive_int(name: str, default: int, minimum: int = 1) -> int:
+        try:
+            value = int(_setting(name) or default)
+        except ValueError as exc:
+            raise ValueError(f"{name} 必须是整数且不小于 {minimum}") from exc
+        if value < minimum:
+            raise ValueError(f"{name} 必须是整数且不小于 {minimum}")
+        return value
+
+    level = (_setting("LOG_LEVEL") or "INFO").upper()
+    output = _setting("LOG_OUTPUT") or "both"
+    console_format = _setting("LOG_CONSOLE_FORMAT") or "text"
+    timezone = _setting("LOG_TIMEZONE") or "Asia/Singapore"
+    if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        raise ValueError("LOG_LEVEL 必须是 DEBUG、INFO、WARNING、ERROR 或 CRITICAL")
+    if output not in {"stdout", "file", "both"}:
+        raise ValueError("LOG_OUTPUT 必须是 stdout、file 或 both")
+    if console_format not in {"text", "json"}:
+        raise ValueError("LOG_CONSOLE_FORMAT 必须是 text 或 json")
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("LOG_TIMEZONE 必须是有效的 IANA 时区，例如 Asia/Singapore") from exc
+    return LoggingSettings(
+        level=level,
+        output=output,
+        console_format=console_format,
+        directory=directory.resolve(),
+        retention_days=positive_int("LOG_RETENTION_DAYS", 30),
+        # 单条记录最多 64 KiB；文件必须容得下一条，不能从中间切断 JSON。
+        max_file_bytes=positive_int("LOG_MAX_FILE_BYTES", 104857600, 65536),
+        timezone=timezone,
+        cleanup_interval_seconds=positive_int("LOG_CLEANUP_INTERVAL_SECONDS", 3600),
+    )

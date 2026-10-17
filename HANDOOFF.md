@@ -2126,3 +2126,52 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 - 前端 pnpm typecheck 通过；pnpm test 48 passed / 8 files。
 
 未部署：业务 API/worker 未重启，迁移 0016 仍未执行业务库，前端未构建发布；两个新参数在配置页出现依赖 0016 落库。
+
+### 2026-10-17 后端日志基础服务：规划确认与实现
+
+用户先要求使用 grill-me 规划基础日志，不在各业务函数添加日志；随后确认推荐的技术方案、API/Worker/Beat 统一入口及文件/stdout 两种输出，并明确默认保留 30 天可修改、每日与 100 MiB 双条件切分。读取交接后使用 grilling 和 karpathy-guidelines；grilling 要求的只读事实调查使用了 logging_facts 子代理，编码与验证由主代理完成。保留此前前端及交接改动。
+
+实现：
+
+- 新增 core/logging：stdlib logging + structlog 25.5，幂等初始化、上下文绑定/恢复、UTF-8 文本终端与单行 JSON 文件、异常格式化、递归脱敏及单条 64 KiB 上限。提取 core/redaction，既有上游错误继续保留 16000 字符及原截断文案；长文本测试发现 DSN 脱敏正则回溯过慢，已限制协议名为短 ASCII 并通过回归。
+- 文件默认 logs/{api,worker,beat}/日期.PID-启动标识.序号.jsonl。每日按 Asia/Singapore 切分，达到 104857600 字节另开分片，重启不覆盖；按文件日期保留包含当天的 30 天。启动和每小时清理，不依赖新日志；文件占用下次重试，正常并发删除不报错，不递归或清理其他文件。写入失败限频告警并回退已脱敏记录到 stderr。
+- FastAPI 纯 ASGI 中间件生成/校验并回传 X-Request-ID，记录方法/路由模板/状态/耗时，支持流式响应；500 处理恢复关联 ID，Uvicorn 不重复打印堆栈。Celery 发布/执行信号传播已有上下文并恢复线程及嵌套任务状态，记录执行开始/结束/重试/异常，屏蔽默认返回值模板。task_id 与业务 ID 保持区别，不把执行 SUCCESS 当业务成功；未补 API→数据库→Beat 的持久化关联字段。
+- 日志部署参数位于 core/settings.py 和两个 .env.example；LOG_RETENTION_DAYS=30、LOG_MAX_FILE_BYTES=104857600 均可改，启动时生效，未修改真实 .env。同步依赖/锁文件、分层约束、.gitignore、启动指南与工程20。
+- Windows 启动脚本保留 UTF-8 BOM，复用 Python 解析日志配置，后台需要 file/both；不再覆盖固定 stdout/stderr 文件。Compose 默认 JSON stdout + Docker local driver 100m/5 文件，开启 file/both 时写 backendlogs 卷；镜像预建日志目录给应用用户，容器 Celery 使用 quiet 避免横幅混入结构化输出。
+
+验证：
+
+- 最终后端全量 tests/unit tests/contract：697 passed / 9 skipped，20.30 秒，退出码 0。
+- 新增 14 项日志专项全部通过：跨天/大小切分、30 天日期边界、多分片、闲置定时清理、文件占用与并发删除、重启与幂等、多线程及两个真实子进程独立文件、脱敏/限长/回退、环境配置、真实 FastAPI 请求/500/流式响应、Uvicorn 去重、Celery 内存 broker 发布与 eager/嵌套/线程并发。
+- 相关 Ruff 通过，import-linter 5 kept / 0 broken；19 项 PowerShell 进程身份回归通过；git diff --check 通过。
+- Docker 命令不可用，已用 YAML 解析验证环境、卷和轮转设置，未构建或启动容器；未跑 PostgreSQL 集成测试或前端验证，本轮未改业务 SQL/模型或前端。
+
+业务服务未重启，未迁移或改写业务数据库，未调用真实模型，未提交或推送。真实环境加载新版后生效。运行日志保留期不是停机时持续清理保证，单文件大小也不是总磁盘限额；初始化前直接标准流输出/终端横幅不长期保存，详见工程20。既有模型调用账本、Agent 事件与配置审计保持原职责。
+
+### 2026-10-17 日志模块审查问题修复
+
+用户要求修复未提交更改审查中的三个问题。读取交接后沿用 karpathy-guidelines，保留全部既有改动，未使用子代理。
+
+- Windows 启动脚本将日志配置、后台输出模式及目录创建预检移到 `-Force` 停止旧服务之前；预检失败保留旧实例，`-Stop` / `-Status` 仍提前返回。保留启动与测试脚本的 UTF-8 BOM。
+- API 模块级应用装配失败时，使用统一 logger 记录 `api_initialization_failed` 后重新抛出。日志初始化后的失败原因与堆栈可以落盘，隐藏窗口启动也可读取，退出码仍表示失败。
+- Celery 任务失败信号区分字符串与真实 traceback：父进程提供的字符串直接进入统一异常字段，单列异常类型与原因，统一脱敏及限长；保留真实 traceback / None 原有处理及任务上下文恢复。
+- 同步工程20和本地启动指南。每日切分、100 MiB 分片及默认包含当天的 30 天保留规则未变。
+
+验证：
+
+- 先用回归复现三个缺陷，再修复。API 使用两个真实子进程验证无效数据库 URL 与注入装配异常均非零退出且有脱敏日志，失败发生在外部连接创建之前。Celery 覆盖字符串、真实 traceback、None，并在 except 块之外发送真实任务失败信号，防止借用当前异常导致假通过。
+- 日志专项 19 passed；后端全量 `tests/unit tests/contract`：702 passed / 9 skipped，39.57 秒，退出码 0。
+- PowerShell 进程身份与启动预检共 32 项断言通过；所有停止、端口与目录操作均使用替身，未启停真实服务。
+- 相关 Ruff 通过；import-linter 5 kept / 0 broken；UTF-8 BOM 与 `git diff --check` 检查通过。
+
+未重启业务 API/worker/beat、未修改真实 .env、未迁移或改写业务数据库、未调用真实模型、未提交或推送。未改 SQL 或前端，本轮未跑数据库集成与前端测试。
+
+### 2026-10-17 日志包实现移入 setup.py
+
+用户要求将日志初始化等实现从 `core/logging/__init__.py` 移到普通模块。读取交接后按 karpathy-guidelines 做最小拆分，保留现有改动。
+
+- 新增 `core/logging/setup.py`，承载初始化、logger 获取、关闭资源及内部状态；`__init__.py` 仅导出原有六个公共接口，外部导入路径与日志行为保持不变。
+- 同步日志测试夹具的内部状态读取位置及工程20的文件职责说明。
+- 验证：现有日志专项 19 passed（14.00 秒），Ruff 通过，import-linter 5 kept / 0 broken，`git diff --check` 通过。仅调整模块组织，未新增测试或重复运行全量测试。
+
+未启停业务服务、未修改真实 .env 或数据库、未提交或推送。

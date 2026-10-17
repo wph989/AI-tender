@@ -48,7 +48,7 @@ $ApiDir = Join-Path $Root 'apps\api'
 $PythonExe = Join-Path $ApiDir '.venv\Scripts\python.exe'
 $ApiEnvFile = Join-Path $ApiDir '.env'
 $TmpDir = Join-Path $Root '.tmp'
-$LogDir = Join-Path $TmpDir 'logs'
+$LogDir = Join-Path $Root 'logs'
 $PidFile = Join-Path $TmpDir 'backend-pids.json'
 $BeatSchedule = Join-Path $TmpDir 'celerybeat-schedule'
 $HealthUrl = 'http://127.0.0.1:8300/api/v1/healthz'
@@ -177,12 +177,14 @@ function Get-StrayProcesses {
 
 function Show-LogTail {
     param([string]$Name, [int]$Lines = 25)
-    foreach ($stream in @('err', 'out')) {
-        $path = Join-Path $LogDir "$Name.$stream.log"
-        if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 0) {
-            Write-Host "[$Name.$stream.log] 最后 $Lines 行" -ForegroundColor DarkYellow
-            Get-Content -LiteralPath $path -Tail $Lines -Encoding UTF8 | ForEach-Object { Write-Host "  $_" }
-        }
+    $serviceDir = Join-Path $LogDir $Name
+    if (-not (Test-Path -LiteralPath $serviceDir)) { return }
+    $latest = Get-ChildItem -LiteralPath $serviceDir -Filter '*.jsonl' -File |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($latest) {
+        Write-Host "[$($latest.Name)] 最后 $Lines 行" -ForegroundColor DarkYellow
+        Get-Content -LiteralPath $latest.FullName -Tail $Lines -Encoding UTF8 |
+            ForEach-Object { Write-Host "  $_" }
     }
 }
 
@@ -330,6 +332,17 @@ foreach ($process in Get-StrayProcesses) {
     $runningServices += "未登记(pid=$($process.ProcessId))"
 }
 
+# 必须先完成日志预检，避免 -Force 停掉旧服务后才发现新实例无法启动。
+# 复用后端的解析器：自定义目录与 .env 优先级不能在 PowerShell 再维护一份。
+$loggingJson = & $PythonExe -X utf8 -c 'import json; from tender.core.settings import logging_settings; s = logging_settings(); print(json.dumps(dict(directory=str(s.directory), output=s.output)))'
+if ($LASTEXITCODE -ne 0) { throw '日志配置无效，请检查 apps/api/.env。' }
+$loggingOptions = $loggingJson | ConvertFrom-Json
+if ($loggingOptions.output -eq 'stdout') {
+    throw '隐藏窗口启动需要 LOG_OUTPUT=file 或 both；stdout 模式请按指南在前台运行。'
+}
+$LogDir = $loggingOptions.directory
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
 if ($runningServices.Count -gt 0) {
     if (-not $Force) {
         Write-Host ("后端已在运行：{0}" -f ($runningServices -join '、')) -ForegroundColor Yellow
@@ -351,19 +364,13 @@ if (Get-NetTCPConnection -State Listen -LocalPort $ApiPort -ErrorAction Silently
 }
 
 
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-
 $started = New-Object System.Collections.Generic.List[object]
 
 Write-Host '正在启动后端三个进程……' -ForegroundColor Cyan
 foreach ($def in Get-ServiceDefs) {
-    $stdout = Join-Path $LogDir "$($def.Name).out.log"
-    $stderr = Join-Path $LogDir "$($def.Name).err.log"
-
-    # 后台常驻不需要占终端窗口，统一写日志；Hidden 也避免弹出一堆黑框
+    # 文件由 Python 日志模块按日期和大小管理；不再生成覆盖历史、无限增长的重定向副本。
     $process = Start-Process -FilePath $PythonExe -ArgumentList $def.Args -WorkingDirectory $ApiDir `
-        -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        -WindowStyle Hidden -PassThru
 
     $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue
     $service = ConvertTo-ServiceRecord -ProcessInfo $processInfo
@@ -407,7 +414,7 @@ Write-Host '  worker   消费 tender / convert / parse / analysis 队列'
 Write-Host '  beat     每 5 秒读配置中心上限并派发差额'
 Write-Host ''
 Write-Host "日志目录：$LogDir" -ForegroundColor DarkGray
-Write-Host '  实时跟日志：Get-Content -Wait .tmp\logs\worker.err.log   （celery 的输出走 stderr）' -ForegroundColor DarkGray
+Write-Host '  API / worker / beat 分目录保存 JSONL，默认保留 30 天；查看方法见本地启动指南。' -ForegroundColor DarkGray
 Write-Host '  查询状态：  .\scripts\start-backend.ps1 -Status' -ForegroundColor DarkGray
 Write-Host '  停止：      .\scripts\start-backend.ps1 -Stop' -ForegroundColor DarkGray
 Write-Host ''
