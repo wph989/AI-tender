@@ -42,6 +42,9 @@ export interface AnalysisField {
   verification: string;
   module_keys?: string[];
   output?: AnalysisOutput;
+  // 展示保留业务身份；范围、修订和筛选不能从归纳文字中猜测。
+  record?: ModuleRecord | BusinessRecord;
+  contextOnly?: boolean;
 }
 
 export interface KnowledgeSource {
@@ -178,6 +181,8 @@ export interface BusinessRecord {
   predicate?: "supersedes" | "conflicts" | "requires" | "contains" | null;
   subject_id?: string;
   object_id?: string;
+  subject_key?: string;
+  object_key?: string;
   effective_status?: "active" | "unknown";
   superseded_in?: AnalysisScope[];
   conflicts_in?: AnalysisScope[];
@@ -207,6 +212,9 @@ export interface AnalysisGap {
   detail: string;
   scope: AnalysisScope;
   record_id?: string;
+  key?: string;
+  topic?: string;
+  module_key?: string;
 }
 
 export interface AnalysisCoverage {
@@ -215,6 +223,7 @@ export interface AnalysisCoverage {
   status: string;
   scope: AnalysisScope;
   detail: string;
+  module_key?: string;
 }
 
 export interface AnalysisDataset {

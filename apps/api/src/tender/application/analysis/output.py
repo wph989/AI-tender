@@ -18,11 +18,15 @@ class _OutputSection(BaseModel):
     title: Annotated[str, Field(pattern=r"\S")]
     layout: Literal["table", "list", "tree"]
     columns: list[Annotated[str, Field(pattern=r"\S")]] = Field(min_length=1)
+    scalar_columns: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def unique_columns(self):
         if len(set(self.columns)) != len(self.columns):
             raise ValueError("输出列名不能重复")
+        if (len(set(self.scalar_columns)) != len(self.scalar_columns)
+                or set(self.scalar_columns) - set(self.columns)):
+            raise ValueError("单值列必须来自输出列且不能重复")
         return self
 
 
@@ -44,7 +48,7 @@ def output_schema(snapshot: dict, module_key: str) -> dict:
     path = module_key + "/references/output_schema.json"
     if path in snapshot:
         try:
-            return _OutputSchema.model_validate_json(snapshot[path]).model_dump()
+            return _OutputSchema.model_validate_json(snapshot[path]).model_dump(exclude_unset=True)
         except ValueError as exc:
             # 已声明却损坏是资源错误，回退会使模型规则与实际展示悄悄分叉。
             raise ValueError("模块 Skill JSON 输出声明无效：" + module_key) from exc
@@ -104,6 +108,10 @@ def record_output(record: dict, schema: dict) -> dict:
     content = record.get("content") or {}
     if not content or set(content) - set(section["columns"]):
         raise ValueError("content 只能填写当前分类的内容键：" + "、".join(section["columns"]))
+    # 两列各自的数组没有可靠配对语义；仅新快照声明单值列，旧报告保留原协议。
+    for column in section.get("scalar_columns", []):
+        if column in content and not isinstance(content[column], str):
+            raise ValueError(f"{column}必须是单个事项名称；请将多个独立字段分别逐条提交")
     for value in content.values():
         values = value if isinstance(value, list) else [value]
         if not values or any(not isinstance(v, str) or not v.strip() for v in values):

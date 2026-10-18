@@ -60,6 +60,7 @@ it("正文只用独立 content，Skill 列顺序及证据身份完整保留", ()
   expect(result[0]?.output?.content).toEqual(record.content);
   expect(result[0]?.output?.columns).toEqual(["要求摘要", "关键要求"]);
   expect(result[0]?.values[0]?.citations).toEqual([ref]);
-  expect(result[0]?.note).toBe("适用范围：A标段；部分条件待核对");
+  expect(result[0]?.note).toBe("适用范围：A标段");
+  expect(result[0]?.record).toEqual(record);
   expect(recordItems({ ...data, evidence: {}, records: [record] })).toEqual([]);
 });

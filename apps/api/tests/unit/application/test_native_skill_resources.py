@@ -43,11 +43,15 @@ def example_rows(value, *, cross_file=False):
 @pytest.mark.parametrize("key", MODULES)
 def test_native_and_historical_schemas_keep_existing_public_shape(key):
     expected = LEGACY["schemas"][key]
-    assert output_schema(SNAPSHOT, key) == expected
+    actual = output_schema(SNAPSHOT, key)
+    public_shape = copy.deepcopy(actual)
+    for section in public_shape["sections"]:
+        section.pop("scalar_columns", None)
+    assert public_shape == expected
     assert output_schema(LEGACY["snapshot"], key) == expected
     # 原生声明不依赖 Markdown 或硬编码专题分支，也无需访问当前磁盘。
     path = key + "/references/output_schema.json"
-    assert output_schema({path: SNAPSHOT[path]}, key) == expected
+    assert output_schema({path: SNAPSHOT[path]}, key) == actual
 
 
 @pytest.mark.parametrize("invalid", [
@@ -190,3 +194,28 @@ def test_example_cannot_cite_unread_or_invented_quote():
     raw["citations"][0] = {"block_id": "example-1", "quote": "预付全部价款"}
     with pytest.raises(ValueError, match="引用"):
         prepare_records([SynthesisRecord.model_validate(raw)], state, seen, key)
+
+
+def test_fact_labels_cannot_be_parallel_arrays_in_new_snapshots():
+    from tender.application.analysis.output import record_output
+
+    key = "project_basic_info_parsing"
+    record = {"key": "identity", "group": "项目基本信息", "content": {
+        "字段": ["项目名称", "项目编号"], "内容": ["示例项目", "A-1"],
+    }}
+    with pytest.raises(ValueError, match="单个事项"):
+        record_output(record, output_schema(SNAPSHOT, key))
+    # 历史快照不改写、也不推断数组配对；前端按复合记录明确呈现。
+    legacy_output = record_output(record, output_schema(LEGACY["snapshot"], key))
+    assert legacy_output["content"] == record["content"]
+    record["content"] = {"字段": "项目范围", "内容": ["安装设备", "完成调试"]}
+    assert record_output(record, output_schema(SNAPSHOT, key))["content"] == record["content"]
+
+
+def test_scalar_columns_must_belong_to_declared_columns():
+    key = "project_basic_info_parsing"
+    path = key + "/references/output_schema.json"
+    value = json.loads(SNAPSHOT[path])
+    value["sections"][0]["scalar_columns"] = ["不存在的字段"]
+    with pytest.raises(ValueError, match="JSON 输出声明无效"):
+        output_schema({path: json.dumps(value)}, key)

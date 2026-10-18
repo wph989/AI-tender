@@ -58,7 +58,6 @@ function context(lotId: number, offset = 0): AnalysisContext {
 
 async function openPreview(page: Page) {
   await page.goto("/projects/1");
-  await page.getByText("投标要求汇总", { exact: true }).click();
   await page.getByRole("button", { name: "按标段查看要求", exact: true }).click();
   return page.getByRole("dialog", { name: "按标段查看投标要求", exact: true });
 }
@@ -104,13 +103,13 @@ test("多标段必须显式单选，分页完整加载，原文入口先校验�
   expect(requests).toHaveLength(0);
   await selectLot(page, "A标段");
   await dialog.getByRole("button", { name: "查看要求", exact: true }).click();
-  await expect(dialog.getByRole("cell", { name: "采购交换机项目 原文", exact: true })).toBeVisible();
-  await expect(dialog.getByRole("cell", { name: "所有标段须提供营业执照 原文", exact: true })).toBeVisible();
-  await expect(dialog.getByRole("cell", { name: "B标段专用要求 原文", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("cell", { name: /采购交换机项目/ })).toBeVisible();
+  await expect(dialog.getByRole("cell", { name: /所有标段须提供营业执照/ })).toBeVisible();
+  await expect(dialog.getByRole("cell", { name: /B标段专用要求/ })).toHaveCount(0);
   await dialog.getByRole("button", { name: "加载更多要求", exact: true }).click();
   await expect(dialog.getByRole("button", { name: "加载更多要求", exact: true })).toHaveCount(0);
   await dialog.locator('.ant-pagination-item[title="11"]').click();
-  await expect(dialog.getByRole("cell", { name: "A标段要求100 原文", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("cell", { name: /A标段要求100/ })).toBeVisible();
   expect(requests.map((r) => [r.snapshot_id, r.lot_id, r.offset])).toEqual([[10, 1, 0], [10, 1, 100]]);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
   await page.screenshot({ path: info.outputPath("analysis-preview.png"), fullPage: true });
@@ -123,7 +122,7 @@ test("多标段必须显式单选，分页完整加载，原文入口先校验�
     path: "public/samples/sample-tender.pdf", contentType: "application/pdf",
   }));
   const resolved = page.waitForRequest("**/knowledge/citations/resolve");
-  await dialog.getByRole("button", { name: "原文", exact: true }).first().click();
+  await dialog.getByRole("button", { name: /^定位：/ }).first().click();
   expect((await resolved).postDataJSON()).toMatchObject({ source_id: 1, parse_run_id: 1, anchor: "p1b1" });
   await expect(dialog).not.toBeVisible();
   await expect(page.getByRole("region", { name: "引用原文", exact: true })).toBeVisible();
@@ -145,9 +144,9 @@ test("切换标段后丢弃仍在途中的旧依据", async ({ page }) => {
   await first;
   await selectLot(page, "B标段");
   await dialog.getByRole("button", { name: "查看要求", exact: true }).click();
-  await expect(dialog.getByRole("cell", { name: "B标段专用要求 原文", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("cell", { name: /B标段专用要求/ })).toBeVisible();
   release();
-  await expect(dialog.getByRole("cell", { name: "A标段要求0 原文", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("cell", { name: /A标段要求0/ })).toHaveCount(0);
   await expect(dialog.getByRole("button", { name: "加载更多要求", exact: true })).toHaveCount(0);
 });
 
@@ -155,24 +154,23 @@ test("更换报告清除标段选择，过期快照错误不显示旧依据", as
   const dialog = await openPreview(page);
   await selectLot(page, "A标段");
   await dialog.getByRole("button", { name: "查看要求", exact: true }).click();
-  await expect(dialog.getByRole("cell", { name: "A标段要求0 原文", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("cell", { name: /A标段要求0/ })).toBeVisible();
   await dialog.getByRole("button", { name: "关闭", exact: true }).click();
   await expect(dialog).not.toBeVisible();
   const nextData = page.waitForResponse("**/analysis/reports/2/data");
   await page.getByRole("combobox", { name: "选择报告版本", exact: true }).click();
   await page.locator(".ant-select-dropdown").getByText("报告 #2 · 已完成", { exact: true }).click();
   await nextData;
-  await page.getByText("投标要求汇总", { exact: true }).click();
   await page.getByRole("button", { name: "按标段查看要求", exact: true }).click();
   await expect(dialog.getByRole("button", { name: "查看要求", exact: true })).toBeDisabled();
-  await expect(dialog.getByRole("cell", { name: "A标段要求0 原文", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("cell", { name: /A标段要求0/ })).toHaveCount(0);
   await page.route("**/api/v1/analysis/reports/2/context", (route) => route.fulfill({
     status: 409, json: { error: { code: "data_stale", message: "依据已更新，请使用当前有效分析快照" } },
   }));
   await selectLot(page, "B标段");
   await dialog.getByRole("button", { name: "查看要求", exact: true }).click();
   await expect(dialog.getByText("依据已更新，请使用当前有效分析快照", { exact: true })).toBeVisible();
-  await expect(dialog.getByRole("cell", { name: "B标段专用要求 原文", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("cell", { name: /B标段专用要求/ })).toHaveCount(0);
 });
 
 test("目录未核对完整时，一个已识别标段也不能默认选中", async ({ page }) => {
@@ -185,4 +183,13 @@ test("目录未核对完整时，一个已识别标段也不能默认选中", as
   await expect(dialog.getByRole("button", { name: "查看要求", exact: true })).toBeDisabled();
   await selectLot(page, "A标段");
   await expect(dialog.getByRole("button", { name: "查看要求", exact: true })).toBeEnabled();
+});
+
+test("依据不足的报告保留正文入口，但禁止进入标段编制预览", async ({ page }) => {
+  const data = snapshot();
+  data.data.readiness = "unavailable";
+  await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({ json: data }));
+  await page.goto("/projects/1");
+  await expect(page.getByRole("button", { name: "按标段查看要求", exact: true })).toBeDisabled();
+  await expect(page.getByRole("tab", { name: "解析正文", exact: true })).toBeVisible();
 });

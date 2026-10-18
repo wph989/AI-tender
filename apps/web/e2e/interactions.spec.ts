@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { calls, mockApi, models, profile } from "./fixtures";
+import { calls, mockApi, selectModule, models, profile } from "./fixtures";
 
 let pageErrors: string[];
 test.beforeEach(async ({ page }) => {
@@ -165,8 +165,9 @@ test("执行中取消持续刷新，退出后只补跑选中的已取消模块",
   await page.goto("/projects/1");
   await page.getByRole("button", { name: "取消任务", exact: true }).click();
   await expect(page.getByText("正在停止分析，结束后可继续未完成的专题。")).toBeVisible();
-  await page.getByRole("tab", { name: /保证金要求/ }).click();
-  const retry = page.getByRole("button", { name: "继续本专题", exact: true });
+  await selectModule(page, 2);
+  await page.locator(".module-operations > summary").click();
+  const retry = page.getByRole("button", { name: "重新解析本模块", exact: true });
   await expect(retry).toBeDisabled();
   phase = "stopped";
   await expect(retry).toBeEnabled({ timeout: 10000 });

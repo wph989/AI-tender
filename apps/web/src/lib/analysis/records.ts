@@ -17,12 +17,11 @@ export function recordItems(data: ModuleRecords): AnalysisField[] {
     if (!citations.length) return [];
     const section = sections.get(record.group) ?? sections.get("*");
     if (!section || !record.content) throw new Error("专题结果的展示格式不完整，请重试");
-    const note = "适用范围：" + scopeLabel(record.scope)
-      + (record.structuring === "partial" ? "；部分条件待核对" : "");
+    const note = "适用范围：" + scopeLabel(record.scope);
     return [{
       id: record.id, field: record.title, group: record.group, sort_order: record.sort_order,
       values: [{ value: record.text, citations }], verification: record.verification,
-      note,
+      note, record,
       output: {
         version, layout: section.layout, columns: section.columns,
         key: record.key, content: record.content, parent_key: record.parent_key ?? null,

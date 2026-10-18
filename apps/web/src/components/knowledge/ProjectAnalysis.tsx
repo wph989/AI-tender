@@ -1,9 +1,9 @@
 "use client";
 import { useFeedback } from "@/hooks/useFeedback";
-import { Alert, Button, Segmented, Select, Tabs } from "antd";
+import { Alert, Button, Segmented, Select } from "antd";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { message as errorMessage } from "@/lib/errors";
 import { AppRail } from "@/components/AppRail";
 import { Icon } from "@/components/Icon";
@@ -21,11 +21,8 @@ import type {
 } from "@/types/knowledge";
 import { isActive, STATE_LABELS } from "@/types/knowledge";
 import { CitationViewer } from "./CitationViewer";
-import { ModuleMarkdown } from "./ModuleMarkdown";
 import { QuestionPanel } from "./QuestionPanel";
-import { AnalysisDataPanel } from "./AnalysisDataPanel";
-import { ResearchGaps } from "./ResearchGaps";
-import { AnalysisFailureNotice } from "./AnalysisFailureNotice";
+import { AnalysisResults } from "./AnalysisResults";
 
 export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const [name, setName] = useState("项目分析");
@@ -46,7 +43,15 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const [selected, setSelected] = useState<Citation | null>(null);
   const [answerRefs, setAnswerRefs] = useState<Citation[]>([]);
   const [mobileDocument, setMobileDocument] = useState(false);
+  const [documentVisible, setDocumentVisible] = useState(true);
+  const [documentWidth, setDocumentWidth] = useState(36);
   const [activeItem, setActiveItem] = useState<string>();
+  const [locationRevision, setLocationRevision] = useState(0);
+  // 位置请求与选中身份分开：重复点击同一条依据也必须重新滚动。
+  const activateItem = useCallback((id?: string) => {
+    setActiveItem(id);
+    setLocationRevision((revision) => revision + 1);
+  }, []);
   const chosenReport = useRef<number | null>(null);
   const initialized = useRef(false);
   const locateAbort = useRef<AbortController | null>(null);
@@ -165,14 +170,15 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       const resolved = await resolveCitation(ref, controller.signal);
       if (!controller.signal.aborted) {
         setSelected(resolved);
-        setActiveItem(itemId);
+        activateItem(itemId);
         setMobileDocument(true);
+        setDocumentVisible(true);
       }
     } catch (e) {
       if (!controller.signal.aborted)
         setError(e instanceof Error ? e.message : "原文无法打开");
     }
-  }, []);
+  }, [activateItem]);
   const perform = async (action: () => Promise<unknown>) => {
     if (busy) return;
     setBusy(true);
@@ -492,11 +498,6 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
             )}
           </div>
         </details>
-        {report?.stale && (
-          <p className="notice my-2">
-            项目材料或分析设置已变化。这份报告保留原版本依据，请生成新报告。
-          </p>
-        )}
         <div className="analysis-mobile-switch">
           <button
             aria-pressed={!mobileDocument}
@@ -512,7 +513,15 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
             {selected ? "引用原文" : "文档预览"}
           </button>
         </div>
-        <div className="analysis-split" data-document={mobileDocument}>
+        <div className="analysis-reading-tools">
+          <button type="button" aria-expanded={documentVisible} onClick={() => setDocumentVisible(!documentVisible)}>
+            {documentVisible ? "收起原文，专注结果" : "展开原文对照"}
+          </button>
+          {documentVisible && <label>原文宽度<input type="range" min={25} max={55} value={documentWidth}
+            aria-label="原文区域宽度" onChange={(event) => setDocumentWidth(Number(event.target.value))} /></label>}
+        </div>
+        <div className="analysis-split" data-document={mobileDocument} data-document-hidden={!documentVisible}
+          style={{ "--document-width": documentWidth + "%" } as CSSProperties}>
           <section className="analysis-content">
             <div hidden={tab !== "ask"}>
               <QuestionPanel
@@ -523,9 +532,6 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
               />
             </div>
             <div hidden={tab !== "report"}>
-              {/* 放进结果滚动区，展开长清单时仍为原文和窄屏定位保留可用高度。 */}
-              {/* 报告切换时重新挂载，避免新报告短暂沿用旧快照、标段选择或预览请求。 */}
-              {report?.data_schema_version && <AnalysisDataPanel key={report.id} report={report} onLocate={(ref) => void locate(ref)} />}
               {!report ? (
                 <div className="empty-state">
                   <span className="empty-icon">
@@ -538,359 +544,17 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                   {!state && <p role="status">正在加载资料…</p>}
                 </div>
               ) : (
-                <>
-                  <div className="report-heading">
-                    <div>
-                      <p className="text-xs text-slate-400">项目综合报告</p>
-                      <h2>{STATE_LABELS[report.status] ?? report.status}</h2>
-                    </div>
-                    <Select<string>
-                      aria-label="选择报告版本"
-                      value={String(report.id)}
-                      onChange={(selectedValue) => {
-                        chosenReport.current = Number(selectedValue);
-                        setSelected(null);
-                        setActiveItem(undefined);
-                        setActiveModuleId(null);
-                        refresh();
-                      }}
-                    >
-                      {state?.reports.map((r) => (
-                        <Select.Option key={r.id} value={String(r.id)}>
-                          报告 #{r.id} · {STATE_LABELS[r.status] ?? r.status}
-                        </Select.Option>
-                      ))}
-                    </Select>
-                  </div>
-                  {report.coverage.mode === "agent_research" && (
-                    <p className="mb-3 text-sm text-slate-500">
-                      已完成{" "}
-                      {
-                        report.modules.filter((m) => m.status === "completed")
-                          .length
-                      }{" "}
-                      / {report.modules.length} 个专题 · 已保存{" "}
-                      {report.modules.reduce(
-                        (count, module) => count + module.items.length,
-                        0,
-                      )}{" "}
-                      项成果
-                    </p>
-                  )}
-                  {report.coverage.partial && (
-                    <p className="notice mb-3">
-                      部分文件尚未完整读取，请在「分析范围与设置」中查看。
-                    </p>
-                  )}
-                  {report.status === "waiting" && (
-                    <p className="notice mb-3">
-                      正在等待本次全部文件可用。请到文件管理查看失败原因；需要先分析可用材料时，可取消本次任务后勾选部分分析。
-                    </p>
-                  )}
-                  {report.error_message && (
-                    <AnalysisFailureNotice message={report.error_message} canceled={report.status === "canceled"} />
-                  )}
-                  {report.runtime_retired && (
-                    <p className="notice mb-3">
-                      该报告由已下线的旧解析流程生成，仅供查看；需要最新分析请重新发起。
-                    </p>
-                  )}
-                  {isActive(report.status) && (
-                    <Button
-                      htmlType="submit"
-                      className={" mb-3"}
-                      disabled={busy}
-                      onClick={() =>
-                        void perform(() =>
-                          knowledgeRequest(
-                            "/analysis/reports/" + report.id + "/cancel",
-                            "POST",
-                            {},
-                          ),
-                        )
-                      }
-                    >
-                      取消任务
-                    </Button>
-                  )}
-                  {["failed", "partial", "canceled"].includes(report.status) &&
-                    !report.runtime_retired &&
-                    report.modules.some((module) =>
-                      ["failed", "canceled"].includes(module.status),
-                    ) && (
-                      <Button
-                        htmlType="submit"
-                        className={" mb-3"}
-                        disabled={busy || running}
-                        onClick={() =>
-                          void perform(() =>
-                            knowledgeRequest(
-                              "/analysis/reports/" + report.id + "/retry",
-                              "POST",
-                              {},
-                            ),
-                          )
-                        }
-                      >
-                        继续未完成专题
-                      </Button>
-                    )}
-                  {canceling && (
-                    <Alert
-                      className="mb-3"
-                      type="info"
-                      showIcon
-                      title="正在停止分析，结束后可继续未完成的专题。"
-                    />
-                  )}
-                  {["failed", "canceled"].includes(report.status) &&
-                    !report.runtime_retired &&
-                    !report.modules.length && (
-                      <Button
-                        htmlType="submit"
-                        className={" mb-3"}
-                        disabled={busy || running}
-                        onClick={() =>
-                          void perform(() =>
-                            knowledgeRequest(
-                              "/analysis/reports/" + report.id + "/retry",
-                              "POST",
-                              {},
-                            ),
-                          )
-                        }
-                      >
-                        重试分析
-                      </Button>
-                    )}
-                  {["failed", "partial", "canceled", "completed"].includes(
-                    report.status,
-                  ) &&
-                    !report.runtime_retired &&
-                    !!report.modules.length && (
-                      <Button
-                        htmlType="submit"
-                        className={" mb-3"}
-                        disabled={busy || running}
-                        onClick={() =>
-                          void perform(() =>
-                            knowledgeRequest(
-                              "/analysis/reports/" + report.id + "/retry",
-                              "POST",
-                              {
-                                module_keys: report.modules.map(
-                                  (module) => module.module_key,
-                                ),
-                              },
-                            ),
-                          )
-                        }
-                      >
-                        重新分析全部专题
-                      </Button>
-                    )}
-                  {!!report.summary?.length && (
-                    <details className="report-module mb-4">
-                      <summary className="cursor-pointer text-sm font-medium">
-                        综合汇总 · {report.summary.length} 项
-                      </summary>
-                      <p className="my-3 text-xs text-slate-500">
-                        合并重复事项，保留各份来源与不同结论。详细专题见下方。
-                      </p>
-                      <ModuleMarkdown
-                        items={report.summary.map((item) => ({
-                          ...item,
-                          id: "summary-" + item.id,
-                        }))}
-                        activeId={activeItem}
-                        onLocate={(ref, itemId) => void locate(ref, itemId)}
-                      />
-                    </details>
-                  )}
-                  {(() => {
-                    // 模块标签按后端调度顺序（module.id）排列，与 worker 日志一致，便于对照运行记录排查。
-                    const modules = report.modules;
-                    const firstCompleted =
-                      modules.find((m) => m.items.length > 0)?.id ??
-                      modules.find((m) => m.status === "completed")?.id;
-                    const currentId = modules.some(
-                      (m) => m.id === activeModuleId,
-                    )
-                      ? activeModuleId
-                      : activeModuleId === null && firstCompleted !== undefined
-                        ? firstCompleted
-                        : (firstCompleted ?? modules[0]?.id);
-                    const current = modules.find((m) => m.id === currentId);
-                    if (!modules.length) return null;
-                    return (
-                      <>
-                        <Tabs
-                          activeKey={String(currentId)}
-                          onChange={(id) => setActiveModuleId(Number(id))}
-                          items={modules.map((module) => ({
-                            key: String(module.id),
-                            label: (
-                              <span className="flex flex-col items-start">
-                                <span>{module.title}</span>
-                                <small className="module-tab-status">
-                                  {module.status === "completed"
-                                    ? `${module.items.length} 项`
-                                    : (STATE_LABELS[module.status] ??
-                                      module.status)}
-                                </small>
-                              </span>
-                            ),
-                            children:
-                              module.id === currentId && current ? (
-                                <section className="report-module">
-                                  <div className="report-module-heading">
-                                    <h3>{current.title}</h3>
-                                    <span>
-                                      {STATE_LABELS[current.status] ??
-                                        current.status}
-                                    </span>
-                                  </div>
-                                  {!!current.runs?.length && (
-                                    <details className="mb-3 text-xs text-slate-500">
-                                      <summary className="cursor-pointer">
-                                        运行记录 · 第{" "}
-                                        {current.runs.at(-1)?.attempt} 次
-                                      </summary>
-                                      <ul className="mt-2 space-y-2">
-                                        {current.runs.map((run) => (
-                                          <li key={run.id}>
-                                            第 {run.attempt} 次 ·{" "}
-                                            {STATE_LABELS[run.status] ??
-                                              run.status}{" "}
-                                            · 模型请求 {run.model_calls}/
-                                            {run.limits.max_model_calls} ·
-                                            工具调用 {run.tool_calls}/
-                                            {run.limits.max_tool_calls} ·
-                                            单次输出上限{" "}
-                                            {run.limits.max_output_tokens} token
-                                            {run.started_at && (
-                                              <>
-                                                {" "}
-                                                · 开始于{" "}
-                                                {new Date(
-                                                  run.started_at,
-                                                ).toLocaleTimeString("zh-CN")}
-                                              </>
-                                            )}
-                                            {run.error_message && (
-                                              <p className="mt-1 text-red-600">
-                                                {run.error_message}
-                                              </p>
-                                            )}
-                                          </li>
-                                        ))}
-                                      </ul>
-                                    </details>
-                                  )}
-                                  {["failed", "canceled"].includes(current.status) && (
-                                    <AnalysisFailureNotice message={current.error_message}
-                                      canceled={current.status === "canceled"}
-                                      action={!report.runtime_retired && (
-                                        <Button
-                                          htmlType="submit"
-                                          disabled={busy || running}
-                                          onClick={() =>
-                                            void perform(() =>
-                                              knowledgeRequest(
-                                                "/analysis/reports/" +
-                                                  report.id +
-                                                  "/retry",
-                                                "POST",
-                                                {
-                                                  module_keys: [
-                                                    current.module_key,
-                                                  ],
-                                                },
-                                              ),
-                                            )
-                                          }
-                                        >
-                                          继续本专题
-                                        </Button>
-                                      )} />
-                                  )}
-                                  {current.status === "completed" &&
-                                    !report.runtime_retired && (
-                                      <p className="mb-3">
-                                        <Button
-                                          htmlType="submit"
-                                          disabled={busy || running}
-                                          onClick={() =>
-                                            void perform(() =>
-                                              knowledgeRequest(
-                                                "/analysis/reports/" +
-                                                  report.id +
-                                                  "/retry",
-                                                "POST",
-                                                {
-                                                  module_keys: [
-                                                    current.module_key,
-                                                  ],
-                                                },
-                                              ),
-                                            )
-                                          }
-                                        >
-                                          重新分析本专题
-                                        </Button>
-                                      </p>
-                                    )}
-                                  <ResearchGaps key={report.id + ":" + current.id} gaps={current.research_gaps} />
-                                  {current.records_loading ? (
-                                    <p role="status" className="py-3 text-sm text-slate-500">正在加载专题结果…</p>
-                                  ) : current.records_error ? (
-                                    <Alert type="error" showIcon title="专题结果读取失败"
-                                      description={current.records_error}
-                                      action={<Button onClick={refresh}>重新加载</Button>} />
-                                  ) : current.items.length > 0 ? (
-                                    <>
-                                      {current.status !== "completed" && (
-                                        <p
-                                          className="my-3 text-sm text-slate-500"
-                                          role="status"
-                                        >
-                                          已保存 {current.items.length}{" "}
-                                          项已核实结果，分析尚未完成。继续分析会保留已有结果。
-                                        </p>
-                                      )}
-                                      <ModuleMarkdown
-                                        items={current.items}
-                                        activeId={activeItem}
-                                        onLocate={(ref, itemId) => void locate(ref, itemId)}
-                                      />
-                                    </>
-                                  ) : (
-                                    <p className="py-3 text-sm text-slate-500">
-                                      {current.status === "completed"
-                                        ? "当前检索未找到该主题的明确要求。"
-                                        : current.status === "pending"
-                                          ? "排队等待分析…"
-                                          : current.status === "canceled"
-                                            ? "本专题已停止，暂无已核实成果。"
-                                            : current.status === "failed"
-                                              ? "本次还没有可用的分析结果。"
-                                              : "正在检索与核对原文…"}
-                                    </p>
-                                  )}
-                                  {current.research_summary && (
-                                    <details className="research-process" key={"process:" + report.id + ":" + current.id}>
-                                      <summary>查看分析过程</summary>
-                                      <p>{current.research_summary}</p>
-                                    </details>
-                                  )}
-                                </section>
-                              ) : null,
-                          }))}
-                        />
-                      </>
-                    );
-                  })()}
-                </>
+                <AnalysisResults key={report.id} report={report} reports={state?.reports ?? []}
+                  activeModuleId={activeModuleId} activeItem={activeItem} locationRevision={locationRevision} busy={busy} running={running}
+                  onChooseModule={setActiveModuleId} onActiveItem={activateItem}
+                  onChooseReport={(id) => {
+                    locateAbort.current?.abort(); chosenReport.current = id;
+                    setSelected(null); setActiveItem(undefined); setActiveModuleId(null); refresh();
+                  }}
+                  onLocate={(ref, itemId) => void locate(ref, itemId)} onRefresh={refresh}
+                  onAction={(action, keys) => void perform(() => knowledgeRequest(
+                    `/analysis/reports/${report.id}/${action}`, "POST", keys ? { module_keys: keys } : {},
+                  ))} />
               )}
             </div>
           </section>
@@ -905,15 +569,9 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                   if (item) {
                     setTab("report");
                     setActiveModuleId(item.module.id);
-                    setActiveItem(item.item.id);
+                    activateItem(item.item.id);
                     setMobileDocument(false);
-                    setTimeout(
-                      () =>
-                        document
-                          .getElementById("report-item-" + item.item.id)
-                          ?.scrollIntoView({ block: "center" }),
-                      0,
-                    );
+
                   }
                 }}
               />

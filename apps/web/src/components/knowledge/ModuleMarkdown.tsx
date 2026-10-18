@@ -1,16 +1,17 @@
 "use client";
 
-import { useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Icon } from "@/components/Icon";
-import type { AnalysisField, Citation, FieldValue } from "@/types/knowledge";
+import { EvidenceReferences as ValueLocates } from "./EvidenceReferences";
+import { scopeLabel } from "@/lib/analysis/scope";
+import { unpairedFields } from "@/lib/analysis/presentation";
+import type { AnalysisField, BusinessRecord, Citation, FieldValue } from "@/types/knowledge";
 
 /**
  * 专题结果优先使用 Skill 定义的分类、列名和树结构；历史报告保留原有投影。
  * - 定位与综合正文独立绑定，让归纳后的要求仍可回查完整原文。
- * - 定位图标跟在取值后面（不单独占一列）：图标紧贴它要证明的那个值，一眼能看出值得位置。
- *   同一个值里重复的同一处原文按“资料 + 元素 + 页 + 摘录”去重，只留一个图标。
+ * - 同一事项的依据集中展示；多处依据先展开完整摘录，避免同页按钮难以区分。
  * - 每个值仍绑定自己的引用（经校验的真实依据），重复值提醒与未支持提示保持原样。
  * - 正文由 react-markdown 与 GFM 插件渲染，支持标准列表和表格，忽略模型返回的 HTML。
  */
@@ -18,16 +19,28 @@ export function ModuleMarkdown({
   items,
   onLocate,
   activeId,
+  relatedItems,
+  resolvedRelations = [],
+  filtered = false,
+  locationRevision = 0,
+  onRevealItem,
 }: {
   items: AnalysisField[];
   onLocate: (ref: Citation, itemId?: string) => void;
   activeId?: string;
+  relatedItems?: AnalysisField[];
+  resolvedRelations?: BusinessRecord[];
+  filtered?: boolean;
+  locationRevision?: number;
+  onRevealItem?: (id: string) => void;
 }) {
   const groups = useMemo(() => groupFields(items), [items]);
   const conflicts = useMemo(() => items.filter(needsReview), [items]);
 
   if (items.some((item) => item.output)) {
-    return <StructuredModule items={items} onLocate={onLocate} activeId={activeId} />;
+    return <StructuredModule items={items} onLocate={onLocate} activeId={activeId}
+      relatedItems={relatedItems ?? items} resolvedRelations={resolvedRelations}
+      filtered={filtered} locationRevision={locationRevision} onRevealItem={onRevealItem} />;
   }
 
   return (
@@ -122,98 +135,163 @@ export function ModuleMarkdown({
   );
 }
 
-/** 使用专题 JSON 的真实列与条目层级；旧报告仍由上方投影展示，避免伪造历史汇总。 */
-function StructuredModule({
-  items, onLocate, activeId,
-}: {
+/** 身份、适用范围和依据共用一套展示；具体内容按字段语义选择阅读结构。 */
+function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRelations, filtered, locationRevision, onRevealItem }: {
   items: AnalysisField[];
   onLocate: (ref: Citation, itemId?: string) => void;
   activeId?: string;
+  relatedItems: AnalysisField[];
+  resolvedRelations: BusinessRecord[];
+  filtered: boolean;
+  locationRevision: number;
+  onRevealItem?: (id: string) => void;
 }) {
-  const groups = groupFields(items.filter((item) => item.output?.layout !== "tree"));
-  const nodes = items.filter((item) => item.output?.layout === "tree")
-    .sort((a, b) => a.sort_order - b.sort_order);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const nodes = items.filter((item) => item.output?.layout === "tree");
   const nodeKeys = new Set(nodes.map((item) => item.output!.key));
-  const refs = (item: AnalysisField) => valueCitations({
-    value: "", citations: item.values.flatMap((value) => value.citations),
-  });
+  const groups = groupFields(items.filter((item) => item.output?.layout !== "tree"));
+  useEffect(() => {
+    // 父子都命中时也要展开；contextOnly 只表示计数身份，不能代表是否正在筛选。
+    const opened: Record<string, boolean> = Object.fromEntries(filtered
+      ? items.filter((item) => item.output?.layout === "tree").map((item) => [item.id, true]) : []);
+    const active = items.find((item) => item.id === activeId);
+    if (active) opened[active.id] = true;
+    let parent = active?.output?.parent_key;
+    const visited = new Set<string>();
+    while (parent && !visited.has(parent)) {
+      visited.add(parent);
+      const item = items.find((candidate) => candidate.output?.key === parent);
+      if (!item) break;
+      opened[item.id] = true;
+      parent = item.output?.parent_key;
+    }
+    if (Object.keys(opened).length) setExpanded((previous) => ({ ...previous, ...opened }));
+  }, [activeId, items, filtered, locationRevision]);
   const identity = (item: AnalysisField) => ({
-    id: "report-item-" + item.id,
-    "data-report-item": item.id,
-    className: activeId === item.id ? "report-item-active" : "",
+    id: "report-item-" + item.id, "data-report-item": item.id,
+    className: "result-record" + (activeId === item.id ? " report-item-active" : ""),
   });
-  const content = (value: string | string[] | undefined) =>
-    Array.isArray(value)
-      ? <ol className="list-decimal space-y-1 pl-5">{value.map((line, i) =>
-          <li key={i}>{renderMarkdown(line.replace(/<br\s*\/?>/gi, "\n"))}</li>)}</ol>
-      : value ? renderMarkdown(value.replace(/<br\s*\/?>/gi, "\n\n")) : "—";
-  const tree = (parent: string | null): ReactNode => (
-    <ul className="module-outline">
-      {nodes.filter((item) => {
-        const key = item.output!.parent_key;
-        // 来源撤销后父节点可能不可见，子节点仍可读时作为独立节点展示。
-        return parent === null ? !key || !nodeKeys.has(key) : key === parent;
-      }).map((item) => (
-        <li key={item.id} {...identity(item)}>
-          <strong>{renderInline(item.field)}</strong>
-          <ValueLocates refs={refs(item)} onLocate={(ref) => onLocate(ref, item.id)} />
-          <div className="module-markdown-body mt-2">{content(item.output!.content["编制要求"])}</div>
-          {nodes.some((child) => child.output!.parent_key === item.output!.key)
-            && tree(item.output!.key)}
-        </li>
-      ))}
-    </ul>
-  );
-  return (
-    <div className="module-markdown">
-      {nodes.length > 0 && tree(null)}
-      {[...groups.entries()].map(([name, rows]) => {
-        const output = rows.find((item) => item.output)?.output;
-        return (
-          <section key={name} className="module-group">
-            {name !== "未分类" && <h4 className="module-group-title">{name}</h4>}
-            {output?.layout === "table" ? (
-              <div className="overflow-x-auto">
-                <table className="module-table module-structured-table">
-                  <thead><tr>{output.columns.map((column) =>
-                    <th scope="col" key={column}>{column}</th>)}</tr></thead>
-                  <tbody>{rows.map((item) => (
-                    <tr key={item.id} {...identity(item)}>
-                      {output.columns.map((column, index) => (
-                        <td key={column} data-label={column} className="module-markdown-body">
-                          {content(item.output?.content[column])}
-                          {index === output.columns.length - 1 && <>
-                            <ValueLocates refs={refs(item)} onLocate={(ref) => onLocate(ref, item.id)} />
-                            {!!item.note && <p className="field-note">{item.note}</p>}
-                          </>}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}</tbody>
-                </table>
-              </div>
-            ) : (
-              <ol className="module-result-list">
-                {rows.map((item, index) => (
-                  <li key={item.id} {...identity(item)}>
-                    <h5 className="mb-2 font-semibold">{index + 1}. {renderInline(item.field)}</h5>
-                    {item.output ? item.output.columns.filter((key) => key in item.output!.content).map((key) => (
-                      <div key={key} className="module-markdown-body mb-3">
-                        {key !== "背景" && <strong>{key}</strong>}
-                        {content(item.output!.content[key])}
-                      </div>
-                    )) : <p>{item.note || "来源已不可用，请更新分析。"}</p>}
-                    <ValueLocates refs={refs(item)} onLocate={(ref) => onLocate(ref, item.id)} />
-                    {!!item.note && item.output && <p className="field-note">{item.note}</p>}
-                  </li>
-                ))}
-              </ol>
-            )}
-          </section>
-        );
-      })}
-    </div>
-  );
+  const content = (value: string | string[] | undefined): ReactNode => Array.isArray(value)
+    ? <ul className="result-points">{value.map((line, index) =>
+        <li key={index}>{renderMarkdown(line.replace(/<br\s*\/?>/gi, "\n"))}</li>)}</ul>
+    : value ? renderMarkdown(value.replace(/<br\s*\/?>/gi, "\n\n")) : null;
+  const references = (item: AnalysisField) => <ValueLocates
+    refs={item.values.flatMap((value) => value.citations)} onLocate={(ref) => onLocate(ref, item.id)} />;
+  const scope = (item: AnalysisField) => <span className="result-scope"
+    data-unknown={item.record?.scope.kind === "unknown" || undefined}>
+    {item.record ? "适用范围：" + scopeLabel(item.record.scope) : item.note}
+    {item.contextOnly && " · 上级材料，仅供定位"}
+  </span>;
+  const relationLinks = (item: AnalysisField) => {
+    const record = item.record;
+    if (!record) return null;
+    // 原始 key 会复用，端点内容或范围变化后关系可能失效；只用快照确认的身份连接。
+    const relations = resolvedRelations.filter((relation) => relation.id === item.id
+      || relation.object_id === item.id || relation.subject_id === item.id);
+    if (record.kind === "relation" && !relations.length) return <p className="result-relations">
+      关系端点或适用范围尚未确认，请结合原文及待核对事项核实。
+    </p>;
+    const links = relations.flatMap((relation) => {
+      const endpoints = relatedItems.filter((candidate) => candidate.record?.kind !== "relation"
+        && [relation.subject_id, relation.object_id].includes(candidate.id));
+      return endpoints.filter((endpoint) => endpoint.id !== item.id).map((endpoint) => ({
+        id: endpoint.id, title: endpoint.field,
+        label: relation.predicate === "conflicts" ? "冲突条款" : relation.predicate === "supersedes"
+          ? (endpoint.id === relation.subject_id
+            ? "修订条款" : "原条款") : "关联条款",
+      }));
+    });
+    if (!links.length && !record.superseded_in?.length && !record.conflicts_in?.length) return null;
+    return <div className="result-relations">
+      {Boolean(record.superseded_in?.length) && <span>部分适用范围已有修订</span>}
+      {Boolean(record.conflicts_in?.length) && <span>存在待核对冲突</span>}
+      {[...new Map(links.map((link) => [link.id, link])).values()].map((link) =>
+        <button type="button" key={link.id} onClick={() => onRevealItem?.(link.id)}>
+          {link.label}：{link.title}
+        </button>)}
+    </div>;
+  };
+  const details = (item: AnalysisField) => {
+    const record = item.record;
+    if (!record) return null;
+    const conditions = record.conditions;
+    if (!conditions?.expression && !conditions?.terms.length && !conditions?.exceptions.length
+      && !record.materials?.length) return null;
+    return <details className="record-conditions"><summary>条件与证明材料</summary>
+      {conditions.expression && <p>{conditions.expression}</p>}
+      {!!conditions.terms.length && <ul>{conditions.terms.map((term, index) =>
+        <li key={index}>{term.subject} {term.operator} {term.value}{term.unit} {term.time_basis}</li>)}</ul>}
+      {!!conditions.exceptions.length && <div>例外条件{content(conditions.exceptions)}</div>}
+      {!!record.materials.length && <ul>{record.materials.map((material, index) =>
+        <li key={index}><strong>{material.name}</strong>：{material.requirement}</li>)}</ul>}
+    </details>;
+  };
+  const heading = (item: AnalysisField) => <header className="result-record-heading">
+    <div><h5>{renderInline(item.field)}</h5>{scope(item)}</div>
+    {item.output?.content["满分分值"] && <span className="result-score">满分 {item.output.content["满分分值"]}</span>}
+  </header>;
+  const fields = (item: AnalysisField) => {
+    const output = item.output;
+    if (!output) return <p>{item.note || "来源已不可用，请更新分析。"}</p>;
+    if (unpairedFields(item)) return <div className="compound-record">
+      <p className="record-attention">原记录包含多个字段，未声明逐项对应关系。以下保留原始内容，请结合依据核对。</p>
+      <div className="compound-labels">{(output.content["字段"] as string[]).map((label, index) =>
+        <span key={index}>{label}</span>)}</div>
+      <div className="module-markdown-body">{content(output.content["内容"])}</div>
+    </div>;
+    if (output.columns.length === 2 && output.columns[0] === "字段" && output.columns[1] === "内容") {
+      return <dl className="result-properties"><div><dt>{content(output.content["字段"]) || item.field}</dt>
+        <dd className="module-markdown-body">{content(output.content["内容"])}</dd></div></dl>;
+    }
+    return <dl className="result-properties">{output.columns.filter((column) => column in output.content
+      && column !== "满分分值").map((column) => <div key={column}>
+      {column !== "背景" && <dt>{column}</dt>}
+      <dd className="module-markdown-body">{content(output.content[column])}</dd>
+    </div>)}</dl>;
+  };
+  const tree = (parent: string | null, path = new Set<string>()): ReactNode => <ul className="module-outline">
+    {nodes.filter((item) => !path.has(item.output!.key) && (parent === null
+      ? !item.output!.parent_key || !nodeKeys.has(item.output!.parent_key)
+      : item.output!.parent_key === parent)).map((item) => <li key={item.id} {...identity(item)}>
+      <details open={expanded[item.id] ?? parent === null}
+        onToggle={(event) => {
+          const open = event.currentTarget.open;
+          setExpanded((old) => old[item.id] === open ? old : { ...old, [item.id]: open });
+        }}>
+        <summary><strong>{renderInline(item.field)}</strong>{scope(item)}</summary>
+        <div className="module-markdown-body">{fields(item)}</div>
+        {details(item)}{relationLinks(item)}{references(item)}
+        {tree(item.output!.key, new Set([...path, item.output!.key]))}
+      </details>
+    </li>)}
+  </ul>;
+  return <div className="module-markdown">
+    {!!nodes.length && <><div className="outline-actions">
+      <button type="button" onClick={() => setExpanded(Object.fromEntries(nodes.map((item) => [item.id, true])))}>展开全部材料</button>
+      <button type="button" onClick={() => setExpanded(Object.fromEntries(nodes.map((item) => [item.id, false])))}>收起全部材料</button>
+    </div>{tree(null)}</>}
+    {[...groups.entries()].map(([name, rows]) => {
+      const output = rows.find((item) => item.output)?.output;
+      // 短价格事项保留横向比较；长条款与评分档次用完整宽度阅读。
+      const comparable = output?.layout === "table" && rows.some((item) =>
+        ["price_requirement_parsing", "deposit_requirement_parsing", "biz_standard_parsing"].includes(item.record?.module_key ?? ""));
+      return <section key={name} className="module-group" data-result-group={name}>
+        {name !== "未分类" && <h4 className="module-group-title">{name}</h4>}
+        {comparable && output ? <div className="overflow-x-auto"><table className="module-table module-structured-table">
+          <thead><tr><th scope="col">事项与范围</th>{output.columns.map((column) => <th scope="col" key={column}>{column}</th>)}</tr></thead>
+          <tbody>{rows.map((item) => <tr key={item.id} {...identity(item)}>
+            <th scope="row">{heading(item)}{relationLinks(item)}</th>
+            {output.columns.map((column, index) => <td key={column} data-label={column} className="module-markdown-body">
+              {content(item.output?.content[column]) || <span className="text-slate-400">本项未提供</span>}
+              {index === output.columns.length - 1 && <>{details(item)}{references(item)}</>}
+            </td>)}
+          </tr>)}</tbody>
+        </table></div> : <div className="module-result-list">{rows.map((item) => <article key={item.id} {...identity(item)}>
+          {heading(item)}{fields(item)}{details(item)}{relationLinks(item)}{references(item)}
+        </article>)}</div>}
+      </section>;
+    })}
+  </div>;
 }
 
 /** 分批提交顺序不等于展示顺序；组内稳定排序，同序字段保留提交先后。 */
@@ -225,34 +303,13 @@ function groupFields(items: AnalysisField[]): Map<string, AnalysisField[]> {
   }
   for (const fields of groups.values())
     fields.sort((a, b) => a.sort_order - b.sort_order);
+  // 项目概况先交代项目本身，再展示参与单位；不依赖模型分批提交的先后。
+  if (items.some((item) => item.record?.module_key === "project_basic_info_parsing")) {
+    const order = ["项目基本信息", "分标信息", "甲方信息", "代理信息"];
+    const rank = (name: string) => order.includes(name) ? order.indexOf(name) : order.length;
+    return new Map([...groups].sort(([a], [b]) => rank(a) - rank(b)));
+  }
   return groups;
-}
-
-/** 取值后面紧跟的定位图标：没有引用时不渲染，避免出现点不开的空图标。 */
-function ValueLocates({
-  refs,
-  onLocate,
-}: {
-  refs: Citation[];
-  onLocate: (ref: Citation) => void;
-}) {
-  if (!refs.length) return null;
-  return (
-    <span className="value-locates" role="group" aria-label="原文依据">
-      {refs.map((ref, index) => (
-        <button
-          type="button"
-          key={ref.source_id + ":" + ref.element_id + ":" + index}
-          title={locateTitle(ref)}
-          aria-label={"定位：" + locateTitle(ref)}
-          onClick={() => onLocate(ref)}
-        >
-          <Icon name="target" size={13} />
-          <span>{refs.length > 1 ? `${index + 1} · ` : ""}{ref.page_no ? `第 ${ref.page_no} 页` : "查看原文"}</span>
-        </button>
-      ))}
-    </span>
-  );
 }
 
 /**
@@ -270,14 +327,6 @@ function valueCitations(value: FieldValue): Citation[] {
     result.push(ref);
   }
   return result;
-}
-
-function locateTitle(ref: Citation): string {
-  const where =
-    (ref.file_name ?? "原文") +
-    (ref.page_no ? " 第 " + ref.page_no + " 页" : "");
-  const quote = (ref.quote ?? "").replace(/\s+/g, " ").trim();
-  return quote ? where + "：" + quote.slice(0, 42) : where;
 }
 
 /** 一个字段出现多个不同值，或引用未获支持时，属于需要用户核对的信息。 */

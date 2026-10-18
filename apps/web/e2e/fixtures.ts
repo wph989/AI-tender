@@ -1,5 +1,10 @@
 import type { Page } from "@playwright/test";
 
+export async function selectModule(page: Page, id: number) {
+  await page.getByRole("tablist", { name: "解析专题", exact: true })
+    .locator(`[data-module-id="${id}"]`).click();
+}
+
 const date = "2026-10-10T10:00:00Z";
 export const provider = {
   id: 1,
