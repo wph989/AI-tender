@@ -9,10 +9,10 @@ docs/设计/12 第 6 节，api/llm.py 取的是 `p.api_key_ciphertext`）。这�
 为什么值得单独一个契约测试：这类错误编译器、ruff、分层检查全都不管，只有真机才会报，
 而「真机跑一遍抽取」的成本远高于一个纯文本断言。
 
-扫描范围：`worker/` 与 `adapters/pg/`——按工程结构，裸 SQL 只允许留在这两处
-（ORM 表达不到的 advisorLock / pg_locks 元数据查询，见 adapters/pg/locks.py 与
-repositories/agent_runtime.py 的文件头说明）。其余目录应当只有 ORM 取数，
-裸 SQL 一旦回流，这个测试的扫描面会立刻把它抓出来。
+扫描范围仍保留 `worker/` 与 `adapters/pg/`，以覆盖历史位置的潜在回流。
+当前 Worker 不允许直接访问数据库，导入边界由 test_layer_boundaries.py 检查；
+ORM 表达不到的系统目录查询留在 adapters/pg/locks.py 与
+repositories/analysis/runtime.py。这里仅核对能够识别的裸 SQL 列引用。
 
 只做一件事：**凡是 `别名.列名` 且该别名由 `表名 AS 别名` 或 `FROM/JOIN 表名 别名`
 给出来的，列名必须在 DDL 里属于那张表**。不做通用 SQL 校验（那需要真解析器）；

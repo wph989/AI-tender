@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import Connection, Engine, select
@@ -17,22 +16,8 @@ from tender.adapters.pg.models import ConfigRelease
 from tender.config import schema
 from tender.config.snapshot import save_snapshot
 from tender.core import settings
-from tender.ports.config_cache import ConfigCache
-
-
-@dataclass(frozen=True, slots=True)
-class ActiveConfig:
-    release_id: int
-    version_no: int
-    values: Mapping[str, Any]
-    resolved: Mapping[str, Any]
-
-    def cache_payload(self) -> dict[str, Any]:
-        return {
-            "release_id": self.release_id,
-            "version_no": self.version_no,
-            "values": dict(self.values),
-        }
+from tender.ports.configuration.cache import ConfigCache
+from tender.ports.configuration.registry import ActiveConfig as ActiveConfig
 
 
 def _payload_to_active(payload: Mapping[str, Any]) -> ActiveConfig:
@@ -87,7 +72,8 @@ class ConfigRegistry:
         调用方先 `active(...)` 再开事务，避免事务里等 Redis；没有 active release
         （迁移还没跑）时返回 None，任务行上的 config_snapshot_id 为空就是证据。
         """
-        target = active if active is not None else self.active(company_id)
+        # 显式的 None 表示事务前没有活动版本；不能持锁后再次回源，读入更晚的配置。
+        target = active
         if target is None:
             return None
         return save_snapshot(

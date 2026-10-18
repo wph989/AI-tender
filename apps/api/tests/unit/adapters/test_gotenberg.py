@@ -17,8 +17,8 @@ from threading import Thread
 import httpx
 import pytest
 
-from tender.adapters.gotenberg import GotenbergConverter, _output_stem
-from tender.domain.errors import ConversionFailed, ConversionUnavailable
+from tender.adapters.documents.gotenberg import GotenbergConverter, _output_stem
+from tender.domain.shared.errors import ConversionFailed, ConversionUnavailable
 
 PDF_BYTES = b"%PDF-1.7\n% fake pdf bytes for tests\n"
 

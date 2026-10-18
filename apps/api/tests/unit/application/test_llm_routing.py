@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-from tender.application.llm_routing import CallRecord, ModelCandidate, RoutingModel
-from tender.domain.errors import (
+from tender.application.llm.routing import CallRecord, ModelCandidate, RoutingModel
+from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
     ModelOutputTruncated,
@@ -18,7 +18,7 @@ from tender.domain.errors import (
     ModelUnavailable,
     TenderError,
 )
-from tender.ports.llm import ChatGateway, Completion
+from tender.ports.llm.chat import ChatGateway, Completion
 
 
 class _ScriptedClient:
@@ -187,7 +187,7 @@ def test_format_correction_does_not_reset_total_request_budget():
         _ScriptedGateway({name: [InvalidModelOutput("非法 JSON")] * 3 for name in "ab"}),
         records.append,
     )
-    from tender.application.analysis_skills import json_completion
+    from tender.application.analysis.skills import json_completion
 
     with pytest.raises(ModelCallFailed):
         asyncio.run(json_completion(router, "分析"))
@@ -483,7 +483,7 @@ def test_switching_models_of_same_provider_cannot_bypass_429():
 
 
 def test_retry_after_waits_without_burning_requests(monkeypatch):
-    from tender.application import llm_routing
+    from tender.application.llm import routing as llm_routing
 
     now, sleeps, records = [100.0], [], []
     monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
@@ -512,7 +512,7 @@ def test_retry_after_waits_without_burning_requests(monkeypatch):
 def test_disabled_failover_waits_for_primary_instead_of_using_a_lower_priority_model(
     monkeypatch, already_cooling
 ):
-    from tender.application import llm_routing
+    from tender.application.llm import routing as llm_routing
 
     now, records = [100.0], []
     monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
@@ -572,7 +572,7 @@ def test_cancel_during_shared_cooldown_sends_no_request():
 
 def test_slow_candidates_leave_time_for_final_fallback_within_deadline(monkeypatch):
     """非 Agent 功能仍按计划请求切分剩余时间：慢候选不能吃光后备模型的窗口。"""
-    from tender.application import llm_routing
+    from tender.application.llm import routing as llm_routing
 
     now, timeouts, records = [100.0], [], []
     monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
@@ -611,7 +611,7 @@ def test_slow_candidates_leave_time_for_final_fallback_within_deadline(monkeypat
 
 def test_agent_module_window_is_a_continuous_budget_for_the_current_request(monkeypatch):
     """Agent 多轮已有模块总时限：当前请求用连续窗口，不能切成小片反复打断生成。"""
-    from tender.application import llm_routing
+    from tender.application.llm import routing as llm_routing
 
     now, timeouts, records = [100.0], [], []
     monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])

@@ -12,22 +12,22 @@ from synthesis_fixtures import research_calls, research_done, submission, summar
 from test_analysis_research import block, session
 from test_deep_analysis import KEY, SKILL, ScriptedRouter, call, submitted_field
 
-from tender.application.analysis_policy import (
-    correction_count,
-    load_module_skill,
-    select_verified_repeats,
-)
-from tender.application.analysis_research import ToolArgumentError
-from tender.application.analysis_skills import MODULES, skill_snapshot, verify_items
-from tender.application.deep_analysis import (
+from tender.application.analysis.agent import (
     ResearchMiddleware,
     RoutedAgentModel,
     build_module_agent,
     invoke_module,
 )
-from tender.application.knowledge import validate_items
-from tender.domain.errors import InvalidModelOutput, ModelOutputTruncated, ModelUnavailable
-from tender.ports.llm import Completion
+from tender.application.analysis.policy import (
+    correction_count,
+    load_module_skill,
+    select_verified_repeats,
+)
+from tender.application.analysis.research import ToolArgumentError
+from tender.application.analysis.skills import MODULES, skill_snapshot, verify_items
+from tender.application.knowledge.content import validate_items
+from tender.domain.shared.errors import InvalidModelOutput, ModelOutputTruncated, ModelUnavailable
+from tender.ports.llm.chat import Completion
 
 
 async def noop(*args):

@@ -6,9 +6,9 @@ import json
 import httpx
 import pytest
 
-from tender.adapters.openai_chat import OpenAIChatModel
-from tender.adapters.rerank_http import HttpRerankModel
-from tender.domain.errors import (
+from tender.adapters.llm.openai_chat import OpenAIChatModel
+from tender.adapters.llm.rerank_http import HttpRerankModel
+from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
     ModelRefused,

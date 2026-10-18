@@ -6,8 +6,8 @@ from decimal import Decimal
 
 import pytest
 
-from tender.domain.bbox import Bbox, PixelBox, to_decimal
-from tender.domain.errors import BboxFormatError
+from tender.domain.documents.bbox import Bbox, PixelBox, to_decimal
+from tender.domain.shared.errors import BboxFormatError
 
 
 def test_to_decimal_goes_through_str() -> None:

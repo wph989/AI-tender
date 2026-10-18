@@ -13,7 +13,8 @@ from test_analysis_research import block, session
 from test_deep_analysis import KEY as MODULE
 from test_deep_analysis import SKILL, ScriptedRouter, call
 
-from tender.application.analysis_data import (
+from tender.application.analysis.agent import RoutedAgentModel, build_module_agent, invoke_module
+from tender.application.analysis.data import (
     BusinessRecord,
     ContextError,
     ContextInput,
@@ -25,10 +26,9 @@ from tender.application.analysis_data import (
     prepare_coverage,
     prepare_records,
 )
-from tender.application.analysis_data_store import accessible_data
-from tender.application.analysis_policy import correction_count, progress_signature
-from tender.application.deep_analysis import RoutedAgentModel, build_module_agent, invoke_module
-from tender.application.knowledge import merge_field_entries
+from tender.application.analysis.data_store import accessible_data
+from tender.application.analysis.policy import correction_count, progress_signature
+from tender.application.knowledge.content import merge_field_entries
 
 KEY = "project_basic_info_parsing"
 COMMON = {"kind": "common", "lot_refs": []}

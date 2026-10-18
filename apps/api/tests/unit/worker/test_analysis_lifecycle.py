@@ -5,9 +5,10 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from tender.application.deep_analysis import RUNTIME_VERSION
-from tender.ports.repository.knowledge import KnowledgeStore
-from tender.worker import deep_analysis, knowledge
+from tender.application.analysis.contract import RUNTIME_VERSION
+from tender.ports.repository.knowledge.store import KnowledgeStore
+from tender.worker.analysis import controller as deep_analysis
+from tender.worker.knowledge import tasks as knowledge
 
 
 @pytest.fixture

@@ -10,7 +10,7 @@ from test_analysis_research import block, session, source
 from test_analysis_synthesis import execute
 from test_deep_analysis import call
 
-from tender.application.analysis_skills import skill_snapshot, verify_items
+from tender.application.analysis.skills import skill_snapshot, verify_items
 
 KEY = "scoring_standard_parsing"
 SNAPSHOT = skill_snapshot() | {

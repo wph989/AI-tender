@@ -17,19 +17,15 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Engine, func, select, update
-
-from tender.adapters.pg.models import Job
-from tender.adapters.pg.session import create_pg_engine
-from tender.adapters.redis_cache import RedisConfigCache
-from tender.config.registry import ConfigRegistry
 from tender.core import settings
+from tender.core.di import create_dispatch_repository, create_worker_config_reader
+from tender.ports.configuration.registry import ConfigReader
 from tender.worker.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-_engine: Engine = create_pg_engine()
-_registry: ConfigRegistry | None = None
+_repository = create_dispatch_repository()
+_registry: ConfigReader | None = None
 _last_run_at = 0.0
 
 
@@ -52,51 +48,14 @@ STREAMS: tuple[Stream, ...] = (
         "tender.worker.tasks.process_file",
     ),
     Stream("parse", ("submitting",), "parse.max_inflight", "tender.worker.tasks.submit_parse"),
-
 )
 
 
-def _inflight_count(stream: Stream, company_id: int) -> Any:
-    """在途计数口径 =「已派发且未结束」（见模块 docstring）。"""
-    return select(func.count()).where(
-        Job.company_id == company_id,
-        Job.status.in_(("pending", "submitting", "running")),
-        Job.finished_at.is_(None),
-        Job.dispatched_at.is_not(None),
-        Job.stage.in_(stream.stages),
-    )
-
-
-def _pending_jobs(stream: Stream, company_id: int, max_rows: int | None) -> Any:
-    """待派发候选：同一 stage 只派发本轮可用配额内的任务。"""
-    return (
-        select(Job.id)
-        .where(
-            Job.company_id == company_id,
-            Job.status == "pending",
-            Job.finished_at.is_(None),
-            Job.dispatched_at.is_(None),
-            Job.stage.in_(stream.stages),
-        )
-        .order_by(Job.created_at, Job.id)
-        .limit(max_rows)
-        .with_for_update(skip_locked=True)
-    )
-
-
-def _mark_dispatched(job_id: str) -> Any:
-    return (
-        update(Job)
-        .where(Job.id == job_id, Job.dispatched_at.is_(None))
-        .values(dispatched_at=func.now(), updated_at=func.now())
-    )
-
-
-def registry() -> ConfigRegistry:
+def registry() -> ConfigReader:
     """进程内单例：beat 每秒唤醒，不该每次都新建 Redis 连接。"""
     global _registry
     if _registry is None:
-        _registry = ConfigRegistry(_engine, RedisConfigCache())
+        _registry = create_worker_config_reader()
     return _registry
 
 
@@ -115,21 +74,22 @@ def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
     而"少发一次"会导致任务卡在 pending 直到下次改配置，代价更大。
     """
     sent = 0
-    with _engine.begin() as connection:
-        inflight = int(connection.execute(_inflight_count(stream, company_id)).scalar_one())
+    with _repository.transaction() as transaction:
+        inflight = transaction.inflight(stream.stages, company_id)
         room = capacity(limit, inflight)
         if room == 0:
             return 0
-        candidates = connection.execute(_pending_jobs(stream, company_id, room)).mappings().all()
-        for row in candidates:
+        candidates = transaction.pending(stream.stages, company_id, room)
+        for job_id in candidates:
             try:
-                celery_app.send_task(stream.task_name, args=[row["id"]])
+                celery_app.send_task(stream.task_name, args=[job_id])
             except Exception:
                 # broker 不可用时留待下一 tick；已发出去的消息不受影响。
-                logger.warning("dispatch.fail", exc_info=True,
-                               extra={"job_id": row["id"], "stream": stream.name})
+                logger.warning(
+                    "dispatch.fail", exc_info=True, extra={"job_id": job_id, "stream": stream.name}
+                )
                 break
-            connection.execute(_mark_dispatched(row["id"]))
+            transaction.mark_dispatched(job_id)
             sent += 1
     return sent
 

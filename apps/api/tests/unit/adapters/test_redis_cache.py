@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from tender.adapters.redis_cache import INVALIDATE_CHANNEL, RedisConfigCache
+from tender.adapters.configuration.redis_cache import INVALIDATE_CHANNEL, RedisConfigCache
 
 
 class _FakeClient:

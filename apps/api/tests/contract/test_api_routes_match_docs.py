@@ -12,16 +12,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from tender.api import (
-    config,
-    jobs,
-    knowledge,
-    llm,
-    parsing,
-    project_files,
-    projects,
-    versions,
-)
+from tender.api.analysis import routes as analysis_api
+from tender.api.configuration import routes as config
+from tender.api.documents import parsing, versions
+from tender.api.jobs import routes as jobs
+from tender.api.knowledge import routes as knowledge
+from tender.api.llm import routes as llm
+from tender.api.projects import files as project_files
+from tender.api.projects import routes as projects
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _DOC = _REPO_ROOT / "docs" / "设计" / "05-后端API设计.md"
@@ -58,6 +56,7 @@ def _implemented() -> set[str]:
         parsing.router,
         jobs.router,
         knowledge.router,
+        analysis_api.router,
         llm.router,
     )
     found: set[str] = set()

@@ -7,18 +7,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI
 
-from tender.api import (
-    config,
-    jobs,
-    knowledge,
-    llm,
-    parsing,
-    project_files,
-    projects,
-    versions,
-)
-from tender.api.errors import install_error_handlers
-from tender.api.logging import RequestLoggingMiddleware
+from tender.api.analysis import routes as analysis_api
+from tender.api.configuration import routes as config
+from tender.api.documents import parsing, versions
+from tender.api.jobs import routes as jobs
+from tender.api.knowledge import routes as knowledge
+from tender.api.llm import routes as llm
+from tender.api.projects import files as project_files
+from tender.api.projects import routes as projects
+from tender.api.shared.errors import install_error_handlers
+from tender.api.shared.logging import RequestLoggingMiddleware
 from tender.core.di import ApiComponents, create_api_components
 from tender.core.logging import configure_logging, get_logger
 
@@ -51,6 +49,7 @@ def create_app(components: ApiComponents | None = None) -> FastAPI:
     app.include_router(llm.router)
     app.include_router(config.router)
     app.include_router(knowledge.router)
+    app.include_router(analysis_api.router)
     return app
 
 

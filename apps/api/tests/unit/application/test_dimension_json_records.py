@@ -8,9 +8,9 @@ from test_analysis_research import block, session
 from test_analysis_synthesis import execute
 from test_deep_analysis import call
 
-from tender.application.analysis_data import module_records
-from tender.application.analysis_policy import load_module_skill
-from tender.application.analysis_skills import skill_snapshot
+from tender.application.analysis.data import module_records
+from tender.application.analysis.policy import load_module_skill
+from tender.application.analysis.skills import skill_snapshot
 
 
 def test_dimension_collects_all_evidence_before_synthesizing_independent_records():

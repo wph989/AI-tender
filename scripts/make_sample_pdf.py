@@ -43,8 +43,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
-from tender.domain.bbox import Bbox
-from tender.domain.page import PageGeometry
+from tender.domain.documents.bbox import Bbox
+from tender.domain.documents.page import PageGeometry
 
 PAGE_W, PAGE_H = 595.276, 841.89  # A4 竖版，pt
 MARGIN = 56.0

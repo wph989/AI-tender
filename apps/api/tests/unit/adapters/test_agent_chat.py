@@ -8,9 +8,9 @@ import pytest
 from langchain_core.messages import HumanMessage, ToolMessage, message_to_dict
 from structlog.testing import capture_logs
 
-from tender.adapters.agent_chat import AgentChat
-from tender.application.llm_routing import ModelCandidate, RoutingModel
-from tender.domain.errors import (
+from tender.adapters.llm.agent_chat import AgentChat
+from tender.application.llm.routing import ModelCandidate, RoutingModel
+from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
     ModelOutputTruncated,

@@ -7,8 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from tender.api.errors import install_error_handlers
-from tender.api.llm import (
+from tender.api.llm.routes import (
     BindingsRequest,
     FeaturePatch,
     ModelCreate,
@@ -16,7 +15,8 @@ from tender.api.llm import (
     _api_key_for,
     router,
 )
-from tender.application.model_profiles import validate_model
+from tender.api.shared.errors import install_error_handlers
+from tender.application.llm.profiles import validate_model
 from tender.core.error_details import error_detail
 from tender.core.secrets import SecretKeyUnavailable
 

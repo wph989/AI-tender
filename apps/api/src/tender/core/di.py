@@ -2,28 +2,66 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from sqlalchemy import Engine
 
-from tender.adapters.celery_queue import CeleryTaskQueue
-from tender.adapters.gotenberg import GotenbergConverter
-from tender.adapters.openai_chat import OpenAIChatModel
-from tender.adapters.openai_embedding import OpenAIEmbeddingModel
+from tender.adapters.configuration.redis_cache import RedisConfigCache
+from tender.adapters.documents.gotenberg import GotenbergConverter
+from tender.adapters.documents.mineru import MinerUParser
+from tender.adapters.jobs.celery_queue import CeleryTaskQueue
+from tender.adapters.llm.openai_chat import OpenAIChatModel
+from tender.adapters.llm.openai_embedding import OpenAIEmbeddingModel
+from tender.adapters.llm.provider_image import ProviderImageModel
+from tender.adapters.llm.rerank_http import HttpRerankModel
+from tender.adapters.pg.repositories.configuration.releases import ConfigRepository
+from tender.adapters.pg.repositories.documents.parsing import ParseRepository
+from tender.adapters.pg.repositories.documents.pipeline import DocumentPipelineRepository
+from tender.adapters.pg.repositories.documents.versions import VersionRepository
+from tender.adapters.pg.repositories.jobs.coordination import TaskLocks
+from tender.adapters.pg.repositories.jobs.dispatch import DispatchRepository
+from tender.adapters.pg.repositories.jobs.tasks import JobRepository
+from tender.adapters.pg.repositories.knowledge.store import KnowledgeStore
+from tender.adapters.pg.repositories.llm.management import LlmRepository
+from tender.adapters.pg.repositories.llm.provider_cooldown import ProviderCooldown
+from tender.adapters.pg.repositories.llm.runtime import ModelRuntimeRepository
+from tender.adapters.pg.repositories.projects.files import ProjectFileRepository
+from tender.adapters.pg.repositories.projects.projects import ProjectRepository
 from tender.adapters.pg.session import create_pg_engine
-from tender.adapters.provider_image import ProviderImageModel
-from tender.adapters.redis_cache import RedisConfigCache
-from tender.adapters.rerank_http import HttpRerankModel
-from tender.adapters.s3 import S3BlobStore
+from tender.adapters.storage.s3 import S3BlobStore
+from tender.application.analysis.service import AnalysisService
+from tender.application.configuration.service import ConfigService
+from tender.application.documents.parsing import ParseService
+from tender.application.documents.versions import VersionService
+from tender.application.jobs.service import JobService
+from tender.application.knowledge.service import KnowledgeService
+from tender.application.llm.service import LlmService
+from tender.application.projects.files import ProjectFileService
+from tender.application.projects.service import ProjectService
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
 from tender.core.secrets import decrypt_secret
-from tender.ports.blob_store import BlobStore
-from tender.ports.converter import OfficeConverter
-from tender.ports.embedding import EmbeddingModel
-from tender.ports.llm import ChatGateway, ModelGateway
-from tender.ports.task_queue import TaskQueue
+from tender.ports.configuration.registry import ConfigReader
+from tender.ports.documents.converter import OfficeConverter
+from tender.ports.documents.parser import DocumentParser
+from tender.ports.jobs.coordination import TaskLocks as TaskLocksPort
+from tender.ports.jobs.queue import TaskQueue
+from tender.ports.llm.chat import ChatGateway, ModelGateway
+from tender.ports.llm.cooldown import ProviderCooldown as ProviderCooldownPort
+from tender.ports.llm.embedding import EmbeddingModel
+from tender.ports.llm.media import ImageGenerationModel
+from tender.ports.llm.rerank import RerankModel
+from tender.ports.repository.documents.pipeline import (
+    DocumentPipelineRepository as DocumentPipelinePort,
+)
+from tender.ports.repository.jobs.dispatch import DispatchRepository as DispatchPort
+from tender.ports.repository.knowledge.store import KnowledgeStore as KnowledgeStorePort
+from tender.ports.repository.llm.runtime import ModelRuntimeRepository as ModelRuntimePort
+from tender.ports.storage.blob_store import BlobStore
 
 
 def create_model_gateway(
@@ -73,7 +111,7 @@ def create_embedding_gateway(config: dict) -> EmbeddingModel:
     )
 
 
-def create_image_gateway(config: dict) -> ProviderImageModel:
+def create_image_gateway(config: dict) -> ImageGenerationModel:
     return ProviderImageModel(
         config["base_url"],
         config["model_id"],
@@ -85,7 +123,7 @@ def create_image_gateway(config: dict) -> ProviderImageModel:
     )
 
 
-def create_rerank_gateway(config: dict) -> HttpRerankModel:
+def create_rerank_gateway(config: dict) -> RerankModel:
     key = config.get("api_key")
     if "api_key" not in config and config.get("auth_mode") == "api_key":
         if not config.get("api_key_ciphertext"):
@@ -136,3 +174,152 @@ def create_api_components() -> ApiComponents:
         model_gateway=create_model_gateway,
         configs=ConfigRegistry(engine, RedisConfigCache()),
     )
+
+
+# 用例只接收端口；具体仓储和外部网关统一在这里装配，防止业务模块反向依赖实现。
+def create_project_service(engine: Engine, company_id: int) -> ProjectService:
+    return ProjectService(ProjectRepository(engine, company_id), company_id)
+
+
+def create_job_service(engine: Engine, company_id: int) -> JobService:
+    return JobService(JobRepository(engine, company_id), company_id)
+
+
+def create_version_service(engine: Engine, company_id: int) -> VersionService:
+    return VersionService(VersionRepository(engine, company_id), company_id)
+
+
+def create_parse_service(engine: Engine, company_id: int, configs: ConfigRegistry) -> ParseService:
+    return ParseService(
+        ParseRepository(engine, company_id, configs),
+        company_id,
+        configs,
+        VersionRepository(engine, company_id),
+    )
+
+
+def create_project_file_service(
+    engine: Engine,
+    company_id: int,
+    blobs: BlobStore,
+    configs: ConfigRegistry,
+) -> ProjectFileService:
+    return ProjectFileService(
+        ProjectFileRepository(engine, company_id, configs),
+        company_id,
+        blobs,
+        configs,
+    )
+
+
+def create_config_service(
+    engine: Engine, company_id: int, configs: ConfigRegistry
+) -> ConfigService:
+    return ConfigService(ConfigRepository(engine, company_id), company_id, configs)
+
+
+def create_llm_service(
+    engine: Engine,
+    model_gateway: ModelGateway,
+    *,
+    embedding_gateway: Any,
+    image_gateway: Any,
+    rerank_gateway: Any,
+) -> LlmService:
+    return LlmService(
+        LlmRepository(engine),
+        model_gateway,
+        embedding_gateway=embedding_gateway,
+        image_gateway=image_gateway,
+        rerank_gateway=rerank_gateway,
+    )
+
+
+def create_knowledge_service(
+    engine: Engine,
+    company_id: int,
+    configs: ConfigRegistry,
+) -> KnowledgeService:
+    return KnowledgeService(
+        KnowledgeStore(engine, company_id, configs),
+        company_id,
+        configs,
+        create_embedding_gateway,
+        create_parse_service(engine, company_id, configs),
+    )
+
+
+def create_analysis_service(
+    engine: Engine,
+    company_id: int,
+    configs: ConfigRegistry,
+) -> AnalysisService:
+    knowledge = create_knowledge_service(engine, company_id, configs)
+    return AnalysisService(
+        knowledge.store,
+        company_id,
+        configs,
+        create_embedding_gateway,
+        knowledge,
+    )
+
+
+@lru_cache(maxsize=1)
+def _worker_engine() -> Engine:
+    # Worker 的业务模块共用进程内引擎，入口层无需持有连接池或数据库类型。
+    return create_pg_engine()
+
+
+@lru_cache(maxsize=1)
+def _worker_configs() -> ConfigRegistry:
+    return ConfigRegistry(_worker_engine(), RedisConfigCache())
+
+
+def create_worker_config_reader() -> ConfigReader:
+    return _worker_configs()
+
+
+def create_document_pipeline_repository(engine: Engine | None = None) -> DocumentPipelinePort:
+    selected = engine if engine is not None else _worker_engine()
+    return DocumentPipelineRepository(selected, ConfigRegistry(selected))
+
+
+def create_dispatch_repository(engine: Engine | None = None) -> DispatchPort:
+    return DispatchRepository(engine if engine is not None else _worker_engine())
+
+
+def create_task_locks(engine: Engine | None = None) -> TaskLocksPort:
+    return TaskLocks(engine if engine is not None else _worker_engine())
+
+
+def create_model_runtime_repository(engine: Engine | None = None) -> ModelRuntimePort:
+    return ModelRuntimeRepository(engine if engine is not None else _worker_engine())
+
+
+def create_provider_cooldown() -> ProviderCooldownPort:
+    return ProviderCooldown(_worker_engine())
+
+
+def create_worker_knowledge_store() -> KnowledgeStorePort:
+    return KnowledgeStore(_worker_engine(), settings.company_id(), _worker_configs())
+
+
+def create_document_parser(pdf_loader: Callable[[str], Awaitable[bytes]]) -> DocumentParser:
+    return MinerUParser(
+        settings.mineru_url(), pdf_loader=pdf_loader, api_key=settings.mineru_api_key()
+    )
+
+
+def open_analysis_checkpoints() -> AbstractAsyncContextManager[Any]:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from tender.adapters.pg.analysis.checkpoints import checkpoint_dsn
+
+    # 返回上下文管理器，检查点连接仍随单次运行关闭，不在 Worker 导入时建表。
+    return AsyncPostgresSaver.from_conn_string(checkpoint_dsn())
+
+
+def run_analysis_async(coroutine: Coroutine[Any, Any, Any]) -> Any:
+    from tender.adapters.pg.analysis.checkpoints import run_async
+
+    return run_async(coroutine)

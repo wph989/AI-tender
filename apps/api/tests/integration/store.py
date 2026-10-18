@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from tender.adapters.pg.repositories.knowledge import KnowledgeStore
+from tender.adapters.pg.repositories.knowledge.store import KnowledgeStore
 
 
 class SqlStore(KnowledgeStore):

@@ -8,10 +8,10 @@ import pytest
 from test_analysis_research import block
 from test_deep_analysis import submitted_field
 
-from tender.application.analysis_skills import verify_items
-from tender.application.knowledge import validate_items
-from tender.domain.errors import InvalidModelOutput
-from tender.ports.llm import Completion
+from tender.application.analysis.skills import verify_items
+from tender.application.knowledge.content import validate_items
+from tender.domain.shared.errors import InvalidModelOutput
+from tender.ports.llm.chat import Completion
 
 
 class ReferenceReviewer:

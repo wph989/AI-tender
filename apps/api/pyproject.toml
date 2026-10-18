@@ -46,6 +46,8 @@ dev = [
     "ruff>=0.9",
     # 分层依赖方向必须由工具强制：规则一旦靠自觉遵守，三个月后必然破防（docs/工程/10 第 4.4 节）
     "import-linter>=2.0",
+    # 协议签名必须由静态检查核对，依赖方向检查不能代替实现兼容性验证。
+    "mypy>=1.18,<2",
     # 只用于生成合成样本（scripts/make_sample_pdf.py）。用 reportlab 而不是内嵌系统字体：
     # 内嵌宋体/雅黑属于再分发字体程序，而样本 PDF 要进版本库（见 docs/工程/07 第 3 节）。
     "reportlab>=4.0",
@@ -57,6 +59,16 @@ packages = ["src/tender"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.mypy]
+# 先强制端口与真实装配的兼容性，不把历史业务代码中的 Any 当作已完成全量严格检查。
+# silent 仍解析导入实现的签名，只不报告非目标模块内部的存量类型问题；不能改成 skip。
+files = ["src/tender/ports", "src/tender/core/di.py"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
+python_version = "3.12"
+follow_imports = "silent"
+check_untyped_defs = true
+warn_unused_ignores = true
 
 [tool.ruff]
 # 中文注释按字符数计宽（一个汉字算 1 个字），100 已经是相当宽的一行，再宽就没法并排看 diff 了
@@ -78,12 +90,12 @@ select = ["E", "F", "W", "I", "UP", "B"]
 [tool.importlinter]
 root_package = "tender"
 
-# 依赖方向见 docs/工程/10 第 4.4 节。四张契约各自管一件事，不要合并成一条——
+# 依赖方向见 docs/工程/10 第 4.4 节。五张契约各自管一件事，不要合并成一条——
 # 合并后报错只会说「分层错了」，说不清错在哪一层。
 [[tool.importlinter.contracts]]
-name = "分层只能向内：domain ← ports ← application ← api"
+name = "分层只能向内：domain ← ports ← application ← api/worker"
 type = "layers"
-layers = ["tender.api", "tender.application", "tender.ports", "tender.domain"]
+layers = ["tender.api | tender.worker", "tender.application", "tender.ports", "tender.domain"]
 
 [[tool.importlinter.contracts]]
 name = "用例层不依赖具体实现（application 与 adapters 互不引用）"

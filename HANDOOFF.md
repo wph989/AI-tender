@@ -1,4 +1,16 @@
-﻿# 前端界面重构交接
+# 前端界面重构交接
+
+> **2026-10-18 本地提交交接**：按用户明确要求，本次提交收录后端业务目录重组、端口与 Worker 边界、任务执行快照、自动类型检查、上传回归修复及配套文档和测试。提交说明为“按业务重组后端并完善任务边界与上传处理”，提交号以 git log 为准。最终离线811项通过、9项跳过；此前数据库边界修复的78项隔离集成通过。本段替代下方历史记录中的“未提交”状态；未推送、未部署。
+
+> **2026-10-18 最新上传修复**：已修复审查确认的两处上传回归：读取内容前检查批次数量/总量，未知大小按剩余额度读取；单文件存储或领域错误不再中断批次，保留成功回执、失败清单与可重试标记。新增20项回归，完整离线811项通过、9项跳过，Ruff、mypy和5项架构契约通过。详见末尾“修复批量上传资源限制与部分失败回执”。未提交、未重启业务服务。
+
+> **2026-10-18 最新后端边界修复**：已修复 Worker 直接 ORM、Protocol 无自动检查、文档执行预算随实时配置变化这三项问题。Worker 经端口访问 PostgreSQL；mypy 检查 ports 与真实装配并纳入离线测试；六项文档执行参数按任务冻结，调度并发/间隔继续实时读取。791项离线通过、9项跳过，78项隔离数据库集成通过。工程11/21及配置文档已同步，临时数据库已停止；详见末尾“修复 Worker 数据访问、协议检查与任务配置边界”。未提交。
+
+> **2026-10-18 最新后端架构说明**：工程11已按当前源码重写为“当前后端架构与设计取舍”，覆盖进程、业务目录、ports/adapters、真实时序、事务与配置，以及尚未统一的边界。工程21继续维护文件树。此次仅更新文档，详见末尾“编写当前后端架构与设计取舍说明”。
+
+> **2026-10-18 最新业务目录交接**：见末尾“在既有架构内按业务模块归组”。已按用户确认的规则完成业务目录分类（含单文件业务），技术基础设施保留技术分类。785项离线、75项隔离数据库集成通过，65条路径的OpenAPI全量一致。文件放置以工程21为准，未提交。
+
+> **2026-10-18 最新架构交接**：见末尾“将职责分层归回既有架构并建立文件树规则”。service/crud/agent 是职责定义，已移除新增同义目录，归回 application/ports/adapters；后端文件放置以 docs/工程/21 为准。772 项离线与75项隔离数据库集成已通过，未提交。
 
 更新日期：2026-10-15
 
@@ -2367,3 +2379,88 @@ ruff/lint-imports 通过、`pnpm typecheck` 与 76 项前端测试通过。
 - 更新工程20、本地启动指南及现有日志断言。后续审查发现 AgentChat 单测仍断言已移除的 `stream.*` 事件，已改为断言不产生独立流事件；同时清理流式适配器遗留的未使用导入、计时变量和过时注释。
 
 静态检查：初次修改后的 Ruff、`compileall`、`git diff --check` 通过；本次审查修复后的 AgentChat 源码与单测 Ruff 通过，`git diff --check` 通过。未运行测试、未调用真实模型、未启停业务服务；加载新版需重启服务。
+
+### 2026-10-18 按四层规范收敛 apps/api 代码边界
+
+用户要求按「api 只做入口、service 承载业务、crud 只访问数据库、agent 管智能体」规范优化 `apps/api`。UTF-8 读取本文件后，保留既有未提交改动，未使用子代理，未自动提交。
+
+- `api/` 路由只保留 DTO、依赖解析、调用服务和响应返回。`config.py`、`llm.py`、`knowledge.py`、`projects.py`、`jobs.py`、`project_files.py`、`versions.py`、`parsing.py` 中直接 SQL、事务和业务判断均已迁出；`api/` 不再 import `crud`/`adapters`/`worker`，也不执行 `select/insert/update/delete`。路由边界通过 `translate_service_errors` 统一保持成功返回、失败抛 `ApiProblem` 的既有直接调用契约。
+- 新增 `services/`：项目、文件、版本、解析、任务、知识库/分析、配置中心、LLM 管理均有业务服务。服务负责权限与状态判断、版本冲突、事务编排、响应整形；不直接持有 ORM `Connection`，数据读写统一调用 `crud`。
+- 新增 `crud/`：项目、文件、版本、解析、任务、知识库、配置、LLM 的 SQL、锁与事务方法集中在此层。配置审计/影响确认 SQL 从 `config/audit.py` 迁入 `crud/config.py`；LLM 的冷却表达式、测试账本、软删除、绑定替换和调用查询全部收口，CRUD 不判断“查不到意味着什么”。
+- Agent 代码已迁入 `agent/`：`deep_analysis.py`、`analysis_research.py`、`analysis_skills.py`、`qa_agent.py`、`agent_runtime.py`、`agent_checkpoints.py`；`application/analysis_contract.py` 保留运行版本常量，避免 application 反向依赖 agent。服务、worker、集成测试和运行命令均已切换到新路径；`apps/` 与 `docs/` 中的源码、文档和命令不再引用旧 `tender.application.*` Agent 路径。
+- `pyproject.toml` 分层契约扩展到 `domain ← ports ← application/adapters ← crud ← agent ← services ← api`；新增 AST 契约测试检查直接 import，防止 `forbidden` 契约沿正常调用链误报，也防止入口层或服务层日后绕过边界。
+
+验证：`ruff check apps/api/src apps/api/tests` 通过；`lint-imports --config apps/api/pyproject.toml` **5 kept / 0 broken**；完整离线 `pytest apps/api/tests/unit apps/api/tests/contract -q` **766 passed / 9 skipped**（43.34 秒，保留两条既有 structlog 异常美化提示）；`test_deepagents_runtime.py --collect-only` 可正常收集 **19 个数据库集成用例**；`git diff --check` 通过（仅 Git 的 CRLF 转换提示）。
+
+未启停业务服务、未连接数据库、未调用真实模型、未修改真实 `.env` 或业务数据、未提交或推送。本机 5432 端口无监听，`TENDER_RUN_DB_TESTS=1` 的隔离 PostgreSQL 集成测试本轮未重跑；配置与 LLM 管理真实数据库路径需在数据库可用时补验。
+
+### 2026-10-18 将职责分层归回既有架构并建立文件树规则
+
+用户明确说明 api/service/crud 是职责定义，上一轮将其理解为必须新建同名目录有误。本轮按用户要求归回现有端口与适配器结构，并提供后续文件放置规则。本节替代上一节“按四层规范”新增 services/crud/agent 目录的约定。
+
+- 原 `services/` 的业务用例归入 `application/`；知识库管理流程使用 `knowledge_service.py`，原 `knowledge.py` 保留知识处理纯函数。原 `crud/` 的实现归入 `adapters/pg/repositories/`，类名改为 Repository；KnowledgeCrud 的方法直接合并到已有 KnowledgeStore/KnowledgeSession，不保留额外包装。
+- Agent 编排文件归回 `application/`。原 `agent_checkpoints.py` 包含 PostgreSQL 连接与 DDL，按实际职责移至 `adapters/pg/checkpoints.py`；部署命令改为 `python -m tender.adapters.pg.checkpoints`，调用者与文档已同步。轻量运行版本契约保留在 `application/analysis_contract.py`。
+- 用例构造函数接收 `ports/repository/` 协议，具体仓储与网关由 `core/di.py` 注入；不接收 Engine、不创建具体仓储、不导入装配点。新增 `ports/config_registry.py` 承载 ActiveConfig/ConfigReader，原 ConfigRegistry 仍为实现并兼容导出 ActiveConfig。
+- 任务配置快照通过事务端口 `snapshot_for_job()` 与任务共用连接，连接只在仓储内传递；保留原配置快照与回源行为。LLM 完整性错误在仓储转换为 RecordConflict，业务重名提示与全局 409 回包保持原语义。既有 api/errors.py 仍允许导入 IntegrityError 做兜底映射，不执行 SQL。
+- 分层契约恢复 api/worker → application → ports → domain、application/adapters 互不引用；AST 契约检查直接/相对导入，并禁止再次创建 services/service/crud/agent 并列目录。新增假端口回归验证配置读取在事务前、快照和任务同事务、冲突回滚与 409 映射。
+- 新增 `docs/工程/21-后端文件树与放置规则.md`，含实际文件树、职责映射、依赖与事务规则、新功能示例、验证命令。根 `AGENTS.md` 增加后端必读及不得为错误目录放宽检查的规则；同步工程10、11、17、设计16及文档索引，删除工程10中过时的计划目录树。
+
+验证：完整离线 `tests/unit tests/contract` **772 passed / 9 skipped**（51.07 秒），保留两条既有 structlog 提示。隔离 PostgreSQL 18.3 集成用例 **75 项累计通过（分批补验）**：配置/模型等26项、报告/Agent/知识库43项，最后6项针对旧引用修正后全过（8.76 秒）。集成中发现上一轮夹具未注入 configs、仍从 API 取内部函数/常量/异常；已改为正式配置装配及真实归属模块，不新增生产兼容包装。Ruff、import-linter **5 kept / 0 broken**、差异空白检查通过。
+
+隔离数据库位于 `.tmp/layout-postgres`，仅绑定 127.0.0.1:55438；在该临时库执行迁移后验证，测试结束已停止。未启停业务 API/worker/beat，未改真实 .env、业务库或数据，未调用真实模型，未提交或推送。旧新增目录原内容移至 `.tmp/layer-refactor-before/` 备份；撤销了上一轮6组 Agent 错误移动的暂存记录，仅更新索引、不还原工作文件，本轮所有改动保持未提交。
+
+### 2026-10-18 在既有架构内按业务模块归组
+
+用户先要求业务分类，随后要求先独立分析合理性，明确不要迎合或收到方案立即执行；该偏好已写入 `C:/Users/wph98/.codex/AGENTS.md`。用户认可分析后授权开始改造，并进一步确认：已确定的业务即使只有一个文件也建目录，便于后续扩展。本轮据此实施，未创建空的预留业务目录。
+
+- 一级架构保留 api/application/ports/adapters/domain/worker。API、用例、仓储协议与仓储实现统一使用 projects、documents、knowledge、analysis、llm、configuration、jobs 业务目录；每层通用代码放 shared。外部端口和适配器按模型、文档、配置、存储、任务归组；领域代码按 documents/knowledge/shared，worker 业务任务也已归组。
+- core、现有 config 基础设施、数据库连接/锁和 ORM 表定义按技术职责保留。包初始化文件保持轻量，不加兼容转发或重导出旧入口。保留 KnowledgeStore 中紧密关联的知识/报告查询，不为目录对称复制 SQL 或套新 CRUD。
+- 共迁移94个源文件；原知识库 HTTP 模块拆为 api/knowledge/routes.py 与 api/analysis/routes.py，共用严格 DTO 基类放 api/shared/dto.py。同步所有源代码、测试、脚本与当前文档导入。application/analysis/skills.py 的资源定位随目录深度调整，仍读取 tender/resources/parse_skills。
+- Celery Python 注册模块已切换新路径，但既有消息名 tender.worker.tasks.*、tender.worker.knowledge.*、beat 名称和队列路由不变，历史消息继续可消费；新增回归实际运行假仓储派发并验证三类消息名与任务注册。检查点命令为 python -m tender.adapters.pg.analysis.checkpoints。
+- 根 AGENTS.md、工程10/11/17及工程21文件树同步。工程21按实际源码生成目录索引，明确单文件业务也归组、技术基础设施例外、共享代码条件、业务依赖和事务边界。架构契约新增根目录禁止散落业务文件、跨层业务名一致性检查，原有依赖约束没有放宽。
+
+验证：完整离线 `tests/unit tests/contract` **785 passed / 9 skipped**（49.05秒）；完整隔离 PostgreSQL `tests/integration` **75 passed**（58.13秒）。保留既有 structlog 提示。Ruff、import-linter **5 kept / 0 broken**、git diff --check 通过。迁移前后完整 OpenAPI 字典完全一致，共65条路径；94个迁移文件剔除导入后的 AST 对比，仅路由拆分与资源相对路径发生预期差异。
+
+验证过程中修正了一处机械字符串替换影响动态 Celery 任务名的问题，并补充任务注册回归；日志测试中的旧文件位置与路由枚举已按实际新位置更新。上述修正均已包含在最终验证中。
+
+迁移前文件快照、映射和 OpenAPI 对比位于 `.tmp/business-grouping/`。复用本轮隔离数据库 `.tmp/layout-postgres`，仅绑定127.0.0.1:55438，测试结束已正常关闭，pg_ctl 返回 server stopped，并确认测试进程退出。未启停业务服务、未改真实 .env 或业务数据库、未调用真实模型、未提交或推送。
+
+### 2026-10-18 编写当前后端架构与设计取舍说明
+
+用户在讨论 ports、adapters 与依赖注入后，要求提供完整文档解释当前后端架构及设计原因。本轮先核对交接、路由、用例、协议、仓储、Worker、配置和架构检查，再更新既有工程11，未新增重复的架构文档，未修改源码或检查规则。
+
+- `docs/工程/11-架构设计.md` 重写为“当前后端架构与设计取舍”：13节、4张 Mermaid 图，解释进程拓扑、业务目录、Protocol 与依赖注入、创建项目/文档解析时序、专题分析、数据事务、配置快照、日志、部署、设计成本和开发指引。所有已确定业务继续按目录归组，包括单文件模块。
+- 将旧稿中的固定字段抽取、旧队列及未落地流程从当前架构说明中移除，区分源码实现与现场部署状态。明确 Beat 发定时消息、Worker 执行派发；任务 SSE 当前轮询数据库；Celery 消息名不随 Python 路径迁移。
+- 如实记录边界：Worker 仍有直接 ORM 操作和局部装配，config 的 registry/snapshot 仍含持久化；Protocol 不自动执行运行时检查，后端未接入 mypy/Pyright；配置采用快照与实时值混合语义；数据库与队列/存储/模型不具备全局事务保证。目录一致性测试仍要求当前七个业务存在，未擅自放宽，也不推广为所有新功能必须补齐各层。
+- 工程21增加架构说明入口，将“调用方向”修正为代码依赖方向，并补充已有实现边界。文档索引增加当前实现入口和工程21表项，工程10中指向工程11坐标规则的小节引用已同步。
+
+验证：4份工程/索引文档通过 UTF-8 解码、75个本地链接、40个源码路径、13个导航锚点和代码围栏检查；`git diff --check` 通过。未重新运行后端测试；工程11中的785项离线与75项数据库结果明确标记为此前目录改造记录。仅文档变更，未启停服务、未访问业务数据库、未调用真实模型、未提交或推送。
+
+### 2026-10-18 修复 Worker 数据访问、协议检查与任务配置边界
+
+用户要求把上一份架构文档揭示的三项问题一并修复。本轮按既有 ports/adapters 结构实施，未增加同义架构层，所有业务文件仍按业务目录归组。保留此前工作区累计改动，未使用子代理、未提交或推送。
+
+- Worker 数据访问收口：文档任务的读取、认领、执行起点、版本及解析产物落库迁入 `adapters/pg/repositories/documents/pipeline.py`；派发查询/标记迁入 `jobs/dispatch.py`；模型候选、策略、账本与测试维护迁入 `llm/runtime.py`；任务锁通过 `ports/jobs/coordination.py` 与 PostgreSQL 实现接入。依赖经 `core/di.py` 装配，Worker 不直接导入 SQLAlchemy、`adapters.pg` 或配置持久化实现，并增加架构契约阻止回流。保持原有 SQL 条件、事务边界和历史 Celery 消息名称。检查点连接也移至装配点提供，但未声称所有非数据库客户端都已统一装配。
+- 中立数据类型：`NormalizedElement` 移至 `domain/documents/element.py`，PDF 检查结果移至 `ports/documents/inspection.py`，避免仓储反向引用 application 或具体 PDF 适配器。
+- 自动类型检查：dev 依赖加入 mypy 并更新锁文件，范围为全部 ports 和 `core/di.py`；使用 `follow_imports = "silent"` 读取真实实现类型。`test_protocol_types.py` 在常规离线测试中运行正向检查，并验证真实仓储的缺方法/错误签名确实报错，防止通过 skip/Any 绕过。修复 OfficeConverter 缺少关闭方法、KnowledgeStore 多余迭代声明、ProjectRepository.list 遮蔽内置 list 的注解问题。尚非全项目 strict，Any/字典内部字段仍需行为验证。
+- 配置快照：`config/schema.py::document_execution_snapshot` 固定轮询初始/最大间隔、轮询上限、转换/解析超时、转换额外重试次数六项。项目文件上传、直接解析、知识资料处理三个入口写入 `job.config_snapshot.execution`，来源为 `created`，没有活动版本时同样保存默认值。旧任务优先从不可变完整快照补齐；没有历史快照时只固定首次执行配置并标记 `legacy_first_execution`，记录补齐时间，在行锁内复查避免并发使用不同值。事务内 snapshot_for_job 不再因显式 None 回源读取更晚版本。利用已有 JSONB 字段，无新迁移。
+- 保留的必要边界：派发并发和间隔继续实时读取，取消/权限/部署连接与凭证不冻结；数据库与队列没有全局事务，原有提交前投递语义未扩展成 Outbox。旧任务缺少历史配置时无法还原创建时值，文档已明确这一限制。
+- 文档与验证入口：更新工程11架构说明、工程21实际文件树、工程18配置限制、质量08配置生效语义以及根 AGENTS.md。新增 `scripts/check-backend.ps1` 统一运行 Ruff、import-linter、unit/contract（含 mypy）；脚本使用 UTF-8 BOM 兼容 Windows PowerShell 5，并通过同一 Python 的 UTF-8 CLI 输出中文契约名称。
+
+验证：Worker/配置/边界专项55项通过；完整离线 **791 passed / 9 skipped**（52.71秒），mypy **40 source files 无错误**，Ruff 通过，import-linter **5 kept / 0 broken**。完整隔离 PostgreSQL 集成 **78 passed**（58.21秒），包括新增的配置变更不影响新任务预算、两类旧任务补齐三项回归。保留既有 structlog 提示；未调用真实模型或解析服务。
+
+文档和脚本收尾后，补验全部契约 **160 passed / 9 skipped**（含 DDL 与 mypy）；4份文档通过 UTF-8、代码围栏、48个本地链接及134个源码文件树条目核对。验证脚本通过 PowerShell 语法、UTF-8 BOM、真实架构 CLI 正常/失败退出码检查；最终 Ruff 和差异空白检查通过。
+
+现场：复用隔离库 `.tmp/layout-postgres`，仅绑定 `127.0.0.1:55438`，迁移版本为 `0016_rate_limit_wait`。验证结束已通过 pg_ctl 正常关闭并确认测试进程24524退出。未启停业务 API/Worker/Beat，未修改真实 `.env` 或业务数据库，未进行现场部署。源码/测试的本轮改动前快照在 `.tmp/worker-boundaries-before/`；临时迁移脚本不得重跑。虚拟环境此前额外安装的 openpyxl/et-xmlfile 在 uv sync 后已恢复。
+
+### 2026-10-18 修复批量上传资源限制与部分失败回执
+
+用户要求修复上轮审查确认的两处问题。本轮只修改项目文件 API、对应业务用例及回归测试，保留其他累计改动和现有目录结构，未使用子代理。
+
+- `application/projects/files.py` 集中声明100个文件和1 GiB总量限制，提供同一纯校验函数供 API 预检和用例最终检查复用。`api/projects/files.py` 在调用任何文件读取前检查数量与元数据总量（包含 ZIP）；大小未知或低报时，每次读取不超过单文件上限与批次剩余额度的较小值，加一个超限探测字节。按已读字节累计，超限立即终止，不继续读取后续文件；空文件与单文件超限的 HTTP 错误保持原有映射，读取后关闭对应上传句柄。
+- 批量用例恢复对 `TenderError` 和 `BlobStoreError` 的逐文件捕获，失败写入 skipped 后继续处理下一文件，已成功入库的 added/jobs 回执得以保留。整批均失败时，存在临时失败返回503/ingest_unavailable且retryable=true；均为永久失败则返回422/upload_failed。未知异常继续抛出，不伪装成可跳过的文件错误。
+- 新增测试按业务归组：`tests/unit/api/projects/test_upload_limits.py`、`tests/unit/application/projects/test_batch_upload.py`。覆盖101个文件/已知总量超限零读取、ZIP纳入总量、未知或低报大小按剩余额度限读、恰好达到预算仍接受、上传及替换的空文件/单文件超限、部分失败保留回执并继续、全部失败的重试标记，以及未知异常传播。
+
+验证：新增首批测试先复现 **14 failed / 2 passed**，修复后专项16项通过；随后补充4项单文件错误映射回归。统一入口 `scripts/check-backend.ps1` 完整通过：Ruff、import-linter **5 kept / 0 broken**、离线 **811 passed / 9 skipped**（47.91秒，包含mypy正向检查与反向探针）。保留2条既有structlog提示；本轮4个源码/测试文件通过UTF-8与空白核对，`git diff --check`通过。
+
+未修改数据库操作、迁移、队列或前端；本轮无需重新启动隔离数据库。未访问业务数据库、对象存储或真实模型，未启停业务服务、未修改真实配置、未提交或推送。

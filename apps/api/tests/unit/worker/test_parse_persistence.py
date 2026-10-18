@@ -10,13 +10,16 @@ from sqlalchemy import Integer, MetaData, create_engine, select
 from sqlalchemy.sql import Insert, Select, Update
 
 from tender.adapters.pg.models import Element
-from tender.application.middle_json import NormalizedElement
-from tender.ports.parser import MiddleJson, ParseJobStatus
-from tender.worker import tasks
+from tender.adapters.pg.repositories.documents.pipeline import DocumentPipelineRepository
+from tender.application.documents.middle_json import NormalizedElement
+from tender.ports.documents.parser import MiddleJson, ParseJobStatus
+from tender.worker.documents import tasks
 
 
 @pytest.mark.parametrize("element_count", [0, 2, 4096])
 def test_poll_parse_persists_elements_within_parameter_limit(monkeypatch, element_count):
+    repository = DocumentPipelineRepository(Mock(), Mock())
+    monkeypatch.setattr(tasks, "_repository", repository)
     elements = [
         NormalizedElement(
             page_no=1,
@@ -44,7 +47,7 @@ def test_poll_parse_persists_elements_within_parameter_limit(monkeypatch, elemen
         "config_snapshot": {},
         "version_page_count": 1,
     }
-    monkeypatch.setattr(tasks, "_job", lambda *_: job)
+    monkeypatch.setattr(repository, "job", lambda *_: job)
     monkeypatch.setattr(
         tasks,
         "_runtime_values",
@@ -53,8 +56,8 @@ def test_poll_parse_persists_elements_within_parameter_limit(monkeypatch, elemen
             "job.poll.max_attempts": 10,
         },
     )
-    monkeypatch.setattr(tasks, "_execution_start", lambda *_: datetime.now(UTC))
-    monkeypatch.setattr(tasks, "_advisory_lock", lambda *_, **__: nullcontext(True))
+    monkeypatch.setattr(repository, "execution_start", lambda *_: datetime.now(UTC))
+    monkeypatch.setattr(tasks._locks, "lock", lambda *_, **__: nullcontext(True))
     monkeypatch.setattr(tasks, "_store", Mock(return_value=Mock()))
     monkeypatch.setattr(tasks, "normalize_middle_json", Mock(return_value=elements))
     monkeypatch.setattr(
@@ -100,7 +103,7 @@ def test_poll_parse_persists_elements_within_parameter_limit(monkeypatch, elemen
             engine = Mock()
             engine.begin.side_effect = lambda: nullcontext(connection)
             engine.connect.side_effect = lambda: nullcontext(connection)
-            monkeypatch.setattr(tasks, "_engine", engine)
+            repository.engine = engine
 
             tasks.poll_parse.run(job["id"])
 

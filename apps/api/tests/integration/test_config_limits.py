@@ -12,15 +12,22 @@ from test_knowledge_flow import add_source
 from test_llm_management import env as env
 from test_llm_management import model, provider
 
-from tender.api import config, knowledge, llm, parsing, project_files, projects
-from tender.api.errors import ApiProblem
-from tender.application.analysis_research import AgentLimits, ResearchSession
-from tender.application.knowledge_retrieval import retrieve_chunks
-from tender.application.model_profiles import FEATURE_FIELDS, MODEL_FIELDS
+from tender.api.analysis import routes as analysis_api
+from tender.api.configuration import routes as config
+from tender.api.documents import parsing
+from tender.api.knowledge import routes as knowledge
+from tender.api.llm import routes as llm
+from tender.api.projects import files as project_files
+from tender.api.projects import routes as projects
+from tender.api.shared.errors import ApiProblem
+from tender.application.analysis.research import AgentLimits, ResearchSession
+from tender.application.knowledge.retrieval import retrieve_chunks
+from tender.application.llm.profiles import FEATURE_FIELDS, MODEL_FIELDS
 from tender.config.registry import ConfigRegistry
-from tender.domain.errors import ParseUnavailable
-from tender.ports.parser import ParseJobStatus, ParseProgress
-from tender.worker import tasks
+from tender.core.di import create_document_pipeline_repository
+from tender.domain.shared.errors import ParseUnavailable
+from tender.ports.documents.parser import ParseJobStatus, ParseProgress
+from tender.worker.documents import tasks
 
 pytestmark = pytest.mark.skipif(os.environ.get("TENDER_RUN_DB_TESTS") != "1", reason="需要数据库")
 
@@ -32,8 +39,10 @@ def runtime(env, monkeypatch):
     components = request.app.state.components
     components.configs = ConfigRegistry(components.engine)
     components.blobs = SimpleNamespace(put=lambda *args, **kwargs: None)
-    monkeypatch.setattr(tasks, "_engine", components.engine)
-    monkeypatch.setattr(tasks, "_advisory_lock", lambda *args, **kwargs: nullcontext(True))
+    monkeypatch.setattr(
+        tasks, "_repository", create_document_pipeline_repository(components.engine)
+    )
+    monkeypatch.setattr(tasks._locks, "lock", lambda *args, **kwargs: nullcontext(True))
     monkeypatch.setattr(tasks, "_store", lambda: SimpleNamespace(close=lambda: None))
     project = projects.create_project(projects.ProjectCreate(name="配置生效验证"), request)
     return request, connection, project["id"]
@@ -101,8 +110,8 @@ def test_finish_correction_config_is_editable_seeded_and_frozen_for_new_reports(
         release(request, {"analysis.max_finish_corrections": 0})
     release(request, {"analysis.max_finish_corrections": 5})
     add_source(connection, pid, "质保三年")
-    knowledge.save_settings(pid, knowledge.AnalysisSettings(category="goods"), request)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    analysis_api.save_settings(pid, analysis_api.AnalysisSettings(category="goods"), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     frozen = connection.execute(text("SELECT runtime_settings FROM analysis_report WHERE id=:id"),
                                 {"id": report["id"]}).scalar_one()
     assert frozen["max_finish_corrections"] == 5
@@ -116,8 +125,8 @@ def test_saved_retrieval_config_freezes_report_and_filters_real_document_chunks(
     for content in ["alpha beta gamma"] * 8 + ["alpha", "无关内容"]:
         add_source(connection, pid, content)
     release(request, {"analysis.similarity_threshold": 0.8, "analysis.max_search_results": 3})
-    knowledge.save_settings(pid, knowledge.AnalysisSettings(category="goods"), request)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    analysis_api.save_settings(pid, analysis_api.AnalysisSettings(category="goods"), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     frozen = connection.execute(text("SELECT runtime_settings FROM analysis_report WHERE id=:id"),
                                 {"id": report["id"]}).scalar_one()
     assert frozen["similarity_threshold"] == 0.8 and frozen["max_search_results"] == 3
@@ -201,14 +210,14 @@ def test_poll_interval_and_attempts_survive_new_task_invocations(runtime, monkey
     monkeypatch.setattr(tasks.poll_parse, "apply_async",
                         lambda **kwargs: delays.append(kwargs["countdown"]))
     tasks.poll_parse.run("poll-fixture")
-    first = tasks._execution_start("poll-fixture", "parse")
+    first = tasks._repository.execution_start("poll-fixture", "parse")
     tasks.poll_parse.run("poll-fixture")
     tasks.poll_parse.run("poll-fixture")
     result = connection.execute(text("SELECT * FROM job WHERE id='poll-fixture'" )).mappings().one()
     assert len(calls) == 2 and delays == [2.5, 2.5]
     assert result["status"] == "failed" and result["error_code"] == "parse_timeout"
     assert result["progress"]["poll_attempts"] == 2
-    assert tasks._execution_start("poll-fixture", "parse") == first
+    assert tasks._repository.execution_start("poll-fixture", "parse") == first
 
 
 def test_expired_parse_deadline_stops_before_external_poll(runtime, monkeypatch):
@@ -265,7 +274,56 @@ def test_conversion_uses_configured_budget_and_preserves_first_start(runtime, mo
 
     monkeypatch.setattr(tasks, "_convert_office_file", convert)
     asyncio.run(tasks._process_office_file(row, None))
-    first = tasks._execution_start("convert-fixture", "convert")
+    first = tasks._repository.execution_start("convert-fixture", "convert")
     asyncio.run(tasks._process_office_file(row, None))
     assert all(0 < seconds <= 120 and retries == 0 for seconds, retries in received)
-    assert tasks._execution_start("convert-fixture", "convert") == first
+    assert tasks._repository.execution_start("convert-fixture", "convert") == first
+
+
+def test_new_job_budget_stays_fixed_after_config_change(runtime):
+    request, connection, pid = runtime
+    release(request, {"job.timeout.parse_minutes": 4, "job.poll.max_attempts": 9})
+    version, _ = add_source(connection, pid, "新任务预算")
+    created = parsing._create_parse_job(
+        version, parsing.ParseRequest(), request, force=True,
+    )
+    before = tasks._repository.runtime_values(created["job_id"])
+    release(request, {"job.timeout.parse_minutes": 44, "job.poll.max_attempts": 99})
+    assert tasks._repository.runtime_values(created["job_id"]) == before
+    assert before["job.timeout.parse_minutes"] == 4
+    assert before["job.poll.max_attempts"] == 9
+    snapshot = connection.execute(text("SELECT config_snapshot FROM job WHERE id=:id"),
+                                  {"id": created["job_id"]}).scalar_one()
+    assert snapshot["execution_origin"] == "created"
+
+
+def test_legacy_job_freezes_first_execution_and_records_origin(runtime):
+    request, connection = parsing_job(runtime)
+    release(request, {"job.timeout.parse_minutes": 3})
+    before = tasks._repository.runtime_values("poll-fixture")
+    release(request, {"job.timeout.parse_minutes": 33})
+    assert tasks._repository.runtime_values("poll-fixture") == before
+    assert before["job.timeout.parse_minutes"] == 3
+    snapshot = connection.execute(text(
+        "SELECT config_snapshot FROM job WHERE id='poll-fixture'"
+    )).scalar_one()
+    assert snapshot["execution_origin"] == "legacy_first_execution"
+    assert snapshot["execution_frozen_at"]
+
+
+def test_legacy_job_uses_historical_snapshot_instead_of_live_values(runtime):
+    request, connection, pid = runtime
+    release(request, {"job.timeout.parse_minutes": 6})
+    version, _ = add_source(connection, pid, "历史快照")
+    created = parsing._create_parse_job(
+        version, parsing.ParseRequest(), request, force=True,
+    )
+    # 模拟升级前的任务：只有 config_snapshot_id，没有内嵌 execution 数据。
+    connection.execute(text("""UPDATE job SET config_snapshot = config_snapshot
+        - 'execution' - 'execution_origin' WHERE id=:id"""), {"id": created["job_id"]})
+    release(request, {"job.timeout.parse_minutes": 66})
+    restored = tasks._repository.runtime_values(created["job_id"])
+    assert restored["job.timeout.parse_minutes"] == 6
+    snapshot = connection.execute(text("SELECT config_snapshot FROM job WHERE id=:id"),
+                                  {"id": created["job_id"]}).scalar_one()
+    assert snapshot["execution_origin"] == "job_config_snapshot"

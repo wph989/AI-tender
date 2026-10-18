@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from celery import signals
 from structlog.contextvars import bind_contextvars, get_contextvars
 
-from tender.adapters.celery_logging import CONTEXT_HEADER
+from tender.adapters.jobs.celery_logging import CONTEXT_HEADER
 from tender.core.logging import bind_context, clear_context, configure_logging, get_logger
 from tender.core.logging.context import CONTEXT_KEYS, valid_identifier
 

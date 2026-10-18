@@ -4,8 +4,8 @@ import asyncio
 
 import pytest
 
-from tender.application.analysis_skills import json_completion
-from tender.application.knowledge import (
+from tender.application.analysis.skills import json_completion
+from tender.application.knowledge.content import (
     cosine,
     fingerprint,
     merge_field_entries,
@@ -13,15 +13,15 @@ from tender.application.knowledge import (
     split_elements,
     validate_items,
 )
-from tender.application.knowledge_retrieval import retrieve_chunks
-from tender.domain.errors import (
+from tender.application.knowledge.retrieval import retrieve_chunks
+from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
     ModelOutputTruncated,
     ModelRefused,
     ModelUnavailable,
 )
-from tender.ports.llm import Completion
+from tender.ports.llm.chat import Completion
 
 
 def block(source=1, text="投标人须具有甲级资质，不接受联合体。"):

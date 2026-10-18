@@ -7,14 +7,11 @@ import pytest
 from langchain_core.messages import AIMessage, message_to_dict
 from test_analysis_research import block
 
-from tender.application.analysis_skills import verify_items
-from tender.application.deep_analysis import (
-    split_absence_claims,
-    validate_project_claims,
-)
-from tender.application.knowledge import validate_items
-from tender.domain.errors import InvalidModelOutput
-from tender.ports.llm import Completion
+from tender.application.analysis.agent import split_absence_claims, validate_project_claims
+from tender.application.analysis.skills import verify_items
+from tender.application.knowledge.content import validate_items
+from tender.domain.shared.errors import InvalidModelOutput
+from tender.ports.llm.chat import Completion
 
 KEY = "project_basic_info_parsing"
 SKILL = {
@@ -430,7 +427,7 @@ def _window_evidence(rows):
 
 def test_support_review_receives_distant_chapter_heading_without_crossing_source_or_gaps():
     """真实人员条款距离章标题20块；扩大语义上下文仍须隔离资料、版本和缺块区间。"""
-    from tender.application.analysis_skills import EvidenceWindows
+    from tender.application.analysis.skills import EvidenceWindows
 
     class Reviewer:
         async def complete(self, prompt):
@@ -486,7 +483,7 @@ def test_support_review_receives_distant_chapter_heading_without_crossing_source
 
 def test_contract_section_heading_does_not_leak_into_next_chapter():
     """通用与专用合同条款的标题离条款很远，必须保留节归属并在新章边界清除。"""
-    from tender.application.analysis_skills import EvidenceWindows
+    from tender.application.analysis.skills import EvidenceWindows
 
     evidence = _window_evidence([(n, 5, "合同正文。") for n in range(40)])
     for offset, content in (

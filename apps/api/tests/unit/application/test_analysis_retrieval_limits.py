@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 from test_analysis_research import block, session, source
 
-from tender.application.agent_runtime import limits_snapshot
-from tender.application.analysis_research import AgentLimits
-from tender.application.knowledge import rank_chunks
-from tender.application.knowledge_retrieval import retrieve_chunks
+from tender.application.analysis.research import AgentLimits
+from tender.application.analysis.runtime import limits_snapshot
+from tender.application.knowledge.content import rank_chunks
+from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.config.schema import resolve_values
 
 

@@ -2,7 +2,7 @@
 
 `dispatched_at` 的语义是「**本阶段**已经投递过了」，不是「这条 job 投递过」。
 派发闸门的候选条件是 `dispatched_at IS NULL`
-（见 [worker/dispatch.py](../../../src/tender/worker/dispatch.py) 的 `_PENDING_SQL`），
+（见 adapters/pg/repositories/jobs/dispatch.py 的 pending_jobs），
 所以任何把 job 从受闸门的阶段推进到**下一个**阶段的 UPDATE，都必须同时清掉这个闩锁。
 
 漏掉的后果不是报错，而是静默停住：job 停在 pending，beat 每 5 秒扫一遍都找不到它，
@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import inspect
 
-from tender.worker import tasks
+from tender.adapters.pg.repositories.documents.pipeline import DocumentPipelineRepository
 
 
 def test_parse_handoff_clears_dispatch_latch() -> None:
     """转换完成、交接给解析的那条 UPDATE 必须清空 dispatched_at。"""
-    source = inspect.getsource(tasks._finish_file_version)
+    source = inspect.getsource(DocumentPipelineRepository.finish_file_version)
     assert "status=status" in source and "stage=stage" in source, (
         "阶段推进的写法变了，请同步检查本测试的前提"
     )
@@ -41,5 +41,5 @@ def test_latch_is_preserved_when_the_job_stops_here() -> None:
     ORM 写法下这条不变式落在 `case` 的 `else_` 分支：只有 should_parse 为真才写 NULL，
     否则必须原样保留 `Job.dispatched_at`。
     """
-    source = inspect.getsource(tasks._finish_file_version)
+    source = inspect.getsource(DocumentPipelineRepository.finish_file_version)
     assert "else_=Job.dispatched_at" in source, "闩锁只应在进入下一阶段时清空，不能无条件清"

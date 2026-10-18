@@ -11,13 +11,17 @@ from data_schema import install_data_schema
 from langchain_core.messages import AIMessage, message_to_dict
 from sqlalchemy import create_engine, text
 
-from tender.adapters.pg.repositories.knowledge import KnowledgeStore, sync_sources
-from tender.api import knowledge, projects
-from tender.application.knowledge import fingerprint, validate_items
+from tender.adapters.pg.repositories.knowledge.store import KnowledgeStore, sync_sources
+from tender.api.analysis import routes as analysis_api
+from tender.api.knowledge import routes as knowledge
+from tender.api.projects import routes as projects
+from tender.api.shared.errors import ApiProblem
+from tender.application.knowledge.content import fingerprint, validate_items
+from tender.config.registry import ConfigRegistry
 from tender.core import settings
-from tender.ports.llm import Completion
-from tender.worker import knowledge as worker
-from tender.worker.deep_analysis import prepare_report
+from tender.ports.llm.chat import Completion
+from tender.worker.analysis.controller import prepare_report
+from tender.worker.knowledge import tasks as worker
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TENDER_RUN_DB_TESTS") != "1", reason="需要数据库集成验证"
@@ -73,11 +77,14 @@ def environment(monkeypatch):
             connect=lambda: nullcontext(connection), begin=lambda: nullcontext(connection)
         )
         request = SimpleNamespace(
-            app=SimpleNamespace(state=SimpleNamespace(components=SimpleNamespace(engine=facade))),
+            # 与正式装配一样提供配置端口；不能让用例为了不完整夹具自行创建数据库实现。
+            app=SimpleNamespace(state=SimpleNamespace(components=SimpleNamespace(
+                engine=facade, configs=ConfigRegistry(facade),
+            ))),
             headers={},
         )
         monkeypatch.setattr(settings, "company_id", lambda: 1)
-        monkeypatch.setattr(worker, "_engine", facade)
+        monkeypatch.setattr(worker, "_store", lambda: KnowledgeStore(facade, 1))
         monkeypatch.setattr(worker, "_model", lambda _, **_limits: FixtureModel())
         project = projects.create_project(projects.ProjectCreate(name="综合分析专项"), request)
         yield request, connection, project["id"]
@@ -191,7 +198,7 @@ class FixtureModel:
 
 
 def configure(request, pid):
-    knowledge.save_settings(pid, knowledge.AnalysisSettings(category="engineering"), request)
+    analysis_api.save_settings(pid, analysis_api.AnalysisSettings(category="engineering"), request)
 
 
 def attach_completed_module(connection, report_id, blocks):
@@ -228,7 +235,7 @@ def test_report_items_survive_reparse_and_show_unavailable_when_deleted(environm
     request, conn, pid = environment
     version, run = add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     # 历史报告（runtime_version=legacy）与新报告共用展示路径，但会被标记为不可再执行。
     conn.execute(
         text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
@@ -238,7 +245,7 @@ def test_report_items_survive_reparse_and_show_unavailable_when_deleted(environm
     collection = knowledge.project_knowledge(pid, request)["collection_id"]
     block = store.readable_chunks(store.sources([collection])[0])[0]
     attach_completed_module(conn, report["id"], [block])
-    loaded = knowledge.get_report(report["id"], request)
+    loaded = analysis_api.get_report(report["id"], request)
     assert loaded["runtime_retired"] is True
     reference = loaded["modules"][0]["items"][0]["values"][0]["citations"][0]
     assert reference["version_id"] == version
@@ -248,7 +255,7 @@ def test_report_items_survive_reparse_and_show_unavailable_when_deleted(environm
         VALUES (:version,'test','standard','1','completed')"""),
         {"version": version},
     )
-    assert knowledge.get_report(report["id"], request)["stale"] is True
+    assert analysis_api.get_report(report["id"], request)["stale"] is True
     conn.execute(
         text("UPDATE project_file SET deleted_at=now() WHERE id=:id"),
         {"id": reference["project_file_id"]},
@@ -256,7 +263,7 @@ def test_report_items_survive_reparse_and_show_unavailable_when_deleted(environm
     with pytest.raises(LookupError):
         store.resolve(reference)
     assert (
-        knowledge.get_report(report["id"], request)["modules"][0]["items"][0]["verification"]
+        analysis_api.get_report(report["id"], request)["modules"][0]["items"][0]["verification"]
         == "unavailable"
     )
 
@@ -266,7 +273,7 @@ def test_unfinished_module_shows_verified_items_saved_in_run_state(environment):
     request, conn, pid = environment
     add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     store = KnowledgeStore(request.app.state.components.engine, 1)
     collection = knowledge.project_knowledge(pid, request)["collection_id"]
     block = store.readable_chunks(store.sources([collection])[0])[0]
@@ -308,7 +315,7 @@ def test_unfinished_module_shows_verified_items_saved_in_run_state(environment):
     )
     module = next(
         entry
-        for entry in knowledge.get_report(report["id"], request)["modules"]
+        for entry in analysis_api.get_report(report["id"], request)["modules"]
         if entry["id"] == module_id
     )
     assert module["status"] == "running"
@@ -321,7 +328,7 @@ def test_report_merges_same_field_versions_and_dedupes_locations(environment):
     request, conn, pid = environment
     add_source(conn, pid, "质保三年。质保五年。")
     configure(request, pid)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     store = KnowledgeStore(request.app.state.components.engine, 1)
     collection = knowledge.project_knowledge(pid, request)["collection_id"]
     block = store.readable_chunks(store.sources([collection])[0])[0]
@@ -368,7 +375,7 @@ def test_report_merges_same_field_versions_and_dedupes_locations(environment):
                 CAST(:items AS JSONB))"""),
         {"report": report["id"], "items": json.dumps(items, ensure_ascii=False)},
     )
-    module = knowledge.get_report(report["id"], request)["modules"][0]
+    module = analysis_api.get_report(report["id"], request)["modules"][0]
     assert [entry["field"] for entry in module["items"]] == ["质保期"]
     assert [value["value"] for value in module["items"][0]["values"]] == ["质保三年", "质保五年"]
     assert len(module["items"][0]["values"][0]["citations"]) == 1
@@ -384,7 +391,7 @@ def test_report_preserves_outline_nodes_with_different_parent_paths(environment,
     content = "商务标。甲标段营业执照须盖章。乙标段营业执照须签字。"
     add_source(conn, pid, content)
     configure(request, pid)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     store = KnowledgeStore(request.app.state.components.engine, 1)
     collection = knowledge.project_knowledge(pid, request)["collection_id"]
     block = store.readable_chunks(store.sources([collection])[0])[0]
@@ -413,7 +420,7 @@ def test_report_preserves_outline_nodes_with_different_parent_paths(environment,
                 CAST(:items AS JSONB))"""),
         {"report": report["id"], "items": json.dumps(items, ensure_ascii=False)},
     )
-    displayed = knowledge.get_report(report["id"], request)["modules"][0]["items"]
+    displayed = analysis_api.get_report(report["id"], request)["modules"][0]["items"]
     assert len(displayed) == 5
     licenses = [item for item in displayed if item["field"] == "营业执照"]
     assert [item["note"].split("上级路径：")[1] for item in licenses] == [
@@ -427,16 +434,16 @@ def test_retired_runtime_report_cannot_run_or_retry(environment):
     request, conn, pid = environment
     add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     conn.execute(
         text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
         {"id": report["id"]},
     )
     asyncio.run(worker._analyze_project(report["id"]))
-    retired = knowledge.get_report(report["id"], request)
+    retired = analysis_api.get_report(report["id"], request)
     assert retired["status"] == "failed" and "已下线" in retired["error_message"]
-    with pytest.raises(knowledge.ApiProblem) as exc:
-        knowledge.retry_report(report["id"], knowledge.RetryInput(), request)
+    with pytest.raises(ApiProblem) as exc:
+        analysis_api.retry_report(report["id"], analysis_api.RetryInput(), request)
     assert exc.value.status_code == 409 and exc.value.code == "runtime_retired"
 
 
@@ -445,7 +452,7 @@ def test_reference_snapshot_change_marks_only_current_runtime_reports_stale(envi
     request, conn, pid = environment
     add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     # 另一项目的历史资料以参考库方式关联进来：当前运行时的报告未记录该来源，应判为已变化。
     reference = projects.create_project(projects.ProjectCreate(name="参考专项"), request)
     add_source(conn, reference["id"], "历史质保五年。")
@@ -458,13 +465,13 @@ def test_reference_snapshot_change_marks_only_current_runtime_reports_stale(envi
         text("INSERT INTO project_knowledge_collection VALUES (:pid,:cid)"),
         {"pid": pid, "cid": collection},
     )
-    assert knowledge.get_report(report["id"], request)["stale"] is True
+    assert analysis_api.get_report(report["id"], request)["stale"] is True
     # 同一份报告标记为旧运行时后，同样的参考来源不能触发 stale：旧流程从不记录参考快照。
     conn.execute(
         text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
         {"id": report["id"]},
     )
-    retired = knowledge.get_report(report["id"], request)
+    retired = analysis_api.get_report(report["id"], request)
     assert retired["runtime_retired"] is True and retired["stale"] is False
 
 
@@ -474,15 +481,19 @@ def test_wait_for_missing_sources_or_explicit_partial_analysis(environment):
     add_source(conn, pid, "要求甲级资质。")
     add_source(conn, pid, "未完成解析的资质要求。", status="failed")
     configure(request, pid)
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     with pytest.raises(ValueError, match="未完整解析"):
-        prepare_report(worker._store(), knowledge.report_row(request, report["id"]))
-    knowledge.cancel_report(report["id"], request)
-    partial = knowledge.start_analysis(pid, knowledge.AnalysisInput(allow_partial=True), request)
-    fixed, sources = prepare_report(worker._store(), knowledge.report_row(request, partial["id"]))
+        prepare_report(worker._store(), analysis_api.report_row(request, report["id"]))
+    analysis_api.cancel_report(report["id"], request)
+    partial = analysis_api.start_analysis(
+        pid, analysis_api.AnalysisInput(allow_partial=True), request
+    )
+    fixed, sources = prepare_report(
+        worker._store(), analysis_api.report_row(request, partial["id"])
+    )
     assert fixed["coverage"]["partial"] is True
     assert [source["file_name"] for source in sources] == ["材料1.pdf"]
-    assert knowledge.get_report(partial["id"], request)["status"] == "running"
+    assert analysis_api.get_report(partial["id"], request)["status"] == "running"
 
 
 def test_graph_expansion_rejects_old_parse_evidence(environment):
@@ -493,7 +504,7 @@ def test_graph_expansion_rejects_old_parse_evidence(environment):
     collection = knowledge.project_knowledge(pid, request)["collection_id"]
     sources = store.sources([collection])
     block = store.readable_chunks(sources[0])[0]
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     conn.execute(
         text("UPDATE analysis_report SET status='completed' WHERE id=:id"), {"id": report["id"]}
     )
@@ -525,7 +536,7 @@ def test_collections_isolate_retrieval_and_answers(environment):
     own_id = knowledge.project_knowledge(pid, request)["collection_id"]
     hits = asyncio.run(knowledge.search_collection(own_id, request, "资质"))["items"]
     assert len(hits) == 1 and "本项目" in hits[0]["content"]
-    with pytest.raises(knowledge.ApiProblem) as exc:
+    with pytest.raises(ApiProblem) as exc:
         knowledge.ask_project(
             pid, knowledge.AskInput(question="资质", collection_ids=[library["id"]]), request
         )
@@ -552,7 +563,7 @@ def test_question_agent_reads_graph_only_evidence(environment, monkeypatch):
     sources = store.sources([own_id])
     blocks = [row for source in sources for row in store.readable_chunks(source)]
     direct = next(row for row in blocks if "甲级资质" in row["content"])
-    report = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     conn.execute(
         text("UPDATE analysis_report SET status='completed' WHERE id=:id"), {"id": report["id"]}
     )

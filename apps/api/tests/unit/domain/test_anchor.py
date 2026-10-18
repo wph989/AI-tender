@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from tender.domain.anchor import Anchor
-from tender.domain.errors import AnchorFormatError, AnchorSequenceError
+from tender.domain.documents.anchor import Anchor
+from tender.domain.shared.errors import AnchorFormatError, AnchorSequenceError
 
 
 def test_parse_and_str_round_trip() -> None:

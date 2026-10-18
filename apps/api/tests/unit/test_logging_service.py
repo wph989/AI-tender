@@ -26,8 +26,12 @@ from celery import Celery
 from fastapi import APIRouter, FastAPI, Query, Request
 from starlette.responses import StreamingResponse
 
-from tender.api.errors import install_error_handlers
-from tender.api.logging import RequestLoggingMiddleware, _AccessLogWindow, throttle_access_log
+from tender.api.shared.errors import install_error_handlers
+from tender.api.shared.logging import (
+    RequestLoggingMiddleware,
+    _AccessLogWindow,
+    throttle_access_log,
+)
 from tender.core import logging as runtime
 from tender.core import settings
 from tender.core.logging import bind_context, configure_logging, get_context, get_logger
@@ -451,7 +455,7 @@ def test_final_rendering_limits_large_event_and_trace(options, json_output, payl
 
 @pytest.mark.parametrize("kind", ["index", "answer"])
 def test_handled_worker_exception_writes_trace_before_marking_failed(options, monkeypatch, kind):
-    from tender.worker import knowledge
+    from tender.worker.knowledge import tasks as knowledge
 
     configure_logging("worker", options)
     db = Mock()
@@ -483,9 +487,9 @@ def test_handled_worker_exception_writes_trace_before_marking_failed(options, mo
 
 
 def test_answer_failure_does_not_replay_raw_sdk_credential(options, monkeypatch):
-    from tender.adapters.agent_chat import AgentChat
-    from tender.application.llm_routing import ModelCandidate, RoutingModel
-    from tender.worker import knowledge
+    from tender.adapters.llm.agent_chat import AgentChat
+    from tender.application.llm.routing import ModelCandidate, RoutingModel
+    from tender.worker.knowledge import tasks as knowledge
 
     secret = "sk-mockedDbKeyOnly-XyzqKrT79452"
     # 数据库中的供应商密钥不在日志初始化的环境凭证中，必须依赖适配器脱敏边界。
@@ -808,7 +812,7 @@ def test_access_log_location_unwraps_endpoint_and_handles_unmatched_requests(opt
     asyncio.run(check())
     logs = read_logs(options.directory)
     assert logs[0]["location"] == f"{Path(__file__).as_posix()}:{endpoint.__code__.co_firstlineno}"
-    assert logs[1]["location"].startswith("tender/api/logging.py:")
+    assert logs[1]["location"].startswith("tender/api/shared/logging.py:")
     assert logs[2]["location"] == logs[0]["location"]
     assert all("outcome" not in entry and "suppressed_count" not in entry for entry in logs)
 
@@ -817,7 +821,7 @@ def test_access_log_location_unwraps_endpoint_and_handles_unmatched_requests(opt
 def test_access_logs_sample_successes_but_keep_errors_and_request_context(
     options, monkeypatch, interval,
 ):
-    from tender.api import logging as access_logging
+    from tender.api.shared import logging as access_logging
 
     configure_logging("api", options)
     clock = [100.0]
@@ -950,7 +954,7 @@ def test_access_log_decorator_preserves_sync_parameters_and_leaves_other_routes_
 
 
 def test_access_log_decorators_use_independent_windows(options, monkeypatch):
-    from tender.api import logging as access_logging
+    from tender.api.shared import logging as access_logging
 
     configure_logging("api", options)
     clock = [0.0]
@@ -986,7 +990,7 @@ def test_access_log_decorators_use_independent_windows(options, monkeypatch):
 
 
 def test_access_log_window_groups_polling_parameters_by_route_template(options, monkeypatch):
-    from tender.api import logging as access_logging
+    from tender.api.shared import logging as access_logging
 
     configure_logging("api", options)
     clock = [100.0]
@@ -1043,11 +1047,20 @@ def test_access_log_window_groups_polling_parameters_by_route_template(options, 
 
 
 def test_only_frontend_polling_routes_enable_access_log_throttling():
-    from tender.api import config, jobs, knowledge, llm, parsing, project_files, projects, versions
+    from tender.api.analysis import routes as analysis
+    from tender.api.configuration import routes as config
+    from tender.api.documents import parsing, versions
+    from tender.api.jobs import routes as jobs
+    from tender.api.knowledge import routes as knowledge
+    from tender.api.llm import routes as llm
+    from tender.api.projects import files as project_files
+    from tender.api.projects import routes as projects
 
     selected = {
         (method, route.path)
-        for module in (config, jobs, knowledge, llm, parsing, project_files, projects, versions)
+        for module in (
+            analysis, config, jobs, knowledge, llm, parsing, project_files, projects, versions
+        )
         for route in module.router.routes
         if getattr(route.endpoint, "_tender_access_log_interval", 0) > 0
         for method in route.methods
@@ -1065,7 +1078,7 @@ def test_only_frontend_polling_routes_enable_access_log_throttling():
 def test_access_log_window_survives_many_distinct_paths_and_cleans_expired_keys(
     options, monkeypatch,
 ):
-    from tender.api import logging as access_logging
+    from tender.api.shared import logging as access_logging
 
     clock = [100.0]
     monkeypatch.setattr(access_logging, "time", SimpleNamespace(monotonic=lambda: clock[0]))
@@ -1128,8 +1141,8 @@ def test_interrupted_successful_stream_is_never_sampled(options, path, error_typ
 def test_celery_real_execution_and_publication_without_external_services(options, monkeypatch):
     from celery import signals
 
-    from tender.adapters.celery_logging import CONTEXT_HEADER, install_publish_logging
-    from tender.adapters.celery_queue import TenderCelery
+    from tender.adapters.jobs.celery_logging import CONTEXT_HEADER, install_publish_logging
+    from tender.adapters.jobs.celery_queue import TenderCelery
     from tender.worker import logging as worker_logging
     from tender.worker.logging import install_worker_logging
 

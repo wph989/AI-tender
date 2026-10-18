@@ -63,7 +63,7 @@ OpenAI Chat Completions 的结构化补全采用流式接收，避免网关在�
 ```powershell
 cd apps/api
 uv run alembic upgrade head
-uv run python -m tender.application.agent_checkpoints
+uv run python -m tender.adapters.pg.analysis.checkpoints
 ```
 
 0008 仅创建业务表和隔离 schema；初始化命令在部署阶段显式调用 AsyncPostgresSaver.setup()。该框架 DDL 包含并发建索引，必须在 autocommit 连接中执行，不能嵌入 Alembic 事务。worker 不自动建表。Windows 两个入口使用 SelectorEventLoop，兼容 psycopg 异步连接。不要修改已应用的0005/0007。

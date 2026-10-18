@@ -11,8 +11,8 @@ from typing import Any
 
 import pytest
 
-from tender.application.middle_json import NormalizedElement, normalize_middle_json
-from tender.domain.errors import ParseFailed
+from tender.application.documents.middle_json import NormalizedElement, normalize_middle_json
+from tender.domain.shared.errors import ParseFailed
 
 
 def _text_block(text: str) -> dict[str, Any]:

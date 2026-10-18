@@ -6,8 +6,8 @@ import json
 import httpx
 import pytest
 
-from tender.adapters.openai_chat import OpenAIChatModel
-from tender.domain.errors import ModelOutputTruncated, ModelRefused, ModelUnavailable
+from tender.adapters.llm.openai_chat import OpenAIChatModel
+from tender.domain.shared.errors import ModelOutputTruncated, ModelRefused, ModelUnavailable
 
 
 class FragmentedStream(httpx.AsyncByteStream):

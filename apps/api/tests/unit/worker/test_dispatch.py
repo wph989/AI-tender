@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from sqlalchemy.dialects import postgresql
 
-from tender.worker.dispatch import STREAMS, _pending_jobs, capacity
+from tender.adapters.pg.repositories.jobs.dispatch import pending_jobs
+from tender.worker.dispatch import STREAMS, capacity
 
 
 def test_capacity_subtracts_inflight() -> None:
@@ -48,7 +49,7 @@ def test_pending_jobs_scope_to_stream_stages() -> None:
     """stage 由绑定参数带入：写错值不再是语法错误，改在编译结果上钉住各线的筛选条件。"""
     convert = next(stream for stream in STREAMS if stream.name == "convert")
     sql = str(
-        _pending_jobs(convert, 7, 3).compile(
+        pending_jobs(convert.stages, 7, 3).compile(
             dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
         )
     )

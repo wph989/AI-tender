@@ -1,0 +1,53 @@
+"""数据库访问端口：用例声明所需操作，PostgreSQL 实现负责 SQL 与事务。"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from contextlib import AbstractContextManager
+from typing import Any, Protocol
+
+
+class ConfigTransaction(Protocol):
+    def lock_company(self) -> None: ...
+
+    def release(self, release_id: int) -> dict[str, Any] | None: ...
+
+    def active_release(self) -> dict[str, Any] | None: ...
+
+    def next_version_no(self) -> int: ...
+
+    def archive_active(self) -> None: ...
+
+    def insert_release(self, values: Mapping[str, Any]) -> int: ...
+
+    def set_release_status(self, release_id: int, status: str) -> None: ...
+
+    def write_audit(
+        self,
+        *,
+        release_id: int,
+        actor: str,
+        action: str,
+        diff: Mapping[str, Any],
+        reason: str | None,
+    ) -> None: ...
+
+    def insert_acks(
+        self, *, release_id: int, actor: str, items: Iterable[Any], comment: str | None
+    ) -> list[tuple[str, str]]: ...
+
+    def load_acks(self, release_id: int) -> list[tuple[str, str]]: ...
+
+    def audit_rows(self, release_id: int, limit: int) -> list[dict[str, Any]]: ...
+
+
+class ConfigRepository(Protocol):
+    def transaction(self) -> AbstractContextManager[ConfigTransaction]: ...
+
+    def release(self, release_id: int) -> dict[str, Any] | None: ...
+
+    def active_release(self) -> dict[str, Any] | None: ...
+
+    def list_releases(self, status: str | None, limit: int) -> list[dict[str, Any]]: ...
+
+    def audit_rows(self, release_id: int | None, limit: int) -> list[dict[str, Any]]: ...

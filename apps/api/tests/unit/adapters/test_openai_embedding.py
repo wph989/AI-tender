@@ -3,8 +3,8 @@ import asyncio
 import httpx
 import pytest
 
-from tender.adapters.openai_embedding import OpenAIEmbeddingModel
-from tender.domain.errors import ModelCallFailed
+from tender.adapters.llm.openai_embedding import OpenAIEmbeddingModel
+from tender.domain.shared.errors import ModelCallFailed
 
 
 def test_embedding_uses_ordered_float_vectors_and_correct_endpoint():

@@ -12,11 +12,11 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine, text
 
-from tender.api import llm
-from tender.api.errors import ApiProblem
+from tender.api.llm import routes as llm
+from tender.api.shared.errors import ApiProblem
 from tender.core.settings import database_url
-from tender.domain.errors import ModelInUse
-from tender.ports.llm import Completion
+from tender.domain.shared.errors import ModelInUse
+from tender.ports.llm.chat import Completion
 
 pytestmark = pytest.mark.skipif(os.environ.get("TENDER_RUN_DB_TESTS") != "1", reason="需要数据库")
 
@@ -271,7 +271,7 @@ def test_embedding_probe_returns_measured_vector_shape(env, monkeypatch):
 
 
 def test_complete_configuration_roundtrip_and_capability_proofs_are_independent(env, monkeypatch):
-    from tender.application.model_probes import PROBE_IMAGE
+    from tender.application.llm.probes import PROBE_IMAGE
 
     request, _ = env
     p = provider(request, protocol="gemini")
@@ -318,7 +318,7 @@ def test_complete_configuration_roundtrip_and_capability_proofs_are_independent(
 
 
 def test_image_model_binding_preview_history_and_cleanup(env, monkeypatch):
-    from tender.application.model_probes import PROBE_IMAGE
+    from tender.application.llm.probes import PROBE_IMAGE
 
     request, c = env
     p = provider(request)

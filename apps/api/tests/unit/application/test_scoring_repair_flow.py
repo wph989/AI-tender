@@ -9,9 +9,9 @@ from test_analysis_research import block, session
 from test_analysis_synthesis import execute
 from test_deep_analysis import call, submitted_field
 
-from tender.application.analysis_policy import load_module_skill
-from tender.application.analysis_skills import skill_snapshot, verify_items
-from tender.application.knowledge import validate_items
+from tender.application.analysis.policy import load_module_skill
+from tender.application.analysis.skills import skill_snapshot, verify_items
+from tender.application.knowledge.content import validate_items
 
 KEY = "scoring_standard_parsing"
 SNAPSHOT = skill_snapshot() | {KEY + "/references/coverage.json": "[]"}

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 from tender.core.redaction import redact_text
-from tender.domain.errors import ModelCallFailed, ModelUnavailable
+from tender.domain.shared.errors import ModelCallFailed, ModelUnavailable
 
 MAX_ERROR_LENGTH = 16000
 

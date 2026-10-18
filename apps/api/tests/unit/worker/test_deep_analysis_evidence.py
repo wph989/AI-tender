@@ -1,10 +1,10 @@
-﻿"""校验窗口的证据扩展：引文块要能看到原文物理邻域，但引文本身仍限定已读块。"""
+"""校验窗口的证据扩展：引文块要能看到原文物理邻域，但引文本身仍限定已读块。"""
 
 from __future__ import annotations
 
 import asyncio
 
-from tender.worker.deep_analysis import expand_evidence
+from tender.worker.analysis.controller import expand_evidence
 
 
 def _block(offset: int, content: str, source_id: int = 13) -> dict:

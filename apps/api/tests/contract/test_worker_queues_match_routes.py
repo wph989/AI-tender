@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tender.adapters.celery_queue import create_celery_app
+from tender.adapters.jobs.celery_queue import create_celery_app
 
 ROOT = Path(__file__).resolve().parents[4]
 

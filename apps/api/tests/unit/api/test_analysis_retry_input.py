@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from tender.api.knowledge import RetryInput
+from tender.api.analysis.routes import RetryInput
 
 
 @pytest.mark.parametrize("value", [1, 511, 16385, 262144])

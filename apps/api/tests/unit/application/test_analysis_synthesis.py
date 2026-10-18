@@ -19,17 +19,17 @@ from synthesis_fixtures import (
 from test_analysis_research import block, session
 from test_deep_analysis import KEY, SKILL, ScriptedRouter, call
 
-from tender.application.analysis_output import (
+from tender.application.analysis.agent import RoutedAgentModel, build_module_agent, invoke_module
+from tender.application.analysis.output import (
     ReferenceTrace,
     ResearchTopic,
     output_schema,
     record_output,
     research_checkpoint,
 )
-from tender.application.analysis_research import AgentLimits
-from tender.application.analysis_skills import MODULES, skill_snapshot
-from tender.application.deep_analysis import RoutedAgentModel, build_module_agent, invoke_module
-from tender.domain.errors import InvalidModelOutput, ModelOutputTruncated, ModelUnavailable
+from tender.application.analysis.research import AgentLimits
+from tender.application.analysis.skills import MODULES, skill_snapshot
+from tender.domain.shared.errors import InvalidModelOutput, ModelOutputTruncated, ModelUnavailable
 
 
 def build(
@@ -534,7 +534,7 @@ def test_compaction_keeps_original_evidence_and_synthesis_phase():
             if not tools:
                 from langchain_core.messages import message_to_dict
 
-                from tender.ports.llm import Completion
+                from tender.ports.llm.chat import Completion
 
                 return Completion(
                     content="摘要",

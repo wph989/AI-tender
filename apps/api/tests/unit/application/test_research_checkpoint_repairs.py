@@ -9,14 +9,14 @@ from test_analysis_research import block, session
 from test_analysis_synthesis import build, execute, topic
 from test_deep_analysis import KEY, SKILL, ScriptedRouter, call
 
-from tender.application.analysis_data import (
+from tender.application.analysis.agent import invoke_module
+from tender.application.analysis.data import (
     BusinessRecord,
     assemble_dataset,
     prepare_records,
     resolve_scope,
 )
-from tender.application.analysis_output import ReferenceTrace, ResearchTopic, research_checkpoint
-from tender.application.deep_analysis import invoke_module
+from tender.application.analysis.output import ReferenceTrace, ResearchTopic, research_checkpoint
 
 TOPICS = [{"key": "warranty", "title": "质保期限"}]
 SNAPSHOT = SKILL | {KEY + "/references/coverage.json": json.dumps(TOPICS, ensure_ascii=False)}

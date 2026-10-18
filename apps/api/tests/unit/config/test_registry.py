@@ -106,3 +106,15 @@ def test_close_closes_cache() -> None:
     cache = _FakeCache()
     ConfigRegistry(_EmptyEngine(), cache).close()  # type: ignore[arg-type]
     assert cache.closed is True
+
+
+def test_explicit_absent_config_does_not_read_again_inside_transaction(monkeypatch):
+    from tender.config.registry import ConfigRegistry
+
+    registry = ConfigRegistry(None)
+    monkeypatch.setattr(
+        registry, "active", lambda *_: (_ for _ in ()).throw(
+            AssertionError("事务内不应回源读取更晚的配置")
+        )
+    )
+    assert registry.snapshot_for_job(None, None) is None

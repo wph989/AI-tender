@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import Column, DateTime, Integer, MetaData, Table, create_engine, insert
 
 from tender.adapters.pg.models import KnowledgeCollection
-from tender.adapters.pg.repositories.knowledge import KnowledgeStore
+from tender.adapters.pg.repositories.knowledge.store import KnowledgeStore
 
 
 @pytest.fixture

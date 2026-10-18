@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from tender.application.llm_registry import binding_rows, effective_limit
-from tender.domain.errors import PriorityLimitExceeded
+from tender.application.llm.registry import binding_rows, effective_limit
+from tender.domain.shared.errors import PriorityLimitExceeded
 
 
 def test_binding_rows_derive_priority_from_order() -> None:

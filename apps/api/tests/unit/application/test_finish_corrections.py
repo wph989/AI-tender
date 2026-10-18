@@ -11,10 +11,10 @@ from test_analysis_research import block, session
 from test_analysis_synthesis import execute
 from test_deep_analysis import call, submitted_field
 
-from tender.application.agent_runtime import limits_snapshot
-from tender.application.analysis_research import AgentLimits
-from tender.application.deep_analysis import ResearchMiddleware
-from tender.application.knowledge import validate_items
+from tender.application.analysis.agent import ResearchMiddleware
+from tender.application.analysis.research import AgentLimits
+from tender.application.analysis.runtime import limits_snapshot
+from tender.application.knowledge.content import validate_items
 from tender.config.schema import resolve_values, validate_value
 
 

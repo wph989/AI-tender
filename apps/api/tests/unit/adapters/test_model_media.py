@@ -6,13 +6,13 @@ import json
 import httpx
 import pytest
 
-from tender.adapters.openai_chat import OpenAIChatModel
-from tender.adapters.openai_embedding import OpenAIEmbeddingModel
-from tender.adapters.provider_image import ProviderImageModel
-from tender.application.model_probes import PROBE_IMAGE
-from tender.application.model_profiles import validate_model
-from tender.domain.errors import ModelCallFailed
-from tender.ports.model_media import EmbeddingInput
+from tender.adapters.llm.openai_chat import OpenAIChatModel
+from tender.adapters.llm.openai_embedding import OpenAIEmbeddingModel
+from tender.adapters.llm.provider_image import ProviderImageModel
+from tender.application.llm.probes import PROBE_IMAGE
+from tender.application.llm.profiles import validate_model
+from tender.domain.shared.errors import ModelCallFailed
+from tender.ports.llm.media import EmbeddingInput
 
 
 @pytest.mark.parametrize(

@@ -2,34 +2,13 @@
 
 import pytest
 
-import tender.worker.model_routing as extraction
-from tender.application.llm_routing import ModelCandidate
+import tender.worker.llm.routing as extraction
+from tender.application.llm.routing import ModelCandidate
 
 
-class _EmptyPolicy:
-    """策略查询返回空时路由使用默认值；这里只关心候选的重试次数。"""
-
-    def mappings(self):
-        return self
-
-    def first(self):
+class _FakeRepository:
+    def policy(self, feature_key):
         return None
-
-
-class _FakeConnection:
-    def execute(self, *args, **kwargs):
-        return _EmptyPolicy()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class _FakeEngine:
-    def connect(self):
-        return _FakeConnection()
 
 
 class _CapturedRouting:
@@ -56,7 +35,7 @@ def _candidate(registry_id: int, extra_retries: int) -> ModelCandidate:
     "limit,expected", [(2, [2, 1]), (None, [5, 1])]
 )
 def test_extra_retries_limit_only_lowers_configured_retries(monkeypatch, limit, expected):
-    monkeypatch.setattr(extraction, "_engine", _FakeEngine())
+    monkeypatch.setattr(extraction, "_repository", _FakeRepository())
     monkeypatch.setattr(
         extraction,
         "_load_candidates",

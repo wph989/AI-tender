@@ -12,10 +12,10 @@ from test_analysis_synthesis import execute
 from test_deep_analysis import call
 from test_llm_routing import _candidate, _ScriptedGateway
 
-from tender.application.llm_routing import RoutingModel
+from tender.application.llm.routing import RoutingModel
 from tender.core.logging import bind_context, get_context, get_logger
-from tender.domain.errors import ModelUnavailable
-from tender.worker import deep_analysis
+from tender.domain.shared.errors import ModelUnavailable
+from tender.worker.analysis import controller as deep_analysis
 
 
 @pytest.mark.parametrize("failover_limit", [1, 2])

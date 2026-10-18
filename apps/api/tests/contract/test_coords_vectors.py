@@ -13,10 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from tender.domain.anchor import Anchor
-from tender.domain.bbox import Bbox
-from tender.domain.errors import AnchorFormatError
-from tender.domain.page import PageGeometry
+from tender.domain.documents.anchor import Anchor
+from tender.domain.documents.bbox import Bbox
+from tender.domain.documents.page import PageGeometry
+from tender.domain.shared.errors import AnchorFormatError
 
 # 向量文件在仓库根的 packages/contract 下，不随包安装：它是两侧共用的开发期事实源
 _VECTORS_PATH = (

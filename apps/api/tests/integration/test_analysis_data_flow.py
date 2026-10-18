@@ -12,16 +12,18 @@ from store import SqlStore
 from test_knowledge_flow import add_source
 from test_knowledge_flow import environment as environment
 
-from tender.api import knowledge
-from tender.api.errors import install_error_handlers
-from tender.application.analysis_data import (
+from tender.api.analysis import routes as analysis_api
+from tender.api.knowledge import routes as knowledge
+from tender.api.shared.errors import install_error_handlers
+from tender.application.analysis import service as analysis
+from tender.application.analysis.data import (
     BusinessRecord,
     display_items,
     module_data,
     prepare_records,
 )
-from tender.application.analysis_data_store import publish_data_snapshot
-from tender.application.knowledge import encode
+from tender.application.analysis.data_store import publish_data_snapshot
+from tender.application.knowledge.content import encode
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TENDER_RUN_DB_TESTS") != "1", reason="需要数据库集成验证"
@@ -37,8 +39,8 @@ def basis(environment):
         "本项目分为A标段、B标段。所有标段须提供营业执照。"
         "A标段质保三年。B标段质保五年。补遗：A标段质保四年。"
     ))
-    knowledge.save_settings(pid, knowledge.AnalysisSettings(category="goods"), request)
-    created = knowledge.start_analysis(pid, knowledge.AnalysisInput(), request)
+    analysis_api.save_settings(pid, analysis_api.AnalysisSettings(category="goods"), request)
+    created = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     store = knowledge.store(request)
     # 夹具与终态断言要写测试 schema：直连同一批临时表，但展示与发布仍走仓储。
     db = SqlStore(store.engine, store.company_id)
@@ -77,6 +79,7 @@ def basis(environment):
     app = FastAPI()
     app.state.components = request.app.state.components
     app.include_router(knowledge.router)
+    app.include_router(analysis_api.router)
     install_error_handlers(app)
     with TestClient(app) as client:
         yield SimpleNamespace(
@@ -217,7 +220,9 @@ def test_new_revision_preserves_history_and_rejects_old_or_foreign_snapshot(basi
         "lot_id": first["data"]["lots"][0]["lot_id"],
     })
     assert response.status_code == 409 and response.json()["error"]["code"] == "data_stale"
-    other = knowledge.start_analysis(basis.project_id, knowledge.AnalysisInput(), basis.request)
+    other = analysis_api.start_analysis(
+        basis.project_id, analysis_api.AnalysisInput(), basis.request
+    )
     foreign = basis.client.get(
         f"/api/v1/analysis/reports/{other['id']}/data?snapshot_id={first['id']}",
     )
@@ -235,7 +240,7 @@ def test_running_and_changed_report_cannot_supply_context(basis):
     assert response.status_code == 409 and response.json()["error"]["code"] == "report_running"
     basis.db.execute("UPDATE analysis_report SET status='completed' WHERE id=:id",
                      {"id": basis.report_id})
-    knowledge.save_settings(basis.project_id, knowledge.AnalysisSettings(category="service"),
+    analysis_api.save_settings(basis.project_id, analysis_api.AnalysisSettings(category="service"),
                             basis.request)
     response = basis.client.post(basis.path + "/context", json=request)
     assert response.status_code == 409 and response.json()["error"]["code"] == "data_stale"
@@ -316,7 +321,7 @@ def test_cancel_orphaned_retry_publishes_new_snapshot_without_reusing_old_data(b
 
 def test_known_project_lots_missing_from_analysis_require_explicit_selection(basis):
     publish_data_snapshot(basis.db, basis.report_id)
-    known = knowledge.analysis_status(basis.project_id, basis.request)["lots"]
+    known = analysis_api.analysis_status(basis.project_id, basis.request)["lots"]
     basis.db.execute("UPDATE analysis_report SET lot_settings=CAST(:lots AS JSONB) WHERE id=:id",
                      {"lots": encode(known), "id": basis.report_id})
     business = copy.deepcopy(basis.business)
@@ -391,7 +396,7 @@ def test_content_references_and_revocation_during_retrieval(basis, monkeypatch):
                              {"id": basis.source["project_file_id"]})
         return [reference], {}
 
-    monkeypatch.setattr(knowledge, "retrieve_chunks", retrieve)
+    monkeypatch.setattr(analysis, "retrieve_chunks", retrieve)
     request = {"snapshot_id": snapshot["id"], "purpose": "content",
                "lot_id": snapshot["data"]["lots"][0]["lot_id"],
                "requirement_ids": [requirement["id"]]}

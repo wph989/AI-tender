@@ -206,6 +206,22 @@ def resolve_values(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
     return resolved
 
 
+def document_execution_snapshot(values: Mapping[str, Any] | None) -> dict[str, Any]:
+    """冻结任务执行预算；派发并发和间隔仍由调度器读取实时配置。"""
+    resolved = resolve_values(values)
+    return {
+        key: resolved[key]
+        for key in (
+            "job.poll.initial_interval_ms",
+            "job.poll.max_interval_ms",
+            "job.poll.max_attempts",
+            "job.timeout.convert_minutes",
+            "job.timeout.parse_minutes",
+            "job.retry.convert_500",
+        )
+    }
+
+
 def validate_value(key: str, value: Any) -> str | None:
     """返回错误说明；None 表示合法。页面与 API 共用同一份类型口径。"""
     entry = item(key)

@@ -6,9 +6,9 @@ from decimal import Decimal
 
 import pytest
 
-from tender.domain.bbox import Bbox
-from tender.domain.errors import InvalidRotationError
-from tender.domain.page import PageGeometry
+from tender.domain.documents.bbox import Bbox
+from tender.domain.documents.page import PageGeometry
+from tender.domain.shared.errors import InvalidRotationError
 
 
 def _page(rotation: int) -> PageGeometry:

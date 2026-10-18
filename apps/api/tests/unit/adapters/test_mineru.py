@@ -18,8 +18,8 @@ from collections.abc import Awaitable, Callable
 import httpx
 import pytest
 
-from tender.adapters.mineru import MinerUParser
-from tender.domain.errors import ParseFailed
+from tender.adapters.documents.mineru import MinerUParser
+from tender.domain.shared.errors import ParseFailed
 
 BASE_URL = "http://mineru.test"
 UPLOAD_ID = "upload_6f180b7b7c4973962e1d3eb0"
