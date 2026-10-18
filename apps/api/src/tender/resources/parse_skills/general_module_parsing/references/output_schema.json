@@ -1,0 +1,21 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "补充发现",
+      "layout": "table",
+      "columns": [
+        "事项",
+        "分析结论"
+      ]
+    },
+    {
+      "title": "跨文件关联",
+      "layout": "table",
+      "columns": [
+        "事项",
+        "分析结论"
+      ]
+    }
+  ]
+}

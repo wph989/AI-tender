@@ -1,0 +1,53 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "类似项目业绩要求",
+      "layout": "table",
+      "columns": [
+        "业绩要求",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "业绩时间范围要求",
+      "layout": "table",
+      "columns": [
+        "时间要求",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "业绩金额要求",
+      "layout": "table",
+      "columns": [
+        "金额要求",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "证明材料要求",
+      "layout": "table",
+      "columns": [
+        "材料要求",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "业绩评分标准",
+      "layout": "table",
+      "columns": [
+        "评分标准",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "特定行业业绩要求",
+      "layout": "table",
+      "columns": [
+        "行业要求",
+        "具体描述"
+      ]
+    }
+  ]
+}

@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from hashlib import sha256
 
 from tender.application.analysis.data import semantic_payload
+from tender.application.analysis.output import output_schema
 from tender.application.knowledge.content import CATEGORIES, fingerprint, normalized
 
 
@@ -20,6 +21,10 @@ def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = (
     digest = sha256(json.dumps(resources, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     # 核心细则在首次推理前加载，避免模型仅凭通用协议分析；示例仍按需读取。
     ref_dir = key + "/references/"
+    native_format = ref_dir + "output_schema.json" in resources
+    if native_format:
+        # 原生声明也标识已适配的资源包；先校验，不能带着损坏格式进入模型推理。
+        output_schema(snapshot, key)
     output_path = ref_dir + "output_format.md"
     instructions = content
     references = [output_path] if output_path in resources else []
@@ -32,9 +37,9 @@ def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = (
     references.extend(
         ref_dir + category + "/extraction_rules.md"
         for category in dict.fromkeys(categories)
-        # 技术 Skill 只引用方案模板；旧参数参考不能覆盖其明确排除纯参数的边界。
+        # 新包的技术细则已围绕方案重写；旧快照仍跳过冲突参数细则，保留历史语义。
         if category in CATEGORIES
-        and key != "tech_requirement_parsing"
+        and (key != "tech_requirement_parsing" or native_format)
         and ref_dir + category + "/extraction_rules.md" in resources
     )
     for reference in references:

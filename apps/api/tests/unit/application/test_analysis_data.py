@@ -116,6 +116,89 @@ def test_same_key_corrections_keep_identity_and_conditions_are_kept_for_review()
     assert second["business"]["conditions"]["terms"][0]["time_basis"] is None
 
 
+def test_support_review_omits_unspecified_attributes_but_keeps_actual_claims():
+    from tender.application.analysis.skills import verify_items
+    from tender.ports.llm.chat import Completion
+
+    async def run():
+        records = [record("plain"), record("detailed", conditions={
+            "expression": "两项均须满足", "logic": "all", "terms": [
+                {"subject": "期限", "operator": ">=", "value": "3", "unit": "年"}],
+            "exceptions": ["例外条件"],
+        }, materials=[{"name": "证明", "requirement": "提交原件"}], scoring={
+            "max_points": "0", "tiers": [{"condition": "未提供", "points": "0"}],
+            "deductions": ["每缺一项扣分"],
+        })]
+        items = prepare_records(records, {}, {"s1r1c0": block()}, KEY)
+        before = copy.deepcopy(items)
+        sent = []
+
+        class Reviewer:
+            async def complete(self, prompt):
+                # 检查真正送给模型的数据，不能只验证一个未被调用的辅助函数。
+                sent.extend(json.loads(prompt.rsplit("\n", 1)[1]))
+                return Completion(content=json.dumps({"reviews": [
+                    {"supported": True, "unsupported_claims": []} for _ in items
+                ]}), model="fixture")
+
+        await verify_items(Reviewer(), items, explain=True)
+        plain, detailed = [row["business"] for row in sent]
+        assert not {"conditions", "materials", "scoring", "parent_key", "predicate"} & plain.keys()
+        assert plain["scope"] == COMMON
+        for key in ("scope", "conditions", "materials", "scoring"):
+            assert detailed[key] == before[1]["business"][key]
+        # 送审表示不改变持久记录或纠错身份，空字段继续保留原有存储结构。
+        assert [item["business"] for item in items] == [item["business"] for item in before]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("quote_catalog,select_catalog,scope,expected", [
+    (False, False, {"kind": "lots", "lot_refs": ["Ａ标段", "B标段"]}, "unsupported"),
+    (True, False, {"kind": "lots", "lot_refs": ["Ａ标段", "B标段"]}, "unsupported"),
+    (True, True, {"kind": "lots", "lot_refs": ["Ａ标段", "B标段"]}, "supported"),
+    (False, False, COMMON, "supported"),
+])
+def test_scope_identifiers_must_remain_in_selected_quotes(
+    quote_catalog, select_catalog, scope, expected,
+):
+    from tender.application.analysis.skills import verify_items
+    from tender.ports.llm.chat import Completion
+
+    async def run():
+        requirement = block() | {"content": "各标段质保三年。"}
+        catalog = block() | {"block_id": "catalog", "offset": 1, "element_id": 2,
+                             "content": "本项目包括 A 标段和 B 标段。"}
+        refs = [{"block_id": requirement["block_id"], "quote": requirement["content"]}]
+        if quote_catalog:
+            refs.append({"block_id": "catalog", "quote": catalog["content"]})
+        row = BusinessRecord.model_validate(
+            record(text=requirement["content"], scope=scope).model_dump() | {"citations": refs}
+        )
+        seen = {r["block_id"]: r for r in (requirement, catalog)}
+        items = prepare_records([row], {}, seen, KEY)
+        selected = [requirement["block_id"]] + (["catalog"] if select_catalog else [])
+
+        class PermissiveReviewer:
+            async def complete(self, prompt):
+                # 模拟真实模型误放行；上下文含名单也不能替代最终记录自己的引文。
+                return Completion(content=json.dumps({"reviews": [{
+                    "supported": True, "unsupported_claims": [],
+                    "unresolved_references": [], "evidence_ids": [selected],
+                }]}), model="fixture")
+
+        await verify_items(PermissiveReviewer(), items, explain=True,
+                           evidence=seen, select_evidence=True)
+        assert items[0]["verification"] == expected
+        if expected == "unsupported":
+            assert "lot_refs" in " ".join(items[0]["verification_claim_issues"])
+        else:
+            assert not items[0]["verification_claim_issues"]
+            assert [r["block_id"] for r in items[0]["values"][0]["citations"]] == selected
+
+    asyncio.run(run())
+
+
 def test_deep_format_tree_is_preserved_and_cycles_are_rejected():
     records = [record(str(n), text=f"材料{n}", kind="format_node", node_type="section",
                       parent_key=str(n-1) if n else None) for n in range(5)]

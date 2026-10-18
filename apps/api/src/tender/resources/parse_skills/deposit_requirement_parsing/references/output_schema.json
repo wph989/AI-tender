@@ -1,0 +1,21 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "投标保证金",
+      "layout": "table",
+      "columns": [
+        "项目",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "履约保证金",
+      "layout": "table",
+      "columns": [
+        "项目",
+        "具体要求"
+      ]
+    }
+  ]
+}

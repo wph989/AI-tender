@@ -1,0 +1,37 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "甲方信息",
+      "layout": "table",
+      "columns": [
+        "字段",
+        "内容"
+      ]
+    },
+    {
+      "title": "代理信息",
+      "layout": "table",
+      "columns": [
+        "字段",
+        "内容"
+      ]
+    },
+    {
+      "title": "项目基本信息",
+      "layout": "table",
+      "columns": [
+        "字段",
+        "内容"
+      ]
+    },
+    {
+      "title": "分标信息",
+      "layout": "table",
+      "columns": [
+        "字段",
+        "内容"
+      ]
+    }
+  ]
+}

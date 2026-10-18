@@ -136,6 +136,35 @@ def test_early_submission_is_rejected_then_full_research_can_finish():
     assert "综合输出" in str(router.requests[-1][0])
 
 
+def test_synthesis_carries_recorded_findings_outside_compressible_history():
+    async def run():
+        findings = "独立事项甲和乙均须分别保留，附件中的例外仍待核对"
+        trace = {
+            "topic": "warranty", "from_block_id": "s1r1c0", "target": "质保附件",
+            "status": "missing", "detail": "授权资料没有提供附件正文", "evidence_ids": [],
+        }
+        state, _, router = await execute([
+            *research_calls(topics=[topic(detail=findings)], references=[trace]),
+            call("submit_analysis", submission([summary_record()], final=False), "save"),
+            call("submit_analysis", submission(), "finish"),
+        ], snapshot=SKILL | {KEY + "/references/coverage.json": '[{"key":"warranty"}]'})
+        # 历史工具消息会被摘要替换；每轮系统上下文仍须提供已登记事项和具体缺口。
+        for messages, _ in router.requests[-2:]:
+            system = "\n".join(str(m["data"]["content"]) for m in messages
+                               if m["type"] == "system")
+            assert findings in system
+            assert "质保附件" in system and "s1r1c0" in system
+            assert "研究已登记" in system
+            assert "按当前 Skill 的全部主题完成检索与转引追踪后" not in system
+            assert '"project_searches"' not in system
+        handoff = json.loads(state["tool_results"]["call_research"]["data"]["content"])
+        assert any(g["code"] == "unresolved_reference" for g in handoff["gaps"])
+        assert any(g["code"] == "unresolved_reference"
+                   for g in state["draft"]["business_data"]["gaps"])
+
+    asyncio.run(run())
+
+
 def topic(status="covered", **kwargs):
     return {
         "topic": "warranty",
@@ -332,17 +361,81 @@ def test_new_evidence_invalidates_old_batches_and_requires_a_new_synthesis(tool)
                 call(tool, new_args, "new"),
                 call("submit_analysis", submission([combined]), "early"),
                 call("complete_research", research_done(), "again"),
+                call(tool, new_args, "repeat"),
                 call("submit_analysis", submission([combined]), "finish"),
             ],
             research=research,
         )
         after = next(s for s in saved if "call_new" in s.get("tool_results", {}))
         assert not after.get("staged_items") and "research_completed" not in after
+        feedback = json.loads(after["tool_results"]["call_new"]["data"]["content"])
+        assert feedback["phase"] == "research"
+        assert "complete_research" in feedback["next_action"]
         assert "complete_research" in state["tool_results"]["call_early"]["data"]["content"]
+        repeated = json.loads(state["tool_results"]["call_repeat"]["data"]["content"])
+        assert "phase" not in repeated and "next_action" not in repeated
         records = state["draft"]["business_data"]["records"]
         assert len(records) == 1 and records[0]["content"] == combined["content"]
         assert "citations" not in records[0] and len(records[0]["evidence_ids"]) == 2
         assert len(state["draft"]["business_data"]["evidence"]) == 2
+
+    asyncio.run(run())
+
+
+def test_exact_quote_reread_keeps_verified_records_and_synthesis_phase():
+    async def run():
+        original = block()
+        neighbour = block() | {"block_id": "next", "element_id": 2, "offset": 1,
+                               "content": "验收后的服务范围另见附件。"}
+        research = session([original, neighbour])
+
+        async def retrieve(sources, query):
+            return [original], {}
+
+        research.retrieve = retrieve
+        state, saved, _ = await execute([
+            *research_calls(),
+            call("submit_analysis", submission([summary_record()], final=False), "save"),
+            call("read_document", {"block_id": original["block_id"], "before": 0,
+                                   "after": 0}, "quote"),
+            call("submit_analysis", submission([]), "finish"),
+        ], research=research)
+        after = next(s for s in saved if "call_quote" in s.get("tool_results", {}))
+        assert after["research_completed"] and len(after["staged_items"]) == 1
+        feedback = json.loads(after["tool_results"]["call_quote"]["data"]["content"])
+        assert [row["id"] for row in feedback["blocks"]] == [original["block_id"]]
+        assert "phase" not in feedback
+        assert set(research.seen) == {original["block_id"]}
+        assert len(state["draft"]["business_data"]["records"]) == 1
+
+    asyncio.run(run())
+
+
+def test_one_model_turn_can_stage_independent_records_without_losing_individual_saves():
+    async def run():
+        quotes = ["质保三年", "交付30日", "包含培训"]
+        records = [summary_record(
+            key=f"requirement-{index}", title=quote, text=quote, quote=quote,
+            content={"字段": quote, "内容": quote},
+        ) for index, quote in enumerate(quotes)]
+        calls = [call("submit_analysis", submission([entry], final=False), index)
+                 for index, entry in enumerate(records)]
+        grouped = AIMessage(content="", tool_calls=calls)
+        reviewed = []
+
+        async def review(items):
+            reviewed.append([item["business"]["key"] for item in items])
+            await accept(items)
+
+        state, saved, router = await execute([
+            *research_calls(), grouped, call("submit_analysis", submission(), "finish"),
+        ], research=session([block() | {"content": "；".join(quotes)}]), review=review)
+        assert reviewed == [[entry["key"] for entry in records]]
+        assert len(router.requests) == 5  # 清单、检索、研究登记、三次单条工具调用、显式收尾。
+        assert {1, 2, 3} <= {len(s.get("staged_items", [])) for s in saved}
+        published = state["draft"]["business_data"]["records"]
+        assert [entry["key"] for entry in published] == [entry["key"] for entry in records]
+        assert all(len(entry["evidence_ids"]) == 1 for entry in published)
 
     asyncio.run(run())
 
@@ -528,7 +621,13 @@ def test_checkpoint_replay_keeps_research_phase_and_does_not_repeat_retrieval():
     asyncio.run(run())
 
 
-def test_compaction_keeps_original_evidence_and_synthesis_phase():
+def test_compaction_keeps_evidence_and_phase_with_project_prompt(monkeypatch):
+    from tender.application.analysis import agent
+
+    # 用不同指令验证真实图读取了项目摘要模板，避免只断言默认提示词的文字。
+    monkeypatch.setattr(agent, "ANALYSIS_SUMMARY_PROMPT", "摘要契约探针\n{messages}")
+    summary_requests = []
+
     class CompactRouter(ScriptedRouter):
         async def chat(self, messages, tools):
             if not tools:
@@ -536,11 +635,13 @@ def test_compaction_keeps_original_evidence_and_synthesis_phase():
 
                 from tender.ports.llm.chat import Completion
 
+                summary_requests.append(messages)
                 return Completion(
                     content="摘要",
                     model="fixture",
                     agent_message=message_to_dict(
-                        AIMessage(content="已检索质保，等待综合输出"),
+                        # 被压缩的是较早片段，摘要落后于当前阶段时也不能清掉已登记研究。
+                        AIMessage(content="历史片段只有检索，尚未看到研究登记"),
                     ),
                 )
             return await super().chat(messages, tools)
@@ -561,5 +662,9 @@ def test_compaction_keeps_original_evidence_and_synthesis_phase():
         await invoke_module(graph, files, thread_id="compact", task="分析" + "历史说明。" * 1000)
         assert research.seen["s1r1c0"]["content"].endswith("其他条款。" * 500)
         assert state["research_completed"] and state["draft"]
+        assert summary_requests
+        assert all("摘要契约探针" in str(messages) and "{messages}" not in str(messages)
+                   for messages in summary_requests)
+        assert state["draft"]["fields"][0]["values"][0]["citations"][0]["quote"] == "质保三年"
 
     asyncio.run(run())

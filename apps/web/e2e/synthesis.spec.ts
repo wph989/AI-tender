@@ -219,7 +219,24 @@ test("评分专题使用 Skill 的列名并保留各评分档次", async ({ page
   await expect(table.getByRole("listitem")).toHaveCount(2);
   await expect(table).toContainText("最高6分；须提供合同及验收证明。");
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  await table.scrollIntoViewIfNeeded();
   await page.screenshot({ path: info.outputPath("synthesis-scoring.png"), fullPage: true });
+});
+
+test("共享原文的评分事项往返定位仍回到评分，页码入口可见", async ({ page }) => {
+  await page.getByRole("tab", { name: /评分办法/ }).click();
+  const row = page.locator('[data-report-item="score"]');
+  const locate = row.getByRole("button", { name: /^定位：/ });
+  await expect(locate).toContainText("第 1 页");
+  await locate.click();
+  const viewer = page.getByRole("region", { name: "引用原文", exact: true });
+  await expect(viewer).toBeVisible();
+  const badge = viewer.locator("[data-annotation-badge]").first();
+  await expect(badge).toBeVisible();
+  await badge.click();
+  await expect(page.getByRole("tab", { name: /评分办法/ })).toHaveAttribute("aria-selected", "true");
+  await expect(row).toBeVisible();
+  await expect(row).toHaveClass(/report-item-active/);
 });
 
 test("格式专题保留三层材料结构，项目提供文档预览入口", async ({ page }, info) => {

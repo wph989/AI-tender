@@ -82,7 +82,7 @@ export function CitationViewer({ selected, citations, onReverse }: Props) {
   }, [pdf, pages, citation, locate, refs]);
 
   return <section className="citation-viewer" aria-label={citation ? "引用原文" : "文档预览"}>
-    <div className="citation-heading"><strong className="truncate">{selected.file_name}</strong><span>第 {citation?.page_no ?? currentPage} 页</span></div>
+    <div className="citation-heading"><strong className="truncate">{selected.file_name}</strong><span>第 {currentPage} 页</span></div>
     <Toolbar pageCount={pages.length} />
     {(error || notice) && <p role="status" className="notice m-2">{error ?? notice}</p>}
     <div className="min-h-0 flex-1">{pdf && pages.length ? <DocumentViewer pdf={pdf} pages={pages} index={index} registry={registry} onError={setError}

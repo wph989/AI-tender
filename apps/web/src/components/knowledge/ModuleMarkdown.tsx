@@ -20,7 +20,7 @@ export function ModuleMarkdown({
   activeId,
 }: {
   items: AnalysisField[];
-  onLocate: (ref: Citation) => void;
+  onLocate: (ref: Citation, itemId?: string) => void;
   activeId?: string;
 }) {
   const groups = useMemo(() => groupFields(items), [items]);
@@ -90,7 +90,7 @@ export function ModuleMarkdown({
                             value.value,
                             <ValueLocates
                               refs={valueCitations(value)}
-                              onLocate={onLocate}
+                              onLocate={(ref) => onLocate(ref, item.id)}
                             />,
                           )}
                         </li>
@@ -127,7 +127,7 @@ function StructuredModule({
   items, onLocate, activeId,
 }: {
   items: AnalysisField[];
-  onLocate: (ref: Citation) => void;
+  onLocate: (ref: Citation, itemId?: string) => void;
   activeId?: string;
 }) {
   const groups = groupFields(items.filter((item) => item.output?.layout !== "tree"));
@@ -148,7 +148,7 @@ function StructuredModule({
           <li key={i}>{renderMarkdown(line.replace(/<br\s*\/?>/gi, "\n"))}</li>)}</ol>
       : value ? renderMarkdown(value.replace(/<br\s*\/?>/gi, "\n\n")) : "—";
   const tree = (parent: string | null): ReactNode => (
-    <ul className="space-y-3 border-l border-slate-200 pl-4">
+    <ul className="module-outline">
       {nodes.filter((item) => {
         const key = item.output!.parent_key;
         // 来源撤销后父节点可能不可见，子节点仍可读时作为独立节点展示。
@@ -156,7 +156,7 @@ function StructuredModule({
       }).map((item) => (
         <li key={item.id} {...identity(item)}>
           <strong>{renderInline(item.field)}</strong>
-          <ValueLocates refs={refs(item)} onLocate={onLocate} />
+          <ValueLocates refs={refs(item)} onLocate={(ref) => onLocate(ref, item.id)} />
           <div className="module-markdown-body mt-2">{content(item.output!.content["编制要求"])}</div>
           {nodes.some((child) => child.output!.parent_key === item.output!.key)
             && tree(item.output!.key)}
@@ -180,10 +180,10 @@ function StructuredModule({
                   <tbody>{rows.map((item) => (
                     <tr key={item.id} {...identity(item)}>
                       {output.columns.map((column, index) => (
-                        <td key={column} className="module-markdown-body">
+                        <td key={column} data-label={column} className="module-markdown-body">
                           {content(item.output?.content[column])}
                           {index === output.columns.length - 1 && <>
-                            <ValueLocates refs={refs(item)} onLocate={onLocate} />
+                            <ValueLocates refs={refs(item)} onLocate={(ref) => onLocate(ref, item.id)} />
                             {!!item.note && <p className="field-note">{item.note}</p>}
                           </>}
                         </td>
@@ -193,7 +193,7 @@ function StructuredModule({
                 </table>
               </div>
             ) : (
-              <ol className="space-y-5">
+              <ol className="module-result-list">
                 {rows.map((item, index) => (
                   <li key={item.id} {...identity(item)}>
                     <h5 className="mb-2 font-semibold">{index + 1}. {renderInline(item.field)}</h5>
@@ -203,7 +203,7 @@ function StructuredModule({
                         {content(item.output!.content[key])}
                       </div>
                     )) : <p>{item.note || "来源已不可用，请更新分析。"}</p>}
-                    <ValueLocates refs={refs(item)} onLocate={onLocate} />
+                    <ValueLocates refs={refs(item)} onLocate={(ref) => onLocate(ref, item.id)} />
                     {!!item.note && item.output && <p className="field-note">{item.note}</p>}
                   </li>
                 ))}
@@ -238,7 +238,7 @@ function ValueLocates({
 }) {
   if (!refs.length) return null;
   return (
-    <span className="value-locates">
+    <span className="value-locates" role="group" aria-label="原文依据">
       {refs.map((ref, index) => (
         <button
           type="button"
@@ -248,6 +248,7 @@ function ValueLocates({
           onClick={() => onLocate(ref)}
         >
           <Icon name="target" size={13} />
+          <span>{refs.length > 1 ? `${index + 1} · ` : ""}{ref.page_no ? `第 ${ref.page_no} 页` : "查看原文"}</span>
         </button>
       ))}
     </span>
@@ -261,7 +262,7 @@ function valueCitations(value: FieldValue): Citation[] {
   const seen = new Set<string>();
   const result: Citation[] = [];
   for (const ref of value.citations ?? []) {
-    const key = [ref.source_id, ref.element_id, ref.page_no, ref.quote].join(
+    const key = [ref.source_id, ref.version_id, ref.parse_run_id, ref.element_id, ref.page_no, ref.quote].join(
       "\u0000",
     );
     if (seen.has(key)) continue;

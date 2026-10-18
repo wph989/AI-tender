@@ -3,17 +3,56 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tender.application.knowledge.content import normalized
 
 OUTPUT_VERSION = "1"
 
 
+class _OutputSection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    title: Annotated[str, Field(pattern=r"\S")]
+    layout: Literal["table", "list", "tree"]
+    columns: list[Annotated[str, Field(pattern=r"\S")]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_columns(self):
+        if len(set(self.columns)) != len(self.columns):
+            raise ValueError("输出列名不能重复")
+        return self
+
+
+class _OutputSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: Literal["1"]
+    sections: list[_OutputSection] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_sections(self):
+        if len({section.title for section in self.sections}) != len(self.sections):
+            raise ValueError("输出分类不能重复")
+        return self
+
+
 def output_schema(snapshot: dict, module_key: str) -> dict:
-    """表格列直接来自冻结的 Skill，避免前后端各维护一套专题模板。"""
+    """从冻结声明读取格式；仅无声明的历史快照沿用原 Markdown 解释方式。"""
+    path = module_key + "/references/output_schema.json"
+    if path in snapshot:
+        try:
+            return _OutputSchema.model_validate_json(snapshot[path]).model_dump()
+        except ValueError as exc:
+            # 已声明却损坏是资源错误，回退会使模型规则与实际展示悄悄分叉。
+            raise ValueError("模块 Skill JSON 输出声明无效：" + module_key) from exc
+    return _legacy_output_schema(snapshot, module_key)
+
+
+def _legacy_output_schema(snapshot: dict, module_key: str) -> dict:
+    """旧报告继续解释自己的模板，不能从当前资源补入新规则。"""
     if module_key == "bid_format_outline_parsing":
         return {"version": OUTPUT_VERSION, "sections": [
             {"title": "*", "layout": "tree", "columns": ["编制要求"]},
@@ -96,7 +135,9 @@ class ResearchTopic(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     topic: str = Field(min_length=1)
-    status: Literal["covered", "searched_not_found", "unresolved"]
+    status: Literal["covered", "searched_not_found", "unresolved"] = Field(
+        description="covered表示本主题已核对；仍有未读条件或缺失转引目标时用unresolved",
+    )
     queries: list[str] = Field(
         default_factory=list,
         description="可选的检索意图说明；真实检索词由服务端记录，无需逐字复述",
@@ -111,8 +152,12 @@ class ReferenceTrace(BaseModel):
     topic: str = Field(min_length=1)
     from_block_id: str = Field(min_length=1)
     target: str = Field(min_length=1)
-    status: Literal["resolved", "missing", "cycle", "budget_exhausted"]
-    evidence_ids: list[str] = Field(default_factory=list)
+    status: Literal["resolved", "missing", "cycle", "budget_exhausted"] = Field(
+        description="resolved表示已读到目标实质条款；只找到索引或目标仍缺失不能标记resolved",
+    )
+    evidence_ids: list[str] = Field(
+        default_factory=list, description="目标实质条款的已读ID，不用转引起点或另一处索引替代",
+    )
     detail: str = ""
 
 

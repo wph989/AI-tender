@@ -1,0 +1,13 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "*",
+      "layout": "table",
+      "columns": [
+        "字段",
+        "内容"
+      ]
+    }
+  ]
+}

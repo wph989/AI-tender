@@ -1,0 +1,12 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "*",
+      "layout": "tree",
+      "columns": [
+        "编制要求"
+      ]
+    }
+  ]
+}

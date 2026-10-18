@@ -12,6 +12,7 @@ import {
   knowledgeRequest, loadReportRecords, resolveCitation, supportsModuleRecords,
 } from "@/lib/api/knowledge";
 import { loadProject } from "@/lib/api/client";
+import { findCitationResult } from "@/lib/analysis/citations";
 import type {
   AnalysisReport,
   AnalysisStatus,
@@ -156,7 +157,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     ],
     [report, answerRefs],
   );
-  const locate = useCallback(async (ref: Citation) => {
+  const locate = useCallback(async (ref: Citation, itemId?: string) => {
     locateAbort.current?.abort();
     const controller = new AbortController();
     locateAbort.current = controller;
@@ -164,6 +165,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       const resolved = await resolveCitation(ref, controller.signal);
       if (!controller.signal.aborted) {
         setSelected(resolved);
+        setActiveItem(itemId);
         setMobileDocument(true);
       }
     } catch (e) {
@@ -701,7 +703,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                           id: "summary-" + item.id,
                         }))}
                         activeId={activeItem}
-                        onLocate={(ref) => void locate(ref)}
+                        onLocate={(ref, itemId) => void locate(ref, itemId)}
                       />
                     </details>
                   )}
@@ -859,7 +861,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                                       <ModuleMarkdown
                                         items={current.items}
                                         activeId={activeItem}
-                                        onLocate={(ref) => void locate(ref)}
+                                        onLocate={(ref, itemId) => void locate(ref, itemId)}
                                       />
                                     </>
                                   ) : (
@@ -899,19 +901,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                 selected={preview}
                 citations={selected && !refs.includes(selected) ? [...refs, selected] : refs}
                 onReverse={(ref) => {
-                  const item = report?.modules
-                    .flatMap((m) =>
-                      m.items.map((i) => ({ module: m, item: i })),
-                    )
-                    .find(({ item }) =>
-                      item.values.some((value) =>
-                        value.citations.some(
-                          (r) =>
-                            r.source_id === ref.source_id &&
-                            r.element_id === ref.element_id,
-                        ),
-                      ),
-                    );
+                  const item = findCitationResult(report?.modules ?? [], ref, activeItem, activeModuleId);
                   if (item) {
                     setTab("report");
                     setActiveModuleId(item.module.id);

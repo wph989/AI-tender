@@ -88,6 +88,28 @@ def test_unread_or_fabricated_quotes_are_rejected():
         validate_items([bad], {row["block_id"]: row})
 
 
+def test_all_rewritten_citations_in_one_value_are_reported_together():
+    first = block(1, "报价包含税费。")
+    second = block(2, "专利使用费已包含在投标报价中。")
+    record = item(first)
+    record["values"][0]["citations"] = [
+        {"block_id": first["block_id"], "quote": "报价已含税"},
+        {"block_id": second["block_id"], "quote": "知识产权费已含"},
+    ]
+    seen = {row["block_id"]: row for row in (first, second)}
+    with pytest.raises(ValueError) as error:
+        validate_items([record], seen, align=False)
+    # 逐个纠正第一处错误会耗尽同一事项的预算，反馈必须同时指出两处改写。
+    assert first["block_id"] in str(error.value)
+    assert second["block_id"] in str(error.value)
+    assert "逐字" in str(error.value)
+    record["values"][0]["citations"] = [
+        {"block_id": row["block_id"], "quote": row["content"]} for row in (first, second)
+    ]
+    accepted = validate_items([record], seen, align=False)
+    assert len(accepted[0]["values"][0]["citations"]) == 2
+
+
 def test_citation_is_realigned_to_the_value_it_supports():
     """定位必须是值本身出现的原文：同一块里的其它事实不能冒充依据。"""
     row = block(

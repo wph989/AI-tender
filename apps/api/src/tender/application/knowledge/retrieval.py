@@ -68,7 +68,8 @@ async def retrieve_chunks(
     # 专题先过滤后保留足够候选供重排；不能被旧的16块截断限制可配置的返回数量。
     ranked = rank_chunks(
         rows, question, vector,
-        limit=max(30, max_results) if max_results is not None else 16,
+        # 多保留一个达标候选才能区分“恰好返回 N 条”和“还有结果被截断”。
+        limit=max(30, max_results + 1) if max_results is not None else 16,
         min_similarity=min_similarity,
     )
     reranked = False
@@ -89,6 +90,7 @@ async def retrieve_chunks(
         finally:
             if client:
                 await client.aclose()
+    search_limited = max_results is not None and len(ranked) > max_results
     if max_results is not None:
         ranked = ranked[:max_results]
     return ranked, {
@@ -99,4 +101,5 @@ async def retrieve_chunks(
         "embedding_configured": config is not None,
         **({"similarity_threshold": min_similarity, "max_results": max_results}
            if min_similarity is not None or max_results is not None else {}),
+        **({"search_limited": search_limited} if max_results is not None else {}),
     }

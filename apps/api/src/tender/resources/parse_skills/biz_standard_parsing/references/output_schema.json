@@ -1,0 +1,77 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "付款条件",
+      "layout": "table",
+      "columns": [
+        "付款要素",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "交付要求",
+      "layout": "table",
+      "columns": [
+        "交付要素",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "验收条款",
+      "layout": "table",
+      "columns": [
+        "验收要素",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "质保与售后服务",
+      "layout": "table",
+      "columns": [
+        "服务要素",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "违约责任",
+      "layout": "table",
+      "columns": [
+        "违约情形",
+        "责任内容"
+      ]
+    },
+    {
+      "title": "保险与担保要求",
+      "layout": "table",
+      "columns": [
+        "担保类型",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "知识产权与保密",
+      "layout": "table",
+      "columns": [
+        "条款类型",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "争议解决",
+      "layout": "table",
+      "columns": [
+        "解决方式",
+        "具体内容"
+      ]
+    },
+    {
+      "title": "合同变更与终止",
+      "layout": "table",
+      "columns": [
+        "条款类型",
+        "具体要求"
+      ]
+    }
+  ]
+}

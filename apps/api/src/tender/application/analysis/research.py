@@ -190,6 +190,7 @@ class ResearchSession:
         rows, info = await self.retrieve(sources, query.strip())
         # 专题使用运行快照里的数量上限；问答沿用原协议，避免串改其它消费入口。
         result_limit = self.limits.max_search_results if self.compact_results else 12
+        search_limited = bool(info.get("search_limited")) or len(rows) > result_limit
         rows, relations = rows[:result_limit], []
         if self.expand:
             # 扩展必须处于同一次检索工具内，让 Agent 真正读到关联原文；范围仍是本次所选资料。
@@ -199,6 +200,7 @@ class ResearchSession:
             raise PermissionError("检索返回了所选范围以外的资料，不能将参考资料混入本项目")
         if self.compact_results:
             # 扩展也不能绕过专题单次输出上限；未返回的关系证据不会登记进证据账。
+            search_limited = search_limited or len(rows) > result_limit
             rows = rows[:result_limit]
         # 查询等待期间可能撤销关联，结果进入模型上下文前再次检查。
         await self.authorize()
@@ -213,6 +215,21 @@ class ResearchSession:
             ]
         if self.expand and not self.compact_results:
             result["relations"] = relations
+        if self.compact_results and search_limited:
+            # 只说明检索窗口未覆盖全部匹配，不把未读原文或检索分数传给模型。
+            # 提示不会替代证据预算警告，也不强制模型把所有相似片段变成业务结果。
+            result.update(
+                search_limited=True,
+                search_hint="本次仍有匹配内容未返回，请按未覆盖子主题或限定 source_id 继续检索；"
+                "重复同一查询不会翻页，不能仅凭当前返回数量认定主题已穷尽。",
+            )
+        elif self.compact_results and not rows and info.get("mode") == "keyword":
+            # 关键词回退按组合词的命中比例过滤；长查询空命中不能证明单个主题没有条款。
+            # 仅对真正空召回提示，已读证据去重后的空 blocks 仍是成功命中。
+            result["search_hint"] = (
+                "本次使用关键词检索且未命中，组合查询中的多个词会共同参与匹配；"
+                "请改用单一核心概念或原文中的短语，按子主题分别检索。未命中不等于原文未约定。"
+            )
         self.events.append(
             {
                 "action": "search_result",
@@ -223,6 +240,7 @@ class ResearchSession:
                     b["id" if self.compact_results else "block_id"] for b in result["blocks"]
                 ],
                 **info,
+                "search_limited": search_limited,
                 "relations": relations,
             }
         )

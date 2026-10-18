@@ -84,7 +84,9 @@ def test_keyword_fallback_uses_hit_ratio_and_filters_before_limit():
     assert rank_chunks([{"content": "alpha"}], "alpha beta gamma", min_similarity=0.6) == []
 
 
-@pytest.mark.parametrize(("count", "maximum", "expected"), [(100, 6, 6), (2, 6, 2), (40, 20, 20)])
+@pytest.mark.parametrize(("count", "maximum", "expected"), [
+    (100, 6, 6), (2, 6, 2), (40, 20, 20), (6, 6, 6), (31, 30, 30), (30, 30, 30),
+])
 def test_many_matches_obey_configurable_limit_without_old_sixteen_block_cap(
     count, maximum, expected,
 ):
@@ -95,6 +97,7 @@ def test_many_matches_obey_configurable_limit_without_old_sixteen_block_cap(
         )
         assert len(hits) == expected and info["max_results"] == maximum
         assert info["similarity_threshold"] == 0.6
+        assert info["search_limited"] is (count > maximum)
 
     asyncio.run(run())
 
@@ -169,7 +172,11 @@ def test_compact_tool_only_delivers_qualified_id_and_text_under_limit():
         assert len(result["blocks"]) == len(research.seen) == 3
         assert all(set(row) == {"id", "text"} for row in result["blocks"])
         assert "retrieval" not in result
-        assert (await research.search("alpha beta gamma", "project"))["blocks"] == []
+        assert result["search_limited"] is True
+        assert "限定 source_id" in result["search_hint"]
+        assert research.events[-1]["search_limited"] is True
+        empty = await research.search("alpha beta gamma", "project")
+        assert empty["blocks"] == [] and "search_limited" not in empty
 
     asyncio.run(run())
 
@@ -183,7 +190,8 @@ def test_compact_expansion_cannot_exceed_limit_or_bypass_scope_check():
             return blocks + rows(8)[2:], []
 
         research.expand = expand
-        assert len((await research.search("投标保证金", "project"))["blocks"]) == 2
+        result = await research.search("投标保证金", "project")
+        assert len(result["blocks"]) == 2 and result["search_limited"] is True
         assert len(research.seen) == 2
 
         async def forbidden(_sources, blocks):
@@ -192,5 +200,38 @@ def test_compact_expansion_cannot_exceed_limit_or_bypass_scope_check():
         research.expand = forbidden
         with pytest.raises(PermissionError):
             await research.search("投标保证金", "project")
+
+    asyncio.run(run())
+
+
+def test_keyword_empty_search_guides_narrower_query_without_weakening_threshold():
+    async def run():
+        blocks = [block() | {"content": "监理报酬清单：详见附件4报价表。"}]
+        research = session(blocks)
+        research.compact_results = True
+
+        async def retrieve(_sources, query):
+            return await retrieve_chunks(
+                Store(blocks), [SOURCE], query, lambda: None, lambda _: Embedding(),
+                min_similarity=0.6, max_results=6,
+            )
+
+        research.retrieve = retrieve
+        # 真实标书验收中，堆叠多个主题会把只包含目标名称的转引块过滤掉。
+        empty = await research.search("报价表 增值税税金 一次性报价", "project")
+        assert empty["blocks"] == [] and research.seen == {}
+        assert "关键词" in empty["search_hint"] and "单一" in empty["search_hint"]
+        assert research.events[-1]["similarity_threshold"] == 0.6
+        found = await research.search("报价表", "project")
+        assert len(found["blocks"]) == 1 and "search_hint" not in found
+        repeated = await research.search("报价表", "project")
+        assert repeated["already_read"] and "search_hint" not in repeated
+
+        async def semantic_empty(_sources, _query):
+            return [], {"mode": "hybrid"}
+
+        research.retrieve = semantic_empty
+        semantic = await research.search("报价表", "project")
+        assert "search_hint" not in semantic
 
     asyncio.run(run())

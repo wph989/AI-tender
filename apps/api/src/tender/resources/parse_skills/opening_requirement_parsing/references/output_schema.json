@@ -1,0 +1,61 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "开标时间",
+      "layout": "table",
+      "columns": [
+        "时间要素",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "开标地点",
+      "layout": "table",
+      "columns": [
+        "地点要素",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "开标方式",
+      "layout": "table",
+      "columns": [
+        "方式类型",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "参与人员要求",
+      "layout": "table",
+      "columns": [
+        "人员类型",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "开标程序",
+      "layout": "table",
+      "columns": [
+        "程序步骤",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "公开程度",
+      "layout": "table",
+      "columns": [
+        "公开要素",
+        "具体要求"
+      ]
+    },
+    {
+      "title": "其他开标相关要求",
+      "layout": "table",
+      "columns": [
+        "要求类型",
+        "具体内容"
+      ]
+    }
+  ]
+}

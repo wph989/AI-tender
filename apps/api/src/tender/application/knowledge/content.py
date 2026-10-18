@@ -415,6 +415,7 @@ def validate_items(
         if not isinstance(values, list) or not values:
             raise ValueError("字段条目缺少解析值列表")
         clean_values = []
+        citation_errors = []
         for value_entry in values:
             if not isinstance(value_entry, dict):
                 raise ValueError("解析值必须是对象")
@@ -437,11 +438,11 @@ def validate_items(
                         align_citation(read_blocks, registered, value) if align else registered
                     )
                 except ValueError as exc:
-                    # 大批提交只报“引文无效”无法知道应补读哪一块，导致模型反复重写无关节点。
-                    raise ValueError(
-                        f"字段“{field[:80]}”引用 {str(ref['block_id'])[:60]} 校验失败：{exc}"
-                    ) from exc
+                    # 同一事项可能有多处改写，一次列全错误块，避免逐个报错耗尽纠正预算。
+                    citation_errors.append(f"引用 {str(ref['block_id'])[:60]} 校验失败：{exc}")
             clean_values.append({"value": value, "citations": refs})
+        if citation_errors:
+            raise ValueError(f"字段“{field[:80]}”：" + "；".join(dict.fromkeys(citation_errors)))
         clean_values = dedupe_values(clean_values)
         note = entry.get("note", "")
         if not isinstance(note, str):

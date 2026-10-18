@@ -1,0 +1,21 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "项目背景",
+      "layout": "list",
+      "columns": [
+        "背景"
+      ]
+    },
+    {
+      "title": "技术方案要求",
+      "layout": "list",
+      "columns": [
+        "章节来源",
+        "要求摘要",
+        "关键要求"
+      ]
+    }
+  ]
+}

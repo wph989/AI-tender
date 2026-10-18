@@ -73,11 +73,12 @@ def test_large_submission_is_rejected_without_losing_saved_result():
     assert len(state["draft"]["business_data"]["records"]) == 2
 
 
-def test_technical_skill_keeps_reference_plan_boundary_before_first_inference():
+def test_technical_skill_loads_adapted_category_rules_before_first_inference():
     loaded = load_module_skill(skill_snapshot(), "tech_requirement_parsing", categories=["goods"])
     assert "只输出两类内容：项目背景、技术方案要求" in loaded["instructions"]
     assert "纯参数清单" in loaded["instructions"]
-    assert not any("/goods/" in path for path in loaded["references"])
+    assert any("/goods/" in path for path in loaded["references"])
+    assert "安装调试、测试验证、迁移与运维方案" in loaded["instructions"]
 
 
 def test_missing_one_evidence_cannot_leave_a_partially_supported_record():

@@ -1,0 +1,45 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "主体资格类",
+      "layout": "table",
+      "columns": [
+        "废标情形",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "投标文件形式类",
+      "layout": "table",
+      "columns": [
+        "废标情形",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "实质性响应类",
+      "layout": "table",
+      "columns": [
+        "废标情形",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "违法违规类",
+      "layout": "table",
+      "columns": [
+        "废标情形",
+        "具体描述"
+      ]
+    },
+    {
+      "title": "其他废标情形",
+      "layout": "table",
+      "columns": [
+        "废标情形",
+        "具体描述"
+      ]
+    }
+  ]
+}

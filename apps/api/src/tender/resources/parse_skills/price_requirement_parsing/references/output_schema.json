@@ -1,0 +1,30 @@
+{
+  "version": "1",
+  "sections": [
+    {
+      "title": "投标限价",
+      "layout": "table",
+      "columns": [
+        "限价类型",
+        "金额或范围（原文）",
+        "超限处理"
+      ]
+    },
+    {
+      "title": "价格构成",
+      "layout": "table",
+      "columns": [
+        "费用项",
+        "计算方式或比例（原文）"
+      ]
+    },
+    {
+      "title": "折扣/下浮",
+      "layout": "table",
+      "columns": [
+        "下浮类型",
+        "范围或要求（原文）"
+      ]
+    }
+  ]
+}

@@ -86,6 +86,38 @@ def test_retriever_cannot_mix_authorized_reference_into_project_scope():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("budget_key", ["model_calls_remaining", "tool_calls_remaining"])
+def test_call_budget_reserves_synthesis_and_keeps_quote_reread_available(budget_key):
+    async def run():
+        state = {}
+        research = session([block()])
+        router = ScriptedRouter([
+            *research_calls(),
+            call("search_document", {"query": "继续扩展"}, "limited"),
+            call("read_document", {"block_id": "s1r1c0", "before": 0, "after": 0}, "quote"),
+            call("submit_analysis", submission([summary_record()]), "finish"),
+        ])
+
+        async def review(items):
+            for item in items:
+                item["verification"] = "supported"
+
+        def status():
+            # 前期允许正常研究；模拟真实账本进入最后四分之一调用预算，时间仍充足。
+            return {"seconds_remaining": 1000, "finish_reserve_seconds": 90,
+                    budget_key: (9 if state.get("research_completed") else 30)}
+
+        graph, files = build(router, research, state, budget_status=status, review_support=review)
+        await invoke_module(graph, files, thread_id="call-budget", task="分析")
+        limited = state["tool_results"]["call_limited"]["data"]
+        assert limited["status"] == "error" and "收尾" in limited["content"]
+        assert state["tool_results"]["call_quote"]["data"]["status"] == "success"
+        assert not any(e.get("query") == "继续扩展" for e in research.events)
+        assert len(state["draft"]["business_data"]["records"]) == 1
+
+    asyncio.run(run())
+
+
 def test_skill_is_loaded_before_first_model_and_survives_checkpoint():
     async def run():
         router = ScriptedRouter(
