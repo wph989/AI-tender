@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from tender.application.analysis.data import semantic_payload
-from tender.application.knowledge.content import fingerprint, match_text, normalized, validate_items
+from tender.application.knowledge.content import (
+    dedupe_citations,
+    fingerprint,
+    match_text,
+    normalized,
+    validate_items,
+)
 from tender.domain.shared.errors import InvalidModelOutput, ModelOutputTruncated
 from tender.ports.llm.chat import StructuredTextModel
 
@@ -318,7 +324,7 @@ def _review_citation(ref: Mapping[str, Any], windows: EvidenceWindows, *, neighb
     return payload
 
 
-def _compact_review_value(value: dict, item: dict, windows: EvidenceWindows, budget: list) -> dict:
+def _review_evidence(value: dict, item: dict, windows: EvidenceWindows, budget: list) -> dict:
     """校验模型也只接收证据ID和文本；定位与来源归属由服务端账本检查。"""
     citations, context = [], {}
     for ref in value.get("citations", []):
@@ -338,7 +344,32 @@ def _compact_review_value(value: dict, item: dict, windows: EvidenceWindows, bud
             if candidate["offset"] in texts:
                 key = str(candidate["block_id"])
                 context[key] = {"id": key, "text": texts[candidate["offset"]]}
-    return {"value": value.get("value"), "citations": citations, "context": list(context.values())}
+    return {"citations": citations, "context": list(context.values())}
+
+
+def _compact_review_values(item: dict, windows: EvidenceWindows, budget: list) -> dict:
+    """候选原文按集合共享；值只指向自己的集合，长清单不重复展开整套引文和上下文。"""
+    indexes: dict[tuple[tuple[str, str], ...], int] = {}
+    representatives: list[dict] = []
+    values = []
+    for value in item["values"]:
+        # 同块的不同摘录也代表不同候选，不能只按块 ID 合并而让值借用其它断言。
+        key = tuple(sorted((str(ref["block_id"]), ref["quote"]) for ref in value["citations"]))
+        if key not in indexes:
+            indexes[key] = len(representatives)
+            representatives.append(value)
+        index = indexes[key]
+        if attribution_claims(item | value):
+            # 任一共享值需要核对章节时保留邻域，不能被先出现的普通值降级成仅同块上下文。
+            representatives[index] = value
+        values.append({"value": value.get("value"), "evidence_set": index} | (
+            {"content_path": value["content_path"]} if value.get("content_path") else {}
+        ))
+    return {
+        "evidence_sets": [_review_evidence(value, item, windows, budget)
+                          for value in representatives],
+        "values": values,
+    }
 
 
 def _validate_evidence_selection(review: dict, item: dict) -> None:
@@ -362,7 +393,8 @@ def _validate_evidence_selection(review: dict, item: dict) -> None:
             if not chosen:
                 raise InvalidModelOutput("通过的解析值必须选择至少一条直接证据")
             # 跨来源证据常代表修订双方或项目与参考的适用关系，不能靠排序删掉其中一方。
-            if {r.get("source_id") for r in refs} != {
+            # 正文单元只从整项候选中挑自己的来源；整项值仍保留跨来源证据，不能把修订双方丢掉。
+            if not value.get("content_path") and {r.get("source_id") for r in refs} != {
                 r.get("source_id") for r in refs if str(r["block_id"]) in chosen
             }:
                 raise InvalidModelOutput("跨来源结论必须保留各方必要引用，再在同一来源内去重")
@@ -393,6 +425,20 @@ def _missing_scope_refs(item: dict, selections: list[list[str]]) -> list[str]:
     # 只忽略排版空白与全半角，不从旁边的context推导或展开未引用的标段名单。
     return [ref for ref in scope.get("lot_refs", [])
             if not any(match_text(ref) in quote for quote in quotes)]
+
+
+def _content_review(item: dict) -> dict:
+    """整项核对范围与关系，正文单元分别选证；同一次请求完成，前端不按文字相似度猜配。"""
+    content = (item.get("output") or {}).get("content", {})
+    refs = dedupe_citations([ref for value in item["values"] for ref in value["citations"]])
+    values = list(item["values"])
+    for column, raw in content.items():
+        for index, text in enumerate(raw if isinstance(raw, list) else [raw]):
+            values.append({
+                "value": f"{column}：{text}", "citations": refs,
+                "content_path": [column, index],
+            })
+    return {**item, "values": values}
 
 
 async def verify_items(
@@ -440,11 +486,15 @@ async def verify_items(
     )
     if select_evidence:
         context_rule = (
-            "citations 是可选择的原文引文（仅id/text）；context 是同资料原文和标题上下文，"
+            "evidence_sets 是本字段的候选证据集合；每个value的evidence_set是从0开始的集合索引。"
+            "共享候选集合不代表共享断言或判定，仍须逐值核对与选证。"
+            "集合内citations 是可选择的原文引文（仅id/text）；context 是同资料原文和标题上下文，"
             "仅帮助核对归属，不能用context补造citations里没有的事实。"
             "上下文列表可能缺块，不得凭列表相邻认定连续、父子归属或修订关系。"
         )
     for batch in batches:
+        # 仅扩展送审视图，避免逐条正文被误当成同一字段的多个冲突值写回公开投影。
+        review_batch = [_content_review(item) for item in batch] if select_evidence else batch
         # 邻近块总量按调用封顶，避免个别长条目把校验提示重新推回超时区间；
         # 批量送审时按条目数放大，单条仍保留原额度，避免多条字段互相挤占章节上下文。
         neighbour_budget = [max(8000, 4000 * len(batch))]
@@ -479,12 +529,16 @@ async def verify_items(
                 '每条review还必须包含"evidence_ids":[["证据ID"],...]，与本字段values一一对应。'
                 "每个值优先选择直接、完整支撑全部事实的最佳一处，等价重复引用不保留；"
                 "跨块条件、不同主体或标段、冲突和修订双方的必要证据必须保留。"
-                "只能选择该值citations已有的ID，不能选择context中的其他ID。"
-                "跨来源引用须保留各来源至少一处。不输出置信分数，相似度不能证明正确。"
+                "只能选择该值evidence_set所指集合citations已有的ID，不能借用其它集合或context中的ID。"
+                "整项值的跨来源引用须保留各来源至少一处。后续正文单元只选择支持该单元的来源，"
+                "不需要继承整项的其它来源。不输出置信分数，相似度不能证明正确。"
+                "含content_path的value是整项正文的单元，路径仅表示列名与数组位置；"
+                "逐个核对该单元并选证。字段名、章节来源等元信息不必重复整项细则，"
+                "是否完成转引解析仍核对不含content_path的整项值。"
                 "supported必须针对所选证据集合判断；任一值无充分证据时supported=false，说明缺口。"
             )
 
-        def validate_review(verdict, batch=batch):
+        def validate_review(verdict, batch=review_batch):
             reviews = verdict.get("reviews")
             if explain:
                 if not isinstance(reviews, list) or len(reviews) != len(batch):
@@ -537,6 +591,7 @@ async def verify_items(
             "校验每个解析值是否由其引用原文支持。"
             "逐一检查 field 名称与每个 value 的全部断言及其相互一致性，不能只核对关键词。"
             "允许不改变含义的同义改写和简洁表述，不因缺少完全相同的词语就判无依据；"
+            "content及其正文单元中的Markdown加粗、分段和列表标记只用于展示，按去掉排版后的语义核对；"
             "金额、时间、主体、适用范围、否定、前提与例外均不得增删或改变。"
             "同一字段的多个 value 分别校验，引用必须逐值对应，不能互相借用。"
             "一个完整事项可以由本值的多处独立引文共同支持，不要求这些引文物理相邻；"
@@ -577,11 +632,9 @@ async def verify_items(
                         "business": (
                             _review_business(item["business"]) if item.get("business") else None
                         ),
-                        # 值级校验：每个值带自己的引文送审，不能用字段级证据抵充。
-                        "values": [
-                            _compact_review_value(value, item, windows, neighbour_budget)
-                            if select_evidence
-                            else {
+                        # 集合共享只压缩送审表示；选证验证仍使用每个值原有的候选范围。
+                        **(_compact_review_values(item, windows, neighbour_budget)
+                           if select_evidence else {"values": [{
                                 "value": value.get("value"),
                                 "citations": [
                                     _review_citation(
@@ -594,11 +647,9 @@ async def verify_items(
                                     )
                                     for ref in value.get("citations", [])
                                 ],
-                            }
-                            for value in item.get("values", [])
-                        ],
+                            } for value in item.get("values", [])]}),
                     }
-                    for item in batch
+                    for item in review_batch
                 ],
                 ensure_ascii=False,
             ),
@@ -606,7 +657,7 @@ async def verify_items(
         )
         reviews = verdict.get("reviews") if explain else None
         if select_evidence:
-            for item, review in zip(batch, reviews, strict=True):
+            for item, review in zip(review_batch, reviews, strict=True):
                 missing = _missing_scope_refs(item, review["evidence_ids"])
                 if missing:
                     # 模型可能误放行范围，或去重时删掉名单；作为内容问题返回，不重试模型格式。
@@ -647,12 +698,20 @@ async def verify_items(
                         for target in reviews[index]["unresolved_references"]
                     )
             if flag and select_evidence:
+                reviewed = review_batch[index]
+                bound: dict[str, list[list[dict]]] = {}
                 for value, chosen in zip(
-                    item["values"], reviews[index]["evidence_ids"], strict=True
+                    reviewed["values"], reviews[index]["evidence_ids"], strict=True
                 ):
-                    value["citations"] = [
+                    selected = [
                         r for r in value["citations"] if str(r["block_id"]) in chosen
                     ]
+                    if path := value.get("content_path"):
+                        bound.setdefault(path[0], []).append(selected)
+                    else:
+                        value["citations"] = selected
+                if bound:
+                    item["output"] = {**item["output"], "citations": bound}
     return items
 
 

@@ -6,6 +6,7 @@ import { useAnalysisSnapshot } from "@/hooks/useAnalysisSnapshot";
 import { filterResults, resultCounts, unpairedFields } from "@/lib/analysis/presentation";
 import { groupGaps, type DisplayGap } from "@/lib/analysis/gaps";
 import { scopeLabel } from "@/lib/analysis/scope";
+import { formatDateTime } from "@/lib/format";
 import { isActive, STATE_LABELS, type AnalysisReport, type Citation } from "@/types/knowledge";
 import { AnalysisDataPanel } from "./AnalysisDataPanel";
 import { AnalysisFailureNotice } from "./AnalysisFailureNotice";
@@ -79,7 +80,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       existing.push({ key: `pair:${item.id}`, code: "unpaired_fields", recordId: item.id,
         moduleKey: module.module_key, moduleTitle: module.title, topicTitle: item.field,
         scope: item.record?.scope, scopeLabel: item.record ? scopeLabel(item.record.scope) : undefined,
-        detail: "原记录把多个字段与内容分别保存，未声明对应关系；请核对原文，重新分析时按单个事项保存。" });
+        detail: "字段与内容数量不一致，缺失项已在表格中标出；请核对原文后重新解析本模块。" });
     }
     return existing;
   }, [data, modules]);
@@ -143,6 +144,9 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       </p>
       <div className="report-actions" role="group" aria-label="报告操作">
         <Button onClick={onRefresh}>刷新结果</Button>
+        {!report.runtime_retired && <Button disabled={busy || running || !current || isActive(current?.status)}
+          title={current ? `重新解析：${current.title}` : "请先选择一个专题"}
+          onClick={() => { if (current) onAction("retry", [current.module_key]); }}>重新解析本模块</Button>}
         {isActive(report.status) && <Button disabled={busy || report.canceling} onClick={() => onAction("cancel")}>取消任务</Button>}
         {!report.runtime_retired && <Button disabled={busy || running || !canResume}
           onClick={() => onAction("retry")}>补跑未完成模块</Button>}
@@ -227,16 +231,30 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       </div>
       {visible.map((module) => <section key={module.id} className="report-module" aria-label={module.title}>
         <div className="report-module-heading"><h3>{module.title}</h3>
-          {!report.runtime_retired && <Button size="small" disabled={busy || running || isActive(module.status)}
-            onClick={() => onAction("retry", [module.module_key])}>重新解析本模块</Button>}
           {!!gaps.filter((gap) => gap.moduleKey === module.module_key).length && <button type="button" className="module-gap-link"
             onClick={() => { onChooseModule(module.id); setView("gaps"); }}>查看本专题待核对事项</button>}
         </div>
         <details className="module-operations"><summary>{module.status === "completed" ? "分析记录" : `${STATE_LABELS[module.status] ?? module.status} · 查看原因与运行记录`}</summary>
           {["failed", "canceled"].includes(module.status) && <AnalysisFailureNotice message={module.error_message}
             canceled={module.status === "canceled"} />}
-          {module.runs?.map((run) => <p key={run.id} className="run-detail">第 {run.attempt} 次 · {STATE_LABELS[run.status] ?? run.status}
-            · 模型请求 {run.model_calls}/{run.limits.max_model_calls} · 工具调用 {run.tool_calls}/{run.limits.max_tool_calls}</p>)}
+          {!!module.runs?.length && <ol className="analysis-runs" aria-label="历次分析记录">
+            {module.runs.map((run) => <li key={run.id} className="run-detail" aria-label={`第 ${run.attempt} 次分析`}>
+              <div className="run-summary"><strong>第 {run.attempt} 次 · {STATE_LABELS[run.status] ?? run.status}</strong>
+                <span>模型请求 {run.model_calls}/{run.limits.max_model_calls} · 工具调用 {run.tool_calls}/{run.limits.max_tool_calls}</span>
+              </div>
+              <dl className="run-times">
+                <div><dt>开始时间</dt><dd><time dateTime={run.started_at ?? undefined}>{formatDateTime(run.started_at)}</time></dd></div>
+                <div><dt>结束时间</dt><dd>{run.finished_at
+                  ? <time dateTime={run.finished_at}>{formatDateTime(run.finished_at)}</time>
+                  : isActive(run.status) ? "尚未结束" : "未记录"}</dd></div>
+              </dl>
+              {/* 每次尝试独立保留原因，后续成功不能覆盖此前失败或取消的信息。 */}
+              {(run.error_message || ["failed", "canceled"].includes(run.status)) && <p className="run-error" data-status={run.status}>
+                <strong>{run.status === "canceled" ? "停止原因" : run.status === "failed" ? "失败原因" : "运行说明"}：</strong>
+                {run.error_message || "未记录"}
+              </p>}
+            </li>)}
+          </ol>}
           {module.research_summary && <details className="research-process"><summary>查看分析过程</summary><p>{module.research_summary}</p></details>}
         </details>
         {module.records_loading ? <p role="status">正在加载专题结果…</p> : module.records_error ? <Alert type="error" title="专题结果读取失败"

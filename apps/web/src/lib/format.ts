@@ -35,3 +35,12 @@ export function formatTime(iso: string | null | undefined, now: number = Date.no
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
+
+/** 运行记录需要追溯每次尝试，使用浏览器本地时区并保留到秒，避免相邻运行无法区分。 */
+export function formatDateTime(iso: string | null | undefined): string {
+  if (!iso || Number.isNaN(Date.parse(iso))) return "未记录";
+  return new Date(iso).toLocaleString("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  });
+}

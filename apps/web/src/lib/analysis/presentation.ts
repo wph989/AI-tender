@@ -16,8 +16,25 @@ export function matchesScope(scope: Scope | undefined, selected: string): boolea
 }
 
 export function unpairedFields(item: AnalysisField): boolean {
-  return Boolean(item.output?.columns.includes("字段")
-    && Array.isArray(item.output.content["字段"]));
+  const fields = item.output?.content["字段"];
+  const values = item.output?.content["内容"];
+  if (!Array.isArray(fields) || fields.length === 1) return false;
+  return !fields.length || !Array.isArray(values) || fields.length !== values.length;
+}
+
+/** KV 数组按原顺序逐行对应；单个字段的多条内容保持在同一格，不拆成缺少字段的行。 */
+export function keyValueRows(item: AnalysisField) {
+  const fields = item.output?.content["字段"];
+  const values = item.output?.content["内容"];
+  if (!Array.isArray(fields) || fields.length === 1) {
+    return [{ key: (Array.isArray(fields) ? fields[0] : fields) || item.field,
+      value: item.output ? values : item.note || "来源已不可用，请更新分析。", contentIndex: 0 }];
+  }
+  const content = Array.isArray(values) ? values : values ? [values] : [];
+  // 数量不符时保留全部原始项并标出缺失，不能用较短数组截掉字段或内容。
+  return Array.from({ length: Math.max(fields.length, content.length, 1) }, (_, index) => ({
+    key: fields[index] || "未提供字段", value: content[index], contentIndex: index,
+  }));
 }
 
 export function needsAttention(item: AnalysisField, gaps: AnalysisGap[] = []): boolean {

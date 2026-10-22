@@ -116,6 +116,69 @@ test.beforeEach(async ({ page }) => {
 });
 test.afterEach(() => expect(errors).toEqual([]));
 
+test("逐条依据校验失败只阻断当前专题，仍能切换到其它有效专题", async ({ page }) => {
+  const invalid = records(modules[0]!);
+  invalid.records[0]!.content_evidence = { 背景: [] };
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) =>
+    route.fulfill({ json: invalid }));
+  await page.reload();
+  await selectModule(page, 1);
+  await expect(page.getByRole("region", { name: "技术要求", exact: true }))
+    .toContainText("专题结果的逐条依据不完整，请重新解析本模块");
+  await selectModule(page, 2);
+  await expect(page.locator('[data-report-item="score"]')).toContainText("同类项目业绩");
+});
+
+test("点击合并定位后可打开当前事项的全部摘录，切换事项与位置不混入其它摘录", async ({ page }, info) => {
+  const first = { ...citation, quote: "本项目预算为2130万元。" };
+  const label = { ...citation, quote: "本项目建设预算：" };
+  const condition = { ...citation, quote: "预算调整须提交审批记录。" };
+  const unrelated = { ...citation, quote: "另一事项的质保说明。" };
+  const next = { ...citation, element_id: 2, anchor: "p1b2", quote: "服务期为2年。" };
+  const data = records(modules[0]!);
+  data.evidence = { first, label, condition, unrelated, next };
+  data.records = [
+    { ...data.records[0]!, content: { 背景: ["预算2130万元", "服务期2年"] },
+      evidence_ids: ["first", "label", "condition", "next"], content_evidence: { 背景: [["first", "label"], ["next"]] } },
+    { ...data.records[0]!, id: "another", key: "another", title: "质保事项", content: { 背景: "质保说明" },
+      evidence_ids: ["unrelated"], content_evidence: { 背景: [["unrelated"]] } },
+  ];
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  // 正式 resolve 只返回位置身份，摘录应继续来自当前事项，不能被其它事项的同位置引用替代。
+  await page.route("**/api/v1/knowledge/citations/resolve", (route) => {
+    const { quote: _quote, ...resolved } = route.request().postDataJSON().element_id === 2 ? next : first;
+    return route.fulfill({ json: resolved });
+  });
+  await page.reload();
+  const buttons = page.locator('[data-report-item="background"] .value-locates-inline button');
+  await expect(buttons).toHaveCount(2);
+  const viewer = page.getByRole("region", { name: "引用原文", exact: true });
+  await buttons.first().click();
+  const summary = viewer.getByText("查看本事项的 3 条原文摘录", { exact: true });
+  await summary.click();
+  await expect(viewer.locator(".citation-excerpt blockquote")).toHaveText([first.quote, label.quote, condition.quote]);
+  await expect(viewer.locator(".citation-excerpt")).not.toContainText(unrelated.quote);
+  await expect(viewer.locator(".citation-excerpt")).not.toContainText(next.quote);
+  await expect(viewer.locator("[data-active-evidence]")).toHaveCount(1);
+  await viewer.screenshot({ path: info.outputPath("merged-citation-excerpts.png") });
+  // 多段摘录共用有限高度，手机也必须能在该区域滚到最后一段。
+  const lastQuote = viewer.locator(".citation-excerpt blockquote").last();
+  await lastQuote.scrollIntoViewIfNeeded();
+  await expect(lastQuote).toBeInViewport();
+  await viewer.screenshot({ path: info.outputPath("merged-citation-excerpts-last.png") });
+  await summary.click();
+  await expect(lastQuote).not.toBeVisible();
+  await summary.focus();
+  await page.keyboard.press("Enter");
+  await expect(lastQuote).toBeVisible();
+  if (info.project.name === "mobile") await page.getByRole("button", { name: "分析内容", exact: true }).click();
+  await buttons.nth(1).click();
+  await expect(viewer.locator(".citation-excerpt")).toHaveText(next.quote);
+  if (info.project.name === "mobile") await page.getByRole("button", { name: "分析内容", exact: true }).click();
+  await page.locator('[data-report-item="another"] .value-locates-inline button').click();
+  await expect(viewer.locator(".citation-excerpt")).toHaveText(unrelated.quote);
+});
+
 function source(versionId: number | null, name: string): KnowledgeSource {
   return {
     source_id: 2, collection_id: 1, project_id: 1, project_file_id: 2,
@@ -147,6 +210,7 @@ test("默认预览首个文档，点击引用后轮询不抢回默认文件", as
   await expect(preview).toContainText("第一份文档.pdf");
   await expect(preview.locator("canvas").first()).toBeVisible();
   await expect(preview.locator(".citation-excerpt")).toHaveCount(0);
+  await expect(preview.locator("[data-active-evidence], [data-annotation-badge]")).toHaveCount(0);
   await page.screenshot({ path: info.outputPath("default-document-preview.png"), fullPage: true });
   if (info.project.name === "mobile") {
     await page.getByRole("button", { name: "分析内容", exact: true }).click();
@@ -227,11 +291,13 @@ test("评分专题使用 Skill 的列名并保留各评分档次", async ({ page
   await page.screenshot({ path: info.outputPath("synthesis-scoring.png"), fullPage: true });
 });
 
-test("共享原文的评分事项往返定位仍回到评分，页码入口可见", async ({ page }) => {
+test("共享原文的评分事项往返定位仍回到评分，图标保留页码提示", async ({ page }) => {
   await selectModule(page, 2);
   const row = page.locator('[data-report-item="score"]');
   const locate = row.getByRole("button", { name: /^定位：/ });
-  await expect(locate).toContainText("第 1 页");
+  await expect(locate).toHaveText("");
+  await expect(locate).toHaveAttribute("title", /第 1 页/);
+  await expect(locate.locator("svg")).toHaveCount(1);
   await locate.click();
   const viewer = page.getByRole("region", { name: "引用原文", exact: true });
   await expect(viewer).toBeVisible();
@@ -318,31 +384,76 @@ test("切换报告时延迟的旧维度结果不能覆盖新报告", async ({ pa
   await expect(page.getByText("制定分阶段迁移方案并说明回退与服务保障。", { exact: true })).toHaveCount(0);
 });
 
-test("字段逐项显示，历史数组保留原内容且能从待核对跳回", async ({ page }) => {
+test("KV 表格逐行对应，单字段保留多条内容，数量不符可从待核对跳回", async ({ page }) => {
   const data = records(modules[0]!);
   data.output_schema.sections = [{ title: "项目信息", layout: "table", columns: ["字段", "内容"] }];
   data.records = [
     { ...data.records[0]!, id: "single", key: "single", kind: "fact", group: "项目信息",
       title: "采购名称", content: { 字段: "项目名称", 内容: "通信采购项目" } },
     { ...data.records[0]!, id: "compound", key: "compound", kind: "fact", group: "项目信息",
-      title: "历史概况", content: { 字段: ["预算", "服务期"], 内容: ["100万元", "三年"] } },
+      title: "项目概况", content: { 字段: ["预算", "服务期"], 内容: ["100万元", "三年"] } },
+    { ...data.records[0]!, id: "multi", key: "multi", kind: "fact", group: "项目信息",
+      title: "项目范围", content: { 字段: ["项目范围"], 内容: ["安装", "调试"] } },
+    { ...data.records[0]!, id: "incomplete", key: "incomplete", kind: "fact", group: "项目信息",
+      title: "地点与工期", content: { 字段: ["地点", "工期"], 内容: ["浙江省内"] } },
   ];
   await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
   await page.reload();
   const single = page.locator('[data-report-item="single"]');
-  await expect(single.locator("dt")).toHaveText("项目名称");
-  await expect(single.locator("dd")).toHaveText("通信采购项目");
+  const table = page.getByRole("table", { name: "项目信息", exact: true });
+  await expect(table.getByRole("columnheader")).toHaveText(["字段", "内容"]);
+  await expect(single.getByRole("rowheader")).toHaveText("项目名称");
+  await expect(single.locator(".result-kv-value")).toHaveText("通信采购项目");
   const compound = page.locator('[data-report-item="compound"]');
-  await expect(compound.locator(".record-attention")).toContainText("未声明逐项对应关系");
-  await expect(compound.locator(".compound-labels > span")).toHaveText(["预算", "服务期"]);
-  await expect(compound.locator(".result-points > li")).toHaveText(["100万元", "三年"]);
+  await expect(compound.locator(".record-attention")).toHaveCount(0);
+  await expect(compound.getByRole("rowheader")).toHaveText(["预算", "服务期"]);
+  await expect(compound.locator(".result-kv-value")).toHaveText(["100万元", "三年"]);
+  const multi = page.locator('[data-report-item="multi"]');
+  await expect(multi.getByRole("rowheader")).toHaveText("项目范围");
+  await expect(multi.locator(".result-points > li")).toHaveText(["安装", "调试"]);
+  const incomplete = page.locator('[data-report-item="incomplete"]');
+  await expect(incomplete.getByRole("rowheader")).toHaveText(["地点", "工期"]);
+  await expect(incomplete.locator(".result-kv-value")).toHaveText(["浙江省内", "未提供内容"]);
   await page.getByRole("checkbox", { name: "仅待核对条目" }).check();
   await expect(single).toHaveCount(0);
-  await expect(compound).toBeVisible();
+  await expect(compound).toHaveCount(0);
+  await expect(multi).toHaveCount(0);
+  await expect(incomplete).toBeVisible();
   await page.getByRole("button", { name: "查看本专题待核对事项" }).click();
   await page.getByRole("button", { name: "查看相关事项", exact: true }).click();
-  await expect(compound).toHaveClass(/report-item-active/);
+  await expect(incomplete).toHaveClass(/report-item-active/);
   await expect(page.getByRole("checkbox", { name: "仅待核对条目" })).not.toBeChecked();
+});
+
+test("KV 每行仅显示定位图标，拆行后仍定位本行原文", async ({ page }, info) => {
+  const data = records(modules[0]!);
+  const second = { ...citation, element_id: 2, anchor: "p1b2", quote: "服务期为三年。" };
+  data.output_schema.sections = [{ title: "项目基本信息", layout: "table", columns: ["字段", "内容"] }];
+  data.evidence = { source: citation, term: second };
+  data.records = [{ ...data.records[0]!, id: "kv-record", key: "kv-record", kind: "fact", group: "项目基本信息",
+    content: { 字段: ["项目预算", "服务期限"], 内容: ["2130万元", "三年"] }, evidence_ids: ["source", "term"],
+    content_evidence: { 字段: [["source"], ["term"]], 内容: [["source"], ["term"]] },
+  }];
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({ json: second }));
+  await page.reload();
+  const table = page.getByRole("table", { name: "项目基本信息", exact: true });
+  const record = table.locator('[data-report-item="kv-record"]');
+  await expect(record.getByRole("rowheader")).toHaveText(["项目预算", "服务期限"]);
+  await expect(record.locator(".result-kv-value")).toHaveText(["2130万元", "三年"]);
+  await expect(record.locator(".value-locates button")).toHaveText(["", ""]);
+  await expect(record.locator(".value-locates button svg")).toHaveCount(2);
+  await expect(page.locator("#report-item-kv-record")).toHaveCount(1);
+  await expect(record.locator(".record-attention, .compound-labels")).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await table.screenshot({ path: info.outputPath("kv-icon-locators.png") });
+  const term = record.getByRole("row").nth(1).getByRole("button", { name: /^定位：/ });
+  await expect(term).toHaveAttribute("title", /服务期为三年/);
+  const resolved = page.waitForRequest("**/knowledge/citations/resolve");
+  await term.click();
+  expect((await resolved).postDataJSON()).toMatchObject({ element_id: 2, anchor: "p1b2" });
+  const viewer = page.getByRole("region", { name: "引用原文", exact: true });
+  await expect(viewer.locator("[data-active-evidence]")).toHaveAttribute("data-active-anchor", "p1b2");
 });
 
 test("多处同页依据保留完整摘录，去重后仍能准确定位第二处", async ({ page }) => {
@@ -512,8 +623,11 @@ test("重复点击同一原文角标仍滚回已选结果", async ({ page }, inf
   await expect(badge).toBeVisible();
   await badge.click();
   await expect(target).toBeInViewport();
-  await page.locator(".analysis-content").evaluate((element) => { element.scrollTop = element.scrollHeight; });
-  await expect(target).not.toBeInViewport();
+  // 反向定位会延迟到正文布局完成后滚动；轮询手动移开，避免与这次滚动抢时序。
+  await expect(async () => {
+    await page.locator(".analysis-content").evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    await expect(target).not.toBeInViewport({ timeout: 300 });
+  }).toPass({ timeout: 5000 });
   if (info.project.name === "mobile") await page.getByRole("button", { name: "引用原文", exact: true }).click();
   await badge.click();
   await expect(target).toBeInViewport();
@@ -547,6 +661,9 @@ test("模块标签和三种重解析操作直接可用，提交范围互不混�
   const tabs = page.getByRole("tablist", { name: "解析专题", exact: true });
   await expect(tabs.getByRole("tab")).toHaveCount(4);
   await expect(page.getByRole("combobox", { name: "解析专题" })).toHaveCount(0);
+  const actions = page.getByRole("group", { name: "报告操作", exact: true });
+  await expect(actions.getByRole("button")).toHaveText(["刷新结果", "重新解析本模块", "补跑未完成模块", "全部重新解析"]);
+  await expect(page.locator(".report-module-heading").getByRole("button", { name: "重新解析本模块" })).toHaveCount(0);
   await tabs.locator('[data-module-id="1"]').focus();
   await page.keyboard.press("ArrowRight");
   await expect(tabs.locator('[data-module-id="2"]')).toHaveAttribute("aria-selected", "true");
@@ -558,4 +675,244 @@ test("模块标签和三种重解析操作直接可用，提交范围互不混�
   await page.getByRole("button", { name: "全部重新解析", exact: true }).click();
   await expect.poll(() => requests).toHaveLength(3);
   expect(requests[2]).toEqual({ module_keys: modules.map((module) => module.module_key) });
+  await selectModule(page, 0);
+  await expect(actions.getByRole("button", { name: "重新解析本模块", exact: true })).toBeDisabled();
+});
+
+test("正文同一事项的位置跨条去重，不同出处直接定位且原文框保持透明", async ({ page }, info) => {
+  const data = records(modules[0]!);
+  const first = { ...citation, quote: "本项目预算为2130万元。", bbox: [0.1, 0.12, 0.8, 0.18] as [number, number, number, number] };
+  const second = { ...citation, element_id: 2, anchor: "p1b2", quote: "服务期为2年。",
+    bbox: [0.1, 0.25, 0.8, 0.31] as [number, number, number, number] };
+  data.records = [{ ...data.records[0]!, content: { 背景: ["本项目预算为**2130万元**。", "服务期为2年。", "本项目预算2130万元，服务期2年。"] },
+    evidence_ids: ["source", "duplicate", "term"], content_evidence: { 背景: [["source", "duplicate"], ["term"], ["source", "term"]] } }];
+  // 同一原文块的摘录不同也只显示一个图标，完整摘录仍保留，定位请求使用真实原始引用。
+  const duplicate = { ...first, quote: "同一预算原文块中的另一段摘录。" };
+  data.evidence = { source: first, duplicate, term: second };
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({
+    json: route.request().postDataJSON().element_id === 2 ? second : first,
+  }));
+  await page.reload();
+  const record = page.locator('[data-report-item="background"]');
+  const points = record.locator(".result-points > li");
+  await expect(points).toHaveCount(3);
+  await expect(points.nth(0).getByRole("button")).toHaveCount(1);
+  await expect(points.nth(0).getByRole("button")).toHaveAttribute("title", new RegExp(duplicate.quote));
+  await expect(points.nth(0).getByRole("button")).toHaveAttribute("title", new RegExp(first.quote));
+  await expect(points.nth(1).getByRole("button")).toHaveCount(1);
+  await expect(points.nth(2).getByRole("button")).toHaveCount(0);
+  await expect(points.getByRole("button")).toHaveText(["", ""]);
+  await expect(points.nth(0).locator("strong")).toHaveText("2130万元");
+  await expect(record.locator(".result-points > li > p > .value-locates-inline")).toHaveCount(2);
+  await expect(record.locator(":scope > .value-locates")).toHaveCount(0);
+  await expect(record.getByRole("button", { name: /查看 .* 处依据/ })).toHaveCount(0);
+  await record.screenshot({ path: info.outputPath("inline-citations.png") });
+  const resolved = page.waitForRequest("**/knowledge/citations/resolve");
+  await points.nth(1).getByRole("button").click();
+  expect((await resolved).postDataJSON()).toMatchObject({ element_id: 2, anchor: "p1b2" });
+  const viewer = page.getByRole("region", { name: "引用原文", exact: true });
+  await expect(viewer.locator("[data-active-evidence]")).toHaveAttribute("data-active-anchor", "p1b2");
+  const styles = await viewer.locator("[data-evidence-anchor], [data-active-evidence]").evaluateAll((frames) =>
+    frames.map((frame) => { const style = getComputedStyle(frame); return {
+      background: style.backgroundColor, shadow: style.boxShadow, border: parseFloat(style.borderTopWidth),
+    }; }));
+  expect(styles).toHaveLength(1);
+  for (const style of styles) {
+    expect(style.background).toBe("rgba(0, 0, 0, 0)");
+    expect(style.shadow).toBe("none");
+    expect(style.border).toBeGreaterThanOrEqual(3);
+  }
+  await expect(viewer.locator("[data-annotation-badge]")).toHaveCount(1);
+  await expect(viewer.locator('[data-evidence-anchor="p1b1"]')).toHaveCount(0);
+  await viewer.screenshot({ path: info.outputPath("outline-only-location.png") });
+  if (info.project.name === "mobile") await page.getByRole("button", { name: "分析内容", exact: true }).click();
+  const firstResolved = page.waitForRequest("**/knowledge/citations/resolve");
+  await points.nth(0).getByRole("button").click();
+  expect((await firstResolved).postDataJSON()).toMatchObject({ element_id: 1, anchor: "p1b1" });
+  await expect(viewer.locator("[data-active-evidence]")).toHaveCount(1);
+  await expect(viewer.locator("[data-active-evidence]")).toHaveAttribute("data-active-anchor", "p1b1");
+  await expect(viewer.locator('[data-active-anchor="p1b2"]')).toHaveCount(0);
+  await expect(viewer.locator("[data-annotation-badge]")).toHaveCount(1);
+  // 重复点击也应重播定位动画，但不能累积新的框。
+  const previous = await viewer.locator("[data-active-evidence]").elementHandle();
+  if (info.project.name === "mobile") await page.getByRole("button", { name: "分析内容", exact: true }).click();
+  await points.nth(0).getByRole("button").click();
+  await expect.poll(() => previous!.evaluate((frame) => frame.isConnected)).toBe(false);
+  await expect(viewer.locator("[data-active-evidence]")).toHaveCount(1);
+});
+
+test("跨页切换定位只显示当前页的一个框，缺失坐标保留页级框", async ({ page }, info) => {
+  const data = records(modules[0]!);
+  const next = { ...citation, element_id: 2, anchor: "p2b1", page_no: 2 };
+  const pageOnly = { ...next, element_id: 3, anchor: "p2b2", bbox: null };
+  const refs = [citation, next, pageOnly];
+  data.evidence = { source: citation, next, pageOnly };
+  data.records = [{ ...data.records[0]!, content: { 背景: ["第一页依据。", "第二页依据。", "第二页无块坐标。"] },
+    evidence_ids: ["source", "next", "pageOnly"], content_evidence: { 背景: [["source"], ["next"], ["pageOnly"]] } }];
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await page.route("**/api/v1/versions/1/pages", (route) => route.fulfill({ json: { pages: [1, 2].map((page_no) =>
+    ({ page_no, width_pt: 595, height_pt: 842, rotation: 0, has_text_layer: true })) } }));
+  await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({
+    json: refs.find((ref) => ref.element_id === route.request().postDataJSON().element_id),
+  }));
+  await page.reload();
+  const buttons = page.locator('[data-report-item="background"] .result-points button');
+  const viewer = page.getByRole("region", { name: "引用原文", exact: true });
+  for (const index of [0, 1, 2, 0]) {
+    if (index !== 0 || await viewer.count()) {
+      if (info.project.name === "mobile") await page.getByRole("button", { name: "分析内容", exact: true }).click();
+    }
+    await buttons.nth(index).click();
+    const ref = refs[index]!;
+    await expect(viewer.locator("[data-active-evidence]")).toHaveCount(1);
+    await expect(viewer.locator("[data-active-evidence]")).toHaveAttribute("data-active-anchor", ref.anchor);
+    await expect(viewer.locator(`[data-page-no="${ref.page_no === 1 ? 2 : 1}"] [data-active-evidence]`)).toHaveCount(0);
+    await expect(viewer.locator("[data-annotation-badge]")).toHaveCount(ref.bbox ? 1 : 0);
+    if (!ref.bbox) await expect(viewer.locator("[data-active-evidence]")).toHaveCSS("border-top-style", "dashed");
+  }
+});
+
+for (const module of [
+  { id: 4, title: "报价要求", module_key: "price_requirement_parsing", status: "completed", error_message: null,
+    items: [item("price", "报价组成", "报价要求", "table", ["事项", "要求"],
+      { 事项: "报价组成", 要求: ["包含税费。", "包含运输费用。"] })] },
+  modules[1]!, modules[2]!,
+]) test(`${module.title}同一事项跨列合并重复定位，不同事项各自保留入口`, async ({ page }) => {
+  const data = records(module);
+  if (module.module_key === "scoring_standard_parsing") {
+    data.records[0]!.content = { ...data.records[0]!.content, 满分分值: "**6分**" };
+  }
+  const second = { ...citation, element_id: 2, anchor: "p1b2", quote: "第二条独立原文。" };
+  data.evidence = { source: citation, second };
+  for (const record of data.records) {
+    record.evidence_ids = ["source", "second"];
+    record.content_evidence = Object.fromEntries(Object.entries(record.content!).map(([column, value]) =>
+      [column, (Array.isArray(value) ? value : [value]).map((_, index) => [index ? "second" : "source"])]));
+  }
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, { modules: [{ ...module, items: [] }] }) }));
+  await page.route(`**/api/v1/analysis/reports/1/modules/${module.module_key}/records`, (route) => route.fulfill({ json: data }));
+  await page.reload();
+  if (module.module_key === "bid_format_outline_parsing") await page.getByRole("button", { name: "展开全部材料" }).click();
+  const first = page.locator(`[data-report-item="${module.items[0]!.id}"]`);
+  if (module.module_key === "scoring_standard_parsing") {
+    await expect(first.locator(".result-score .value-locates-inline")).toBeVisible();
+    await expect(first.locator(".result-score strong")).toHaveText("6分");
+    await expect(first.locator(".result-score")).not.toContainText("**");
+  }
+  if (module.module_key === "price_requirement_parsing") await expect(first.locator('td[data-label="要求"] .result-points > li .value-locates-inline')).toHaveCount(1);
+  if (module.module_key !== "bid_format_outline_parsing") {
+    await expect(first.locator(".value-locates-inline button")).toHaveCount(2);
+  }
+  await expect(first.getByRole("button", { name: /查看 .* 处依据/ })).toHaveCount(0);
+  for (const record of data.records) {
+    const element = page.locator(`[data-report-item="${record.id}"]`);
+    await expect(element.locator(".value-locates-inline").first()).toBeVisible();
+    if (module.module_key === "bid_format_outline_parsing") {
+      // 父节点包含子节点 DOM，按当前节点计数，确保共用出处不会吞掉子事项自己的入口。
+      await expect(element.locator(":scope > details > .module-markdown-body .value-locates-inline button, :scope > details > .record-extra-evidence button")).toHaveCount(2);
+    }
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test("正文外的条件与证明材料保留补充依据，正文来源不重复集中展示", async ({ page }) => {
+  const data = records(modules[0]!);
+  const second = { ...citation, element_id: 2, anchor: "p1b2", quote: "仅在业务低谷窗口实施，并提交审批记录。" };
+  data.evidence = { source: citation, condition: second };
+  data.records = [{ ...data.records[0]!, content: { 背景: ["实施平台迁移。"] },
+    evidence_ids: ["source", "condition"], content_evidence: { 背景: [["source"]] },
+    conditions: { expression: "仅在业务低谷窗口实施。", logic: "text", terms: [], exceptions: [] },
+    materials: [{ name: "审批记录", requirement: "提交审批记录。" }],
+  }];
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({ json: second }));
+  await page.reload();
+  const record = page.locator('[data-report-item="background"]');
+  await record.locator(".record-conditions > summary").click();
+  await expect(record.locator(".record-conditions")).toContainText("审批记录");
+  await expect(record.locator(".result-points > li button")).toHaveCount(1);
+  const extra = record.getByRole("group", { name: "补充依据", exact: true });
+  await expect(extra.getByRole("button")).toHaveCount(1);
+  await expect(extra.getByRole("button")).toHaveAttribute("title", /仅在业务低谷窗口/);
+  const resolved = page.waitForRequest("**/knowledge/citations/resolve");
+  await extra.getByRole("button").click();
+  expect((await resolved).postDataJSON()).toMatchObject({ element_id: 2, anchor: "p1b2" });
+});
+
+test("字段名和补充条件的同位置摘录合并到正文图标，完整提示保留", async ({ page }) => {
+  const module: AnalysisModule = { ...modules[0]!, module_key: "project_basic_info_parsing", title: "项目概况",
+    items: [item("project-name", "项目名称", "项目基本信息", "table", ["字段", "内容"],
+      { 字段: "项目名称", 内容: "平台改造项目" })] };
+  const data = records(module);
+  // 不同摘录仍是独立证据，但同位置只留一个图标，合并后的提示必须全部保留。
+  const label = { ...citation, quote: "本次采购项目名称：" };
+  const condition = { ...citation, quote: "实施前须提交审批记录。" };
+  data.evidence = { source: citation, label, condition };
+  data.records[0] = { ...data.records[0]!, evidence_ids: ["source", "label", "condition"],
+    content_evidence: { 字段: [["label"]], 内容: [["source"]] },
+  };
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, { modules: [{ ...module, items: [] }] }) }));
+  await page.route("**/api/v1/analysis/reports/1/modules/project_basic_info_parsing/records", (route) => route.fulfill({ json: data }));
+  await page.reload();
+  const record = page.locator('[data-report-item="project-name"]');
+  await expect(record.locator(".result-kv-value button")).toHaveCount(1);
+  const extra = record.getByRole("group", { name: "补充依据", exact: true });
+  await expect(extra).toHaveCount(0);
+  await expect(record.locator(".result-kv-value button")).toHaveAttribute("title", /本次采购项目名称/);
+  await expect(record.locator(".result-kv-value button")).toHaveAttribute("title", /实施前须提交审批记录/);
+  await expect(record.locator(".result-kv-value button")).toHaveAttribute("title", new RegExp(citation.quote));
+});
+
+test.describe("每次分析的时间与原因", () => {
+  test.use({ timezoneId: "Asia/Singapore" });
+
+  test("最后一次成功仍保留各次失败原因，缺失时间不伪造", async ({ page }, info) => {
+    const run = {
+      id: 1, attempt: 1, status: "failed", thread_id: "run-1", started_at: "2026-10-19T01:01:01Z",
+      finished_at: "2026-10-19T01:02:03Z", deadline_at: "2026-10-19T01:30:00Z",
+      model_calls: 10, tool_calls: 8, prompt_tokens: 100, completion_tokens: 50,
+      limits: { max_model_calls: 80, max_tool_calls: 100, timeout_seconds: 1800, max_output_tokens: 8192 },
+      error_message: "HTTP 429：模型服务限流。\n请稍后重试。",
+    };
+    const runs = [run,
+      { ...run, id: 2, attempt: 2, status: "canceled", error_message: "用户取消了本次分析。" },
+      { ...run, id: 3, attempt: 3, started_at: null, finished_at: null, error_message: null },
+      { ...run, id: 4, attempt: 4, status: "completed", error_message: null },
+    ];
+    await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+      modules: modules.map((module, index) => ({ ...module, items: [], runs: index === 0 ? runs : [] })),
+    }) }));
+    await page.reload();
+    await page.locator(".module-operations > summary").click();
+    const history = page.getByRole("list", { name: "历次分析记录", exact: true });
+    await expect(history.getByRole("listitem")).toHaveCount(4);
+    const failed = history.getByRole("listitem", { name: "第 1 次分析", exact: true });
+    await expect(failed).toContainText("2026/10/19 09:01:01");
+    await expect(failed).toContainText("2026/10/19 09:02:03");
+    await expect(failed.locator(".run-error")).toHaveText("失败原因：HTTP 429：模型服务限流。 请稍后重试。");
+    await expect(history.getByRole("listitem", { name: "第 2 次分析", exact: true })).toContainText("停止原因：用户取消了本次分析。");
+    const missing = history.getByRole("listitem", { name: "第 3 次分析", exact: true });
+    await expect(missing.locator(".run-times dd")).toHaveText(["未记录", "未记录"]);
+    await expect(missing).toContainText("失败原因：未记录");
+    await expect(history.getByRole("listitem", { name: "第 4 次分析", exact: true }).locator(".run-error")).toHaveCount(0);
+    await history.screenshot({ path: info.outputPath("analysis-run-history.png") });
+  });
+
+  test("运行中的结束时间显示尚未结束，不能用截止时间替代", async ({ page }) => {
+    await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+      status: "running", modules: [{ ...modules[0]!, items: [], status: "running", runs: [{
+        id: 1, attempt: 1, status: "running", thread_id: "run-1", started_at: "2026-10-19T01:01:01Z",
+        finished_at: null, deadline_at: "2026-10-19T01:30:00Z", model_calls: 1, tool_calls: 1,
+        prompt_tokens: 100, completion_tokens: 50, error_message: null,
+        limits: { max_model_calls: 80, max_tool_calls: 100, timeout_seconds: 1800, max_output_tokens: 8192 },
+      }] }],
+    }) }));
+    await page.reload();
+    await page.locator(".module-operations > summary").click();
+    const history = page.getByRole("list", { name: "历次分析记录", exact: true });
+    await expect(history).toContainText("尚未结束");
+    await expect(history).not.toContainText("09:30:00");
+    await expect(page.getByRole("button", { name: "重新解析本模块", exact: true })).toBeDisabled();
+  });
 });

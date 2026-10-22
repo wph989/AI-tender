@@ -279,13 +279,22 @@ def module_data(state: dict) -> dict:
         refs = dedupe_citations([
             ref for value in item["values"] for ref in value["citations"]
         ])
+        refs_by_id = {fingerprint(ref): ref for ref in refs}
+        if bindings := (item.get("output") or {}).get("citations"):
+            # 整项与正文单元可能选中不同的等价出处；逐条绑定必须保留自己实际校验过的引用。
+            record["content_evidence"] = {
+                column: [[fingerprint(ref) for ref in group] for group in groups]
+                for column, groups in bindings.items()
+            }
+            for groups in bindings.values():
+                for group in groups:
+                    for ref in group:
+                        refs_by_id[fingerprint(ref)] = ref
         # 分析内容可以独立用于下游；位置和原文只保存在证据表，通过稳定 ID 关联。
         record.pop("citations", None)
-        record["evidence_ids"] = []
-        for ref in refs:
-            evidence_id = fingerprint(ref)
+        record["evidence_ids"] = list(refs_by_id)
+        for evidence_id, ref in refs_by_id.items():
             evidence[evidence_id] = copy.deepcopy(ref)
-            record["evidence_ids"].append(evidence_id)
         records.append(record)
     return {
         "schema_version": DATA_VERSION, "records": records, "evidence": evidence,
@@ -307,6 +316,16 @@ def display_items(items: list[dict]) -> list[dict]:
         if business and business["kind"] == "coverage":
             continue
         rendered = {k: v for k, v in item.items() if k != "business"}
+        if bindings := (item.get("output") or {}).get("citations"):
+            # 逐条选中的额外出处也要经过既有可见性检查，避免整体出处可读时漏检局部引用。
+            values = list(rendered["values"])
+            refs = [*values[0]["citations"], *(
+                ref for groups in bindings.values() for group in groups for ref in group
+            )]
+            values[0] = {
+                **values[0], "citations": list({fingerprint(ref): ref for ref in refs}.values()),
+            }
+            rendered["values"] = values
         if business:
             scope = business["scope"]
             label = {"common": "公共要求", "unknown": "归属待确认"}.get(scope["kind"])

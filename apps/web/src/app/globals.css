@@ -50,6 +50,8 @@
 .citation-heading { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 12px 16px; background: white; font-size: 12px; }
 .citation-heading span { flex-shrink: 0; color: #85859b; }
 .citation-excerpt { flex-shrink: 0; max-height: 100px; overflow: auto; background: #f5f1fc; border-top: 1px solid #e5e3ed; padding: 10px 16px; font-size: 12px; line-height: 1.7; }
+.citation-excerpt summary { cursor: pointer; color: #7156ce; }
+.citation-excerpt blockquote { margin-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .report-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; }
 .report-heading h2 { font-size: 24px; font-weight: 600; margin-top: 5px; }
 .report-heading select { max-width: 55%; }
@@ -117,9 +119,9 @@
 .module-table tbody tr.report-item-active { outline: none; background: #f5f1fc; }
 .module-field-name { display: block; }
 .module-table .module-keys { display: inline-block; margin-top: 4px; }
-/* 页码让用户在跳转前识别依据；可换行的入口避免长结果或多引用挤出窄屏。 */
-.value-locates { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0 0 6px; vertical-align: middle; max-width: 100%; }
-.value-locates button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 32px; padding: 5px 9px; border: 1px solid #e5def3; border-radius: 8px; background: #f5f1fc; color: #7156ce; font-size: 11px; line-height: 1.4; white-space: nowrap; }
+/* 正文只留定位图标；出处由提示说明，固定点击面积兼顾密度与键盘、触屏操作。 */
+.value-locates { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px; margin: 0 0 0 4px; vertical-align: middle; max-width: 100%; }
+.value-locates button { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 26px; height: 26px; min-height: 26px; padding: 4px; border: 0; border-radius: 5px; background: transparent; color: #7156ce; }
 .value-locates button:hover { background: #e2d7f7; }
 .value-locates button:focus-visible { outline: 2px solid #7156ce; outline-offset: 2px; }
 .module-result-list { display: grid; gap: 14px; }
@@ -137,7 +139,7 @@
   .module-structured-table tbody td + td { border-top: 1px solid #efedf4; }
   .module-structured-table tbody td::before { content: attr(data-label); display: block; margin-bottom: 6px; color: #85859b; font-size: 11px; }
   .module-structured-table .value-locates { margin-left: 0; }
-  .value-locates button { min-height: 40px; padding-inline: 11px; }
+  .value-locates button { width: 32px; height: 32px; min-height: 32px; padding: 6px; }
   .module-result-list > li { padding: 14px; }
 }
 .field-warning { margin-top: 6px; font-size: 12px; color: #a4405b; }
@@ -410,7 +412,7 @@
 .document-area { flex: 1; min-width: 0; }
 .mobile-view-switch { display: none; }
 .outline-nav { width: 205px; }
-@keyframes evidence-pulse { 0% { opacity: .15; } 50%,100% { opacity: 1; } }
+@keyframes evidence-pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
 .evidence-pulse { animation: evidence-pulse 600ms ease-out 2; }
 @keyframes sheet-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .sheet-in { animation: sheet-in 250ms ease-out both; }
@@ -579,7 +581,16 @@
 .module-operations { padding: 8px 0; font-size: 12px; color: #70748c; }
 .module-operations > summary { cursor: pointer; width: fit-content; }
 .module-operations > .ant-btn, .module-operations > .analysis-failure { margin-top: 10px; }
-.run-detail { margin-top: 8px; }
+.analysis-runs { margin-top: 8px; }
+.run-detail { padding: 10px 0; border-bottom: 1px solid #eeeef5; line-height: 1.8; }
+.run-summary { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.run-summary strong { color: #575b74; font-weight: 500; }
+.run-times { display: flex; flex-wrap: wrap; gap: 4px 20px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.run-times > div { display: flex; gap: 8px; }
+.run-times dd { margin: 0; }
+.run-error { margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.run-error strong { font-weight: 500; }
+.run-error[data-status=failed] { color: #a4425c; }
 .result-empty { padding: 24px 0; font-size: 13px; color: #70748c; line-height: 1.8; }
 .snapshot-notice { font-size: 12px; color: #70748c; margin-bottom: 10px; }
 .snapshot-notice summary { cursor: pointer; }
@@ -597,12 +608,20 @@
 .result-properties dt { color: #70748c; font-weight: 500; line-height: 1.8; overflow-wrap: anywhere; }
 .result-properties dd { margin: 0; min-width: 0; line-height: 1.8; }
 .result-points { padding-left: 18px; list-style: disc; display: grid; gap: 6px; }
-.compound-labels { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
-.compound-labels > span { padding: 3px 7px; border-radius: 4px; background: #f0f1f7; color: #70748c; font-size: 12px; }
+/* KV 保持两列和同行边界，长条款在内容格内换行，窄屏也能直接看出字段归属。 */
+.module-kv-table { table-layout: fixed; line-height: 1.8; }
+.module-kv-table th:first-child { width: 20%; }
+.module-kv-table th[scope=row] { font-weight: 500; }
+.module-kv-table .result-kv-value > :last-child { margin-bottom: 0; }
+.module-kv-table .report-item-active { outline: none; border-radius: 0; }
+.module-kv-table .report-item-active th { background: #f5f1fc; box-shadow: inset 3px 0 #b9a5ee; }
+.result-kv-context { margin-top: 6px; }
+.result-kv-context > .result-scope { font-size: 11px; }
 .record-attention { padding: 9px 12px; border-left: 3px solid #d6ac52; background: #fffbeb; color: #865e1c; font-size: 12px; line-height: 1.7; }
 .record-conditions { margin-top: 10px; font-size: 12px; line-height: 1.8; color: #575b74; }
 .record-conditions summary { cursor: pointer; width: fit-content; color: #7156ce; }
 .record-conditions ul { padding-left: 18px; list-style: disc; }
+.record-extra-evidence { margin-top: 8px; font-size: 12px; color: #70748c; }
 .result-relations { display: grid; gap: 6px; margin: 10px 0; padding-left: 10px; border-left: 2px solid #d6ac52; font-size: 12px; color: #865e1c; }
 .result-relations button { text-align: left; color: #7156ce; }
 .analysis-results .module-structured-table th[scope=row] { width: 25%; min-width: 130px; font-weight: 400; vertical-align: top; }
@@ -612,7 +631,7 @@
 .module-outline > li > details > summary .result-scope { margin-left: 16px; }
 .module-outline > li > details > .module-markdown-body { padding: 10px 0 0 16px; }
 .module-outline:empty { display: none; }
-.evidence-file { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+.value-locates-inline { margin-left: 4px; }
 .evidence-picker { width: min(410px, calc(100vw - 48px)); max-height: 50vh; overflow: auto; }
 .evidence-picker > p { margin-bottom: 8px; font-size: 12px; color: #70748c; }
 .evidence-picker ol { display: grid; gap: 8px; }
@@ -657,7 +676,8 @@
   .result-record-heading { gap: 6px; }
   .result-score { font-size: 12px; padding: 3px 5px; }
   .module-structured-table tbody th[scope=row] { display: block; width: 100%; padding: 12px 0 0; border: 0; }
-  .evidence-file { max-width: 145px; }
+  .module-kv-table th:first-child { width: 29%; }
+  .module-kv-table th, .module-kv-table td { padding: 8px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .analysis-results *, .evidence-picker * { scroll-behavior: auto !important; }

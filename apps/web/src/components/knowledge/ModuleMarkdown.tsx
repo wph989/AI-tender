@@ -5,13 +5,14 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { EvidenceReferences as ValueLocates } from "./EvidenceReferences";
 import { scopeLabel } from "@/lib/analysis/scope";
-import { unpairedFields } from "@/lib/analysis/presentation";
+import { keyValueRows, unpairedFields } from "@/lib/analysis/presentation";
+import { presentCitations } from "@/lib/analysis/citations";
 import type { AnalysisField, BusinessRecord, Citation, FieldValue } from "@/types/knowledge";
 
 /**
  * 专题结果优先使用 Skill 定义的分类、列名和树结构；历史报告保留原有投影。
  * - 定位与综合正文独立绑定，让归纳后的要求仍可回查完整原文。
- * - 同一事项的依据集中展示；多处依据先展开完整摘录，避免同页按钮难以区分。
+ * - 新结果按正文单元绑定来源，同一事项内的位置只在首次出现的正文后展示，全部摘录保留在提示中。
  * - 每个值仍绑定自己的引用（经校验的真实依据），重复值提醒与未支持提示保持原样。
  * - 正文由 react-markdown 与 GFM 插件渲染，支持标准列表和表格，忽略模型返回的 HTML。
  */
@@ -147,6 +148,8 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
   onRevealItem?: (id: string) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // 预先按整项分配入口，避免各列独立去重，也避免渲染过程消耗共享 Set 导致重渲染丢入口。
+  const citations = useMemo(() => new Map(items.map((item) => [item.id, presentCitations(item)])), [items]);
   const nodes = items.filter((item) => item.output?.layout === "tree");
   const nodeKeys = new Set(nodes.map((item) => item.output!.key));
   const groups = groupFields(items.filter((item) => item.output?.layout !== "tree"));
@@ -171,12 +174,25 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
     id: "report-item-" + item.id, "data-report-item": item.id,
     className: "result-record" + (activeId === item.id ? " report-item-active" : ""),
   });
-  const content = (value: string | string[] | undefined): ReactNode => Array.isArray(value)
-    ? <ul className="result-points">{value.map((line, index) =>
-        <li key={index}>{renderMarkdown(line.replace(/<br\s*\/?>/gi, "\n"))}</li>)}</ul>
-    : value ? renderMarkdown(value.replace(/<br\s*\/?>/gi, "\n\n")) : null;
-  const references = (item: AnalysisField) => <ValueLocates
-    refs={item.values.flatMap((value) => value.citations)} onLocate={(ref) => onLocate(ref, item.id)} />;
+  const content = (value: string | string[] | undefined, item?: AnalysisField, column?: string, offset = 0): ReactNode => {
+    const render = (line: string, index: number) => {
+      // KV 数组拆成表格行后仍使用原内容序号，不能让各行都取到第一条引用。
+      const refs = item && column ? citations.get(item.id)?.content[column]?.[index + offset] : undefined;
+      return renderMarkdown(line.replace(/<br\s*\/?>/gi, "\n\n"), refs?.length
+        ? <ValueLocates inline refs={refs} onLocate={(ref) => onLocate(ref, item?.id)} /> : undefined);
+    };
+    return Array.isArray(value)
+      ? <ul className="result-points">{value.map((line, index) => <li key={index}>{render(line, index)}</li>)}</ul>
+      : value ? render(value, 0) : null;
+  };
+  const references = (item: AnalysisField) => {
+    const extra = citations.get(item.id)?.extra ?? [];
+    if (!extra.length) return null;
+    if (!item.output?.citations) return <ValueLocates refs={extra} onLocate={(ref) => onLocate(ref, item.id)} />;
+    return <p className="record-extra-evidence" role="group" aria-label="补充依据">补充依据
+      <ValueLocates inline refs={extra} onLocate={(ref) => onLocate(ref, item.id)} />
+    </p>;
+  };
   const scope = (item: AnalysisField) => <span className="result-scope"
     data-unknown={item.record?.scope.kind === "unknown" || undefined}>
     {item.record ? "适用范围：" + scopeLabel(item.record.scope) : item.note}
@@ -228,25 +244,19 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
   };
   const heading = (item: AnalysisField) => <header className="result-record-heading">
     <div><h5>{renderInline(item.field)}</h5>{scope(item)}</div>
-    {item.output?.content["满分分值"] && <span className="result-score">满分 {item.output.content["满分分值"]}</span>}
+    {item.output?.content["满分分值"] && <span className="result-score">满分 {renderInline(
+      [item.output.content["满分分值"]].flat().join("；"))}
+      {!!citations.get(item.id)?.content["满分分值"]?.flat().length && <ValueLocates inline refs={citations.get(item.id)!.content["满分分值"]!.flat()}
+        onLocate={(ref) => onLocate(ref, item.id)} />}
+    </span>}
   </header>;
   const fields = (item: AnalysisField) => {
     const output = item.output;
     if (!output) return <p>{item.note || "来源已不可用，请更新分析。"}</p>;
-    if (unpairedFields(item)) return <div className="compound-record">
-      <p className="record-attention">原记录包含多个字段，未声明逐项对应关系。以下保留原始内容，请结合依据核对。</p>
-      <div className="compound-labels">{(output.content["字段"] as string[]).map((label, index) =>
-        <span key={index}>{label}</span>)}</div>
-      <div className="module-markdown-body">{content(output.content["内容"])}</div>
-    </div>;
-    if (output.columns.length === 2 && output.columns[0] === "字段" && output.columns[1] === "内容") {
-      return <dl className="result-properties"><div><dt>{content(output.content["字段"]) || item.field}</dt>
-        <dd className="module-markdown-body">{content(output.content["内容"])}</dd></div></dl>;
-    }
     return <dl className="result-properties">{output.columns.filter((column) => column in output.content
       && column !== "满分分值").map((column) => <div key={column}>
       {column !== "背景" && <dt>{column}</dt>}
-      <dd className="module-markdown-body">{content(output.content[column])}</dd>
+      <dd className="module-markdown-body">{content(output.content[column], item, column)}</dd>
     </div>)}</dl>;
   };
   const tree = (parent: string | null, path = new Set<string>()): ReactNode => <ul className="module-outline">
@@ -272,17 +282,35 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
     </div>{tree(null)}</>}
     {[...groups.entries()].map(([name, rows]) => {
       const output = rows.find((item) => item.output)?.output;
+      const keyValue = output?.columns.length === 2 && output.columns[0] === "字段" && output.columns[1] === "内容";
       // 短价格事项保留横向比较；长条款与评分档次用完整宽度阅读。
       const comparable = output?.layout === "table" && rows.some((item) =>
         ["price_requirement_parsing", "deposit_requirement_parsing", "biz_standard_parsing"].includes(item.record?.module_key ?? ""));
       return <section key={name} className="module-group" data-result-group={name}>
         {name !== "未分类" && <h4 className="module-group-title">{name}</h4>}
-        {comparable && output ? <div className="overflow-x-auto"><table className="module-table module-structured-table">
+        {keyValue ? <table className="module-table module-kv-table" aria-label={name}>
+          <thead><tr><th scope="col">字段</th><th scope="col">内容</th></tr></thead>
+          {rows.map((item) => {
+            const pairs = keyValueRows(item);
+            // 一条记录可含多对 KV，用 tbody 保留唯一事项身份，逐行显示时不制造重复锚点。
+            return <tbody key={item.id} {...identity(item)}>{pairs.map((pair, index) => <tr key={index}>
+              <th scope="row">{renderInline(pair.key)}</th>
+              <td><div className="result-kv-value module-markdown-body">
+                {content(pair.value, item, "内容", pair.contentIndex) || <span className="text-slate-400">未提供内容</span>}
+              </div>
+                {index === pairs.length - 1 && <div className="result-kv-context">
+                  {scope(item)}{details(item)}{relationLinks(item)}{references(item)}
+                  {unpairedFields(item) && <p className="record-attention">字段与内容数量不一致，请核对缺失项后重新解析。</p>}
+                </div>}
+              </td>
+            </tr>)}</tbody>;
+          })}
+        </table> : comparable && output ? <div className="overflow-x-auto"><table className="module-table module-structured-table">
           <thead><tr><th scope="col">事项与范围</th>{output.columns.map((column) => <th scope="col" key={column}>{column}</th>)}</tr></thead>
           <tbody>{rows.map((item) => <tr key={item.id} {...identity(item)}>
             <th scope="row">{heading(item)}{relationLinks(item)}</th>
             {output.columns.map((column, index) => <td key={column} data-label={column} className="module-markdown-body">
-              {content(item.output?.content[column]) || <span className="text-slate-400">本项未提供</span>}
+              {content(item.output?.content[column], item, column) || <span className="text-slate-400">本项未提供</span>}
               {index === output.columns.length - 1 && <>{details(item)}{references(item)}</>}
             </td>)}
           </tr>)}</tbody>
@@ -312,16 +340,17 @@ function groupFields(items: AnalysisField[]): Map<string, AnalysisField[]> {
   return groups;
 }
 
-/**
- * 单个值自己的引用去重：按钮跟在值后面，重复的同一处原文在这个值里没有额外信息。
- */
+/** 摘录参与身份比较，不能把同一原文块的其它句子误认为已有定位。 */
+function citationKey(ref: Citation): string {
+  return [ref.source_id, ref.version_id, ref.parse_run_id, ref.element_id, ref.page_no, ref.quote].join("\u0000");
+}
+
+/** 单个值自己的引用去重：重复的同一处原文在这个值里没有额外信息。 */
 function valueCitations(value: FieldValue): Citation[] {
   const seen = new Set<string>();
   const result: Citation[] = [];
   for (const ref of value.citations ?? []) {
-    const key = [ref.source_id, ref.version_id, ref.parse_run_id, ref.element_id, ref.page_no, ref.quote].join(
-      "\u0000",
-    );
+    const key = citationKey(ref);
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(ref);

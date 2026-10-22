@@ -23,7 +23,7 @@ it("按标段筛选保留公共要求，排除未知范围和近似标段名", (
   expect(scopeLabel({ kind: "lots", lot_refs: ["甲标段"], lot_ids: [1] })).toBe("甲标段");
 });
 
-it("历史复合字段明确待核对，不把部分结构化等同于业务条件缺失", () => {
+it("KV 数组按项对应，只将数量不符列为待核对", () => {
   const normal = item("normal");
   const gap: AnalysisGap = { code: "incomplete_structure", detail: "未提取数量", record_id: "normal",
     scope: { kind: "common", lot_ids: [], lot_refs: [] } };
@@ -32,9 +32,13 @@ it("历史复合字段明确待核对，不把部分结构化等同于业务条�
   const compound = { ...normal, output: { version: "1", key: "compound", layout: "table" as const,
     parent_key: null, node_type: null,
     columns: ["字段", "内容"], content: { 字段: ["项目", "预算"], 内容: ["工程", "100万元"] } } };
-  expect(unpairedFields(compound)).toBe(true);
-  expect(needsAttention(compound)).toBe(true);
+  expect(unpairedFields(compound)).toBe(false);
+  expect(needsAttention(compound)).toBe(false);
+  const incomplete = { ...compound, output: { ...compound.output, content: { 字段: ["项目", "预算"], 内容: ["工程"] } } };
+  expect(unpairedFields(incomplete)).toBe(true);
+  expect(needsAttention(incomplete)).toBe(true);
   expect(unpairedFields({ ...compound, output: { ...compound.output, content: { 字段: "项目范围", 内容: ["安装", "调试"] } } })).toBe(false);
+  expect(unpairedFields({ ...compound, output: { ...compound.output, content: { 字段: ["项目范围"], 内容: ["安装", "调试"] } } })).toBe(false);
 });
 
 it("深层材料搜索与分类联合筛选保留祖先，但只计直接命中的节点", () => {

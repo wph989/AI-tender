@@ -12,7 +12,7 @@ import {
   knowledgeRequest, loadReportRecords, resolveCitation, supportsModuleRecords,
 } from "@/lib/api/knowledge";
 import { loadProject } from "@/lib/api/client";
-import { findCitationResult } from "@/lib/analysis/citations";
+import { citationLocationKey, findCitationResult } from "@/lib/analysis/citations";
 import type {
   AnalysisReport,
   AnalysisStatus,
@@ -41,6 +41,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const [collections, setCollections] = useState<KnowledgeCollection[]>([]);
   const [linked, setLinked] = useState<number[]>([]);
   const [selected, setSelected] = useState<Citation | null>(null);
+  const [selectedQuotes, setSelectedQuotes] = useState<string[]>([]);
   const [answerRefs, setAnswerRefs] = useState<Citation[]>([]);
   const [mobileDocument, setMobileDocument] = useState(false);
   const [documentVisible, setDocumentVisible] = useState(true);
@@ -169,6 +170,12 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     try {
       const resolved = await resolveCitation(ref, controller.signal);
       if (!controller.signal.aborted) {
+        // 按点击时的事项保存全部同位置摘录，避免切专题或轮询后混入其它事项的依据。
+        const item = report?.modules.flatMap((module) => module.items).find((entry) => entry.id === itemId);
+        const scopedRefs = itemId ? item?.values.flatMap((value) => value.citations) ?? [] : answerRefs;
+        const location = citationLocationKey(ref);
+        setSelectedQuotes([...new Set([ref.quote, ...scopedRefs
+          .filter((candidate) => citationLocationKey(candidate) === location).map((candidate) => candidate.quote)])]);
         setSelected(resolved);
         activateItem(itemId);
         setMobileDocument(true);
@@ -178,7 +185,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       if (!controller.signal.aborted)
         setError(e instanceof Error ? e.message : "原文无法打开");
     }
-  }, [activateItem]);
+  }, [activateItem, report, answerRefs]);
   const perform = async (action: () => Promise<unknown>) => {
     if (busy) return;
     setBusy(true);
@@ -563,6 +570,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
               <CitationViewer
                 key={preview.version_id + ":" + (selected?.parse_run_id ?? "preview")}
                 selected={preview}
+                quotes={selectedQuotes}
                 citations={selected && !refs.includes(selected) ? [...refs, selected] : refs}
                 onReverse={(ref) => {
                   const item = findCitationResult(report?.modules ?? [], ref, activeItem, activeModuleId);

@@ -88,7 +88,6 @@ export function PageView({ pdf, page, scale, items, registry, onError, onLocate 
       <div ref={evidenceRootRef} className="absolute inset-0">
         <EvidenceLayer
           pageNo={pageNo}
-          items={items}
           activeEvidence={activeEvidence}
           pulseKey={pulseKey}
           viewport={viewport}

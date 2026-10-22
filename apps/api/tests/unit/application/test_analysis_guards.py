@@ -390,7 +390,9 @@ def test_selector_sees_only_ids_and_text_and_keeps_best_citation_location():
         verify_items(selector, items, explain=True, evidence=evidence, select_evidence=True)
     )
     value = selector.batch[0]["values"][0]
-    assert all(set(r) == {"id", "text"} for r in value["citations"] + value["context"])
+    evidence_set = selector.batch[0]["evidence_sets"][value["evidence_set"]]
+    assert all(set(r) == {"id", "text"}
+               for r in evidence_set["citations"] + evidence_set["context"])
     refs = items[0]["values"][0]["citations"]
     assert len(refs) == 1 and refs[0]["block_id"] == "duplicate"
     assert refs[0]["page_no"] == 8 and refs[0]["bbox"] == [4, 3, 2, 1]
@@ -404,7 +406,8 @@ def test_compact_review_does_not_expand_long_neighbours_back_to_full_text():
     selector = Selector(["duplicate"])
     asyncio.run(verify_items(selector, items, explain=True, evidence=evidence,
                              select_evidence=True))
-    context = selector.batch[0]["values"][0]["context"]
+    value = selector.batch[0]["values"][0]
+    context = selector.batch[0]["evidence_sets"][value["evidence_set"]]["context"]
     assert sum(len(r["text"]) for r in context) < 3000
     assert all("已截断" in r["text"] for r in context)
 

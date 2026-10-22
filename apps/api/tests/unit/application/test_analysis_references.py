@@ -33,7 +33,9 @@ class ReferenceReviewer:
                     "supported": True,
                     "unsupported_claims": [],
                     "unresolved_references": targets,
-                    "evidence_ids": [[r["id"] for r in v["citations"]] for v in item["values"]],
+                    "evidence_ids": [[r["id"] for r in
+                                      item["evidence_sets"][v["evidence_set"]]["citations"]]
+                                     for v in item["values"]],
                 }
             )
         return Completion(content=json.dumps({"reviews": reviews}), model="fixture")

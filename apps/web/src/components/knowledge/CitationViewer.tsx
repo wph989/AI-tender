@@ -17,13 +17,16 @@ import type { WirePageMeta } from "@/types/workbench";
 interface Props {
   selected: Citation | Pick<Citation, "version_id" | "file_name">;
   citations: Citation[];
+  /** 当前点击事项在当前位置的原始摘录，不与其它事项的同位置引用混合。 */
+  quotes?: string[];
   onReverse?: (ref: Citation) => void;
 }
 
 /** 复用同一 PDF.js、虚拟页和定位 Hook；父级用版本及批次作为 key 隔离旧定位。 */
-export function CitationViewer({ selected, citations, onReverse }: Props) {
+export function CitationViewer({ selected, citations, quotes, onReverse }: Props) {
   // 默认预览只需要文件身份，不伪造引用、页码锚点或高亮区域。
   const citation = "source_id" in selected ? selected : null;
+  const excerpts = quotes?.length ? quotes : citation ? [citation.quote] : [];
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [pages, setPages] = useState<WirePageMeta[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -34,7 +37,7 @@ export function CitationViewer({ selected, citations, onReverse }: Props) {
   const currentPage = useViewerStore((state) => state.currentPage);
   const refs = useMemo(() => {
     if (!citation) return [];
-    // 多条结论可引用同一原文块；画一次框即可，重复叠色会遮住正文。
+    // 多条结论可引用同一原文块；只画一次框和角标，避免重复标记干扰原文阅读。
     const blocks = new Map<number, Citation>();
     for (const ref of citations) {
       if (ref.source_id === citation.source_id && ref.version_id === citation.version_id && ref.parse_run_id === citation.parse_run_id) blocks.set(ref.element_id, ref);
@@ -88,6 +91,12 @@ export function CitationViewer({ selected, citations, onReverse }: Props) {
     <div className="min-h-0 flex-1">{pdf && pages.length ? <DocumentViewer pdf={pdf} pages={pages} index={index} registry={registry} onError={setError}
       onLocate={(item) => { const ref = refs[item.evidenceId - 1]; if (ref) onReverse?.(ref); }} />
       : <p className="p-8 text-slate-500">正在打开文档…</p>}</div>
-    {citation && <blockquote className="citation-excerpt">{citation.quote}</blockquote>}
+    {/* 多摘录可点击或触屏展开；每段仍是原始引文，不拼接后冒充一条证据。 */}
+    {citation && (excerpts.length > 1
+      ? <details key={excerpts.join("\u0000")} className="citation-excerpt">
+          <summary>查看本事项的 {excerpts.length} 条原文摘录</summary>
+          {excerpts.map((quote, index) => <blockquote key={index}>{quote}</blockquote>)}
+        </details>
+      : <blockquote className="citation-excerpt">{excerpts[0]}</blockquote>)}
   </section>;
 }

@@ -26,6 +26,8 @@ export interface AnalysisOutput {
   layout: "table" | "list" | "tree";
   columns: string[];
   content: Record<string, string | string[]>;
+  // 每个内容单元使用经校验的独立引用，数组位置与 content 中的条目一一对应。
+  citations?: Record<string, Citation[][]>;
   key: string;
   parent_key: string | null;
   node_type: "group" | "section" | null;
@@ -191,6 +193,7 @@ export interface BusinessRecord {
 /** 维度原始业务记录未解析标段目录，引用通过独立证据集合关联。 */
 export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"> {
   evidence_ids: string[];
+  content_evidence?: Record<string, string[][]>;
   scope: Omit<AnalysisScope, "lot_ids">;
 }
 
