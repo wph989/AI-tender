@@ -348,6 +348,9 @@ class ResearchMiddleware(AgentMiddleware):
             return True
         if not self.state.get("output_schema"):
             return False
+        if len(self.research.seen) >= self.research.limits.max_evidence_blocks:
+            # 原文额度已满时，扩展检索和大窗口补读不会增加证据，必须把机会留给综合。
+            return True
         # 与时间预留一致，最后四分之一次数用于补读、研究登记、逐条提交及支持性校验。
         # 使用运行账剩余次数，不能用研究工具次数代替全部工具调用；硬上限仍由仓储执行。
         return any(
@@ -366,6 +369,9 @@ class ResearchMiddleware(AgentMiddleware):
         )
         status = status | {"evidence_blocks_remaining": evidence_remaining}
         searches = [e for e in self.research.events if e["action"] == "search_result"]
+        closing_research = (self.state.get("output_schema") and (
+            self.state.get("finish_only") or self.budget_needs_synthesis(status)
+        ))
         phase = "综合输出" if self.state.get("research_completed") else "检索与转引追踪"
         hint = (
             "当前阶段：" + phase + "。证据账保留" + str(len(self.research.seen)) + "块原文。"
@@ -375,6 +381,9 @@ class ResearchMiddleware(AgentMiddleware):
                 "优先使用已读证据；仅复制引用时按交接ID以before=0、after=0回读原块。"
                 "发现实质条件缺口才补查，新证据会使旧综合失效并要求重新登记。"
                 if self.state.get("research_completed") else
+                "。本轮检索已到收尾边界，请立即 complete_research；已读部分据实登记，"
+                "未核对主题及未读附件声明 unresolved/missing，再综合已有可靠事项。"
+                if closing_research else
                 "。按当前 Skill 的全部主题完成检索与转引追踪后，调用 complete_research。"
                 "之后再用全部原文综合生成 content JSON。"
             )
@@ -460,6 +469,19 @@ class ResearchMiddleware(AgentMiddleware):
             )
         if evidence_remaining <= 12:
             hint += "新增证据额度即将用完，请先结束检索再综合已核对事项；补读仍可返回已读原文。"
+        tools = request.tools
+        if closing_research:
+            # 仅写“停止检索”无法阻止模型反复补读；收尾阶段只暴露可推进当前阶段的工具。
+            # 仍在检索时先登记真实缺口，不由服务端伪造已完成覆盖；综合后保留原块回读和提交。
+            allowed = ({"complete_research", "read_document", "submit_analysis"}
+                       if self.state.get("research_completed") else {"complete_research"})
+            if not any(e.get("scope") == "project" for e in searches):
+                # 登记仍要求一次真实项目检索；极早进入收尾时不能删除满足门禁的唯一动作。
+                allowed.add("search_document")
+            tools = [tool for tool in tools if (
+                tool.get("function", {}).get("name") if isinstance(tool, dict) else tool.name
+            ) in allowed]
+            hint += "\n当前仅提供研究登记、已有原文回读与提交所需工具；未核对部分登记缺口。"
         content = request.system_message.content if request.system_message else ""
         content = (
             content + "\n" + hint
@@ -474,7 +496,9 @@ class ResearchMiddleware(AgentMiddleware):
                 staged_item_count=len(self.state.get("staged_items", [])),
                 no_progress_rounds=self.state.get("no_progress_rounds", 0), budget=status,
             )
-            return await handler(request.override(system_message=SystemMessage(content=content)))
+            return await handler(request.override(
+                system_message=SystemMessage(content=content), tools=tools,
+            ))
 
     def feedback(self, text: str, remaining: int = 2) -> dict:
         """把校验结论作为运行时反馈交回主 Agent，由它决定如何修正。"""
@@ -496,6 +520,13 @@ class ResearchMiddleware(AgentMiddleware):
 
     def drop_pending(self, pending_ids: set[str]) -> None:
         """中止模块时丢弃未获支持的版本；上一版已核实内容仍保留在暂存结果中。"""
+        for entry in self.state.get("staged_items", []):
+            if (entry["id"] in pending_ids and entry.get("verification") != "supported"
+                    and entry.get("business", {}).get("kind") == "coverage"):
+                # 旧证明ID沿用后，恢复旧核实版本不能替新改写的不适用说明背书。
+                for coverage in self.state.get("business_coverage", []):
+                    if coverage.get("review_id") == entry["id"]:
+                        coverage.update(status="pending", detail="本次不适用证明尚未通过原文校验")
         self.state["staged_items"] = [
             entry
             for entry in self.state.get("staged_items", [])
@@ -698,6 +729,11 @@ class ResearchMiddleware(AgentMiddleware):
                 kept.append(previous)
             issues = "；".join(entry.get("verification_issues") or []) or "引用未支持该字段的断言"
             label = field_label(entry)
+            if entry.get("business", {}).get("kind") == "coverage":
+                # 本次证明未通过即为待核对，不能等三次纠错耗尽后才撤销“不适用”。
+                for coverage in self.state.get("business_coverage", []):
+                    if coverage.get("review_id") == entry["id"]:
+                        coverage.update(status="pending", detail=issues)
             reference_only = (entry.get("verification_references")
                               and not entry.get("verification_claim_issues"))
             if reference_only and entry.get("business"):
@@ -709,11 +745,6 @@ class ResearchMiddleware(AgentMiddleware):
             if failures >= self.research.limits.max_validation_failures:
                 if entry.get("business"):
                     self.state.setdefault("rejected_records", {})[entry["id"]] = True
-                    if entry["business"]["kind"] == "coverage":
-                        # 证明已被拒绝，不能继续将主题标成“不适用”，但保留其它可靠成果。
-                        for coverage in self.state.get("business_coverage", []):
-                            if coverage.get("review_id") == entry["id"]:
-                                coverage.update(status="pending", detail=issues)
                     self.record_gap(
                         entry, issues,
                         "unresolved_reference" if reference_only else "unknown_condition",
@@ -880,10 +911,18 @@ class ResearchMiddleware(AgentMiddleware):
             result = None
             try:
                 name = request.tool_call["name"]
+                if name == "submit_analysis":
+                    # 同轮工具串行执行：后续暂存或无效提交撤销前一提交的完成意图，
+                    # 否则它尚未纠正就会借用旧 final 发布残缺成果；同ID重放已在上方返回。
+                    self.state.pop("pending_final", None)
                 signature = tool_key(name, request.tool_call["args"])
                 counts = self.state.setdefault("identical_tool_calls", {})
                 counts[signature] = counts.get(signature, 0) + 1
-                if counts[signature] > self.research.limits.max_identical_tool_calls:
+                # 多个独立事项可共用原文；成功回读已有缓存，重复并不表示检索陷入循环。
+                cached_read = (name == "read_document" and signature in
+                               self.state.get("read_tool_cache", {}))
+                if (not cached_read
+                        and counts[signature] > self.research.limits.max_identical_tool_calls):
                     raise RuntimeError("相同工具与参数重复调用已达上限：" + name)
                 try:
                     was_synthesis = bool(self.state.get("research_completed"))
@@ -891,7 +930,10 @@ class ResearchMiddleware(AgentMiddleware):
                     if request.tool_call["name"] in {"search_document", "search_knowledge"} and (
                         self.state.get("finish_only")
                         or self.budget_needs_synthesis(status)
-                    ):
+                    ) and not (name == "search_document" and not any(
+                        e["action"] == "search_result" and e.get("scope") == "project"
+                        for e in self.research.events
+                    )):
                         raise ToolArgumentError(
                             "已进入校验收尾预算，请基于已读证据提交；尚未登记研究时先complete_research。"
                             "未完成范围写入检索总结；必要引文仍可read_document回读"
@@ -1120,10 +1162,25 @@ def build_module_agent(
             invalidate_summary()
         return result
 
-    async def read_document(block_id: str, before: int = 2, after: int = 2) -> dict:
+    async def read_document(
+        block_id: str,
+        before: Annotated[int, Field(ge=0, le=11)] = 2,
+        after: Annotated[int, Field(ge=0, le=11)] = 2,
+    ) -> dict:
         """补读已知证据的邻近原文，before/after合计最多11；补入新块后重新汇总。"""
         before_ids = set(research.seen)
+        if len(research.seen) >= research.limits.max_evidence_blocks:
+            # 此时邻域无法接纳新块，只回读已登记原块；先检查参数，避免替非法参数消耗机会。
+            if any(type(n) is not int or n < 0 for n in (before, after)) or before + after > 11:
+                raise ToolArgumentError("before/after 必须为非负整数，连同当前块每次最多12块")
+            before = after = 0
         result = await research.read_evidence(block_id, before, after)
+        if len(research.seen) >= research.limits.max_evidence_blocks and before == after == 0:
+            # 明确告知实际读取范围，避免把原块回读误认为邻域或整段清单已核对完成。
+            result = result | {
+                "quote_only": True,
+                "warning": "证据额度已满，本次仅回读已登记原块，未补入邻域；未核对部分保留缺口。",
+            }
         if set(research.seen) != before_ids:
             invalidate_summary()
         return result
@@ -1194,13 +1251,23 @@ def build_module_agent(
                 if old.get("verification") == "supported":
                     staged.append(old)
                 continue
-            if old.get("verification") == "supported":
-                state.setdefault("business_previous", {})[entry["id"]] = old
+            # 循环也遍历已有逐条绑定的旧条目，两侧都须忽略校验器生成的信息，
+            # 否则提交新事项或空提交收尾会将未改写的旧事项重新送审。
             unchanged = old.get("verification") == "supported" and all(
                 entry.get(k) == old.get(k)
-                for k in ("field", "group", "sort_order", "values", "note", "business", "output")
-            )
-            entry["verification"] = "supported" if unchanged else "pending"
+                for k in ("field", "group", "sort_order", "values", "note", "business")
+            ) and {
+                k: v for k, v in entry.get("output", {}).items() if k != "citations"
+            } == {
+                k: v for k, v in old.get("output", {}).items() if k != "citations"
+            }
+            if unchanged:
+                # 复用已核实版本并保留绑定，避免额外请求或丢掉正文单元的原文定位。
+                staged.append(old)
+                continue
+            if old.get("verification") == "supported":
+                state.setdefault("business_previous", {})[entry["id"]] = old
+            entry["verification"] = "pending"
             staged.append(entry)
         state["staged_items"] = staged
         if errors:

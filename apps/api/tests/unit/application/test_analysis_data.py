@@ -407,6 +407,22 @@ def test_not_applicable_proofs_are_independent_for_each_lot(legacy_keys):
     assert all(c["citations"][0]["quote"] == quote for c in data["coverage"])
 
 
+@pytest.mark.parametrize("legacy_id", [False, True])
+def test_coverage_correction_reuses_proof_identity_from_checkpoint(legacy_id):
+    state = {"business_topics": [{"key": "deposit", "title": "保证金"}]}
+    quote = "本项目无需保证金"
+    seen = {"s1r1c0": block() | {"content": quote}}
+    entry = CoverageInput(topic="deposit", scope=COMMON, status="not_applicable", detail=quote,
+                          citations=[{"block_id": "s1r1c0", "quote": quote}])
+    coverage, first = prepare_coverage([entry], state, seen, state["business_topics"], KEY)
+    expected = "legacy-proof" if legacy_id else first[0]["id"]
+    coverage[0]["review_id"] = expected
+    state["business_coverage"] = coverage
+    _, corrected = prepare_coverage([entry.model_copy(update={"detail": "无需提交投标保证金"})],
+                                    state, seen, state["business_topics"], KEY)
+    assert corrected[0]["id"] == expected
+
+
 def synthesis_record(record):
     # 数据投影测试仍使用通用业务记录，真实图必须按其专题格式构造综合内容。
     if record.kind == "format_node":

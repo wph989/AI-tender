@@ -446,6 +446,8 @@ def test_incomplete_tool_arguments_are_not_delivered_as_business_submissions(tok
             with pytest.raises(expected) as error:
                 await model.chat([message_to_dict(HumanMessage(content="检索"))], [TOOL])
             assert error.value.completion_tokens == tokens
+            if expected is InvalidModelOutput:
+                assert "search_document" in str(error.value) and "query" in str(error.value)
         finally:
             await model.aclose()
 
@@ -479,10 +481,50 @@ def test_malformed_tool_name_is_bounded_protocol_error_without_echoing_document(
             with pytest.raises(InvalidModelOutput) as error:
                 await model.chat([message_to_dict(HumanMessage(content="检索"))], [TOOL])
             assert len(str(error.value)) < 100 and "机密" not in str(error.value)
+            assert "当前可用工具" in str(error.value) and "search_document" in str(error.value)
         finally:
             await model.aclose()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("wrong_name", [False, True])
+def test_native_protocol_retry_receives_specific_schema_error(wrong_name):
+    requests, records = [], []
+
+    def handle(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if len(requests) == 2:
+            hint = payload["messages"][-1]["content"]
+            assert "search_document" in hint
+            assert ("当前可用工具" if wrong_name else "query") in hint
+        return stream_response(response({
+            "role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_1", "type": "function", "function": {
+                    "name": "unknown" if len(requests) == 1 and wrong_name else "search_document",
+                    "arguments": "{}" if len(requests) == 1 else '{"query":"预算"}',
+                },
+            }],
+        }))
+
+    async def run():
+        model = agent(httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+        router = RoutingModel(
+            "analysis", "fixture", [ModelCandidate(
+                registry_model_id=1, provider_id=1, display_name="fixture", model="fixture",
+                base_url="http://test/v1", api_key=None, timeout=5, temperature=None,
+                max_tokens=128, extra_retries=0,
+            )], lambda *args, **kwargs: model, records.append,
+        )
+        try:
+            reply = await router.chat([message_to_dict(HumanMessage(content="分析预算"))], [TOOL])
+            assert reply.agent_message["data"]["tool_calls"][0]["args"] == {"query": "预算"}
+        finally:
+            await router.aclose()
+
+    asyncio.run(run())
+    assert len(requests) == 2 and [r.status for r in records] == ["error", "ok"]
 
 
 def test_invalid_response_keeps_usage_for_budget_accounting():

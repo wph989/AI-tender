@@ -7,6 +7,9 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from langchain.agents.middleware.types import ModelRequest
+from langchain_core.messages import SystemMessage
+from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
 from synthesis_fixtures import research_calls, research_done, submission, summary_record
 from test_analysis_research import block, session
@@ -23,7 +26,7 @@ from tender.application.analysis.policy import (
     load_module_skill,
     select_verified_repeats,
 )
-from tender.application.analysis.research import ToolArgumentError
+from tender.application.analysis.research import AgentLimits, ToolArgumentError
 from tender.application.analysis.skills import MODULES, skill_snapshot, verify_items
 from tender.application.knowledge.content import validate_items
 from tender.domain.shared.errors import InvalidModelOutput, ModelOutputTruncated, ModelUnavailable
@@ -192,6 +195,118 @@ def test_identical_queries_reuse_results_and_stop_at_limit():
         assert research.tool_calls == 1
         assert len(state["tool_results"]) == 3
         assert len(router.requests) == 4
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_full_evidence_budget_switches_available_tools_to_research_registration(registered):
+    async def run():
+        research = session([block()], limits=AgentLimits(max_evidence_blocks=1))
+        await research.search("质保", "project")
+        state = {}
+        build(ScriptedRouter([]), research, state)
+        if registered:
+            state["research_completed"] = {
+                "topics": [], "references": [], "document_gaps": [], "evidence_ids": ["s1r1c0"],
+            }
+        # 使用真实构图的中间件，验证传给模型的工具，而非只检查提示文案。
+        middleware = ResearchMiddleware(
+            research, state, noop, noop, skill=load_module_skill(SKILL, KEY),
+        )
+        def tool(name):
+            return StructuredTool.from_function(lambda: "", name=name, description=name)
+
+        captured = []
+
+        async def handler(request):
+            captured.append(request)
+
+        await middleware.awrap_model_call(ModelRequest(
+            model=RoutedAgentModel(router=ScriptedRouter([])), messages=[],
+            system_message=SystemMessage(content="分析"),
+            tools=[tool(n) for n in ("search_document", "read_document", "complete_research",
+                                    "submit_analysis", "read_file")],
+        ), handler)
+        assert [t.name for t in captured[0].tools] == (
+            ["read_document", "complete_research", "submit_analysis"] if registered else
+            ["complete_research"]
+        )
+        assert "证据" in captured[0].system_message.text
+
+    asyncio.run(run())
+
+
+def test_full_evidence_budget_rereads_only_registered_block_and_finishes():
+    async def run():
+        rows = [block(), block() | {"block_id": "next", "element_id": 2,
+                                   "offset": 1, "content": "另一独立要求"}]
+        research = session(rows, limits=AgentLimits(max_evidence_blocks=1))
+        state = {}
+        router = ScriptedRouter([
+            *research_calls(),
+            call("read_document", {"block_id": "s1r1c0", "before": 0, "after": 11}, "quote"),
+            call("submit_analysis", submission([summary_record()]), "finish"),
+        ])
+        graph, files = build(router, research, state)
+        await invoke_module(graph, files, thread_id="evidence-full", task="分析")
+        reads = [e for e in research.events if e["action"] == "read_evidence"]
+        assert reads[0]["arguments"] == {"block_id": "s1r1c0", "before": 0, "after": 0}
+        assert set(research.seen) == {"s1r1c0"}
+        result = json.loads(state["tool_results"]["call_quote"]["data"]["content"])
+        assert result["quote_only"] and "未补入邻域" in result["warning"]
+        assert "draft" in state
+
+    asyncio.run(run())
+
+
+def test_same_quote_can_be_reread_for_multiple_independent_submissions():
+    async def run():
+        research = session([block()])
+        state = {}
+        calls = research_calls()
+        for n in range(4):
+            calls.extend([
+                call("read_document", {"block_id": "s1r1c0", "before": 0, "after": 0}, f"q{n}"),
+                call("submit_analysis", submission([summary_record(
+                    key=f"item{n}", title=f"独立事项{n}",
+                    content={"字段": f"事项{n}", "内容": "质保期限为三年"},
+                )], final=False), f"s{n}"),
+            ])
+        calls.append(call("submit_analysis", submission(), "final"))
+        graph, files = build(ScriptedRouter(calls), research, state)
+        await invoke_module(graph, files, thread_id="repeated-quote", task="分析")
+        assert "draft" in state and len(state["draft"]["fields"]) == 4
+        assert sum(e["action"] == "read_evidence" for e in research.events) == 1
+
+    asyncio.run(run())
+
+
+def test_finish_mode_before_first_search_keeps_required_project_search_available():
+    async def run():
+        research, state = session([block()]), {"finish_only": True}
+        build(ScriptedRouter([]), research, state)
+        middleware = ResearchMiddleware(research, state, noop, noop)
+        captured = []
+
+        async def handler(request):
+            captured.append(request)
+
+        tools = [StructuredTool.from_function(lambda: "", name=n, description=n) for n in
+                 ("search_document", "read_document", "complete_research", "submit_analysis")]
+        await middleware.awrap_model_call(ModelRequest(
+            model=RoutedAgentModel(router=ScriptedRouter([])), messages=[], tools=tools,
+        ), handler)
+        # 登记门禁要求实际项目检索，不能在收尾筛工具时把唯一可满足前提的动作删掉。
+        assert [t.name for t in captured[0].tools] == ["search_document", "complete_research"]
+        graph, files = build(ScriptedRouter([
+            call("search_document", {"query": "质保"}, "first"),
+            call("complete_research", research_done(), "research"),
+            call("submit_analysis", submission([summary_record()]), "final"),
+        ]), research, state)
+        await invoke_module(graph, files, thread_id="early-finish", task="分析")
+        assert state["tool_results"]["call_first"]["data"]["status"] == "success"
+        assert "draft" in state
 
     asyncio.run(run())
 

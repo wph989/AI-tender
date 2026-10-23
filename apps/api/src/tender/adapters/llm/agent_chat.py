@@ -199,10 +199,15 @@ class AgentChat:
             )
             for tool in tools
         }
-        missing = any(
-            call["name"] not in required or required[call["name"]] - call["args"].keys()
-            for call in result.tool_calls
-        )
+        issues = []
+        for call in result.tool_calls:
+            if call["name"] not in required:
+                # 模型可把正文误塞进工具名，不能回显未知名称；只给出服务端允许的名单。
+                issues.append("未知工具；当前可用工具：" + "、".join(required))
+            elif absent := required[call["name"]] - call["args"].keys():
+                # 缺项来自本次工具schema，无需回显参数值或整份模型响应即可准确纠正。
+                issues.append(call["name"] + " 缺少必填参数：" + "、".join(sorted(absent)))
+        missing = bool(issues)
         finish = result.response_metadata.get("finish_reason") or result.response_metadata.get(
             "stop_reason"
         )
@@ -216,7 +221,11 @@ class AgentChat:
         if result.invalid_tool_calls:
             raise invalid(InvalidModelOutput, "模型工具调用参数不是合法 JSON")
         if missing:
-            raise invalid(InvalidModelOutput, "模型工具名称或必填参数无效，请按JSON Schema完整返回")
+            raise invalid(
+                InvalidModelOutput,
+                "模型工具名称或必填参数无效：" + "；".join(dict.fromkeys(issues))[:1400]
+                + "。请按JSON Schema完整返回",
+            )
         if not result.content and not result.tool_calls:
             raise invalid(InvalidModelOutput, "模型既未返回正文，也未返回工具调用")
         return Completion(

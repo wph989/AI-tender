@@ -28,8 +28,9 @@ from tender.application.analysis.output import (
     research_checkpoint,
 )
 from tender.application.analysis.research import AgentLimits
-from tender.application.analysis.skills import MODULES, skill_snapshot
+from tender.application.analysis.skills import MODULES, skill_snapshot, verify_items
 from tender.domain.shared.errors import InvalidModelOutput, ModelOutputTruncated, ModelUnavailable
+from tender.ports.llm.chat import Completion
 
 
 def build(
@@ -461,6 +462,193 @@ def test_same_key_correction_replaces_summary_and_unchanged_final_does_not_revie
         assert len(reviewed) == 2 and reviewed[0]["id"] == reviewed[1]["id"]
         records = state["draft"]["business_data"]["records"]
         assert len(records) == 1 and records[0]["content"] == corrected["content"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("changed_content", [False, True])
+def test_resubmission_keeps_verified_bindings_and_reviews_only_content_changes(changed_content):
+    async def run():
+        class Reviewer:
+            calls = 0
+
+            async def complete(self, prompt):
+                self.calls += 1
+                data = json.loads(prompt.rsplit("\n", 1)[-1])
+                return Completion(content=json.dumps({"reviews": [{
+                    "supported": True, "unsupported_claims": [], "unresolved_references": [],
+                    "evidence_ids": [["s1r1c0"] for _ in item["values"]],
+                } for item in data]}), model="fixture")
+
+        reviewer = Reviewer()
+
+        async def review(items):
+            await verify_items(reviewer, items, explain=True, select_evidence=True)
+
+        final_record = summary_record(text="设备质保期限：三年") if changed_content else (
+            summary_record()
+        )
+        state, _, _ = await execute([
+            *research_calls(),
+            call("submit_analysis", submission([summary_record()], final=False), "save"),
+            call("submit_analysis", submission([final_record]), "finish"),
+        ], review=review)
+        assert reviewer.calls == (2 if changed_content else 1)
+        item = state["draft"]["fields"][0]
+        assert item["output"]["content"] == final_record["content"]
+        assert set(item["output"]["citations"]) == {"字段", "内容"}
+        assert set(state["draft"]["business_data"]["records"][0]["content_evidence"]) == {
+            "字段", "内容",
+        }
+
+    asyncio.run(run())
+
+
+def test_new_record_and_empty_final_do_not_review_previously_bound_records():
+    async def run():
+        class Reviewer:
+            def __init__(self):
+                self.batches = []
+
+            async def complete(self, prompt):
+                data = json.loads(prompt.rsplit("\n", 1)[-1])
+                self.batches.append([item["field"] for item in data])
+                return Completion(content=json.dumps({"reviews": [{
+                    "supported": True, "unsupported_claims": [], "unresolved_references": [],
+                    "evidence_ids": [["s1r1c0"] for _ in item["values"]],
+                } for item in data]}), model="fixture")
+
+        reviewer = Reviewer()
+
+        async def review(items):
+            # 真实校验器会生成逐条绑定；仅标记supported的替身无法复现旧条目被重审。
+            await verify_items(reviewer, items, explain=True, select_evidence=True)
+
+        state, saved, _ = await execute([
+            *research_calls(),
+            call("submit_analysis", submission([summary_record()], final=False), "first"),
+            call("submit_analysis", submission([summary_record(
+                key="second", title="另一事项",
+            )], final=False), "second"),
+            call("submit_analysis", submission(), "finish"),
+        ], review=review)
+        assert reviewer.batches == [["质保期限"], ["另一事项"]]
+        first_verified = next(s["staged_items"][0] for s in saved
+                              if s.get("staged_items_verified"))
+        assert state["draft"]["fields"][0] == first_verified
+        records = state["draft"]["business_data"]["records"]
+        assert len(records) == 2
+        assert all(set(r["content_evidence"]) == {"字段", "内容"} for r in records)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("later_invalid", [False, True])
+def test_later_submission_in_the_same_turn_revokes_earlier_completion(later_invalid):
+    async def run():
+        later = summary_record("second", content={"未知列": "错误"}) if later_invalid else (
+            summary_record("second")
+        )
+        state, saved, router = await execute([
+            *research_calls(),
+            AIMessage(content="", tool_calls=[
+                call("submit_analysis", submission([summary_record()]), "early-final"),
+                call("submit_analysis", submission([later], final=False), "later"),
+            ]),
+            call("submit_analysis", submission(), "finish"),
+        ])
+        before_final = [s for s in saved if "call_later" in s.get("tool_results", {})
+                        and "call_finish" not in s.get("tool_results", {})]
+        assert before_final and all("draft" not in s for s in before_final)
+        assert "pending_final" not in before_final[0]
+        assert len(router.requests) == 5
+        assert len(state["draft"]["fields"]) == (1 if later_invalid else 2)
+
+    asyncio.run(run())
+
+
+def test_reworded_not_applicable_proof_keeps_correction_limit_and_honest_coverage():
+    async def run():
+        reviewed = []
+
+        async def review(items):
+            for item in items:
+                reviewed.append(item["id"])
+                item.update(verification="unsupported", verification_issues=["原文不能证明不适用"])
+
+        coverage = [{
+            "topic": "warranty", "scope": COMMON, "status": "not_applicable",
+            "detail": text, "citations": [{"block_id": "s1r1c0", "quote": "质保三年"}],
+        } for text in ("质保条款不适用", "本次无需适用质保条款", "当前项目无需质保条款")]
+        state, saved, _ = await execute([
+            *research_calls(topics=[topic()]),
+            *[call("submit_analysis", submission(coverage=[entry], final=False), index)
+              for index, entry in enumerate(coverage)],
+            call("submit_analysis", submission(), "finish"),
+        ], review=review, snapshot=SKILL | {
+            KEY + "/references/coverage.json": '[{"key":"warranty"}]',
+        })
+        assert len(reviewed) == 3 and len(set(reviewed)) == 1
+        assert state["rejected_records"][reviewed[0]]
+        after_first_review = next(s for s in saved if s.get("correction_failures"))
+        assert after_first_review["business_coverage"][0]["status"] == "pending"
+        data = state["draft"]["business_data"]
+        assert data["coverage"][0]["status"] == "pending"
+        assert any(g["key"].startswith("record:") for g in data["gaps"])
+
+    asyncio.run(run())
+
+
+def test_repeated_supported_coverage_proof_reuses_its_review():
+    async def run():
+        reviewed = []
+
+        async def review(items):
+            reviewed.extend(item["id"] for item in items)
+            await accept(items)
+
+        entry = {"topic": "warranty", "scope": COMMON, "status": "not_applicable",
+                 "detail": "本项目无需保证金",
+                 "citations": [{"block_id": "s1r1c0", "quote": "本项目无需保证金"}]}
+        state, _, _ = await execute([
+            *research_calls(topics=[topic()]),
+            call("submit_analysis", submission(coverage=[entry], final=False), "proof"),
+            call("submit_analysis", submission(coverage=[entry]), "finish"),
+        ], review=review, research=session([block() | {"content": "本项目无需保证金"}]),
+            snapshot=SKILL | {KEY + "/references/coverage.json": '[{"key":"warranty"}]'})
+        assert len(reviewed) == 1
+        assert state["draft"]["business_data"]["coverage"][0]["status"] == "not_applicable"
+
+    asyncio.run(run())
+
+
+def test_interrupted_coverage_correction_does_not_borrow_previous_proof():
+    async def run():
+        state, count = {}, 0
+
+        async def review(items):
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise ModelUnavailable("校验连接中断")
+            await accept(items)
+
+        entry = {"topic": "warranty", "scope": COMMON, "status": "not_applicable",
+                 "detail": "本项目无需保证金",
+                 "citations": [{"block_id": "s1r1c0", "quote": "本项目无需保证金"}]}
+        router = ScriptedRouter([
+            *research_calls(),
+            call("submit_analysis", submission(coverage=[entry], final=False), "proof"),
+            call("submit_analysis", submission(coverage=[entry | {"detail": "无需所有保证金"}]),
+                 "correction"),
+        ])
+        graph, files = build(router, session([block() | {"content": "本项目无需保证金"}]),
+                             state, review=review)
+        with pytest.raises(RuntimeError, match="证据校验请求失败"):
+            await invoke_module(graph, files, thread_id="proof-correction", task="分析")
+        assert state["staged_items"][0]["business"]["text"] == "本项目无需保证金"
+        assert state["business_coverage"][0]["status"] == "pending"
+        assert "draft" not in state
 
     asyncio.run(run())
 

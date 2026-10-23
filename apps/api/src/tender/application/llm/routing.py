@@ -377,10 +377,12 @@ class RoutingModel:
                     ):
                         # 在换候选前纠正已收到的坏格式，避免主模型的可修正问题被后备网络故障掩盖。
                         # 纠正也计入原有总次数和时间预算，不重发未知结果或明确拒绝。
+                        detail = (error_detail(str(exc), api_key=candidate.api_key)
+                                  or "模型响应不符合当前协议")[:1800]
                         request_prompt = prompt + (
-                            "\n上次响应不符合 JSON 协议。请重新返回一个完整 JSON 对象，"
-                            "遵守当前阶段的字段要求；工具动作也必须用 action 对象表达，"
-                            "不能只说明计划。"
+                            "\n上次响应不符合 JSON 协议：" + detail
+                            + "。请重新返回一个完整 JSON 对象，遵守本次请求的字段和结构；"
+                            "不要返回Markdown或计划。"
                         )
                         if chat_request is not None:
                             native_request = chat_request | {
@@ -390,7 +392,10 @@ class RoutingModel:
                                         "type": "human",
                                         "data": {
                                             "content": (
-                                                "上次未返回合法工具调用或正文。请使用已提供的工具，"
+                                                # 校验阶段也使用complete，不能混入旧action协议；
+                                                # 原生工具纠正保留具体缺项，避免相同坏响应循环。
+                                                "上次协议校验失败：" + detail
+                                                + "。请使用本次已提供的工具，"
                                                 "工具参数必须完整符合其 JSON Schema；"
                                                 "完成后返回正式结论。"
                                             )
@@ -428,7 +433,20 @@ class RoutingModel:
                     ), records,
                 )
                 return replace(completion, registry_model_id=candidate.registry_model_id)
-        message = str(first_error) if first_error else "当前模型均已停用或不可调用"
+        # 首候选的渠道故障不能掩盖后备的余额／权限错误；只使用已脱敏的调用账摘要。
+        # 同模型多次重试按原因去重，避免前端堆积相同堆栈或回显凭证。
+        failures = list(dict.fromkeys(
+            (record.model_name_snapshot, record.error_message)
+            for record in records if record.error_message
+        ))
+        if len({name for name, _ in failures}) > 1:
+            message = "所有已尝试模型均未完成请求：\n" + "\n".join(
+                f"{name}：{detail}" for name, detail in failures
+            )
+        else:
+            message = (failures[-1][1] if failures else
+                       "当前模型均已停用或不可调用")
+        message = error_detail(message) or "当前模型均不可调用"
         if unavailable_only and first_error:
             raise ModelUnavailable(message)
         raise ModelCallFailed(message)

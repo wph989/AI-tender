@@ -127,6 +127,22 @@ def test_all_unavailable_raises_unavailable_for_job_level_retry() -> None:
         )
 
 
+def test_final_error_includes_each_candidate_reason_without_exposing_credentials():
+    candidates = [replace(_candidate("a", 1), api_key="fixture-key"), _candidate("b", 2)]
+    gateway = _ScriptedGateway({
+        "a": [ModelUnavailable("渠道失效 fixture-key", http_status=503)],
+        "b": [ModelCallFailed("账户余额不足", http_status=403)],
+    })
+    model = RoutingModel("analysis", "analysis", candidates, gateway, lambda record: None)
+    try:
+        with pytest.raises(ModelCallFailed) as error:
+            asyncio.run(model.complete("解析"))
+        assert "渠道失效" in str(error.value) and "账户余额不足" in str(error.value)
+        assert "fixture-key" not in str(error.value)
+    finally:
+        asyncio.run(model.aclose())
+
+
 def test_call_record_preserves_long_upstream_details_and_hides_candidate_key():
     records: list[CallRecord] = []
     detail = "网关返回 HTTP 429\n" + "x" * 1000 + "\n额度不足 request_id=upstream-123"
@@ -158,6 +174,8 @@ def test_invalid_json_is_corrected_before_trying_an_unavailable_fallback():
     assert [record.status for record in records] == ["error", "ok"]
     assert gateway.prompts[0] == "prompt"
     assert "上次响应不符合 JSON 协议" in gateway.prompts[1]
+    assert "非法 JSON" in gateway.prompts[1]
+    assert "action" not in gateway.prompts[1]
 
 
 def test_invalid_json_exhausts_two_corrections_then_fails_over():

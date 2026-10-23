@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -91,6 +92,19 @@ def read_errors(directory: Path) -> str:
 
 def record(message="中文日志"):
     return logging.LogRecord("tender.test", logging.INFO, __file__, 1, message, (), None)
+
+
+@pytest.mark.parametrize("tail", ["During task with name 'model' and id 'abc'",
+                                  "(Background on this error at: https://sqlalche.me/e/21/e3q8)"])
+def test_error_summary_keeps_actual_exception_before_framework_notes(tail):
+    error = RuntimeError("模型请求预算已耗尽\n具体原因：调用次数达到上限")
+    error.add_note(tail)
+    entry = record("module.fail")
+    entry.exception = "".join(traceback.format_exception(error, chain=False))
+    payload = json.loads(make_formatter(json_output=True, include_exception=False).format(entry))
+    assert payload["error"].startswith("RuntimeError: 模型请求预算已耗尽")
+    assert "具体原因" in payload["error"]
+    assert tail not in payload["error"]
 
 
 @pytest.mark.parametrize("json_output", [True, False])

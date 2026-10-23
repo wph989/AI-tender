@@ -105,7 +105,17 @@ def make_formatter(
     def scrub(_, __, event):
         if not include_exception and (trace := event.pop("exception", None)):
             # 普通日志只显示错误摘要；完整堆栈由同目录的文本错误文件承载。
-            event.setdefault("error", str(trace).rstrip().splitlines()[-1][:500])
+            lines = str(trace).rstrip().splitlines()
+            # Python 3.11 的异常注记和 SQLAlchemy 帮助链接位于最后，不能将它们当作根因。
+            starts = [
+                i for i, line in enumerate(lines)
+                if re.match(r"^[\w.]+(?:Error|Exception|Failed|Unavailable|Truncated):", line)
+            ]
+            summary = lines[starts[-1]:] if starts else lines[-1:]
+            summary = [line for line in summary if not line.startswith(
+                ("During task with name ", "(Background on this error at:")
+            )]
+            event.setdefault("error", "\n".join(summary)[:500])
         # 固定公共字段靠前，业务字段按名称排列；空值省略，0/False 仍有业务含义。
         ordered = {
             key: event[key]

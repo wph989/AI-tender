@@ -239,10 +239,16 @@ def prepare_coverage(
                 "field": "主题不适用：" + entry["topic"],
                 "values": [{"value": entry["detail"], "citations": entry["citations"]}],
             }], seen, align=False)[0]
-            item["id"] = record_identity(state, "coverage:" + fingerprint(entry))
+            proof_key = "coverage:" + fingerprint([entry["topic"], entry["scope"]])
+            previous = next((v for v in state.get("business_coverage", [])
+                             if v["topic"] == entry["topic"] and v["scope"] == entry["scope"]
+                             and v.get("review_id")), None)
+            # 同一主题与范围的证明改写不能重置纠错次数；恢复旧检查点时沿用旧证明ID，
+            # 不同标段仍独立计数。文字与引用变化会重新校验，不参与身份计算。
+            item["id"] = previous["review_id"] if previous else record_identity(state, proof_key)
             item["business"] = {
                 "id": item["id"],
-                "key": "coverage:" + fingerprint([entry["topic"], entry["scope"]]),
+                "key": proof_key,
                 "kind": "coverage", "scope": entry["scope"], "module_key": module_key,
                 "topic": entry["topic"], "text": entry["detail"],
             }
