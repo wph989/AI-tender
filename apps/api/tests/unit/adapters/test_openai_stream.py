@@ -7,7 +7,12 @@ import httpx
 import pytest
 
 from tender.adapters.llm.openai_chat import OpenAIChatModel
-from tender.domain.shared.errors import ModelOutputTruncated, ModelRefused, ModelUnavailable
+from tender.domain.shared.errors import (
+    ModelCallFailed,
+    ModelOutputTruncated,
+    ModelRefused,
+    ModelUnavailable,
+)
 
 
 class FragmentedStream(httpx.AsyncByteStream):
@@ -97,3 +102,17 @@ def test_stream_error_does_not_expose_provider_payload():
     with pytest.raises(ModelUnavailable) as caught:
         complete([{"error": {"message": "secret-provider-body"}}])
     assert "secret-provider-body" not in str(caught.value)
+
+
+@pytest.mark.parametrize("status,expected", [
+    (503, ModelUnavailable), ("503", ModelUnavailable),
+    (429, ModelUnavailable), (403, ModelCallFailed),
+])
+def test_stream_error_code_preserves_supplier_cause_and_retry_policy(status, expected):
+    with pytest.raises(expected) as caught:
+        # 服务可在HTTP 200之后才报错，必须区分过载／限流与拒绝，不能反复重试403。
+        complete([{"error": {"message": "服务过载 api_key=fixture-secret", "code": status}}])
+    assert caught.value.http_status == int(status)
+    assert "服务过载" in str(caught.value)
+    assert "HTTP 200" in str(caught.value) and "流内错误码" in str(caught.value)
+    assert "fixture-secret" not in str(caught.value)

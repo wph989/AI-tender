@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from langchain.agents.middleware.types import ModelRequest
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
 from synthesis_fixtures import research_calls, research_done, submission, summary_record
@@ -260,6 +260,51 @@ def test_full_evidence_budget_rereads_only_registered_block_and_finishes():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("registered", [False, True])
+def test_closing_stage_overrides_stale_read_error_without_rewriting_history(registered):
+    async def run():
+        research = session([block()], limits=AgentLimits(max_evidence_blocks=1))
+        await research.search("质保", "project")
+        state = {}
+        build(ScriptedRouter([]), research, state)
+        if registered:
+            state["research_completed"] = {
+                "topics": [], "references": [], "document_gaps": [], "evidence_ids": ["s1r1c0"],
+            }
+        # 复现真实失败时最后一条反馈仍要求补读，阶段通知须位于它之后且不能改写旧反馈。
+        error = ToolMessage(content="补读参数错误，请修正 before/after 后继续 read_document",
+                            tool_call_id="old-read", name="read_document", status="error")
+        history = [error]
+        captured = []
+
+        async def handler(request):
+            captured.append(request)
+
+        tools = [StructuredTool.from_function(lambda: "", name=n, description=n) for n in
+                 ("search_document", "read_document", "complete_research", "submit_analysis")]
+        middleware = ResearchMiddleware(
+            research, state, noop, noop, skill={"instructions": "专题规则不可重复到阶段通知"},
+        )
+        await middleware.awrap_model_call(ModelRequest(
+            model=RoutedAgentModel(router=ScriptedRouter([])), messages=history,
+            system_message=SystemMessage(content="分析"), tools=tools,
+        ), handler)
+        request = captured[0]
+        assert isinstance(request.messages[-1], HumanMessage)
+        instruction = request.messages[-1].text
+        assert "专题规则不可重复到阶段通知" in request.system_message.text
+        assert "专题规则不可重复到阶段通知" not in instruction
+        assert len(instruction) < 500
+        assert "当前可调用工具：" + "、".join(t.name for t in request.tools) in instruction
+        assert ("逐条提交" if registered else "下一步必须调用 complete_research") in instruction
+        if not registered:
+            assert "当前已停止补读" in instruction and "未读" in instruction
+        assert request.messages[-2] == error and history == [error]
+        assert research.tool_calls == 1 and "draft" not in state
+
+    asyncio.run(run())
+
+
 def test_same_quote_can_be_reread_for_multiple_independent_submissions():
     async def run():
         research = session([block()])
@@ -299,6 +344,9 @@ def test_finish_mode_before_first_search_keeps_required_project_search_available
         ), handler)
         # 登记门禁要求实际项目检索，不能在收尾筛工具时把唯一可满足前提的动作删掉。
         assert [t.name for t in captured[0].tools] == ["search_document", "complete_research"]
+        instruction = captured[0].messages[-1].text
+        assert "先调用 search_document" in instruction
+        assert "下一步必须调用 complete_research" not in instruction
         graph, files = build(ScriptedRouter([
             call("search_document", {"query": "质保"}, "first"),
             call("complete_research", research_done(), "research"),

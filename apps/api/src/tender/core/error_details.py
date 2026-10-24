@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from datetime import UTC, datetime
@@ -47,6 +48,34 @@ def error_detail(value: str | None, *, api_key: str | None = None) -> str | None
     if len(value) > MAX_ERROR_LENGTH:
         value = value[: MAX_ERROR_LENGTH - len(suffix)] + suffix
     return value
+
+
+def stream_error_status(payload: object) -> int | None:
+    """流内错误没有失败HTTP响应，只采纳供应商明确给出的合法错误码。"""
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if isinstance(code, str) and re.fullmatch(r"[45]\d{2}", code):
+        code = int(code)
+    # 不把布尔值、符号错误名或任意文本推测成限流／过载，避免错误重试权限拒绝。
+    return code if type(code) is int and 400 <= code <= 599 else None
+
+
+def raise_stream_error(response: object, payload: object, *, name: str,
+                       api_key: str | None = None) -> None:
+    """流内报告的错误码参与重试分类，摘要仍保留实际HTTP响应状态。"""
+    status = stream_error_status(payload)
+    if status is None:
+        return
+    body = json.dumps(payload, ensure_ascii=False)
+    message = upstream_error(
+        f"{name}流内错误码 {status}（HTTP {response.status_code}）", body, api_key=api_key,
+    )
+    if status in {408, 429} or status >= 500:
+        error = ModelUnavailable(message, http_status=status)
+        error.retry_after = max(retry_after(response), quota_window(body))
+        raise error
+    raise ModelCallFailed(message, http_status=status)
 
 
 def upstream_error(summary: str, body: str | None, *, api_key: str | None = None) -> str:

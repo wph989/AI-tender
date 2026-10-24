@@ -238,6 +238,34 @@ def test_no_hidden_retries_and_upstream_error_is_preserved(status, expected):
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize("status,expected", [
+    (503, ModelUnavailable), ("503", ModelUnavailable),
+    (429, ModelUnavailable), (403, ModelCallFailed),
+])
+def test_stream_error_code_keeps_retry_classification_and_redacted_details(status, expected):
+    async def run():
+        payload = {"error": {"message": "Service temporarily overloaded fixture-key",
+                             "code": status}}
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(
+            200, headers={"content-type": "text/event-stream", "Retry-After": "2"},
+            text="data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n",
+        )))
+        model = agent(client)
+        try:
+            with pytest.raises(expected) as caught:
+                await model.chat([message_to_dict(HumanMessage(content="分析"))], [TOOL])
+            assert caught.value.http_status == int(status)
+            assert "Service temporarily overloaded" in str(caught.value)
+            assert "HTTP 200" in str(caught.value) and "流内错误码" in str(caught.value)
+            assert "fixture-key" not in str(caught.value)
+            if int(status) == 429:
+                assert caught.value.retry_after == 2
+        finally:
+            await model.aclose()
+
+    asyncio.run(run())
+
+
 def test_plain_text_gateway_error_preserves_multiline_body():
     async def run():
         body = "<html>\n网关超时\nrequest_id=upstream-123\n</html>"

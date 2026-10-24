@@ -137,6 +137,36 @@ def test_early_submission_is_rejected_then_full_research_can_finish():
     assert "综合输出" in str(router.requests[-1][0])
 
 
+@pytest.mark.parametrize("problem,path,reason", [
+    ("scope", "records.0.scope", "common/unknown 不填 lot_refs"),
+    ("list", "records", "Input should be a valid list"),
+    ("required", "records.0.content", "Field required"),
+])
+def test_schema_feedback_explains_the_rule_without_echoing_invalid_input(problem, path, reason):
+    async def run():
+        bad = submission([summary_record()])
+        if problem == "scope":
+            bad["records"][0]["scope"] = {"kind": "common", "lot_refs": ["机密错误值"]}
+        elif problem == "list":
+            bad["records"] = "机密错误值"
+        else:
+            bad["records"][0].pop("content")
+            bad["records"][0]["title"] = "机密错误值"
+        state, saved, _ = await execute([
+            *research_calls(),
+            call("submit_analysis", bad, "invalid"),
+            call("submit_analysis", submission([summary_record()]), "corrected"),
+        ])
+        feedback = state["tool_results"]["call_invalid"]["data"]["content"]
+        assert path in feedback and reason in feedback
+        assert "机密错误值" not in feedback
+        after_error = next(s for s in saved if "call_invalid" in s.get("tool_results", {}))
+        assert not after_error.get("staged_items") and "draft" not in after_error
+        assert len(state["draft"]["business_data"]["records"]) == 1
+
+    asyncio.run(run())
+
+
 def test_synthesis_carries_recorded_findings_outside_compressible_history():
     async def run():
         findings = "独立事项甲和乙均须分别保留，附件中的例外仍待核对"

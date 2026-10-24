@@ -10,7 +10,7 @@ import httpx
 from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
-from tender.core.error_details import quota_window, retry_after, upstream_error
+from tender.core.error_details import quota_window, retry_after, stream_error_status, upstream_error
 from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -106,6 +106,13 @@ class AgentChat:
             status = getattr(exc, "status_code", None)
             stream_response = getattr(exc, "_tender_stream_response", None)
             response = getattr(exc, "response", None) or stream_response
+            payload = getattr(exc, "body", None)
+            stream_status = None
+            if status is None and stream_response is not None:
+                # SDK把HTTP 200流中的503/429包装成无status_code的APIError；
+                # 采纳明确的流内错误码，才能沿用路由重试且不会将403误判为临时故障。
+                stream_status = stream_error_status(payload)
+                status = stream_status
             body = None
             if isinstance(response, httpx.Response) and stream_response is None:
                 # SDK 的流式失败响应可能还未读取；只提取上游正文，不回显含请求的异常文本。
@@ -115,7 +122,7 @@ class AgentChat:
                 except (httpx.HTTPError, httpx.StreamError):
                     # 响应已关闭时仍保留原错误分类，继续尝试 SDK 已解析的错误正文。
                     pass
-            if not body and (payload := getattr(exc, "body", None)) is not None:
+            if not body and payload is not None:
                 body = (
                     payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
                 )
@@ -134,7 +141,9 @@ class AgentChat:
                     cause = cause.__cause__
                 summary = (
                     f"Agent 模型连接失败或暂不可用（{type(cause).__name__}）"
-                    + (f"：HTTP {status}" if status is not None else "")
+                    + (f"：流内错误码 {status}（HTTP {stream_response.status_code}）"
+                       if stream_status is not None else
+                       f"：HTTP {status}" if status is not None else "")
                 )
                 if transport_failure:
                     # 只取底层传输异常的消息，不序列化 request、消息正文或鉴权头。
@@ -168,7 +177,9 @@ class AgentChat:
             raise ModelCallFailed(
                 upstream_error(
                     f"Agent 模型调用失败（{type(exc).__name__}）"
-                    + (f"：HTTP {status}" if status is not None else ""),
+                    + (f"：流内错误码 {status}（HTTP {stream_response.status_code}）"
+                       if stream_status is not None else
+                       f"：HTTP {status}" if status is not None else ""),
                     body,
                     api_key=self._api_key,
                 ),

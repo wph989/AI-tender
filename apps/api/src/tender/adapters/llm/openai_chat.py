@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 import httpx
 
-from tender.core.error_details import raise_for_status
+from tender.core.error_details import raise_for_status, raise_stream_error
 from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -112,7 +112,12 @@ class OpenAIChatModel:
                     break
                 try:
                     chunk = json.loads(data)
-                    if not isinstance(chunk, dict) or chunk.get("error"):
+                    if not isinstance(chunk, dict):
+                        raise ValueError("流式服务错误")
+                    if error := chunk.get("error"):
+                        # HTTP 200只表示流已建立；明确的503/429继续有界重试，403立即拒绝。
+                        # 只传递错误对象，不能回显已接收的半截模型正文。
+                        raise_stream_error(response, error, name="LLM", api_key=self._api_key)
                         raise ValueError("流式服务错误")
                     model = chunk.get("model") or model
                     usage = chunk.get("usage") or usage

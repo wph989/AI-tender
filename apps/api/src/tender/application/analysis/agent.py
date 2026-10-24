@@ -470,6 +470,7 @@ class ResearchMiddleware(AgentMiddleware):
         if evidence_remaining <= 12:
             hint += "新增证据额度即将用完，请先结束检索再综合已核对事项；补读仍可返回已读原文。"
         tools = request.tools
+        stage_instruction = ""
         if closing_research:
             # 仅写“停止检索”无法阻止模型反复补读；收尾阶段只暴露可推进当前阶段的工具。
             # 仍在检索时先登记真实缺口，不由服务端伪造已完成覆盖；综合后保留原块回读和提交。
@@ -481,7 +482,24 @@ class ResearchMiddleware(AgentMiddleware):
             tools = [tool for tool in tools if (
                 tool.get("function", {}).get("name") if isinstance(tool, dict) else tool.name
             ) in allowed]
-            hint += "\n当前仅提供研究登记、已有原文回读与提交所需工具；未核对部分登记缺口。"
+            names = [
+                tool.get("function", {}).get("name") if isinstance(tool, dict) else tool.name
+                for tool in tools
+            ]
+            stage_instruction = (
+                "运行时阶段交接，当前可调用工具：" + "、".join(names) + "。"
+                + (
+                    "先调用 search_document 完成一次项目检索，再 complete_research；"
+                    "未核对部分保留缺口。"
+                    if "search_document" in names else
+                    "研究已登记，逐条提交已有可靠成果，最后空records、final=true收尾。"
+                    if self.state.get("research_completed") else
+                    "当前已停止补读，下一步必须调用 complete_research；未读资料据实登记缺口。"
+                    "登记后可回读已读原文、逐条提交，最后显式final=true。"
+                )
+                + "旧工具纠错要求不能恢复当前不可用的工具，不得宣称未核对内容已完整覆盖。"
+            )
+            hint += "\n" + stage_instruction
         content = request.system_message.content if request.system_message else ""
         content = (
             content + "\n" + hint
@@ -496,9 +514,19 @@ class ResearchMiddleware(AgentMiddleware):
                 staged_item_count=len(self.state.get("staged_items", [])),
                 no_progress_rounds=self.state.get("no_progress_rounds", 0), budget=status,
             )
-            return await handler(request.override(
+            overridden = request.override(
                 system_message=SystemMessage(content=content), tools=tools,
-            ))
+            )
+            if stage_instruction:
+                # 最新阶段通知覆盖旧工具纠错指引，历史保持原样；只追加短通知，
+                # 避免把完整Skill与研究账再次复制进普通消息，挤占综合上下文。
+                overridden = overridden.override(
+                    messages=[
+                        *request.messages,
+                        HumanMessage(content=stage_instruction),
+                    ]
+                )
+            return await handler(overridden)
 
     def feedback(self, text: str, remaining: int = 2) -> dict:
         """把校验结论作为运行时反馈交回主 Agent，由它决定如何修正。"""
@@ -1332,8 +1360,12 @@ def build_module_agent(
             raise ToolException(str(exc)) from exc
 
     def validation_feedback(error):
-        # 默认错误包含完整kwargs，会把整份坏草稿重复塞回上下文并浪费摘要/纠正预算。
-        fields = ", ".join(".".join(map(str, e["loc"])) for e in error.errors())[:400]
+        # 只给字段路径无法区分类型错误与范围冲突；保留schema／业务校验原因，
+        # 排除input和ctx，避免把完整坏草稿重复塞回上下文并浪费纠正预算。
+        issues = error.errors(include_input=False, include_context=False, include_url=False)
+        fields = "；".join(
+            ".".join(map(str, e["loc"])) + "：" + e["msg"] for e in issues[:6]
+        )[:1000]
         required = "records（每次最多一条完整事项，条目包含 content 和原文 citations）"
         return (
             "工具参数缺失或类型不符：" + fields + "。请按当前工具schema修正。"
