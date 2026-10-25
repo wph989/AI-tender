@@ -16,11 +16,13 @@ from tender.api.analysis import routes as analysis_api
 from tender.api.knowledge import routes as knowledge
 from tender.api.projects import routes as projects
 from tender.api.shared.errors import ApiProblem
+from tender.application.analysis.execution import prepare_report
+from tender.application.knowledge import execution as knowledge_execution
 from tender.application.knowledge.content import fingerprint, validate_items
+from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.config.registry import ConfigRegistry
-from tender.core import settings
+from tender.core import di, settings
 from tender.ports.llm.chat import Completion
-from tender.worker.analysis.controller import prepare_report
 from tender.worker.knowledge import tasks as worker
 
 pytestmark = pytest.mark.skipif(
@@ -85,7 +87,12 @@ def environment(monkeypatch):
         )
         monkeypatch.setattr(settings, "company_id", lambda: 1)
         monkeypatch.setattr(worker, "_store", lambda: KnowledgeStore(facade, 1))
-        monkeypatch.setattr(worker, "_model", lambda _, **_limits: FixtureModel())
+        def executor(db):
+            result = di.create_knowledge_executor(db)
+            result.model_factory = lambda *args, **limits: FixtureModel()
+            return result
+
+        monkeypatch.setattr(worker, "create_knowledge_executor", executor)
         project = projects.create_project(projects.ProjectCreate(name="综合分析专项"), request)
         yield request, connection, project["id"]
         transaction.rollback()
@@ -519,10 +526,10 @@ def test_graph_expansion_rejects_old_parse_evidence(environment):
             "refs": json.dumps(items[0]["values"][0]["citations"], ensure_ascii=False),
         },
     )
-    _, relations = worker.graph_expand(store, pid, [block], sources)
+    _, relations = knowledge_execution.graph_expand(store, pid, [block], sources)
     assert len(relations) == 1
     changed_sources = [sources[0] | {"parse_run_id": sources[0]["parse_run_id"] + 1}]
-    _, relations = worker.graph_expand(store, pid, [block], changed_sources)
+    _, relations = knowledge_execution.graph_expand(store, pid, [block], changed_sources)
     assert not relations
 
 
@@ -580,7 +587,7 @@ def test_question_agent_reads_graph_only_evidence(environment, monkeypatch):
         # 普通检索只命中资质，保函只能通过数据库图谱扩展进入 Agent 的工具结果。
         return [direct], {"mode": "keyword"}
 
-    monkeypatch.setattr(worker, "retrieve_chunks", retrieve_direct)
+    monkeypatch.setattr(knowledge_execution, "retrieve_chunks", retrieve_direct)
     question = knowledge.ask_project(pid, knowledge.AskInput(question="资质"), request)
     asyncio.run(worker._answer_question(question["id"]))
     answer = knowledge.get_answer(question["id"], request)
@@ -653,17 +660,19 @@ def test_vectors_only_reused_in_same_embedding_space(environment, monkeypatch):
         async def aclose(self):
             pass
 
-    monkeypatch.setattr(worker, "create_embedding_gateway", lambda _: Embedding())
+    monkeypatch.setattr(di, "create_embedding_gateway", lambda _: Embedding())
     knowledge.reindex_collection(own, request)
     index_id = conn.execute(text("SELECT id FROM knowledge_index")).scalar_one()
     asyncio.run(worker._build_index(index_id))
     sources = db.sources([own])
-    hits, info = asyncio.run(worker.retrieve(db, sources, "注册证书", lambda: None))
+    hits, info = asyncio.run(retrieve_chunks(db, sources, "注册证书", lambda: None,
+                                           di.create_embedding_gateway, di.create_rerank_gateway))
     assert hits and info["mode"] == "hybrid"
     current = knowledge.get_collection(own, request)["sources"][0]
     assert current["semantic_ready"] and not current["needs_reindex"]
     config["signature"] = "space-two"
-    hits, info = asyncio.run(worker.retrieve(db, sources, "注册证书", lambda: None))
+    hits, info = asyncio.run(retrieve_chunks(db, sources, "注册证书", lambda: None,
+                                           di.create_embedding_gateway, di.create_rerank_gateway))
     assert not hits and info["mode"] == "keyword"
     changed = knowledge.get_collection(own, request)["sources"][0]
     assert not changed["semantic_ready"] and changed["needs_reindex"]

@@ -69,6 +69,7 @@ from tender.application.analysis.research import (
     ToolArgumentError,
 )
 from tender.application.analysis.skills import MODULES
+from tender.application.analysis.state import AnalysisTransitions
 from tender.application.knowledge.content import fingerprint, merge_field_entries
 from tender.core.error_details import error_detail
 from tender.core.logging import bind_context, get_logger
@@ -341,6 +342,7 @@ class ResearchMiddleware(AgentMiddleware):
             return dict(self.skill or {})
 
         self.skill_loader = StructuredTool.from_function(coroutine=load_skill)
+        self.transitions = AnalysisTransitions(state)
 
     def budget_needs_synthesis(self, status: dict) -> bool:
         """按已冻结总预算预留收尾空间，避免快速检索先耗尽次数、来不及逐条提交。"""
@@ -507,7 +509,7 @@ class ResearchMiddleware(AgentMiddleware):
             else [*content, {"type": "text", "text": hint}]
         )
         with bind_context(
-            agent_phase="synthesis" if self.state.get("research_completed") else "research",
+            agent_phase=self.transitions.phase,
         ):
             logger.info(
                 "agent.round", evidence_count=len(self.research.seen),
@@ -542,28 +544,11 @@ class ResearchMiddleware(AgentMiddleware):
 
     async def persist_verified(self) -> None:
         """校验中断时先落库已判定通过的条目，已核实成果不能随异常丢失。"""
-        self.state["staged_items_verified"] = True
-        self.state["research"] = self.research.checkpoint()
+        self.transitions.mark_verified(self.research.checkpoint())
         await self.save(self.state)
 
     def drop_pending(self, pending_ids: set[str]) -> None:
-        """中止模块时丢弃未获支持的版本；上一版已核实内容仍保留在暂存结果中。"""
-        for entry in self.state.get("staged_items", []):
-            if (entry["id"] in pending_ids and entry.get("verification") != "supported"
-                    and entry.get("business", {}).get("kind") == "coverage"):
-                # 旧证明ID沿用后，恢复旧核实版本不能替新改写的不适用说明背书。
-                for coverage in self.state.get("business_coverage", []):
-                    if coverage.get("review_id") == entry["id"]:
-                        coverage.update(status="pending", detail="本次不适用证明尚未通过原文校验")
-        self.state["staged_items"] = [
-            entry
-            for entry in self.state.get("staged_items", [])
-            if entry["id"] not in pending_ids or entry.get("verification") == "supported"
-        ]
-        for item_id in pending_ids:
-            previous = self.state.get("business_previous", {}).get(item_id)
-            if previous and not any(i["id"] == item_id for i in self.state["staged_items"]):
-                self.state["staged_items"].append(previous)
+        self.transitions.drop_pending(pending_ids)
 
     def record_gap(self, entry: dict, detail: str, code: str) -> None:
         """单条无依据不能让整个维度丢失可靠成果；以业务身份保存明确缺口。"""
@@ -618,7 +603,7 @@ class ResearchMiddleware(AgentMiddleware):
                 entry["business"] for entry in fields if entry.get("business")
             ])
             if issues:
-                self.state.pop("pending_final", None)
+                self.transitions.take_final()
                 return self.feedback("；".join(
                     f"{key}：{detail}" for key, (_, detail) in issues.items()
                 ))
@@ -637,14 +622,14 @@ class ResearchMiddleware(AgentMiddleware):
         if notes:
             # 缺口只进检索总结，不作为结论条目；截断到接口上限避免超长摘要。
             summary = (summary + "\n\n检索缺口（不作为结论条目）：\n" + "\n".join(notes))[:4000]
-        self.state["draft"] = {
+        draft = {
             "fields": fields,
             "relations": self.state.get("staged_relations", []),
             "research_summary": summary,
         }
         if self.state.get("business_protocol"):
-            self.state["draft"]["business_data"] = module_data(self.state)
-        self.state.pop("pending_final", None)
+            draft["business_data"] = module_data(self.state)
+        self.transitions.publish_draft(draft)
         return None
 
     async def run_review_step(self) -> dict | None:
@@ -696,7 +681,7 @@ class ResearchMiddleware(AgentMiddleware):
         ]
         # 收尾意图只属于本次校验；失败反馈后必须重新 final=true，
         # 否则下一轮补读或 final=false 纠正会把删掉坏字段后的残缺结果直接发布。
-        final_request = self.state.pop("pending_final", None)
+        final_request = self.transitions.take_final()
         units = (
             [_relation_unit(link) for link in self.state.get("staged_relations", [])]
             if final_request
@@ -790,7 +775,7 @@ class ResearchMiddleware(AgentMiddleware):
         # 既避免同一事实铺成多行，也不会像“新版覆盖旧版”那样丢掉分批补交的取值。
         if not self.is_outline:
             select_verified_repeats(kept)
-        self.state["staged_items"] = merge_field_entries(kept, is_outline=self.is_outline)
+        self.transitions.replace_items(merge_field_entries(kept, is_outline=self.is_outline))
         if units:
             for link, unit in zip(self.state.get("staged_relations", []), units, strict=True):
                 if unit["verification"] == "supported":
@@ -800,7 +785,7 @@ class ResearchMiddleware(AgentMiddleware):
                 for link, unit in zip(self.state.get("staged_relations", []), units, strict=True)
                 if unit["verification"] == "supported"
             ]
-        self.state["staged_items_verified"] = True
+        self.transitions.mark_verified()
         if errors:
             message = (
                 "已通过字段已独立保存，只修正以下字段；删除无依据推断、补齐原文引用，"
@@ -942,7 +927,7 @@ class ResearchMiddleware(AgentMiddleware):
                 if name == "submit_analysis":
                     # 同轮工具串行执行：后续暂存或无效提交撤销前一提交的完成意图，
                     # 否则它尚未纠正就会借用旧 final 发布残缺成果；同ID重放已在上方返回。
-                    self.state.pop("pending_final", None)
+                    self.transitions.take_final()
                 signature = tool_key(name, request.tool_call["args"])
                 counts = self.state.setdefault("identical_tool_calls", {})
                 counts[signature] = counts.get(signature, 0) + 1
@@ -1144,16 +1129,10 @@ def build_module_agent(
         """列出授权的项目资料和关联知识库资料，不读取全文。"""
         return await research.documents()
 
+    transitions = AnalysisTransitions(state)
+
     def invalidate_summary() -> None:
-        if not state.pop("research_completed", None):
-            return
-        # 新证据可能改变分类、冲突或任务边界，必须重新综合，不能拼接旧批次的局部结论。
-        for name in ("draft", "pending_final", "business_previous", "rejected_records",
-                     "gap_notes"):
-            state.pop(name, None)
-        for name in ("staged_items", "staged_relations", "business_coverage", "business_gaps"):
-            state[name] = []
-        state["staged_items_verified"] = True
+        transitions.evidence_changed()
 
     def update_search_ledger() -> None:
         checkpoint = state.get("research_completed")
@@ -1225,7 +1204,7 @@ def build_module_agent(
                 research_summary or "已完成本轮项目资料检索，未单独核对的主题保留为待核对缺口。",
                 expected_topics=state["business_topics"], research=research,
             )
-            state["research_completed"] = checkpoint
+            transitions.research_completed(checkpoint)
             # 同一批证据再次确认只更新检索缺口；拒绝事项仍需保留到真正补入新证据。
             rejected_gaps = rejected_record_gaps(state)
             state["business_gaps"] = list({
@@ -1297,19 +1276,14 @@ def build_module_agent(
                 state.setdefault("business_previous", {})[entry["id"]] = old
             entry["verification"] = "pending"
             staged.append(entry)
-        state["staged_items"] = staged
+        transitions.replace_items(staged)
         if errors:
             message = "已核实条目保留，请修正：" + "；".join(errors)
             if exhausted:
                 raise RuntimeError("同一事项纠正已达上限。" + message)
             raise ToolException(message)
         if final:
-            state["pending_final"] = {
-                "research_summary": research_summary.strip(),
-            }
-            # 省略清单不是“缺口全部解决”；只有显式清单才授权在校验通过后替换旧内容缺口。
-            if gaps is not None:
-                state["pending_final"]["business_gaps"] = gaps
+            transitions.request_final(research_summary, gaps)
         state["research"] = research.checkpoint()
         await save(state)
         return {

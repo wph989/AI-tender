@@ -214,7 +214,7 @@ services:
               capabilities: [gpu]
 
   # 一次性迁移；失败即中断启动，避免 api / worker 跑在半旧半新的表结构上
-  # 下面 5 个服务（migrate / api / worker / beat / web）只在 --profile app 时启动：
+  # 应用服务（migrate / api / 四组 worker / beat / web）只在 --profile app 时启动：
   # 默认的「只起依赖」跑法用不到它们（应用在宿主机直接跑）。
   migrate:
     profiles: ["app"]
@@ -260,9 +260,7 @@ services:
       retries: 5
       start_period: 20s
 
-  # 转换 / 解析 / Agent 分析及问答都在这里跑。
-  # tender 队列跑 beat 派发的调度任务，漏了它任务会永远停在 pending；
-  # analysis 接收知识索引、专题分析和问答，必须与生产者路由同步，避免分析永久排队。
+  # 转换/提交、轮询、调度、分析使用独立执行池，长任务不占用控制任务的槽位。
   worker:
     profiles: ["app"]
     <<: *api-base
@@ -274,9 +272,98 @@ services:
       - --quiet
       - worker
       - -Q
-      - tender,convert,parse,analysis
+      - convert,parse
+      - -n
+      - documents@%h
       - -c
       - ${WORKER_CONCURRENCY:-4}
+      - -l
+      - info
+    environment: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  worker-scheduler:
+    profiles: ["app"]
+    <<: *api-base
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - tender.worker.celery_app
+      - --quiet
+      - worker
+      - -Q
+      - tender
+      - -n
+      - scheduler@%h
+      - -c
+      - ${SCHEDULER_CONCURRENCY:-1}
+      - -l
+      - info
+    environment: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  worker-poller:
+    profiles: ["app"]
+    <<: *api-base
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - tender.worker.celery_app
+      - --quiet
+      - worker
+      - -Q
+      - poll
+      - -n
+      - poller@%h
+      - -c
+      - ${POLLER_CONCURRENCY:-2}
+      - -l
+      - info
+    environment: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  worker-analysis:
+    profiles: ["app"]
+    <<: *api-base
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - tender.worker.celery_app
+      - --quiet
+      - worker
+      - -Q
+      - analysis
+      - -n
+      - analysis@%h
+      - -c
+      - ${ANALYSIS_CONCURRENCY:-2}
       - -l
       - info
     environment: *api-env

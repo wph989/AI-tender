@@ -42,13 +42,13 @@ from tender.application.shared.errors import (
 )
 from tender.ports.configuration.registry import ConfigReader
 from tender.ports.llm.embedding import EmbeddingModel
-from tender.ports.repository.knowledge.store import KnowledgeStore
+from tender.ports.repository.analysis.reports import ReportRepository
 
 
 class AnalysisService:
     def __init__(
         self,
-        repository: KnowledgeStore,
+        repository: ReportRepository,
         company_id: int,
         configs: ConfigReader,
         embedding_gateway: Callable[[dict], EmbeddingModel],

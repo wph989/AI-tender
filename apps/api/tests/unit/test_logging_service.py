@@ -530,11 +530,15 @@ def test_answer_failure_does_not_replay_raw_sdk_credential(options, monkeypatch)
         "snapshot": {"sources": []}, "question": "测试问题",
     }
     monkeypatch.setattr(knowledge, "_store", lambda: db)
-    monkeypatch.setattr(knowledge, "_model", lambda *args, **kwargs: model)
+    from tender.core.di import create_knowledge_executor
+
+    executor = create_knowledge_executor(db)
+    executor.model_factory = lambda *args, **kwargs: model
+    monkeypatch.setattr(knowledge, "create_knowledge_executor", lambda _: executor)
     asyncio.run(knowledge._answer_question(7))
     details = read_errors(options.directory)
     assert len(calls) == 1 and secret not in calls[0].error_message
-    assert "answer.fail" in details and "Traceback" in details and "_answer_question" in details
+    assert "answer.fail" in details and "Traceback" in details and "answer_question" in details
     assert "ModelCallFailed" in details and "时间预算不足" in details
     assert secret not in details + json.dumps(read_logs(options.directory), ensure_ascii=False)
     db.finish_task.assert_called_once_with(

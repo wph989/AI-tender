@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from tender.worker.analysis.controller import expand_evidence
+from tender.application.analysis.execution import expand_evidence
 
 
 def _block(offset: int, content: str, source_id: int = 13) -> dict:

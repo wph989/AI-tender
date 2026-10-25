@@ -28,7 +28,11 @@ def test_deployment_consumes_all_routed_queues(path, pattern):
         required = {app.conf.task_default_queue} | {
             route["queue"] for route in app.conf.task_routes.values()
         }
-        for queues in configured:
-            assert set(queues.split(",")) == required, path
+        pools = [set(queues.split(",")) for queues in configured]
+        assert set.union(*pools) == required, path
+        # 队列覆盖之外还检查资源隔离，防止长报告挤占调度与轮询的执行槽。
+        assert {"tender"} in pools and {"poll"} in pools, path
+        assert all(not ({"analysis", "convert", "parse"} & pool)
+                   for pool in pools if pool & {"tender", "poll"}), path
     finally:
         app.close()

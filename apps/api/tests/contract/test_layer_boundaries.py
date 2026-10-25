@@ -114,3 +114,11 @@ def test_business_names_are_consistent_across_layers(directory):
     expected = {"projects", "documents", "knowledge", "analysis", "llm", "configuration", "jobs"}
     actual = {path.name for path in (ROOT / directory).iterdir() if path.is_dir()}
     assert expected <= actual
+
+
+def test_application_uses_specific_repository_ports() -> None:
+    # 组合端口只供装配；用例回到宽接口会隐藏跨业务依赖并抬高替身实现成本。
+    assert not any(
+        module.startswith("tender.ports.repository.knowledge.store")
+        for _, module in _imports("application")
+    )

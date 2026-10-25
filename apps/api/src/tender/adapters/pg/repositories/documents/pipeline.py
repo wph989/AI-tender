@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import (
@@ -18,6 +18,7 @@ from sqlalchemy import (
     insert,
     literal,
     null,
+    or_,
     select,
     update,
 )
@@ -35,6 +36,7 @@ from tender.adapters.pg.models import (
     Project,
     ProjectFile,
 )
+from tender.adapters.pg.repositories.jobs.dispatch import DISPATCH_LEASE
 from tender.config.registry import ConfigRegistry
 from tender.config.schema import document_execution_snapshot
 from tender.domain.documents.element import NormalizedElement
@@ -50,6 +52,39 @@ class DocumentPipelineRepository:
     def __init__(self, engine: Engine, configs: ConfigRegistry) -> None:
         self.engine = engine
         self.configs = configs
+
+    def claim_attempt(self, job_id: str, stages: tuple[str, ...]) -> bool:
+        # 调用者已持有 job 会话锁；旧阶段消息不能恢复派发标记、绕过下一阶段配额。
+        with self.engine.begin() as connection:
+            return bool(connection.execute(
+                update(Job).where(
+                    Job.id == job_id,
+                    Job.stage.in_(stages),
+                    Job.status.in_(("pending", "submitting", "running")),
+                    Job.finished_at.is_(None),
+                    or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= func.now()),
+                ).values(
+                    dispatched_at=func.coalesce(Job.dispatched_at, func.now()),
+                    next_attempt_at=None,
+                    dispatch_lease_until=func.now() + DISPATCH_LEASE,
+                )
+            ).rowcount)
+
+    def schedule_attempt(self, job_id: str, delay: float, *, retry: bool = False) -> None:
+        # 先持久化下一轮时间，调度器负责消息；进程退出不会丢掉后续轮询。
+        with self.engine.begin() as connection:
+            connection.execute(update(Job).where(
+                Job.id == job_id, Job.status.in_(("pending", "submitting", "running")),
+                Job.finished_at.is_(None),
+            ).values(
+                next_attempt_at=func.now() + timedelta(seconds=delay),
+                dispatch_lease_until=None,
+                # Celery 新消息的 retries 为零，次数必须随下一轮时间同事务保存。
+                progress=(Job.progress.op("||")(func.jsonb_build_object(
+                    "retry_attempts",
+                    func.coalesce(Job.progress["retry_attempts"].as_integer(), 0) + 1,
+                )) if retry else Job.progress),
+            ))
 
     def runtime_values(self, job_id: str) -> Mapping[str, Any]:
         """优先使用创建时快照；老任务首次补齐后也不能随重试读取新配置。"""
@@ -365,6 +400,8 @@ class DocumentPipelineRepository:
                     error_message=None,
                     updated_at=func.now(),
                     dispatched_at=case((literal(should_parse), null()), else_=Job.dispatched_at),
+                    next_attempt_at=None,
+                    dispatch_lease_until=None,
                     finished_at=case((literal(should_parse), null()), else_=func.now()),
                 )
             )
@@ -487,6 +524,8 @@ class DocumentPipelineRepository:
                     run_id=run_id,
                     status="running",
                     stage="parsing",
+                    next_attempt_at=now,
+                    dispatch_lease_until=None,
                     progress=Job.progress.op("||")(_jsonb({})),
                     error_code=None,
                     error_message=None,

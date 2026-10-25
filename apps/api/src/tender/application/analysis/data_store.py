@@ -12,7 +12,7 @@ from tender.application.analysis.data import (
     module_records,
 )
 from tender.application.knowledge.content import fingerprint, source_state
-from tender.ports.repository.knowledge.store import KnowledgeStore
+from tender.ports.repository.analysis.reports import ReportRepository
 
 
 def snapshot_manifest(status: str, runs: list[dict], modules: list[dict]) -> str:
@@ -34,7 +34,7 @@ def unfinished_runs(runs: list[dict]) -> bool:
     )
 
 
-def snapshot_matches_report(db: KnowledgeStore, snapshot: dict) -> bool:
+def snapshot_matches_report(db: ReportRepository, snapshot: dict) -> bool:
     # 运行账与模块成果一次读出，避免多次查询跨过提交边界而拼出混合版本。
     state = db.snapshot_state(snapshot["report_id"])
     if state is None:
@@ -47,7 +47,7 @@ def snapshot_matches_report(db: KnowledgeStore, snapshot: dict) -> bool:
     )
 
 
-def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
+def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
     report = db.report(report_id)
     if report is None or report["runtime_version"] != RUNTIME_VERSION:
         return None
@@ -135,7 +135,7 @@ def publish_data_snapshot(db: KnowledgeStore, report_id: int) -> dict | None:
 
 
 def accessible_data(
-    db: KnowledgeStore, data: dict, allowed: list[int], *, sources: list[dict] | None = None,
+    db: ReportRepository, data: dict, allowed: list[int], *, sources: list[dict] | None = None,
 ) -> dict:
     """快照存储不可变不代表权限永久有效；读取时整条隐藏失去必要证据的记录。"""
     result = copy.deepcopy(data)

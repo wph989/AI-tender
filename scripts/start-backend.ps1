@@ -1,12 +1,12 @@
 ﻿<#
 .SYNOPSIS
-    一键启动 / 停止 / 查看后端三个进程：API（uvicorn）+ Celery worker + Celery beat。
+    一键启动 / 停止 / 查看后端进程：API、四组独立 Celery Worker 与 Beat。
 
 .DESCRIPTION
-    把《本地启动指南》第 3.1-3.3 节的三条命令固化成一条，省掉每次开三个终端手敲。
-    三个进程各自的职责、以及为什么不能合并成一个，见指南第 1 节与
+    把《本地启动指南》第 3.1-3.3 节的六条命令固化成一条。
+    API、四组 Worker 与 Beat 的职责，见指南第 1 节与
     docs/工程/10-技术选型与工程结构.md 第 3.5 节：API 只往数据库写 pending 的 job，
-    beat 每 5 秒按配置中心的上限派发差额，worker 才是真正执行任务的一方。
+    beat 每秒唤醒独立调度 Worker，按配置中心的上限派发差额，worker 才是真正执行任务的一方。
 
     用法：
       .\scripts\start-backend.ps1            # 启动（已有活着的实例时拒绝重复启动）
@@ -57,7 +57,7 @@ $ApiPort = 8300
 function Get-ServiceDefs {
     # 与指南第 3.1-3.3 节的命令逐字对应：改这里等于改指南，两边要一起改。
     # -P threads 不能省（Windows 没有 fork，默认 prefork 池起不来）；
-    # worker 的 -Q 必须含 tender，因为 beat 发出的 dispatch_pending 也是由 worker 执行的。
+    # 调度与轮询各有独立执行池，长报告和转换不能占满控制任务的槽位。
     @(
         [pscustomobject]@{
             Name = 'api'
@@ -66,16 +66,43 @@ function Get-ServiceDefs {
         }
         [pscustomobject]@{
             Name = 'worker'
-            Desc = 'Celery worker（convert/parse/analysis）'
+            Desc = 'Celery 文档转换与解析提交'
             Args = @(
                 '-m', 'celery', '-A', 'tender.worker.celery_app', 'worker',
-                '-Q', 'tender,convert,parse,analysis',
-                '-P', 'threads', '-c', '4', '-l', 'info'
+                '-Q', 'convert,parse', '-n', 'tender-documents@%h',
+                '-P', 'threads', '-c', '2', '-l', 'info'
+            )
+        }
+        [pscustomobject]@{
+            Name = 'scheduler'
+            Desc = 'Celery 任务调度'
+            Args = @(
+                '-m', 'celery', '-A', 'tender.worker.celery_app', 'worker',
+                '-Q', 'tender', '-n', 'tender-scheduler@%h',
+                '-P', 'threads', '-c', '1', '-l', 'info'
+            )
+        }
+        [pscustomobject]@{
+            Name = 'poller'
+            Desc = 'Celery 解析轮询'
+            Args = @(
+                '-m', 'celery', '-A', 'tender.worker.celery_app', 'worker',
+                '-Q', 'poll', '-n', 'tender-poller@%h',
+                '-P', 'threads', '-c', '2', '-l', 'info'
+            )
+        }
+        [pscustomobject]@{
+            Name = 'analysis'
+            Desc = 'Celery 知识索引、问答与报告'
+            Args = @(
+                '-m', 'celery', '-A', 'tender.worker.celery_app', 'worker',
+                '-Q', 'analysis', '-n', 'tender-analysis@%h',
+                '-P', 'threads', '-c', '2', '-l', 'info'
             )
         }
         [pscustomobject]@{
             Name = 'beat'
-            Desc = 'Celery beat（每 5 秒派发 pending job）'
+            Desc = 'Celery beat（每秒唤醒文档调度）'
             Args = @(
                 '-m', 'celery', '-A', 'tender.worker.celery_app', 'beat', '-l', 'info',
                 # 给路径加引号：仓库目录将来若含空格，celery 才不会被拆成两个参数
@@ -100,7 +127,11 @@ function Get-BackendServiceName {
         return 'api'
     }
     if ($ProcessInfo.CommandLine -match ($prefix + 'celery\s+-A\s+tender\.worker\.celery_app\s+(worker|beat)(?:\s|$)')) {
-        return $Matches[1]
+        $serviceKind = $Matches[1]
+        if ($serviceKind -eq 'worker' -and $ProcessInfo.CommandLine -match 'tender-(scheduler|poller|analysis)@') {
+            return $Matches[1]
+        }
+        return $serviceKind
     }
     return $null
 }
@@ -177,7 +208,8 @@ function Get-StrayProcesses {
 
 function Show-LogTail {
     param([string]$Name, [int]$Lines = 25)
-    $serviceDir = Join-Path $LogDir $Name
+    $logRole = if ($Name -in @('scheduler', 'poller', 'analysis')) { 'worker' } else { $Name }
+    $serviceDir = Join-Path $LogDir $logRole
     if (-not (Test-Path -LiteralPath $serviceDir)) { return }
     $latest = Get-ChildItem -LiteralPath $serviceDir -Filter '*.jsonl' -File |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -410,7 +442,7 @@ Write-TrackedState -Services $started
 Write-Host ''
 Write-Host '后端已启动' -ForegroundColor Cyan
 Write-Host '  API      http://127.0.0.1:8300   （/docs 交互文档；/api/v1/healthz 健康检查）'
-Write-Host '  worker   消费 tender / convert / parse / analysis 队列'
+Write-Host '  workers  分别消费 tender、poll、convert/parse、analysis 队列'
 Write-Host '  beat     每 5 秒读配置中心上限并派发差额'
 Write-Host ''
 Write-Host "日志目录：$LogDir" -ForegroundColor DarkGray

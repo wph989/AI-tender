@@ -35,6 +35,7 @@ class Stream:
 
     name: str
     stages: tuple[str, ...]
+    inflight_stages: tuple[str, ...]
     limit_key: str | None
     task_name: str
 
@@ -44,10 +45,14 @@ STREAMS: tuple[Stream, ...] = (
     Stream(
         "convert",
         ("converting", "probing"),
+        ("converting", "probing", "geometry"),
         "convert.max_inflight",
         "tender.worker.tasks.process_file",
     ),
-    Stream("parse", ("submitting",), "parse.max_inflight", "tender.worker.tasks.submit_parse"),
+    Stream(
+        "parse", ("submitting",), ("submitting", "parsing", "resubmitting"),
+        "parse.max_inflight", "tender.worker.tasks.submit_parse",
+    ),
 )
 
 
@@ -75,7 +80,8 @@ def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
     """
     sent = 0
     with _repository.transaction() as transaction:
-        inflight = transaction.inflight(stream.stages, company_id)
+        transaction.lock_stream(company_id, stream.name)
+        inflight = transaction.inflight(stream.inflight_stages, company_id)
         room = capacity(limit, inflight)
         if room == 0:
             return 0
@@ -94,19 +100,36 @@ def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
     return sent
 
 
+def recover_pending(company_id: int) -> int:
+    """重发过期消息及到期轮询；恢复原任务不额外占用新任务配额。"""
+    sent = 0
+    with _repository.transaction() as transaction:
+        for job_id, task in transaction.recoverable(company_id, 100):
+            try:
+                celery_app.send_task(f"tender.worker.tasks.{task}", args=[job_id])
+            except Exception:
+                logger.warning("recovery.fail", exc_info=True, extra={"job_id": job_id})
+                break
+            transaction.mark_dispatched(job_id)
+            sent += 1
+    return sent
+
+
 @celery_app.task(bind=True, name="tender.worker.dispatch.dispatch_pending", max_retries=0)
 def dispatch_pending(self: Any) -> dict[str, int]:
     """beat 每秒唤醒；实际派发间隔读取当前配置，无需因调小间隔重启beat。"""
     global _last_run_at
     company_id = settings.company_id()
+    # 轮询恢复不受新任务派发间隔或并发下调限制，保证已有任务仍能收尾。
+    recovered = recover_pending(company_id)
     resolved = registry().resolved(company_id)
     interval = float(resolved["dispatch.interval_seconds"])
     now = time.monotonic()
     if now - _last_run_at < interval:
-        return {}
+        return {"recovered": recovered} if recovered else {}
     _last_run_at = now
 
-    dispatched: dict[str, int] = {}
+    dispatched: dict[str, int] = {"recovered": recovered} if recovered else {}
     for stream in STREAMS:
         limit = None if stream.limit_key is None else int(resolved[stream.limit_key])
         count = dispatch_stream(stream, limit, company_id)

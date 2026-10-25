@@ -5,16 +5,25 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from tender.application.analysis import execution as deep_analysis
 from tender.application.analysis.contract import RUNTIME_VERSION
 from tender.ports.repository.knowledge.store import KnowledgeStore
-from tender.worker.analysis import controller as deep_analysis
 from tender.worker.knowledge import tasks as knowledge
 
 
 @pytest.fixture
-def controller(monkeypatch):
+def executor():
+    return deep_analysis.AnalysisExecutor(
+        None, model_factory=Mock(), embedding_gateway=Mock(), rerank_gateway=Mock(),
+        checkpoints=Mock(),
+    )
+
+
+@pytest.fixture
+def controller(monkeypatch, executor):
     report = {"id": 16, "coverage": {}}
     db = Mock(spec=KnowledgeStore)
+    executor.db = db
     db.report_active_modules.return_value = [{"id": 930}, {"id": 931}]
     monkeypatch.setattr(deep_analysis, "prepare_report", lambda *_: (report, []))
     monkeypatch.setattr(deep_analysis, "check_report_access", lambda *_: None)
@@ -25,7 +34,7 @@ def controller(monkeypatch):
 
 @pytest.mark.parametrize("broken_step", ["abandon", "release"])
 def test_cleanup_failure_stops_controller_and_releases_waiters(
-    controller, monkeypatch, broken_step
+    controller, monkeypatch, broken_step, executor
 ):
     db, report, publish = controller
     released = set()
@@ -54,7 +63,7 @@ def test_cleanup_failure_stops_controller_and_releases_waiters(
 
     async def scenario():
         # 外层超时仅用于暴露旧控制器的永久等待，不能充当业务任务的退出机制。
-        await asyncio.wait_for(deep_analysis.analyze_report(db, report), timeout=3)
+        await asyncio.wait_for(executor.analyze_report(report), timeout=3)
 
     asyncio.run(scenario())
     db.fail_report.assert_called_once_with(16, cleanup_error)
@@ -63,7 +72,7 @@ def test_cleanup_failure_stops_controller_and_releases_waiters(
     publish.assert_called_once_with(db, 16)
 
 
-def test_handled_module_failure_allows_other_modules_to_complete(controller, monkeypatch):
+def test_handled_module_failure_allows_other_modules_to_complete(controller, monkeypatch, executor):
     db, report, publish = controller
     rows = [
         {"id": 930, "status": "pending", "items": []},
@@ -71,15 +80,15 @@ def test_handled_module_failure_allows_other_modules_to_complete(controller, mon
     ]
     db.report_modules.return_value = rows
 
-    async def execute(db, report, module, sources):
+    async def execute(report, module, sources):
         if module["id"] == 930:
             rows[0]["status"] = "failed"
             return
         await asyncio.sleep(0.01)
         rows[1]["status"] = "completed"
 
-    monkeypatch.setattr(deep_analysis, "execute_module", execute)
-    asyncio.run(deep_analysis.analyze_report(db, report))
+    monkeypatch.setattr(executor, "execute_module", execute)
+    asyncio.run(executor.analyze_report(report))
     db.fail_report.assert_not_called()
     db.finish_report.assert_called_once_with(16, status="partial", summary=[], error=None)
     publish.assert_called_once_with(db, 16)
@@ -129,9 +138,9 @@ def test_ready_schema_allows_analysis(monkeypatch):
     db.report_for_analysis.return_value = report
     analyze = AsyncMock()
     monkeypatch.setattr(knowledge, "_store", lambda: db)
-    monkeypatch.setattr(deep_analysis, "analyze_report", analyze)
+    monkeypatch.setattr(deep_analysis.AnalysisExecutor, "analyze_report", analyze)
 
     asyncio.run(knowledge._analyze_project(16))
 
-    analyze.assert_awaited_once_with(db, report)
+    analyze.assert_awaited_once_with(report)
     db.finish_task.assert_not_called()

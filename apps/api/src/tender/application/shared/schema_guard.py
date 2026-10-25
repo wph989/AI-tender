@@ -8,14 +8,14 @@
 
 from __future__ import annotations
 
-from tender.ports.repository.knowledge.store import KnowledgeStore
+from tender.ports.repository.shared.schema import SchemaReader
 
 # 分析链路强依赖的对象，缺少任何一个都会在流程中途报错，必须提前发现。
 REQUIRED_COLUMNS = (("analysis_module", "business_data"), ("analysis_report", "derived_lot_ids"))
 REQUIRED_TABLES = ("analysis_data_snapshot",)
 
 
-def missing_schema(db: KnowledgeStore) -> list[str]:
+def missing_schema(db: SchemaReader) -> list[str]:
     """返回业务库缺少的分析数据对象（人类可读），全部就绪时返回空列表。"""
     tables = sorted({table for table, _ in REQUIRED_COLUMNS})
     present = db.schema_columns(tables)

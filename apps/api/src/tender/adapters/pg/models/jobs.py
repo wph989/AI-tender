@@ -33,4 +33,6 @@ class Job(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatch_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     config_snapshot_id: Mapped[int | None] = mapped_column(BigInteger)

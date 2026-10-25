@@ -33,12 +33,15 @@ from tender.adapters.pg.repositories.projects.files import ProjectFileRepository
 from tender.adapters.pg.repositories.projects.projects import ProjectRepository
 from tender.adapters.pg.session import create_pg_engine
 from tender.adapters.storage.s3 import S3BlobStore
+from tender.application.analysis.execution import AnalysisExecutor
 from tender.application.analysis.service import AnalysisService
 from tender.application.configuration.service import ConfigService
 from tender.application.documents.parsing import ParseService
 from tender.application.documents.versions import VersionService
 from tender.application.jobs.service import JobService
+from tender.application.knowledge.execution import KnowledgeExecutor
 from tender.application.knowledge.service import KnowledgeService
+from tender.application.llm.factory import RoutingModelFactory
 from tender.application.llm.service import LlmService
 from tender.application.projects.files import ProjectFileService
 from tender.application.projects.service import ProjectService
@@ -55,10 +58,12 @@ from tender.ports.llm.cooldown import ProviderCooldown as ProviderCooldownPort
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.llm.media import ImageGenerationModel
 from tender.ports.llm.rerank import RerankModel
+from tender.ports.repository.analysis.reports import ReportRepository
 from tender.ports.repository.documents.pipeline import (
     DocumentPipelineRepository as DocumentPipelinePort,
 )
 from tender.ports.repository.jobs.dispatch import DispatchRepository as DispatchPort
+from tender.ports.repository.knowledge.execution import KnowledgeExecutionRepository
 from tender.ports.repository.knowledge.store import KnowledgeStore as KnowledgeStorePort
 from tender.ports.repository.llm.runtime import ModelRuntimeRepository as ModelRuntimePort
 from tender.ports.storage.blob_store import BlobStore
@@ -256,7 +261,7 @@ def create_analysis_service(
 ) -> AnalysisService:
     knowledge = create_knowledge_service(engine, company_id, configs)
     return AnalysisService(
-        knowledge.store,
+        KnowledgeStore(engine, company_id, configs),
         company_id,
         configs,
         create_embedding_gateway,
@@ -298,6 +303,27 @@ def create_model_runtime_repository(engine: Engine | None = None) -> ModelRuntim
 
 def create_provider_cooldown() -> ProviderCooldownPort:
     return ProviderCooldown(_worker_engine())
+
+
+def create_routing_model_factory() -> RoutingModelFactory:
+    return RoutingModelFactory(
+        create_model_runtime_repository(), create_provider_cooldown(), create_model_gateway,
+    )
+
+
+def create_analysis_executor(db: ReportRepository) -> AnalysisExecutor:
+    return AnalysisExecutor(
+        db, model_factory=create_routing_model_factory(),
+        embedding_gateway=create_embedding_gateway, rerank_gateway=create_rerank_gateway,
+        checkpoints=open_analysis_checkpoints,
+    )
+
+
+def create_knowledge_executor(db: KnowledgeExecutionRepository) -> KnowledgeExecutor:
+    return KnowledgeExecutor(
+        db, model_factory=create_routing_model_factory(),
+        embedding_gateway=create_embedding_gateway, rerank_gateway=create_rerank_gateway,
+    )
 
 
 def create_worker_knowledge_store() -> KnowledgeStorePort:

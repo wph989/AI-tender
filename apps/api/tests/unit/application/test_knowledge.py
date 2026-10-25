@@ -332,8 +332,10 @@ def test_slow_search_embedding_falls_back_to_citable_fulltext_and_closes_client(
         def embedding_config(self):
             return {"signature": "test-space"}
 
-        def readable_chunks(self, source):
-            return [row]
+        def search_candidates(self, sources, query, vector, signature, **limits):
+            from tender.ports.repository.knowledge.retrieval import SearchCandidates
+
+            return SearchCandidates([row], [])
 
     class SlowEmbedding:
         canceled = False

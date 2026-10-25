@@ -22,12 +22,13 @@ from tender.adapters.pg.repositories.llm.provider_cooldown import ProviderCooldo
 from tender.api.analysis import routes as analysis_api
 from tender.api.projects import routes as projects
 from tender.api.shared.errors import ApiProblem
+from tender.application.analysis import execution as worker
 from tender.application.analysis import runtime as agent_runtime
 from tender.application.analysis.skills import MODULES, skill_snapshot
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
+from tender.core.di import create_analysis_executor
 from tender.ports.llm.chat import Completion
-from tender.worker.analysis import controller as worker
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TENDER_RUN_DB_TESTS") != "1", reason="需要数据库集成验证"
@@ -118,8 +119,8 @@ def env(monkeypatch):
     )
     # 测试锁空间独立于实际 worker，真实报告不会消耗测试配额。
     monkeypatch.setattr(run_store, "QUOTA_NAMESPACE", 20000000 + int(uuid4().hex[:5], 16))
-    monkeypatch.setattr(worker, "open_analysis_checkpoints",
-                        lambda: AsyncPostgresSaver.from_conn_string(dsn))
+    executor = create_analysis_executor(db)
+    executor.checkpoints = lambda: AsyncPostgresSaver.from_conn_string(dsn)
     monkeypatch.setattr(settings, "company_id", lambda: 1)
 
     async def setup():
@@ -128,7 +129,7 @@ def env(monkeypatch):
 
     run_async(setup())
     try:
-        yield SimpleNamespace(db=db, request=request, engine=engine, dsn=dsn)
+        yield SimpleNamespace(db=db, request=request, engine=engine, dsn=dsn, executor=executor)
     finally:
         engine.dispose()
         with base.begin() as conn:
@@ -335,7 +336,7 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
         async def complete(self, prompt):
             await self.reserve()
             items = json.loads(prompt.rsplit("\n", 1)[-1])
-            refs = items[0]["values"][0]["citations"]
+            refs = items[0]["evidence_sets"][items[0]["values"][0]["evidence_set"]]["citations"]
             assert len(refs) == 2 and all(set(r) == {"id", "text"} for r in refs)
             # 校验请求包含业务属性，不能只核对展示文字后把标段范围直接落库。
             assert items[0]["business"]["scope"] == {"kind": "common", "lot_refs": []}
@@ -348,7 +349,7 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
                                 "supported": True,
                                 "unsupported_claims": [],
                                 "unresolved_references": [],
-                                "evidence_ids": [[selected[-1]]],
+                                "evidence_ids": [[selected[-1]] for _ in items[0]["values"]],
                             }
                         ]
                     }
@@ -360,12 +361,12 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
         return db.readable_chunks(selected_sources[0]), {"mode": "keyword"}
 
     monkeypatch.setattr(
-        worker, "_routing_model",
+        env.executor, "model_factory",
         lambda feature, purpose, **kw: EvidenceRouter(purpose=purpose, **kw),
     )
     monkeypatch.setattr(worker, "retrieve_chunks", retrieve)
     monkeypatch.setattr(env.db, "resolve", resolve)
-    run_async(worker.execute_module(env.db, row, run, sources))
+    run_async(env.executor.execute_module(row, run, sources))
     module = env.db.rows("SELECT * FROM analysis_module WHERE id=:id", {"id": run["module_id"]})[0]
     assert module["status"] == "completed", module["error_message"]
     assert resolved_ids == selected and len(selected) == 1
@@ -415,9 +416,9 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     async def retrieve(db, sources, query, *args, **kwargs):
         return db.readable_chunks(sources[0]), {"mode": "keyword"}
 
-    monkeypatch.setattr(worker, "_routing_model", model)
+    monkeypatch.setattr(env.executor, "model_factory", model)
     monkeypatch.setattr(worker, "retrieve_chunks", retrieve)
-    run_async(worker.analyze_report(env.db, row))
+    run_async(env.executor.analyze_report(row))
     result = analysis_api.get_report(row["id"], env.request)
     bad = [
         (m["module_key"], m["status"], m.get("error_message"))
@@ -703,13 +704,13 @@ def test_cancel_interrupts_active_module_and_releases_quota(env, monkeypatch):
         finally:
             stopped.set()
 
-    monkeypatch.setattr(worker, "_routing_model", lambda *a, **kw: Model())
+    monkeypatch.setattr(env.executor, "model_factory", lambda *a, **kw: Model())
     monkeypatch.setattr(worker, "build_module_agent", lambda **kw: (None, {}))
     monkeypatch.setattr(worker, "invoke_module", blocked_request)
 
     async def scenario():
-        task = asyncio.create_task(worker.execute_module(
-            env.db, runtime.report, runtime.run | {
+        task = asyncio.create_task(env.executor.execute_module(
+            runtime.report, runtime.run | {
                 "module_key": next(iter(MODULES)),
             }, runtime.sources))
         try:

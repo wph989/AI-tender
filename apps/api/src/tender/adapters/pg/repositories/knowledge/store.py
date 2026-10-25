@@ -72,6 +72,7 @@ from tender.config.registry import ConfigRegistry
 from tender.domain.knowledge.text import plain_text, split_elements
 from tender.domain.shared.digest import fingerprint
 from tender.ports.configuration.registry import ActiveConfig
+from tender.ports.repository.knowledge.retrieval import SearchCandidates
 
 
 def ensure_project_collection(connection: Any, project_id: int) -> int:
@@ -398,9 +399,9 @@ class KnowledgeStore:
         with self.engine.connect() as connection:
             return [dict(row) for row in connection.execute(statement).mappings()]
 
-    def blocks(self, source: dict[str, Any]) -> list[dict[str, Any]]:
-        """资料在该解析批次下的全部元素，按页、按序。"""
-        statement = (
+    def _blocks_query(self, source: dict[str, Any]):
+        """原文与索引共用身份/权限筛选，避免索引绕过资料撤销。"""
+        return (
             select(
                 Element.id,
                 Element.anchor,
@@ -441,11 +442,29 @@ class KnowledgeStore:
             )
             .order_by(Element.page_no, Element.order_no)
         )
+
+    def blocks(self, source: dict[str, Any]) -> list[dict[str, Any]]:
         with self.engine.connect() as connection:
-            return [dict(row) for row in connection.execute(statement).mappings()]
+            return [dict(row) for row in connection.execute(self._blocks_query(source)).mappings()]
+
+    def search_candidates(
+        self, sources: list[dict], query: str, vector: list[float] | None,
+        signature: str | None, *, limit: int, min_similarity: float | None,
+    ) -> SearchCandidates:
+        from tender.adapters.pg.repositories.knowledge.retrieval import search_candidates
+
+        return search_candidates(
+            self, sources, query, vector, signature, limit=limit, min_similarity=min_similarity,
+        )
 
     def readable_chunks(self, source: dict[str, Any]) -> list[dict[str, Any]]:
         """分块由元素派生，元素越界一次也不额外查库。"""
+        if source.get("index_id") and source.get("index_status") == "completed":
+            from tender.adapters.pg.repositories.knowledge.retrieval import indexed_chunks
+
+            rows = indexed_chunks(self, source)
+            if rows is not None:
+                return rows
         elements = self.blocks(source)
         by_id = {element["id"]: element for element in elements}
         result = []
@@ -582,15 +601,6 @@ class KnowledgeStore:
             )
 
     # —— 检索与索引 ——
-    def index_vectors(self, index_id: int) -> list[dict[str, Any]]:
-        """索引批次里各分块的向量，用于关键词之外的语义召回。"""
-        with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(KnowledgeChunk.ordinal, KnowledgeChunk.embedding).where(
-                    KnowledgeChunk.index_id == index_id
-                )
-            ).mappings()
-            return [dict(row) for row in rows]
 
     def embedding_config(self) -> dict[str, Any] | None:
         statement = (

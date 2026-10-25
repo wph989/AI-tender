@@ -2,10 +2,14 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import timedelta
 
-from sqlalchemy import Connection, Engine, func, select, update
+from sqlalchemy import Connection, Engine, func, or_, select, update
 
+from tender.adapters.pg.locks import acquire_xact_lock, try_acquire_xact_lock
 from tender.adapters.pg.models import Job
+
+DISPATCH_LEASE = timedelta(seconds=60)
 
 
 def pending_jobs(stages: tuple[str, ...], company_id: int, limit: int | None):
@@ -18,6 +22,7 @@ def pending_jobs(stages: tuple[str, ...], company_id: int, limit: int | None):
             Job.finished_at.is_(None),
             Job.dispatched_at.is_(None),
             Job.stage.in_(stages),
+            or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= func.now()),
         )
         .order_by(Job.created_at, Job.id)
         .limit(limit)
@@ -28,6 +33,10 @@ def pending_jobs(stages: tuple[str, ...], company_id: int, limit: int | None):
 class DispatchTransaction:
     def __init__(self, connection: Connection) -> None:
         self.connection = connection
+
+    def lock_stream(self, company_id: int, stream: str) -> None:
+        # 候选行锁只能防重复领取；公司/资源锁才能保护跨行的总配额。
+        acquire_xact_lock(self.connection, f"document_dispatch:{company_id}:{stream}")
 
     def inflight(self, stages: tuple[str, ...], company_id: int) -> int:
         return int(
@@ -48,9 +57,56 @@ class DispatchTransaction:
     def mark_dispatched(self, job_id: str) -> None:
         self.connection.execute(
             update(Job)
-            .where(Job.id == job_id, Job.dispatched_at.is_(None))
-            .values(dispatched_at=func.now(), updated_at=func.now())
+            .where(Job.id == job_id)
+            .values(
+                dispatched_at=func.now(),
+                dispatch_lease_until=func.now() + DISPATCH_LEASE,
+            )
         )
+
+    def recoverable(self, company_id: int, limit: int) -> list[tuple[str, str]]:
+        rows = self.connection.execute(
+            select(Job.id, Job.stage)
+            .where(
+                Job.company_id == company_id,
+                Job.status.in_(("pending", "submitting", "running")),
+                Job.stage.in_(
+                    ("converting", "probing", "geometry", "submitting", "parsing", "resubmitting")
+                ),
+                Job.finished_at.is_(None),
+                Job.dispatched_at.is_not(None),
+                or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= func.now()),
+                or_(Job.dispatch_lease_until.is_(None), Job.dispatch_lease_until <= func.now()),
+            )
+            .order_by(Job.dispatch_lease_until.asc().nullsfirst(), Job.created_at, Job.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
+        result = []
+        for job_id, stage in rows:
+            # 不抢占活跃执行者；非阻塞取锁避免与执行者的锁顺序形成死锁。
+            if not try_acquire_xact_lock(self.connection, f"job:{job_id}"):
+                # 活跃任务延长扫描租约，让后续批次能轮到失联任务；不触碰其执行预算。
+                self.connection.execute(
+                    update(Job)
+                    .where(Job.id == job_id)
+                    .values(
+                        dispatch_lease_until=func.now() + DISPATCH_LEASE,
+                    )
+                )
+                continue
+            task = (
+                "poll_parse"
+                if stage in {"parsing", "resubmitting"}
+                else "submit_parse"
+                if stage == "submitting"
+                else "process_file"
+                if stage in {"converting", "probing", "geometry"}
+                else None
+            )
+            if task:
+                result.append((job_id, task))
+        return result
 
 
 class DispatchRepository:

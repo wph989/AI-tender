@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 # 分块与去标签的纯规则落 domain，adapters 的检索仓储也要用；这里按用例层的入口再导出。
+from tender.domain.knowledge.search import keywords
 from tender.domain.knowledge.text import plain_text, split_elements
 from tender.domain.shared.digest import fingerprint
 
@@ -458,16 +459,6 @@ def validate_items(
         }
         result.append(clean)
     return result
-
-
-def keywords(query: str) -> list[str]:
-    words = re.findall(r"[a-zA-Z0-9_.-]+|[\u4e00-\u9fff]+", query.lower())
-    # 中文不依赖英文分词配置，长词同时生成二字词，兼顾精确名称与自然问句。
-    return list(
-        dict.fromkeys(
-            words + [w[i : i + 2] for w in words if len(w) > 2 for i in range(len(w) - 1)]
-        )
-    )
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:

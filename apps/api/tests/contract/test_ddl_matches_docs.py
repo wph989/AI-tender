@@ -59,6 +59,11 @@ class _MigrationSpec:
 
 _MIGRATIONS: tuple[_MigrationSpec, ...] = (
     _MigrationSpec(
+        "0017_document_recovery.py",
+        (("设计/03-数据模型与溯源设计.md", 7),),
+        require_tables=False,
+    ),
+    _MigrationSpec(
         "0012_config_limits.py",
         (("设计/12-LLM管理与模型路由.md", 3),),
         require_tables=False,

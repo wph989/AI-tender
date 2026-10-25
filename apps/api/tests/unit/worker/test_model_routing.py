@@ -1,8 +1,10 @@
 """校验 worker 传给路由的额外重试上限：候选必须收敛，且不改变未超限的配置。"""
 
+from unittest.mock import Mock
+
 import pytest
 
-import tender.worker.llm.routing as extraction
+import tender.application.llm.factory as extraction
 from tender.application.llm.routing import ModelCandidate
 
 
@@ -35,12 +37,12 @@ def _candidate(registry_id: int, extra_retries: int) -> ModelCandidate:
     "limit,expected", [(2, [2, 1]), (None, [5, 1])]
 )
 def test_extra_retries_limit_only_lowers_configured_retries(monkeypatch, limit, expected):
-    monkeypatch.setattr(extraction, "_repository", _FakeRepository())
+    factory = extraction.RoutingModelFactory(_FakeRepository(), Mock(), Mock())
     monkeypatch.setattr(
-        extraction,
+        factory,
         "_load_candidates",
         lambda feature_key, purpose: [_candidate(1, 5), _candidate(2, 1)],
     )
     monkeypatch.setattr(extraction, "RoutingModel", _CapturedRouting)
-    model = extraction._routing_model("analysis", "analysis", extra_retries_limit=limit)
+    model = factory("analysis", "analysis", extra_retries_limit=limit)
     assert [candidate.extra_retries for candidate in model.candidates] == expected

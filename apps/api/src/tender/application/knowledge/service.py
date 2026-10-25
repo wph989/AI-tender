@@ -16,11 +16,11 @@ from tender.application.shared.errors import Conflict, Forbidden, InvalidArgumen
 from tender.config.schema import document_execution_snapshot
 from tender.ports.configuration.registry import ConfigReader
 from tender.ports.llm.embedding import EmbeddingModel
-from tender.ports.repository.knowledge.store import KnowledgeStore
+from tender.ports.repository.knowledge.management import KnowledgeRepository
 
 
 def visible_items(
-    store: KnowledgeStore,
+    store: KnowledgeRepository,
     items: list[dict],
     allowed_collections: list[int] | None = None,
 ) -> list[dict]:
@@ -89,7 +89,7 @@ def visible_items(
 class KnowledgeService:
     def __init__(
         self,
-        repository: KnowledgeStore,
+        repository: KnowledgeRepository,
         company_id: int,
         configs: ConfigReader,
         embedding_gateway: Callable[[dict], EmbeddingModel],

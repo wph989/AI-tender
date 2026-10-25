@@ -3,6 +3,7 @@
 import asyncio
 import json
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 from structlog.contextvars import merge_contextvars
@@ -12,10 +13,18 @@ from test_analysis_synthesis import execute
 from test_deep_analysis import call
 from test_llm_routing import _candidate, _ScriptedGateway
 
+from tender.application.analysis import execution as deep_analysis
 from tender.application.llm.routing import RoutingModel
 from tender.core.logging import bind_context, get_context, get_logger
 from tender.domain.shared.errors import ModelUnavailable
-from tender.worker.analysis import controller as deep_analysis
+
+
+@pytest.fixture
+def executor():
+    return deep_analysis.AnalysisExecutor(
+        None, model_factory=Mock(), embedding_gateway=Mock(), rerank_gateway=Mock(),
+        checkpoints=Mock(),
+    )
 
 
 @pytest.mark.parametrize("failover_limit", [1, 2])
@@ -112,17 +121,17 @@ def test_validation_rejection_logs_item_reason_and_correction_count():
     assert rejected["log_level"] == "warning"
 
 
-def test_parallel_modules_keep_context_in_child_tasks_and_threads(monkeypatch):
-    async def probe(db, report, module, sources):
+def test_parallel_modules_keep_context_in_child_tasks_and_threads(monkeypatch, executor):
+    async def probe(report, module, sources):
         await asyncio.sleep(0)
         await asyncio.to_thread(get_logger(__name__).info, "thread_probe", expected=module["id"])
 
-    monkeypatch.setattr(deep_analysis, "_execute_module", probe)
+    monkeypatch.setattr(executor, "_execute_module", probe)
 
     async def check():
         with bind_context(task_id="celery-parent"):
             await asyncio.gather(*(
-                deep_analysis.execute_module(None, {"id": 18}, {"id": run_id}, [])
+                executor.execute_module({"id": 18}, {"id": run_id}, [])
                 for run_id in (99, 100)
             ))
             assert get_context() == {"task_id": "celery-parent"}
@@ -134,7 +143,9 @@ def test_parallel_modules_keep_context_in_child_tasks_and_threads(monkeypatch):
     assert all(log["task_id"] == "celery-parent" for log in logs)
 
 
-def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cause(monkeypatch):
+def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cause(
+    monkeypatch, executor,
+):
     class Runtime:
         def __init__(self, *args):
             pass
@@ -151,7 +162,7 @@ def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cau
 
     monkeypatch.setattr(deep_analysis, "AgentRuntime", Runtime)
     with capture_logs(processors=[merge_contextvars]) as logs:
-        asyncio.run(deep_analysis.execute_module(None, {"id": 18}, {"id": 99}, []))
+        asyncio.run(executor.execute_module({"id": 18}, {"id": 99}, []))
     failure = next(log for log in logs if log["event"] == "module.fail")
     assert failure["run_id"] == 99 and "ModelUnavailable" in failure["exception"]
     assert "上游断连" in failure["exception"] and "claim" in failure["exception"]

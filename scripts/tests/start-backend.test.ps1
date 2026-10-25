@@ -53,6 +53,10 @@ function New-FakeProcess {
 foreach ($entry in @(
     @('api', '-m uvicorn tender.api.app:app --port 8300'),
     @('worker', '-m celery -A tender.worker.celery_app worker -P threads'),
+    @('worker', '-m celery -A tender.worker.celery_app worker -Q convert,parse -n tender-documents@host'),
+    @('scheduler', '-m celery -A tender.worker.celery_app worker -Q tender -n tender-scheduler@host'),
+    @('poller', '-m celery -A tender.worker.celery_app worker -Q poll -n tender-poller@host'),
+    @('analysis', '-m celery -A tender.worker.celery_app worker -Q analysis -n tender-analysis@host'),
     @('beat', '-m celery -A tender.worker.celery_app beat')
 )) {
     $process = New-FakeProcess -Arguments $entry[1]
@@ -64,7 +68,7 @@ foreach ($entry in @(
     Assert-True (Test-ServiceIdentity -Service $roundTrip) '合法进程身份未通过'
     Assert-True (Stop-ServiceProcess -Service $roundTrip) '合法进程无法停止'
 }
-Assert-True ($script:killed.Count -eq 3) '合法的三个服务应各终止一次'
+Assert-True ($script:killed.Count -eq 7) '各组服务和旧版 Worker 均应按身份管理'
 
 $process = New-FakeProcess
 $record = ConvertTo-ServiceRecord -ProcessInfo $process

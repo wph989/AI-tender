@@ -3,17 +3,17 @@
 import asyncio
 from collections.abc import Callable
 
-from tender.application.knowledge.content import rank_chunks, source_state
+from tender.application.knowledge.content import source_state
 from tender.core.logging import get_logger
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.llm.rerank import RerankModel
-from tender.ports.repository.knowledge.store import KnowledgeStore
+from tender.ports.repository.knowledge.retrieval import RetrievalRepository
 
 logger = get_logger(__name__)
 
 
 async def retrieve_chunks(
-    db: KnowledgeStore,
+    db: RetrievalRepository,
     sources: list[dict],
     question: str,
     heartbeat: Callable[[], None],
@@ -24,11 +24,9 @@ async def retrieve_chunks(
     min_similarity: float | None = None,
     max_results: int | None = None,
 ) -> tuple[list[dict], dict]:
-    rows = []
     # 同步数据库访问移到线程池，避免大表查询阻塞进程内事件循环（模型页轮询等）。
     config = await asyncio.to_thread(db.embedding_config)
     vector = None
-    semantic_sources = set()
     warning = None
     if config:
         client = None
@@ -47,31 +45,17 @@ async def retrieve_chunks(
         finally:
             if client:
                 await client.aclose()
-    for source in sources:
-        heartbeat()
-        if source_state(source) not in {"ready", "partial"}:
-            continue
-        blocks = await asyncio.to_thread(db.readable_chunks, source)
-        if (
-            vector is not None
-            and source.get("index_id")
-            and source.get("embedding_signature") == config["signature"]
-        ):
-            vectors = await asyncio.to_thread(db.index_vectors, source["index_id"])
-            by_ordinal = {r["ordinal"]: r["embedding"] for r in vectors}
-            for block in blocks:
-                candidate = by_ordinal.get(block["ordinal"])
-                if candidate is not None and len(candidate) == len(vector):
-                    block["embedding"] = candidate
-                    semantic_sources.add(source["source_id"])
-        rows.extend(blocks)
-    # 专题先过滤后保留足够候选供重排；不能被旧的16块截断限制可配置的返回数量。
-    ranked = rank_chunks(
-        rows, question, vector,
-        # 多保留一个达标候选才能区分“恰好返回 N 条”和“还有结果被截断”。
+    usable = [source for source in sources if source_state(source) in {"ready", "partial"}]
+    await asyncio.to_thread(heartbeat)
+    # 召回与排名在仓储内完成，事件循环只接收有界候选；多取一项判断是否截断。
+    candidates = await asyncio.to_thread(
+        db.search_candidates, usable, question, vector,
+        config["signature"] if config is not None else None,
         limit=max(30, max_results + 1) if max_results is not None else 16,
         min_similarity=min_similarity,
     )
+    ranked = candidates.rows
+    semantic_sources = candidates.semantic_source_ids
     reranked = False
     rerank_config = await asyncio.to_thread(db.rerank_config) if rerank_gateway else None
     if ranked and rerank_config and rerank_gateway:

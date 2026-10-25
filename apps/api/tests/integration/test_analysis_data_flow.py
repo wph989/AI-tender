@@ -133,6 +133,7 @@ def test_independent_module_json_uses_separate_evidence_and_live_permissions(bas
     assert len(result["records"]) == 5
     assert result["output_schema"]["sections"][2] == {
         "title": "项目基本信息", "layout": "table", "columns": ["字段", "内容"],
+        "scalar_columns": ["字段"],
     }
     assert all("citations" not in r for r in result["records"])
     record = next(r for r in result["records"] if r["key"] == "a")

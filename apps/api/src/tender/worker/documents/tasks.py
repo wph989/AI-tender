@@ -57,15 +57,19 @@ def _retry_delay(retries: int) -> int:
     return min(30, 2 ** min(max(retries, 1), 5))
 
 
-def _serialize_job(function: Callable[..., None]) -> Callable[..., None]:
-    @wraps(function)
-    def wrapped(task: Any, job_id: str) -> None:
-        with _locks.lock(f"job:{job_id}", wait=False) as acquired:
-            if not acquired:
-                raise task.retry(countdown=1)
-            function(task, job_id)
+def _serialize_job(*stages: str) -> Callable:
+    def decorate(function: Callable[..., None]) -> Callable[..., None]:
+        @wraps(function)
+        def wrapped(task: Any, job_id: str) -> None:
+            with _locks.lock(f"job:{job_id}", wait=False) as acquired:
+                if not acquired:
+                    raise task.retry(countdown=1)
+                if _repository.claim_attempt(job_id, stages):
+                    function(task, job_id)
 
-    return wrapped
+        return wrapped
+
+    return decorate
 
 
 @asynccontextmanager
@@ -243,7 +247,7 @@ def _process_pdf_file(row: Mapping[str, Any], store: S3BlobStore) -> tuple[int, 
 
 
 @celery_app.task(bind=True, name="tender.worker.tasks.process_file", max_retries=None)
-@_serialize_job
+@_serialize_job("converting", "probing", "geometry")
 def process_file(self: Any, job_id: str) -> None:
     row = _repository.file_job(job_id)
     if row is None:
@@ -278,7 +282,11 @@ def process_file(self: Any, job_id: str) -> None:
             return
         except BlobStoreError as exc:
             _repository.reset_file_job(job_id, stage, "storage_unavailable", str(exc))
-            raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
+            _repository.schedule_attempt(
+                job_id, _retry_delay(int((row.get("progress") or {}).get("retry_attempts", 0))),
+                retry=True,
+            )
+            return
         except ConversionFailed as exc:
             _repository.set_job_failure(job_id, exc.code, str(exc))
             return
@@ -321,7 +329,7 @@ async def _submit(row: Mapping[str, Any], store: S3BlobStore) -> Any:
 
 
 @celery_app.task(bind=True, name="tender.worker.tasks.submit_parse", max_retries=None)
-@_serialize_job
+@_serialize_job("submitting")
 def submit_parse(self: Any, job_id: str) -> None:
     row = _repository.job(job_id)
     if row is None:
@@ -363,13 +371,21 @@ def submit_parse(self: Any, job_id: str) -> None:
         return
     except ParseUnavailable as exc:
         _repository.retry_submission(job_id, exc.code, str(exc))
-        raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
+        _repository.schedule_attempt(
+            job_id, _retry_delay(int((row.get("progress") or {}).get("retry_attempts", 0))),
+            retry=True,
+        )
+        return
     except ParseFailed as exc:
         _repository.set_job_failure(job_id, exc.code, str(exc))
         return
     except BlobStoreError as exc:
         _repository.retry_submission(job_id, "storage_unavailable", str(exc))
-        raise self.retry(exc=exc, countdown=_retry_delay(self.request.retries)) from exc
+        _repository.schedule_attempt(
+            job_id, _retry_delay(int((row.get("progress") or {}).get("retry_attempts", 0))),
+            retry=True,
+        )
+        return
     now = datetime.now(UTC)
     snapshot = asdict(submission.config_snapshot)
     try:
@@ -387,7 +403,7 @@ def submit_parse(self: Any, job_id: str) -> None:
         _mark_submission_unknown(job_id, f"MinerU 已提交但任务记录写入失败：{exc}")
         return
 
-    poll_parse.apply_async(args=(job_id,), countdown=_poll_delay(values, 0))
+    _repository.schedule_attempt(job_id, _poll_delay(values, 0))
 
 
 async def _poll(row: Mapping[str, Any], store: S3BlobStore) -> tuple[Any, Any | None]:
@@ -403,7 +419,7 @@ async def _poll(row: Mapping[str, Any], store: S3BlobStore) -> tuple[Any, Any | 
 
 
 @celery_app.task(bind=True, name="tender.worker.tasks.poll_parse", max_retries=None)
-@_serialize_job
+@_serialize_job("parsing", "resubmitting")
 def poll_parse(self: Any, job_id: str) -> None:
     row = _repository.job(job_id)
     if row is None or row["status"] != "running" or row["run_id"] is None:
@@ -451,12 +467,10 @@ def poll_parse(self: Any, job_id: str) -> None:
         except ParseFailed as failed:
             _repository.set_job_failure(job_id, failed.code, str(failed))
             return
-        except (ParseUnavailable, BlobStoreError) as retryable:
+        except (ParseUnavailable, BlobStoreError):
             _repository.resume_poll(job_id)
-            raise self.retry(
-                exc=retryable,
-                countdown=_poll_delay(values, attempts + 1),
-            ) from retryable
+            _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+            return
 
         if submission.provider_version != row["provider_version"]:
             _repository.set_job_failure(
@@ -466,21 +480,23 @@ def poll_parse(self: Any, job_id: str) -> None:
             )
             return
         _repository.replace_provider_job(job_id, int(row["run_id"]), submission.job_id)
-        poll_parse.apply_async(args=(job_id,), countdown=_poll_delay(values, attempts + 1))
+        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
         return
-    except ParseUnavailable as exc:
-        raise self.retry(exc=exc, countdown=_poll_delay(values, attempts + 1)) from exc
+    except ParseUnavailable:
+        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+        return
     except ParseFailed as exc:
         _repository.set_job_failure(job_id, exc.code, str(exc))
         return
-    except BlobStoreError as exc:
-        raise self.retry(exc=exc, countdown=_poll_delay(values, attempts + 1)) from exc
+    except BlobStoreError:
+        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+        return
 
     now = datetime.now(UTC)
     progress = asdict(status.progress) if status.progress is not None else {}
     if status.status in {"queued", "running"}:
         _repository.update_progress(job_id, progress, now)
-        poll_parse.apply_async(args=(job_id,), countdown=_poll_delay(values, attempts + 1))
+        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
         return
 
     terminal_status = status.status
@@ -493,8 +509,9 @@ def poll_parse(self: Any, job_id: str) -> None:
         raw_middle_key = f"mineru/{row['version_id']}/{row['run_id']}/middle.json"
         try:
             store.put(raw_middle_key, middle_json.raw_bytes, content_type="application/json")
-        except BlobStoreError as exc:
-            raise self.retry(exc=exc, countdown=_poll_delay(values, attempts + 1)) from exc
+        except BlobStoreError:
+            _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+            return
         page_values = middle_json.payload.get("pages")
         page_count = len(page_values) if isinstance(page_values, list) else None
         backend = middle_json.backend

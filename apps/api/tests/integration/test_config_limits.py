@@ -200,21 +200,27 @@ def test_poll_interval_and_attempts_survive_new_task_invocations(runtime, monkey
     request, connection = parsing_job(runtime)
     release(request, {"job.poll.initial_interval_ms": 1500, "job.poll.max_interval_ms": 2500,
                       "job.poll.max_attempts": 2})
-    delays, calls = [], []
+    calls = []
 
     async def poll(*args):
         calls.append(True)
         return ParseJobStatus("fixture", "running", ParseProgress(10, 1, 0), False), None
 
     monkeypatch.setattr(tasks, "_poll", poll)
-    monkeypatch.setattr(tasks.poll_parse, "apply_async",
-                        lambda **kwargs: delays.append(kwargs["countdown"]))
     tasks.poll_parse.run("poll-fixture")
     first = tasks._repository.execution_start("poll-fixture", "parse")
+    due = connection.execute(text(
+        "SELECT next_attempt_at - now() FROM job WHERE id='poll-fixture'"
+    )).scalar_one()
+    assert due == timedelta(seconds=2.5)
     tasks.poll_parse.run("poll-fixture")
-    tasks.poll_parse.run("poll-fixture")
+    assert len(calls) == 1  # 提前重复消息不能消耗轮询预算。
+    for _ in range(2):
+        connection.execute(text("UPDATE job SET next_attempt_at=now() - interval '1 second' "
+                                "WHERE id='poll-fixture'"))
+        tasks.poll_parse.run("poll-fixture")
     result = connection.execute(text("SELECT * FROM job WHERE id='poll-fixture'" )).mappings().one()
-    assert len(calls) == 2 and delays == [2.5, 2.5]
+    assert len(calls) == 2
     assert result["status"] == "failed" and result["error_code"] == "parse_timeout"
     assert result["progress"]["poll_attempts"] == 2
     assert tasks._repository.execution_start("poll-fixture", "parse") == first
@@ -238,21 +244,22 @@ def test_poll_network_retry_uses_configured_delay_and_consumes_attempt(runtime, 
     request, connection = parsing_job(runtime)
     release(request, {"job.poll.initial_interval_ms": 100, "job.poll.max_interval_ms": 150,
                       "job.poll.max_attempts": 1})
-    delays = []
+    calls = []
 
     async def unavailable(*args):
+        calls.append(True)
         raise ParseUnavailable("测试网络故障")
 
-    def retry(**kwargs):
-        delays.append(kwargs["countdown"])
-        return RuntimeError("测试消息重试")
-
     monkeypatch.setattr(tasks, "_poll", unavailable)
-    monkeypatch.setattr(tasks.poll_parse, "retry", retry)
-    with pytest.raises(RuntimeError, match="测试消息重试"):
-        tasks.poll_parse.run("poll-fixture")
     tasks.poll_parse.run("poll-fixture")
-    assert delays == [0.15]
+    due = connection.execute(text(
+        "SELECT next_attempt_at - now() FROM job WHERE id='poll-fixture'"
+    )).scalar_one()
+    assert due == timedelta(seconds=0.15)
+    connection.execute(text("UPDATE job SET next_attempt_at=now() - interval '1 second' "
+                            "WHERE id='poll-fixture'"))
+    tasks.poll_parse.run("poll-fixture")
+    assert calls == [True]
     row = connection.execute(text(
         "SELECT status,progress FROM job WHERE id='poll-fixture'"
     )).mappings().one()
@@ -327,3 +334,25 @@ def test_legacy_job_uses_historical_snapshot_instead_of_live_values(runtime):
     snapshot = connection.execute(text("SELECT config_snapshot FROM job WHERE id=:id"),
                                   {"id": created["job_id"]}).scalar_one()
     assert snapshot["execution_origin"] == "job_config_snapshot"
+
+
+def test_submit_retry_backoff_survives_new_task_messages(runtime, monkeypatch):
+    _, connection = parsing_job(runtime)
+    connection.execute(text("UPDATE job SET status='pending', stage='submitting', run_id=NULL "
+                            "WHERE id='poll-fixture'"))
+
+    async def unavailable(*args):
+        raise ParseUnavailable("模拟提交前网络不可用")
+
+    monkeypatch.setattr(tasks, "_submit", unavailable)
+    starts = []
+    for expected_delay in (2, 2, 4):
+        tasks.submit_parse.run("poll-fixture")
+        row = connection.execute(text("SELECT status, progress, next_attempt_at - now() AS delay "
+                                      "FROM job WHERE id='poll-fixture'")).mappings().one()
+        assert row["status"] == "pending" and row["delay"] == timedelta(seconds=expected_delay)
+        starts.append(row["progress"]["parse_started_at"])
+        connection.execute(text("UPDATE job SET next_attempt_at=now() - interval '1 second' "
+                                "WHERE id='poll-fixture'"))
+    assert row["progress"]["retry_attempts"] == 3
+    assert len(set(starts)) == 1
