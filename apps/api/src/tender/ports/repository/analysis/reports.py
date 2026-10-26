@@ -228,10 +228,6 @@ class ReportRepository(SourceReader, RetrievalRepository, SchemaReader, TaskLife
         """报告收口：写终态、汇总与结束时间，并清掉租约。"""
         ...
 
-    def fail_report(self, report_id: int, error: str) -> None:
-        """报告在运行中异常收尾；已取消的报告不再改写。"""
-        ...
-
     def agent_run_store(self, report: dict[str, Any], run: dict[str, Any]) -> AgentRunStore:
         """取报告/模块运行的状态机入口（见 ``ports.repository.agent_runtime``）。"""
         ...

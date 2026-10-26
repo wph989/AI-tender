@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from tender.application.knowledge.content import source_state
+from tender.application.knowledge.execution import dispatch_ready
 from tender.core.di import (
     create_analysis_executor,
     create_knowledge_executor,
@@ -19,6 +19,13 @@ from tender.worker.celery_app import celery_app
 _locks = create_task_locks()
 _models = create_model_runtime_repository()
 
+# 持久化队列消息名：历史消息按这些名字查找任务，不能随 Python 模块路径调整而改名。
+DISPATCH_TASKS = {
+    "index": "tender.worker.knowledge.build_index",
+    "report": "tender.worker.knowledge.analyze_project",
+    "answer": "tender.worker.knowledge.answer_question",
+}
+
 
 def _store() -> KnowledgeStore:
     return create_worker_knowledge_store()
@@ -29,21 +36,11 @@ def dispatch_knowledge() -> None:
     with _locks.lock("knowledge_dispatch") as acquired:
         if not acquired:
             return
-        db = _store()
         _models.maintain_tests()
-        for source in db.sources(db.collections_pending_index()):
-            if source_state(source) not in {"ready", "partial"} or source["index_id"]:
-                continue
-            db.create_index(source)
-        # 小批次派发限制消息积压；长任务定期续约，重复消息由会话锁拒绝。
-        for kind, task in (
-            ("index", "build_index"),
-            ("report", "analyze_project"),
-            ("answer", "answer_question"),
-        ):
-            for record_id in db.claim_dispatchable(kind, 2):
-                # 这是持久化队列消息的任务名，不能随 Python 模块路径调整而重命名。
-                celery_app.send_task(f"tender.worker.knowledge.{task}", args=[record_id])
+        # 索引登记与任务领取归用例层；入口只按 kind 投递消息。长任务定期续约，
+        # 重复消息由会话锁拒绝。
+        for kind, record_id in dispatch_ready(_store()):
+            celery_app.send_task(DISPATCH_TASKS[kind], args=[record_id])
 
 
 @celery_app.task(name="tender.worker.knowledge.build_index")

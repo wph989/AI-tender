@@ -1,5 +1,6 @@
 """数据库内精确排名，仅返回有界候选；未建索引的资料保留原文回退。"""
 
+from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import (
@@ -19,7 +20,18 @@ from sqlalchemy.sql.expression import Grouping
 
 from tender.adapters.pg.models import Element, KnowledgeChunk, KnowledgeIndex
 from tender.domain.knowledge.search import keywords
+from tender.domain.knowledge.text import CHUNK_VERSION, chunk_bbox, chunk_block_id
 from tender.ports.repository.knowledge.retrieval import SearchCandidates
+
+# 索引「已建成」的唯一判定：三处查询必须同口径，读写版本也来自同一常量。
+_READY_INDEX = (
+    KnowledgeIndex.status == "completed",
+    KnowledgeIndex.chunk_version == CHUNK_VERSION,
+)
+
+
+def _ready_index(index_id: int):
+    return (KnowledgeIndex.id == index_id, *_READY_INDEX)
 
 
 def _indexed_query(store, source):
@@ -32,27 +44,24 @@ def _indexed_query(store, source):
         )
         .join(KnowledgeIndex, KnowledgeIndex.id == KnowledgeChunk.index_id)
         .where(
-            KnowledgeIndex.id == source["index_id"],
+            *_ready_index(source["index_id"]),
             KnowledgeIndex.source_id == source["source_id"],
             KnowledgeIndex.version_id == source["version_id"],
             KnowledgeIndex.run_id == source["parse_run_id"],
-            KnowledgeIndex.status == "completed",
-            KnowledgeIndex.chunk_version == "1",
         )
         .order_by(None)
     )
 
 
-def _payload(row: dict, source: dict) -> dict:
-    result = {
-        **source,
-        **row,
-        "offset": row["ordinal"],
-        "block_id": f"s{source['source_id']}r{source['parse_run_id']}c{row['ordinal']}",
-    }
-    if "bbox_x0" in result:
-        coords = [result.pop("bbox_" + axis) for axis in ("x0", "y0", "x1", "y1")]
-        result["bbox"] = [float(v) for v in coords] if all(v is not None for v in coords) else None
+def _payload(row: Mapping[str, Any], source: dict) -> dict:
+    result = {**source, **row}
+    for axis in ("x0", "y0", "x1", "y1"):
+        result.pop("bbox_" + axis, None)
+    result.update(
+        offset=row["ordinal"],
+        block_id=chunk_block_id(source["source_id"], source["parse_run_id"], row["ordinal"]),
+        bbox=chunk_bbox(row),
+    )
     return result
 
 
@@ -75,17 +84,6 @@ def _columns():
 
 def indexed_chunks(store, source: dict) -> list[dict] | None:
     with store.engine.connect() as connection:
-        # 旧快照或尚未完成的索引允许走原文回退，不把索引缺失解释成文档无内容。
-        valid = connection.execute(
-            select(KnowledgeIndex.id).where(
-                KnowledgeIndex.id == source["index_id"],
-                KnowledgeIndex.status == "completed",
-                KnowledgeIndex.run_id == source["parse_run_id"],
-                KnowledgeIndex.chunk_version == "1",
-            )
-        ).scalar_one_or_none()
-        if valid is None:
-            return None
         query = (
             _indexed_query(store, source)
             .with_only_columns(*_columns())
@@ -93,7 +91,18 @@ def indexed_chunks(store, source: dict) -> list[dict] | None:
                 KnowledgeChunk.ordinal,
             )
         )
-        return [_payload(dict(row), source) for row in connection.execute(query).mappings()]
+        rows = [_payload(dict(row), source) for row in connection.execute(query).mappings()]
+        if rows:
+            return rows
+        # 空结果可能是索引失效而非文档无内容；只在空结果时补一次校验，保留原文回退。
+        # 旧快照或尚未完成的索引允许走原文回退，不把索引缺失解释成文档无内容。
+        valid = connection.execute(
+            select(KnowledgeIndex.id).where(
+                *_ready_index(source["index_id"]),
+                KnowledgeIndex.run_id == source["parse_run_id"],
+            )
+        ).scalar_one_or_none()
+        return [] if valid is not None else None
 
 
 def search_candidates(
@@ -114,11 +123,11 @@ def search_candidates(
             connection.execute(
                 select(KnowledgeIndex.id).where(
                     KnowledgeIndex.id.in_(ids),
-                    KnowledgeIndex.status == "completed",
-                    KnowledgeIndex.chunk_version == "1",
+                    *_READY_INDEX,
                 )
             ).scalars()
         )
+    indexed = []
     fallback = []
     for order, source in enumerate(sources):
         if source.get("index_id") in ready:
@@ -134,7 +143,7 @@ def search_candidates(
                 if vector is not None
                 else literal(None, type_=ARRAY(Double))
             )
-            statements.append(
+            indexed.append(
                 _indexed_query(store, source).with_only_columns(
                     literal(source["source_id"]).label("source_id"),
                     literal(order).label("source_order"),
@@ -162,6 +171,7 @@ def search_candidates(
                         None,
                     )
                 )
+    statements = [*indexed]
     if fallback:
         # 此路径只处理未建索引的资料，已完成索引不向应用传输全文或向量。
         names = [
@@ -194,19 +204,24 @@ def search_candidates(
     if not statements:
         return SearchCandidates([], [])
     candidates = union_all(*statements).cte("candidates")
+    # 每个分块只转换一次小写，命中计数复用，不再按 token 数重复扫描全文。
+    lowered = select(
+        candidates, func.lower(candidates.c.content).label("normalized_content")
+    ).cte("lowered")
     tokens = keywords(query)
     hits = sum(
         (
-            case((func.strpos(func.lower(candidates.c.content), token) > 0, 1), else_=0)
+            case((func.strpos(lowered.c.normalized_content, token) > 0, 1), else_=0)
             for token in tokens
         ),
         literal(0),
     )
+    embedding = lowered.c.embedding
     cosine = literal(None, type_=Double)
     if vector:
-        dimensions = func.generate_subscripts(candidates.c.embedding, 1).column_valued("dim")
+        dimensions = func.generate_subscripts(embedding, 1).column_valued("dim")
         other = Grouping(literal(vector, type_=ARRAY(Double)))[dimensions]
-        item = candidates.c.embedding[dimensions]
+        item = embedding[dimensions]
         cosine = (
             select(
                 func.coalesce(
@@ -218,14 +233,14 @@ def search_candidates(
                     0,
                 )
             )
-            .correlate(candidates)
+            .correlate(lowered)
             .scalar_subquery()
         )
     scored = select(
-        candidates,
+        *(lowered.c[name] for name in candidates.c.keys()),
         hits.label("hits"),
-        candidates.c.embedding.is_not(None).label("semantic"),
-        case((candidates.c.embedding.is_not(None), cosine), else_=hits / max(1, len(tokens))).label(
+        embedding.is_not(None).label("semantic"),
+        case((embedding.is_not(None), cosine), else_=hits / max(1, len(tokens))).label(
             "similarity"
         ),
     ).cte("scored")
@@ -265,15 +280,17 @@ def search_candidates(
         .limit(limit)
     )
     with store.engine.connect() as connection:
-        semantic_ids = list(
-            connection.execute(
-                select(candidates.c.source_id)
-                .where(
-                    candidates.c.embedding.is_not(None),
-                )
-                .distinct()
-            ).scalars()
-        )
+        semantic_ids = []
+        if vector and indexed:
+            # 回退分支的向量恒为空，语义资料集合只需在已建索引的分支上取。
+            semantic_candidates = union_all(*indexed).cte("semantic_candidates")
+            semantic_ids = list(
+                connection.execute(
+                    select(semantic_candidates.c.source_id)
+                    .where(semantic_candidates.c.embedding.is_not(None))
+                    .distinct()
+                ).scalars()
+            )
         rows = []
         for row in connection.execute(final).mappings():
             payload = dict(row)

@@ -13,7 +13,11 @@ class DispatchTransaction(Protocol):
 
     def mark_dispatched(self, job_id: str) -> None: ...
 
-    def recoverable(self, company_id: int, limit: int) -> list[tuple[str, str]]: ...
+    def recoverable(
+        self, company_id: int, limit: int, stages: tuple[str, ...]
+    ) -> list[tuple[str, str]]:
+        """可恢复任务的 ``(job_id, stage)``；任务名由调度侧按 stage 决定。"""
+        ...
 
 
 class DispatchRepository(Protocol):

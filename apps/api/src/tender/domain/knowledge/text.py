@@ -12,11 +12,25 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+# 分块版本随切分规则升级：索引写入与检索回退共用这一口径，避免读取端各自硬编码。
+CHUNK_VERSION = "1"
+
 
 def plain_text(element: Mapping[str, Any]) -> str:
     # 表格的完整 HTML 与纯文本同时保留信息；不沿用旧抽取的 6000 字截断。
     source = str(element.get("html") or element.get("text") or "")
     return html.unescape(re.sub(r"<[^>]+>", " ", source))
+
+
+def chunk_block_id(source_id: int, parse_run_id: int, ordinal: int) -> str:
+    """引文身份：同一解析批次内的块编号，索引分块与原文回退必须完全一致。"""
+    return f"s{source_id}r{parse_run_id}c{ordinal}"
+
+
+def chunk_bbox(row: Mapping[str, Any]) -> list[float] | None:
+    """元素/分块行的定位框；四边齐全才算有效坐标。"""
+    values = [row.get(f"bbox_{axis}") for axis in ("x0", "y0", "x1", "y1")]
+    return [float(value) for value in values] if all(v is not None for v in values) else None
 
 
 def split_elements(elements: Sequence[Mapping[str, Any]], size: int = 1800) -> list[dict]:

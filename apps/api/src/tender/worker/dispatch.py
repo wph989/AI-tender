@@ -40,6 +40,11 @@ class Stream:
     task_name: str
 
 
+# 持久化队列消息名：历史消息按这些名字查找任务，不能随 Python 模块路径调整而改名。
+PROCESS_FILE = "tender.worker.tasks.process_file"
+SUBMIT_PARSE = "tender.worker.tasks.submit_parse"
+POLL_PARSE = "tender.worker.tasks.poll_parse"
+
 # 顺序即优先级：转换完成后才能解析，专题分析由独立报告调度器管理。
 STREAMS: tuple[Stream, ...] = (
     Stream(
@@ -47,13 +52,23 @@ STREAMS: tuple[Stream, ...] = (
         ("converting", "probing"),
         ("converting", "probing", "geometry"),
         "convert.max_inflight",
-        "tender.worker.tasks.process_file",
+        PROCESS_FILE,
     ),
     Stream(
         "parse", ("submitting",), ("submitting", "parsing", "resubmitting"),
-        "parse.max_inflight", "tender.worker.tasks.submit_parse",
+        "parse.max_inflight", SUBMIT_PARSE,
     ),
 )
+
+# 恢复时按任务当前 stage 回到对应入口；只有这些 stage 会重新投递。
+RECOVERY_TASKS: dict[str, str] = {
+    "converting": PROCESS_FILE,
+    "probing": PROCESS_FILE,
+    "geometry": PROCESS_FILE,
+    "submitting": SUBMIT_PARSE,
+    "parsing": POLL_PARSE,
+    "resubmitting": POLL_PARSE,
+}
 
 
 def registry() -> ConfigReader:
@@ -69,6 +84,19 @@ def capacity(limit: int | None, inflight: int) -> int | None:
     if limit is None:
         return None
     return max(0, int(limit) - max(0, int(inflight)))
+
+
+def _deliver(
+    transaction: Any, job_id: str, task_name: str, event: str, **extra: Any
+) -> bool:
+    """投递一条任务并标记已派发；broker 不可用时留待下一 tick。"""
+    try:
+        celery_app.send_task(task_name, args=[job_id])
+    except Exception:
+        logger.warning(event, exc_info=True, extra={"job_id": job_id, **extra})
+        return False
+    transaction.mark_dispatched(job_id)
+    return True
 
 
 def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
@@ -87,15 +115,11 @@ def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
             return 0
         candidates = transaction.pending(stream.stages, company_id, room)
         for job_id in candidates:
-            try:
-                celery_app.send_task(stream.task_name, args=[job_id])
-            except Exception:
-                # broker 不可用时留待下一 tick；已发出去的消息不受影响。
-                logger.warning(
-                    "dispatch.fail", exc_info=True, extra={"job_id": job_id, "stream": stream.name}
-                )
+            delivered = _deliver(
+                transaction, job_id, stream.task_name, "dispatch.fail", stream=stream.name
+            )
+            if not delivered:
                 break
-            transaction.mark_dispatched(job_id)
             sent += 1
     return sent
 
@@ -104,13 +128,9 @@ def recover_pending(company_id: int) -> int:
     """重发过期消息及到期轮询；恢复原任务不额外占用新任务配额。"""
     sent = 0
     with _repository.transaction() as transaction:
-        for job_id, task in transaction.recoverable(company_id, 100):
-            try:
-                celery_app.send_task(f"tender.worker.tasks.{task}", args=[job_id])
-            except Exception:
-                logger.warning("recovery.fail", exc_info=True, extra={"job_id": job_id})
+        for job_id, stage in transaction.recoverable(company_id, 100, tuple(RECOVERY_TASKS)):
+            if not _deliver(transaction, job_id, RECOVERY_TASKS[stage], "recovery.fail"):
                 break
-            transaction.mark_dispatched(job_id)
             sent += 1
     return sent
 
@@ -122,14 +142,14 @@ def dispatch_pending(self: Any) -> dict[str, int]:
     company_id = settings.company_id()
     # 轮询恢复不受新任务派发间隔或并发下调限制，保证已有任务仍能收尾。
     recovered = recover_pending(company_id)
+    dispatched: dict[str, int] = {"recovered": recovered} if recovered else {}
     resolved = registry().resolved(company_id)
     interval = float(resolved["dispatch.interval_seconds"])
     now = time.monotonic()
     if now - _last_run_at < interval:
-        return {"recovered": recovered} if recovered else {}
+        return dispatched
     _last_run_at = now
 
-    dispatched: dict[str, int] = {"recovered": recovered} if recovered else {}
     for stream in STREAMS:
         limit = None if stream.limit_key is None else int(resolved[stream.limit_key])
         count = dispatch_stream(stream, limit, company_id)

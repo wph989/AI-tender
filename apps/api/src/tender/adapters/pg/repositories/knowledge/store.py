@@ -68,8 +68,18 @@ from tender.adapters.pg.repositories.analysis.runtime import (
     requeue_unlocked_runs,
     try_lock_report_execution,
 )
+from tender.adapters.pg.repositories.knowledge.retrieval import (
+    indexed_chunks,
+    search_candidates,
+)
 from tender.config.registry import ConfigRegistry
-from tender.domain.knowledge.text import plain_text, split_elements
+from tender.domain.knowledge.text import (
+    CHUNK_VERSION,
+    chunk_bbox,
+    chunk_block_id,
+    plain_text,
+    split_elements,
+)
 from tender.domain.shared.digest import fingerprint
 from tender.ports.configuration.registry import ActiveConfig
 from tender.ports.repository.knowledge.retrieval import SearchCandidates
@@ -451,8 +461,6 @@ class KnowledgeStore:
         self, sources: list[dict], query: str, vector: list[float] | None,
         signature: str | None, *, limit: int, min_similarity: float | None,
     ) -> SearchCandidates:
-        from tender.adapters.pg.repositories.knowledge.retrieval import search_candidates
-
         return search_candidates(
             self, sources, query, vector, signature, limit=limit, min_similarity=min_similarity,
         )
@@ -460,8 +468,6 @@ class KnowledgeStore:
     def readable_chunks(self, source: dict[str, Any]) -> list[dict[str, Any]]:
         """分块由元素派生，元素越界一次也不额外查库。"""
         if source.get("index_id") and source.get("index_status") == "completed":
-            from tender.adapters.pg.repositories.knowledge.retrieval import indexed_chunks
-
             rows = indexed_chunks(self, source)
             if rows is not None:
                 return rows
@@ -470,18 +476,17 @@ class KnowledgeStore:
         result = []
         for offset, chunk in enumerate(split_elements(elements)):
             element = by_id[chunk["element_id"]]
-            values = [element[f"bbox_{axis}"] for axis in ("x0", "y0", "x1", "y1")]
             result.append(
                 {
                     **source,
                     **chunk,
                     "offset": offset,
-                    "block_id": f"s{source['source_id']}r{source['parse_run_id']}c{offset}",
+                    "block_id": chunk_block_id(
+                        source["source_id"], source["parse_run_id"], offset
+                    ),
                     "anchor": element["anchor"],
                     "page_no": element["page_no"],
-                    "bbox": [float(v) for v in values]
-                    if all(v is not None for v in values)
-                    else None,
+                    "bbox": chunk_bbox(element),
                 }
             )
         return result
@@ -531,12 +536,11 @@ class KnowledgeStore:
             row = connection.execute(statement).mappings().first()
         if row is None:
             raise LookupError("引用原文已删除、撤销访问或与解析批次不符")
-        values = [row[f"bbox_{axis}"] for axis in ("x0", "y0", "x1", "y1")]
         resolved = {
             **ref,
             "page_no": row["page_no"],
             "file_name": row["file_name"],
-            "bbox": [float(v) for v in values] if all(v is not None for v in values) else None,
+            "bbox": chunk_bbox(row),
         }
         if with_content:
             # 展示层要按元素原文回查值的位置，这里顺带返回，避免为同一权限再查一次。
@@ -1071,20 +1075,6 @@ class KnowledgeStore:
                 )
             )
 
-    def fail_report(self, report_id: int, error: str) -> None:
-        """报告在运行中异常收尾；已取消的报告不再改写。"""
-        with self.engine.begin() as connection:
-            connection.execute(
-                update(AnalysisReport)
-                .where(AnalysisReport.id == report_id, AnalysisReport.status != "canceled")
-                .values(
-                    status="failed",
-                    error_message=error,
-                    finished_at=func.now(),
-                    lease_until=None,
-                )
-            )
-
     def mark_answer_running(self, answer_id: int) -> None:
         """问答开始执行。"""
         with self.engine.begin() as connection:
@@ -1118,6 +1108,8 @@ class KnowledgeStore:
                     source_id=source["source_id"],
                     version_id=source["version_id"],
                     run_id=source["parse_run_id"],
+                    # 写入端显式记录分块版本，不依赖数据库默认值；读取端共用同一常量。
+                    chunk_version=CHUNK_VERSION,
                 )
             )
 

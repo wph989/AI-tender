@@ -80,18 +80,19 @@ def test_parallel_dispatch_cannot_overbook(database, monkeypatch):
     assert send.call_count == 1
 
 
-@pytest.mark.parametrize(("status", "stage", "task"), [
-    ("pending", "converting", "process_file"),
-    ("running", "geometry", "process_file"),
-    ("submitting", "submitting", "submit_parse"),
-    ("running", "parsing", "poll_parse"),
-    ("running", "resubmitting", "poll_parse"),
+@pytest.mark.parametrize(("status", "stage"), [
+    ("pending", "converting"),
+    ("running", "geometry"),
+    ("submitting", "submitting"),
+    ("running", "parsing"),
+    ("running", "resubmitting"),
 ])
-def test_lost_messages_recover_at_current_stage(database, status, stage, task):
+def test_lost_messages_recover_at_current_stage(database, status, stage):
     seed(database, "lost", status=status, stage=stage, dispatched=True)
+    stages = tuple(dispatch.RECOVERY_TASKS)
     with DispatchRepository(database).transaction() as tx:
-        assert tx.recoverable(1, 100) == [("lost", task)]
-        assert tx.recoverable(2, 100) == []
+        assert tx.recoverable(1, 100, stages) == [("lost", stage)]
+        assert tx.recoverable(2, 100, stages) == []
 
 
 def test_live_execution_future_attempt_and_terminal_are_not_recovered(database):
@@ -99,14 +100,15 @@ def test_live_execution_future_attempt_and_terminal_are_not_recovered(database):
     seed(database, "later", dispatched=True,
          next_attempt_at=datetime.now(UTC) + timedelta(minutes=1))
     seed(database, "done", status="completed", dispatched=True)
+    stages = tuple(dispatch.RECOVERY_TASKS)
     with TaskLocks(database).lock("job:live") as acquired:
         assert acquired
         with DispatchRepository(database).transaction() as tx:
-            assert tx.recoverable(1, 100) == []
+            assert tx.recoverable(1, 100, stages) == []
     with database.begin() as connection:
         connection.execute(text("UPDATE job SET dispatch_lease_until=now() WHERE id='live'"))
     with DispatchRepository(database).transaction() as tx:
-        assert tx.recoverable(1, 100) == [("live", "poll_parse")]
+        assert tx.recoverable(1, 100, stages) == [("live", "parsing")]
 
 
 def test_failed_publish_remains_recoverable(database, monkeypatch):
@@ -135,10 +137,11 @@ def test_active_first_batch_does_not_starve_lost_message(database):
     seed(database, "lost", status="running", stage="parsing", dispatched=True)
     with TaskLocks(database).lock("job:active") as acquired:
         assert acquired
+        stages = tuple(dispatch.RECOVERY_TASKS)
         with DispatchRepository(database).transaction() as tx:
-            assert tx.recoverable(1, 1) == []
+            assert tx.recoverable(1, 1, stages) == []
         with DispatchRepository(database).transaction() as tx:
-            assert tx.recoverable(1, 1) == [("lost", "poll_parse")]
+            assert tx.recoverable(1, 1, stages) == [("lost", "parsing")]
 
 
 def test_late_conversion_message_cannot_latch_undispatched_parse(database, monkeypatch):

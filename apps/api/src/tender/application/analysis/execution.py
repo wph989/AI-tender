@@ -491,7 +491,7 @@ class AnalysisExecutor:
                 "report.abort",
                 exception="".join(traceback.format_exception(exc, chain=False)),
             )
-            db.fail_report(report["id"], str(exc)[:1000])
+            db.finish_task("report", report["id"], "failed", str(exc)[:1000])
             if isinstance(exc, asyncio.CancelledError):
                 raise
         finally:

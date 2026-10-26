@@ -66,7 +66,7 @@ def test_cleanup_failure_stops_controller_and_releases_waiters(
         await asyncio.wait_for(executor.analyze_report(report), timeout=3)
 
     asyncio.run(scenario())
-    db.fail_report.assert_called_once_with(16, cleanup_error)
+    db.finish_task.assert_called_once_with("report", 16, "failed", cleanup_error)
     db.finish_report.assert_not_called()
     assert released == {930, 931}
     publish.assert_called_once_with(db, 16)
@@ -89,7 +89,7 @@ def test_handled_module_failure_allows_other_modules_to_complete(controller, mon
 
     monkeypatch.setattr(executor, "execute_module", execute)
     asyncio.run(executor.analyze_report(report))
-    db.fail_report.assert_not_called()
+    db.finish_task.assert_not_called()
     db.finish_report.assert_called_once_with(16, status="partial", summary=[], error=None)
     publish.assert_called_once_with(db, 16)
 

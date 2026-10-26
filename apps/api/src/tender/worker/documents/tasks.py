@@ -57,6 +57,15 @@ def _retry_delay(retries: int) -> int:
     return min(30, 2 ** min(max(retries, 1), 5))
 
 
+def _retry_attempts(row: Mapping[str, Any]) -> int:
+    # 次数随任务行持久化，Celery 新消息的 retries 不能作为退避依据。
+    return int((row.get("progress") or {}).get("retry_attempts", 0))
+
+
+def _schedule_retry(job_id: str, row: Mapping[str, Any]) -> None:
+    _repository.schedule_attempt(job_id, _retry_delay(_retry_attempts(row)), retry=True)
+
+
 def _serialize_job(*stages: str) -> Callable:
     def decorate(function: Callable[..., None]) -> Callable[..., None]:
         @wraps(function)
@@ -282,10 +291,7 @@ def process_file(self: Any, job_id: str) -> None:
             return
         except BlobStoreError as exc:
             _repository.reset_file_job(job_id, stage, "storage_unavailable", str(exc))
-            _repository.schedule_attempt(
-                job_id, _retry_delay(int((row.get("progress") or {}).get("retry_attempts", 0))),
-                retry=True,
-            )
+            _schedule_retry(job_id, row)
             return
         except ConversionFailed as exc:
             _repository.set_job_failure(job_id, exc.code, str(exc))
@@ -371,20 +377,14 @@ def submit_parse(self: Any, job_id: str) -> None:
         return
     except ParseUnavailable as exc:
         _repository.retry_submission(job_id, exc.code, str(exc))
-        _repository.schedule_attempt(
-            job_id, _retry_delay(int((row.get("progress") or {}).get("retry_attempts", 0))),
-            retry=True,
-        )
+        _schedule_retry(job_id, row)
         return
     except ParseFailed as exc:
         _repository.set_job_failure(job_id, exc.code, str(exc))
         return
     except BlobStoreError as exc:
         _repository.retry_submission(job_id, "storage_unavailable", str(exc))
-        _repository.schedule_attempt(
-            job_id, _retry_delay(int((row.get("progress") or {}).get("retry_attempts", 0))),
-            retry=True,
-        )
+        _schedule_retry(job_id, row)
         return
     now = datetime.now(UTC)
     snapshot = asdict(submission.config_snapshot)
@@ -438,6 +438,10 @@ def poll_parse(self: Any, job_id: str) -> None:
     if remaining <= 0 or attempts >= int(values["job.poll.max_attempts"]):
         _repository.set_job_failure(job_id, "parse_timeout", "解析已达到总时限或轮询次数上限")
         return
+    # 非终态分支统一按已记账次数退避；只在需要重试时计算，成功收尾不依赖轮询配置。
+    def schedule_retry() -> None:
+        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+
     # 每次真实轮询前记账；网络错误、服务重启与worker恢复不能重置次数。
     _repository.record_poll(job_id, attempts)
 
@@ -469,7 +473,7 @@ def poll_parse(self: Any, job_id: str) -> None:
             return
         except (ParseUnavailable, BlobStoreError):
             _repository.resume_poll(job_id)
-            _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+            schedule_retry()
             return
 
         if submission.provider_version != row["provider_version"]:
@@ -480,23 +484,21 @@ def poll_parse(self: Any, job_id: str) -> None:
             )
             return
         _repository.replace_provider_job(job_id, int(row["run_id"]), submission.job_id)
-        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
-        return
-    except ParseUnavailable:
-        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+        schedule_retry()
         return
     except ParseFailed as exc:
         _repository.set_job_failure(job_id, exc.code, str(exc))
         return
-    except BlobStoreError:
-        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+    except (ParseUnavailable, BlobStoreError):
+        # 网络类失败可退避重试；次数已记在任务行上，重启进程也不会重置。
+        schedule_retry()
         return
 
     now = datetime.now(UTC)
     progress = asdict(status.progress) if status.progress is not None else {}
     if status.status in {"queued", "running"}:
         _repository.update_progress(job_id, progress, now)
-        _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+        schedule_retry()
         return
 
     terminal_status = status.status
@@ -510,7 +512,7 @@ def poll_parse(self: Any, job_id: str) -> None:
         try:
             store.put(raw_middle_key, middle_json.raw_bytes, content_type="application/json")
         except BlobStoreError:
-            _repository.schedule_attempt(job_id, _poll_delay(values, attempts + 1))
+            schedule_retry()
             return
         page_values = middle_json.payload.get("pages")
         page_count = len(page_values) if isinstance(page_values, list) else None

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import traceback
 from collections.abc import Callable
+from typing import Any
 
+from tender.application.knowledge.content import source_state
 from tender.application.knowledge.qa_agent import answer_with_agent
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
@@ -13,9 +15,25 @@ from tender.core.logging import get_logger
 from tender.domain.shared.errors import TenderError
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.llm.rerank import RerankModel
+from tender.ports.repository.knowledge.dispatch import KnowledgeDispatchRepository
 from tender.ports.repository.knowledge.execution import KnowledgeExecutionRepository
 
 logger = get_logger(__name__)
+
+# 知识任务的领取顺序：索引先于依赖它的报告与问答。
+DISPATCH_KINDS = ("index", "report", "answer")
+
+
+def dispatch_ready(db: KnowledgeDispatchRepository) -> list[tuple[str, int]]:
+    """登记到期索引并领取可派发任务；投递哪条消息由调度侧按 kind 决定。"""
+    for source in db.sources(db.collections_pending_index()):
+        if source_state(source) in {"ready", "partial"} and not source["index_id"]:
+            db.create_index(source)
+    return [
+        (kind, record_id)
+        for kind in DISPATCH_KINDS
+        for record_id in db.claim_dispatchable(kind, 2)
+    ]
 
 
 def graph_expand(
@@ -64,6 +82,16 @@ def graph_expand(
                 hits.append(block)
                 seen.add(block["block_id"])
     return hits, selected
+
+
+def _log_failure(event: str, exc: Exception, **fields: Any) -> None:
+    # 业务失败被收敛到数据库后 Celery 会正常返回，必须在这里保留未知错误的堆栈。
+    # 业务异常已在适配器脱敏，不回放原始异常链；未知故障仍保留完整链。
+    logger.error(
+        event,
+        **fields,
+        exception="".join(traceback.format_exception(exc, chain=not isinstance(exc, TenderError))),
+    )
 
 
 class KnowledgeExecutor:
@@ -115,15 +143,7 @@ class KnowledgeExecutor:
                     raise ValueError("向量模型在索引期间改变了维度")
             db.complete_index(index_id, chunks=chunks, vectors=vectors, config=config)
         except Exception as exc:
-            # 业务失败被收敛到数据库后 Celery 会正常返回，必须在这里保留未知错误的堆栈。
-            # 业务异常已在适配器脱敏，不回放原始异常链；未知故障仍保留完整链。
-            logger.error(
-                "index.fail",
-                index_id=index_id,
-                exception="".join(
-                    traceback.format_exception(exc, chain=not isinstance(exc, TenderError)),
-                ),
-            )
+            _log_failure("index.fail", exc, index_id=index_id)
             db.finish_task("index", index_id, "failed", str(exc)[:1000])
         finally:
             if client:
@@ -212,12 +232,5 @@ class KnowledgeExecutor:
             db.save_answer(answer_id, items=items, relations=relations, snapshot=snapshot)
             db.finish_task("answer", answer_id, "completed")
         except Exception as exc:
-            # 路由可能串联带供应商凭证的 SDK 错误，只记录已脱敏的业务异常堆栈。
-            logger.error(
-                "answer.fail",
-                answer_id=answer_id,
-                exception="".join(
-                    traceback.format_exception(exc, chain=not isinstance(exc, TenderError)),
-                ),
-            )
+            _log_failure("answer.fail", exc, answer_id=answer_id)
             db.finish_task("answer", answer_id, "failed", str(exc)[:1000])

@@ -64,15 +64,16 @@ class DispatchTransaction:
             )
         )
 
-    def recoverable(self, company_id: int, limit: int) -> list[tuple[str, str]]:
+    def recoverable(
+        self, company_id: int, limit: int, stages: tuple[str, ...]
+    ) -> list[tuple[str, str]]:
+        """返回 ``(job_id, stage)``；派发哪条消息由调度侧的 stage→任务表决定。"""
         rows = self.connection.execute(
             select(Job.id, Job.stage)
             .where(
                 Job.company_id == company_id,
                 Job.status.in_(("pending", "submitting", "running")),
-                Job.stage.in_(
-                    ("converting", "probing", "geometry", "submitting", "parsing", "resubmitting")
-                ),
+                Job.stage.in_(stages),
                 Job.finished_at.is_(None),
                 Job.dispatched_at.is_not(None),
                 or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= func.now()),
@@ -95,17 +96,7 @@ class DispatchTransaction:
                     )
                 )
                 continue
-            task = (
-                "poll_parse"
-                if stage in {"parsing", "resubmitting"}
-                else "submit_parse"
-                if stage == "submitting"
-                else "process_file"
-                if stage in {"converting", "probing", "geometry"}
-                else None
-            )
-            if task:
-                result.append((job_id, task))
+            result.append((job_id, stage))
         return result
 
 
