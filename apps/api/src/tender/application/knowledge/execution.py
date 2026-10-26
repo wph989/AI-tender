@@ -75,10 +75,17 @@ def graph_expand(
         # 问答每次检索都会尝试扩展；无关联时无需反复读取全部资料。
         return hits, []
     seen = {r["block_id"] for r in hits}
-    wanted = {ref["element_id"] for rel in selected for ref in rel["citations"]}
+    # 只展开关系实际引用的资料；无关资料的整篇切分最终也会被过滤掉。
+    wanted: dict[int, set[int]] = {}
+    for rel in selected:
+        for ref in rel["citations"]:
+            wanted.setdefault(ref["source_id"], set()).add(ref["element_id"])
     for source in sources:
+        element_ids = wanted.get(source["source_id"])
+        if not element_ids:
+            continue
         for block in db.readable_chunks(source):
-            if block["element_id"] in wanted and block["block_id"] not in seen:
+            if block["element_id"] in element_ids and block["block_id"] not in seen:
                 hits.append(block)
                 seen.add(block["block_id"])
     return hits, selected

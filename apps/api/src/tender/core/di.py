@@ -64,6 +64,7 @@ from tender.ports.repository.documents.pipeline import (
 )
 from tender.ports.repository.jobs.dispatch import DispatchRepository as DispatchPort
 from tender.ports.repository.knowledge.execution import KnowledgeExecutionRepository
+from tender.ports.repository.knowledge.management import KnowledgeRepository
 from tender.ports.repository.knowledge.store import KnowledgeStore as KnowledgeStorePort
 from tender.ports.repository.llm.runtime import ModelRuntimeRepository as ModelRuntimePort
 from tender.ports.storage.blob_store import BlobStore
@@ -244,9 +245,12 @@ def create_knowledge_service(
     engine: Engine,
     company_id: int,
     configs: ConfigRegistry,
+    *,
+    repository: KnowledgeRepository | None = None,
 ) -> KnowledgeService:
+    # 调用方已有同一实现的仓储时直接复用，避免同一进程里出现两个等价实例。
     return KnowledgeService(
-        KnowledgeStore(engine, company_id, configs),
+        repository or KnowledgeStore(engine, company_id, configs),
         company_id,
         configs,
         create_embedding_gateway,
@@ -259,13 +263,13 @@ def create_analysis_service(
     company_id: int,
     configs: ConfigRegistry,
 ) -> AnalysisService:
-    knowledge = create_knowledge_service(engine, company_id, configs)
+    store = KnowledgeStore(engine, company_id, configs)
     return AnalysisService(
-        KnowledgeStore(engine, company_id, configs),
+        store,
         company_id,
         configs,
         create_embedding_gateway,
-        knowledge,
+        create_knowledge_service(engine, company_id, configs, repository=store),
     )
 
 
