@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -317,7 +318,8 @@ async def start_model_test(
     payload: TestRequest | None = None,
 ) -> dict[str, Any]:
     service = _service(request)
-    row, test_id, capability = service.begin_model_test(
+    row, test_id, capability = await asyncio.to_thread(
+        service.begin_model_test,
         model_id, payload.capability if payload else None
     )
     background_tasks.add_task(service.run_model_test, row, test_id, capability)

@@ -248,7 +248,9 @@ POST /api/v1/versions/{vid}/reparse 重新生成解析批次，沿用或显式�
 
 `canceling` 期间仍占用当前阶段的在途配额，并阻止同版本或知识来源重复解析。本地转换退出后收尾；已提交的远端解析继续轮询到终态或确认任务不存在，再在同一事务内将 Job 和活动 ParseRun 标为 `canceled`。取消后的轮询不下载解析成果，也不因远端任务丢失而重新提交。提交结果不明时保留占用并提示 `parse_submission_unknown`，需人工核对远端任务后处理，不能把取消请求当作远端已经停止。
 
-SSE 对 `canceling` 发送 `progress`，最终进入 `canceled` 才发送 `done` 并关闭连接；客户端应继续按终态判断结束等待。
+解析超时、轮询预算耗尽或提交结果未知时，任务进入非终态 `draining`，保留首次 `error_code`/`error_message`，`finished_at` 为空，继续占用配额并阻止重复解析。轮询只确认远端生命周期，不要求 MiddleJson 成果存在；确认远端终态或任务不存在后，同事务将 Job/活动 ParseRun 标为 `failed`，保留原错误。无句柄或未知重提的任务需人工核对，不能自动重新提交或依据旧句柄释放占用。
+
+SSE 对 `canceling` 和 `draining` 发送 `progress`，最终进入 `canceled` 或 `failed` 才发送 `done` 并关闭连接；客户端应继续按终态判断结束等待。
 
 ```
 GET /api/v1/jobs/job_01HXZ8Q3/events

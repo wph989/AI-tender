@@ -185,8 +185,8 @@ class KnowledgeExecutor:
                     self.rerank_gateway,
                 )
 
-            async def read_source(source: dict) -> list[dict]:
-                return await asyncio.to_thread(db.readable_chunks, source)
+            async def read_source(source: dict, offset: int, limit: int):
+                return await asyncio.to_thread(db.read_chunk_window, source, offset, limit)
 
             async def expand_selected(selected: list[dict], hits: list[dict]):
                 return await asyncio.to_thread(

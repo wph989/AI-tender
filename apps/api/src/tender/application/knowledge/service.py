@@ -196,7 +196,7 @@ class KnowledgeService:
         return {"queued_count": count}
 
     async def search_collection(self, collection_id: int, query: str) -> dict[str, Any]:
-        self.collection(collection_id)
+        await asyncio.to_thread(self.collection, collection_id)
         hits, info = await retrieve_chunks(
             self.store,
             await asyncio.to_thread(self.store.sources, [collection_id]),
@@ -216,7 +216,7 @@ class KnowledgeService:
             raise NotFound(str(exc), code="citation_unavailable") from exc
 
     async def test_embedding(self) -> dict[str, Any]:
-        config = self.store.embedding_config()
+        config = await asyncio.to_thread(self.store.embedding_config)
         if config is None:
             raise Conflict(
                 "请先在模型管理中绑定语义检索向量模型",

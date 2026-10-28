@@ -59,18 +59,18 @@ async def retrieve_chunks(
     reranked = False
     rerank_config = await asyncio.to_thread(db.rerank_config) if rerank_gateway else None
     if ranked and rerank_config and rerank_gateway:
-        client = None
+        rerank_client = None
         try:
-            client = rerank_gateway(rerank_config)
-            candidates = ranked[:30]
-            order = await client.rerank(
-                question, [r["content"] for r in candidates], len(candidates)
+            rerank_client = rerank_gateway(rerank_config)
+            rerank_candidates = ranked[:30]
+            order = await rerank_client.rerank(
+                question, [row["content"] for row in rerank_candidates], len(rerank_candidates)
             )
             # 供应商可只返回 top_n；其余合格候选保留原顺序，不能跳过它们直接拼接尾部。
             selected = {index for index, _ in order}
             ranked = (
-                [candidates[index] for index, _ in order]
-                + [row for index, row in enumerate(candidates) if index not in selected]
+                [rerank_candidates[index] for index, _ in order]
+                + [row for index, row in enumerate(rerank_candidates) if index not in selected]
                 + ranked[30:]
             )
             reranked = True
@@ -78,8 +78,8 @@ async def retrieve_chunks(
             logger.warning("rerank.fail", exc_info=True)
             warning = (warning + "；" if warning else "") + "重排服务不可用，保留混合检索顺序"
         finally:
-            if client:
-                await client.aclose()
+            if rerank_client:
+                await rerank_client.aclose()
     search_limited = max_results is not None and len(ranked) > max_results
     if max_results is not None:
         ranked = ranked[:max_results]

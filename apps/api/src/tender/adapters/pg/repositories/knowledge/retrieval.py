@@ -20,8 +20,14 @@ from sqlalchemy.sql.expression import Grouping
 
 from tender.adapters.pg.models import Element, KnowledgeChunk, KnowledgeIndex
 from tender.domain.knowledge.search import keywords
-from tender.domain.knowledge.text import CHUNK_VERSION, chunk_bbox, chunk_block_id
+from tender.domain.knowledge.text import (
+    CHUNK_VERSION,
+    chunk_bbox,
+    chunk_block_id,
+    iter_element_chunks,
+)
 from tender.ports.repository.knowledge.retrieval import SearchCandidates
+from tender.ports.repository.knowledge.sources import ChunkWindow
 
 # 索引「已建成」的唯一判定：三处查询必须同口径，读写版本也来自同一常量。
 _READY_INDEX = (
@@ -103,6 +109,49 @@ def indexed_chunks(store, source: dict) -> list[dict] | None:
             )
         ).scalar_one_or_none()
         return [] if valid is not None else None
+
+
+def read_chunk_window(store, source: dict, offset: int, limit: int) -> ChunkWindow:
+    if offset < 0 or not 1 <= limit <= 12:
+        raise ValueError("补读范围无效")
+    with store.engine.connect() as connection:
+        if source.get("index_id"):
+            valid = connection.execute(select(KnowledgeIndex.id).where(
+                *_ready_index(source["index_id"]),
+                KnowledgeIndex.source_id == source["source_id"],
+                KnowledgeIndex.version_id == source["version_id"],
+                KnowledgeIndex.run_id == source["parse_run_id"],
+            )).scalar_one_or_none()
+            if valid is not None:
+                query = _indexed_query(store, source)
+                total = int(connection.execute(
+                    query.with_only_columns(func.count()).order_by(None),
+                ).scalar_one())
+                rows = [_payload(dict(row), source) for row in connection.execute(
+                    query.with_only_columns(*_columns()).where(
+                        KnowledgeChunk.ordinal >= offset,
+                        KnowledgeChunk.ordinal < offset + limit,
+                    ).order_by(KnowledgeChunk.ordinal),
+                ).mappings()]
+                return ChunkWindow(rows, total, offset + limit < total)
+
+        # 旧索引/未建索引只扫描所需前缀；不为取得精确总数读取其余全文。
+        rows = []
+        total = 0
+        result = connection.execute(
+            store._blocks_query(source).execution_options(stream_results=True, max_row_buffer=16),
+        )
+        with result:
+            for element, chunk in iter_element_chunks(result.mappings()):
+                total = chunk["ordinal"] + 1
+                if chunk["ordinal"] >= offset + limit:
+                    return ChunkWindow(rows, None, True)
+                if chunk["ordinal"] >= offset:
+                    position = {key: element[key] for key in (
+                        "anchor", "page_no", "bbox_x0", "bbox_y0", "bbox_x1", "bbox_y1",
+                    )}
+                    rows.append(_payload(position | chunk, source))
+        return ChunkWindow(rows, total, False)
 
 
 def search_candidates(

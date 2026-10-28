@@ -8,9 +8,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tender.application.knowledge.content import normalized
+from tender.ports.repository.knowledge.sources import ChunkWindow
 
 Retrieve = Callable[[list[dict], str], Awaitable[tuple[list[dict], dict]]]
-Read = Callable[[dict], Awaitable[list[dict]]]
+Read = Callable[[dict, int, int], Awaitable[ChunkWindow]]
 Expand = Callable[[list[dict], list[dict]], Awaitable[tuple[list[dict], list[dict]]]]
 
 
@@ -143,7 +144,7 @@ class ResearchSession:
         if omitted and not blocks and not duplicates:
             raise EvidenceBudgetError("本模块已达到证据块预算，请基于已有证据完成分析")
         self.seen = remembered
-        result = {"blocks": blocks, "already_read": list(dict.fromkeys(duplicates))}
+        result: dict[str, Any] = {"blocks": blocks, "already_read": list(dict.fromkeys(duplicates))}
         if omitted:
             result.update(
                 budget_exhausted=True,
@@ -191,7 +192,8 @@ class ResearchSession:
         # 专题使用运行快照里的数量上限；问答沿用原协议，避免串改其它消费入口。
         result_limit = self.limits.max_search_results if self.compact_results else 12
         search_limited = bool(info.get("search_limited")) or len(rows) > result_limit
-        rows, relations = rows[:result_limit], []
+        rows = rows[:result_limit]
+        relations: list[dict] = []
         if self.expand:
             # 扩展必须处于同一次检索工具内，让 Agent 真正读到关联原文；范围仍是本次所选资料。
             rows, relations = await self.expand(sources, rows)
@@ -257,7 +259,9 @@ class ResearchSession:
         if len(sources) != 1:
             raise SourceNotAllowed("证据所属资料不在授权范围")
         await self._begin("read_evidence", {"block_id": block_id, "before": before, "after": after})
-        rows = await self.read(sources[0])
+        offset = max(0, row["offset"] - before)
+        window = await self.read(sources[0], offset, row["offset"] + after + 1 - offset)
+        rows = window.rows
         await self.authorize()
         if any(r["source_id"] != row["source_id"] for r in rows):
             raise PermissionError("补读返回了其它来源的资料")
@@ -280,14 +284,14 @@ class ResearchSession:
         await self._begin(
             "read_document", {"source_id": source_id, "offset": offset, "limit": limit}
         )
-        rows = await self.read(sources[0])
+        window = await self.read(sources[0], offset, limit)
         await self.authorize()
         async with self._lock:
             # 显式补读允许重新返回旧证据；历史压缩后仍可从证据库恢复原文。
-            result = self._remember(rows[offset : offset + limit], deduplicate=False)
+            result = self._remember(window.rows, deduplicate=False)
         return result | {
-            "total": len(rows),
-            "next_offset": (offset + limit if offset + limit < len(rows) else None),
+            "total": window.total,
+            "next_offset": offset + limit if window.has_more else None,
         }
 
     def checkpoint(self) -> dict[str, Any]:

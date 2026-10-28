@@ -144,8 +144,8 @@ def test_saved_retrieval_config_freezes_report_and_filters_real_document_chunks(
                 min_similarity=limits.similarity_threshold, max_results=limits.max_search_results,
             )
 
-        async def read(source):
-            return db.readable_chunks(source)
+        async def read(source, offset, limit):
+            return db.read_chunk_window(source, offset, limit)
 
         async def authorize():
             pass
@@ -221,7 +221,8 @@ def test_poll_interval_and_attempts_survive_new_task_invocations(runtime, monkey
         tasks.poll_parse.run("poll-fixture")
     result = connection.execute(text("SELECT * FROM job WHERE id='poll-fixture'" )).mappings().one()
     assert len(calls) == 2
-    assert result["status"] == "failed" and result["error_code"] == "parse_timeout"
+    assert result["status"] == "draining" and result["error_code"] == "parse_timeout"
+    assert result["finished_at"] is None
     assert result["progress"]["poll_attempts"] == 2
     assert tasks._repository.execution_start("poll-fixture", "parse") == first
 
@@ -261,9 +262,10 @@ def test_poll_network_retry_uses_configured_delay_and_consumes_attempt(runtime, 
     tasks.poll_parse.run("poll-fixture")
     assert calls == [True]
     row = connection.execute(text(
-        "SELECT status,progress FROM job WHERE id='poll-fixture'"
+        "SELECT status,progress,finished_at FROM job WHERE id='poll-fixture'"
     )).mappings().one()
-    assert row["status"] == "failed" and row["progress"]["poll_attempts"] == 1
+    assert row["status"] == "draining" and row["progress"]["poll_attempts"] == 1
+    assert row["finished_at"] is None
 
 
 def test_conversion_uses_configured_budget_and_preserves_first_start(runtime, monkeypatch):

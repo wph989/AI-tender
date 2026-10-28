@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import socket
+from threading import Event, Thread
 
 from tender.adapters.configuration.redis_cache import INVALIDATE_CHANNEL, RedisConfigCache
 
@@ -86,3 +88,30 @@ def test_custom_ttl_is_honored() -> None:
     cache = RedisConfigCache("redis://unused", client=client, ttl_seconds=15)
     cache.set_active(1, {"release_id": 1, "version_no": 1, "values": {}})
     assert client.expirations["config:active:1"] == 15
+
+
+def test_half_open_cache_connection_times_out_and_falls_back(caplog) -> None:
+    # 接受 TCP 连接却不回复 Redis 协议，模拟异常无法立即返回的半开连接。
+    stop = Event()
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(3)
+
+        def serve():
+            connection, _ = listener.accept()
+            with connection:
+                stop.wait(3)
+
+        thread = Thread(target=serve, daemon=True)
+        thread.start()
+        cache = RedisConfigCache(f"redis://127.0.0.1:{listener.getsockname()[1]}/0")
+        try:
+            assert cache.get_active(1) is None
+            assert "Timeout" in caplog.text
+            options = cache._client.connection_pool.connection_kwargs
+            assert options["retry"].get_retries() == 0
+        finally:
+            cache.close()
+            stop.set()
+            thread.join(timeout=4)

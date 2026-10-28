@@ -58,7 +58,7 @@ class ParseTransaction:
             select(Job.id)
             .where(
                 Job.version_id == version_id,
-                Job.status.in_(("pending", "submitting", "running", "canceling")),
+                Job.status.in_(("pending", "submitting", "running", "canceling", "draining")),
             )
             .order_by(Job.created_at.desc())
             .limit(1)

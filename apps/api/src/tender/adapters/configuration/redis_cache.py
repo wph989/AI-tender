@@ -13,6 +13,8 @@ from collections.abc import Mapping
 from typing import Any
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from tender.core import settings
 
@@ -37,7 +39,13 @@ class RedisConfigCache:
     ) -> None:
         # client 可注入：单测不该为了验证序列化逻辑去起一个 Redis。
         self._client = (
-            client if client is not None else redis.Redis.from_url(url or settings.redis_url())
+            client if client is not None else redis.Redis.from_url(
+                url or settings.redis_url(),
+                # 缓存故障必须快速回源，不能让半开连接或客户端默认重试拖住业务请求。
+                socket_connect_timeout=0.5,
+                socket_timeout=0.5,
+                retry=Retry(NoBackoff(), 0),
+            )
         )
         self._ttl_seconds = ttl_seconds
 

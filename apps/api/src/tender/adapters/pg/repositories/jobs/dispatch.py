@@ -43,7 +43,7 @@ class DispatchTransaction:
             self.connection.execute(
                 select(func.count()).where(
                     Job.company_id == company_id,
-                    Job.status.in_(("pending", "submitting", "running", "canceling")),
+                    Job.status.in_(("pending", "submitting", "running", "canceling", "draining")),
                     Job.finished_at.is_(None),
                     Job.dispatched_at.is_not(None),
                     Job.stage.in_(stages),
@@ -72,7 +72,7 @@ class DispatchTransaction:
             select(Job.id, Job.stage)
             .where(
                 Job.company_id == company_id,
-                Job.status.in_(("pending", "submitting", "running", "canceling")),
+                Job.status.in_(("pending", "submitting", "running", "canceling", "draining")),
                 Job.stage.in_(stages),
                 Job.finished_at.is_(None),
                 Job.dispatched_at.is_not(None),

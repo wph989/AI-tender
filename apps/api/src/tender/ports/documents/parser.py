@@ -69,7 +69,7 @@ class DocumentParser(Protocol):
         ...
 
     async def poll(self, job_id: str) -> ParseJobStatus:
-        """读取一次状态；服务索引丢失时抛出 ServiceRestarted。"""
+        """只读取生命周期，不因成果缺失拒绝终态；索引丢失时抛出 ServiceRestarted。"""
         ...
 
     async def fetch_middle_json(self, job_id: str) -> MiddleJson:

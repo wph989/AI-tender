@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import replace
+from threading import Event
 from typing import Any
 
 import pytest
@@ -319,6 +321,95 @@ def test_database_reservation_failure_sends_no_request():
     with pytest.raises(RuntimeError):
         asyncio.run(router.complete("测试"))
     assert gateway.created == []
+
+
+@pytest.mark.parametrize("cancel_count", [1, 2])
+@pytest.mark.parametrize("reservation_fails", [False, True])
+def test_cancel_during_reservation_finishes_ledger_before_exiting(cancel_count, reservation_fails):
+    async def run():
+        loop = asyncio.get_running_loop()
+        entered, reserved = asyncio.Event(), asyncio.Event()
+        release = Event()
+        records = []
+        gateway = _ScriptedGateway({"a": [None]})
+
+        def reserve(record):
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                if not release.wait(5):
+                    raise TimeoutError("测试未释放预占回调")
+                records.append(record)
+                if reservation_fails:
+                    raise RuntimeError("预占提交后连接断开")
+            finally:
+                loop.call_soon_threadsafe(reserved.set)
+
+        router = RoutingModel(
+            "analysis", "analysis", [_candidate("a", 1)], gateway, records.append,
+            reserve=reserve,
+        )
+        task = asyncio.create_task(router.complete("测试"))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            for _ in range(cancel_count):
+                task.cancel()
+                await asyncio.sleep(0)
+            waiting_for_reservation = not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            await asyncio.wait_for(reserved.wait(), 2)
+            assert waiting_for_reservation
+            assert [record.status for record in records] == ["running", "error"]
+            assert "未向供应商发送请求" in records[-1].error_message
+            assert {(record.invocation_id, record.request_ordinal) for record in records} == {
+                (records[0].invocation_id, 1),
+            }
+            assert not gateway.created
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+            await router.aclose()
+
+    asyncio.run(run())
+
+
+def test_cancel_after_sending_request_keeps_unknown_result(monkeypatch):
+    async def run():
+        sent = asyncio.Event()
+        records = []
+        gateway = _ScriptedGateway({"a": [None]})
+
+        async def complete(client, prompt):
+            client.prompts.append(prompt)
+            sent.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(_ScriptedClient, "complete", complete)
+        router = RoutingModel(
+            "analysis", "analysis", [_candidate("a", 1)], gateway, records.append,
+            reserve=records.append,
+        )
+        task = asyncio.create_task(router.complete("测试"))
+        try:
+            await asyncio.wait_for(sent.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            assert [record.status for record in records] == ["running", "unknown"]
+            assert "供应商执行结果未知" in records[-1].error_message
+            assert gateway.prompts == ["测试"]
+        finally:
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+            await router.aclose()
+
+    asyncio.run(run())
 
 
 def test_retry_after_larger_than_deadline_stops_without_retry():

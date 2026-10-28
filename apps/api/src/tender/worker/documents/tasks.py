@@ -347,6 +347,9 @@ def submit_parse(self: Any, job_id: str) -> None:
     if row is None:
         return
     status = str(row["status"])
+    if status == "draining":
+        _poll_stopping(row)
+        return
     if status in {"submitting", "canceling"}:
         # 上次进程可能在 MinerU 已受理后、provider_job_id 落库前退出，重放会产生重复任务。
         _mark_submission_unknown(
@@ -417,6 +420,9 @@ async def _poll(row: Mapping[str, Any], store: S3BlobStore) -> tuple[Any, Any | 
     try:
         status = await parser.poll(str(row["provider_job_id"]))
         middle_json = None
+        if status.status == "completed" and not status.has_middle_json:
+            # 成果校验属于消费路径；只确认远端停止时不应被缺失成果阻塞。
+            raise ParseFailed("MinerU 任务 completed，但没有 middle_json 产物")
         if status.status in {"completed", "partial"} and status.has_middle_json:
             middle_json = await parser.fetch_middle_json(str(row["provider_job_id"]))
         return status, middle_json
@@ -427,16 +433,16 @@ async def _poll(row: Mapping[str, Any], store: S3BlobStore) -> tuple[Any, Any | 
 async def _drain_parse(row: Mapping[str, Any], store: S3BlobStore) -> Any:
     parser = _parser(store)
     try:
-        # 取消仅需确认远端释放资源，不下载或归一化即将丢弃的解析结果。
+        # 取消和失败排空仅需确认远端释放资源，不下载或归一化即将丢弃的成果。
         return await parser.poll(str(row["provider_job_id"]))
     finally:
         await parser.aclose()
 
 
-def _poll_cancellation(row: Mapping[str, Any]) -> None:
+def _poll_stopping(row: Mapping[str, Any]) -> None:
     job_id = str(row["id"])
     if row["stage"] == "resubmitting" or not row.get("provider_job_id"):
-        _mark_submission_unknown(job_id, "取消中的提交结果未知；需人工核对远端任务后收尾")
+        _repository.schedule_attempt(job_id, 30)
         return
     store = _store()
     try:
@@ -444,7 +450,7 @@ def _poll_cancellation(row: Mapping[str, Any]) -> None:
             status = asyncio.run(_drain_parse(row, store))
         except ServiceRestarted:
             # 远端明确丢失原任务，取消流程不能再创建替代任务。
-            _repository.finish_cancellation(job_id, remote_finished=True)
+            _repository.finish_remote_job(job_id)
             return
         except (ParseUnavailable, ParseFailed, BlobStoreError):
             _repository.schedule_attempt(job_id, 30)
@@ -452,7 +458,7 @@ def _poll_cancellation(row: Mapping[str, Any]) -> None:
         if status.status in {"queued", "running"}:
             _repository.schedule_attempt(job_id, 30)
         else:
-            _repository.finish_cancellation(job_id, remote_finished=True)
+            _repository.finish_remote_job(job_id)
     finally:
         store.close()
 
@@ -461,8 +467,8 @@ def _poll_cancellation(row: Mapping[str, Any]) -> None:
 @_serialize_job("parsing", "resubmitting")
 def poll_parse(self: Any, job_id: str) -> None:
     row = _repository.job(job_id)
-    if row is not None and row["status"] == "canceling":
-        _poll_cancellation(row)
+    if row is not None and row["status"] in {"canceling", "draining"}:
+        _poll_stopping(row)
         return
     if row is None or row["status"] != "running" or row["run_id"] is None:
         return

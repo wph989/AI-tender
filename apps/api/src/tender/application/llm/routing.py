@@ -7,6 +7,7 @@ import json
 import random
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from uuid import uuid4
 
@@ -104,11 +105,20 @@ class RoutingModel:
         self._rate_backoff = rate_limit_backoff_seconds
         self._rate_max_wait = rate_limit_max_wait_seconds
 
-    def _remaining(self, candidate: ModelCandidate) -> float:
+    async def _remaining(self, candidate: ModelCandidate) -> float:
         key = candidate.provider_id if candidate.provider_id is not None else candidate.base_url
         local = self._rate_limited_until.get(key, 0) - time.monotonic()
-        shared = self._cooldown_remaining(candidate) if self._cooldown_remaining else 0
+        shared = (
+            await asyncio.to_thread(self._cooldown_remaining, candidate)
+            if self._cooldown_remaining else 0
+        )
         return max(0, local, shared)
+
+    async def _has_available(self, candidates: Sequence[ModelCandidate]) -> bool:
+        for candidate in candidates:
+            if await self._remaining(candidate) == 0:
+                return True
+        return False
 
     @property
     def candidate_count(self) -> int:
@@ -190,10 +200,36 @@ class RoutingModel:
                     ),
                 )
 
-    def _record_call(self, record: CallRecord, records: list[CallRecord]) -> None:
+    async def _record_call(self, record: CallRecord, records: list[CallRecord]) -> None:
         # 逐次请求继续写调用账本；运行日志由外层在整次路由调用结束时汇总一次。
         records.append(record)
-        self._on_call(record)
+        await asyncio.to_thread(self._on_call, record)
+
+    async def _reserve_call(self, record: CallRecord, records: list[CallRecord]) -> None:
+        if self._reserve is None:
+            return
+        reservation = asyncio.create_task(asyncio.to_thread(self._reserve, record))
+        try:
+            await asyncio.shield(reservation)
+        except asyncio.CancelledError:
+            async def finish_cancellation() -> None:
+                # 预占可能在提交后才报错；无论结果如何，都要等写入落定再补终态。
+                with suppress(Exception):
+                    await reservation
+                await self._record_call(replace(
+                    record, status="error",
+                    error_message="本地任务在发送前已取消，未向供应商发送请求",
+                ), records)
+
+            cleanup = asyncio.create_task(finish_cancellation())
+            # 重复取消也不能打断收尾，否则迟到的 running 写入可能覆盖终态。
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+            raise
 
     async def _invoke(
         self, prompt: str, chat_request: dict | None, invocation_id: str,
@@ -214,11 +250,15 @@ class RoutingModel:
         if self._failover_limit == 1:
             # 禁止降级时先固定最高优先级的启用模型；限流排序和429重试不能偷换成后备模型。
             # 管理员停用的候选仍可跳过，但选定后只等待/重试该模型。
-            candidates = tuple(
-                c for c in candidates if self._recheck is None or self._recheck(c) is not None
-            )[:1]
+            selected = []
+            for candidate in candidates:
+                if self._recheck is None or await asyncio.to_thread(self._recheck, candidate):
+                    selected.append(candidate)
+                    break
+            candidates = tuple(selected)
         # 允许降级时先用可用供应商；全在冷却时等待最早恢复者，等待不占请求预算。
-        candidates = sorted(candidates, key=lambda c: self._remaining(c))
+        delays = {candidate: await self._remaining(candidate) for candidate in candidates}
+        candidates = sorted(candidates, key=delays.__getitem__)
         for position, snapshot in enumerate(candidates):
             if candidate_count >= self._failover_limit:
                 break
@@ -231,17 +271,19 @@ class RoutingModel:
             while retry <= max(snapshot.extra_retries, 2):
                 if request_count >= self._max_total or time.monotonic() >= deadline:
                     raise ModelCallFailed("模型调用已达到总请求次数或时间上限，请查看调用记录")
-                delay = self._remaining(snapshot)
-                if delay and any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
+                delay = await self._remaining(snapshot)
+                if delay and await self._has_available(candidates[position + 1 :]):
                     break
                 while delay > 0:
                     if time.monotonic() + delay >= deadline:
                         raise ModelCallFailed("模型调用时间预算不足以等待供应商限流恢复")
                     # 短等待便于取消；跨worker新收到的429可以继续延长当前等待。
                     await asyncio.sleep(min(delay, 1))
-                    delay = self._remaining(snapshot)
+                    delay = await self._remaining(snapshot)
                 # 每次发送重新检查启用和凭证；配置读取失败会停止，不能绕过管理页面。
-                candidate = self._recheck(snapshot) if self._recheck else snapshot
+                candidate = (
+                    await asyncio.to_thread(self._recheck, snapshot) if self._recheck else snapshot
+                )
                 if candidate is None:
                     break
                 # 每个实际请求（含换源、格式纠正、摘要）都先预占模块持久预算。
@@ -271,8 +313,7 @@ class RoutingModel:
                     candidate.model,
                 )
                 # 先登记实际请求身份，数据库失败时不发送收费请求。
-                if self._reserve:
-                    self._reserve(record)
+                await self._reserve_call(record, records)
                 started = time.monotonic()
                 future = candidates[
                     position + 1 : position + 1 + self._failover_limit - candidate_count
@@ -300,7 +341,7 @@ class RoutingModel:
                             timeout=request_timeout,
                         )
                 except asyncio.CancelledError:
-                    self._record_call(
+                    await self._record_call(
                         replace(
                             record,
                             status="unknown",
@@ -314,7 +355,7 @@ class RoutingModel:
                         exc = ModelUnavailable("模型请求超时，供应商执行结果未知")
                     unavailable = isinstance(exc, ModelUnavailable)
                     unavailable_only = unavailable_only and unavailable
-                    self._record_call(
+                    await self._record_call(
                         replace(
                             record,
                             status="unknown"
@@ -343,7 +384,7 @@ class RoutingModel:
                             # 调用方按「可补跑」处理，不会把已核实成果丢掉。
                             break
                         if time.monotonic() + min(delay, remaining_wait) >= deadline:
-                            if any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
+                            if await self._has_available(candidates[position + 1 :]):
                                 break
                             raise ModelCallFailed(
                                 "模型调用时间预算不足以等待供应商限流恢复"
@@ -358,8 +399,8 @@ class RoutingModel:
                         )
                         self._rate_limited_until[key] = time.monotonic() + delay
                         if self._defer_provider:
-                            self._defer_provider(candidate, delay)
-                        if any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
+                            await asyncio.to_thread(self._defer_provider, candidate, delay)
+                        if await self._has_available(candidates[position + 1 :]):
                             break
                         # 429 不计入总请求预算：本次没有产生模型输出。
                         request_count -= 1
@@ -415,14 +456,14 @@ class RoutingModel:
                             getattr(exc, "retry_after", 0),
                         )
                         if time.monotonic() + delay >= deadline:
-                            if any(self._remaining(c) == 0 for c in candidates[position + 1 :]):
+                            if await self._has_available(candidates[position + 1 :]):
                                 break
                             raise ModelCallFailed("模型调用时间预算不足以再次请求") from exc
                         await asyncio.sleep(delay)
                         retry += 1
                         continue
                     break
-                self._record_call(
+                await self._record_call(
                     replace(
                         record,
                         status="ok",

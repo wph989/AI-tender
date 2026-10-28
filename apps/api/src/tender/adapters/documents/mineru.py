@@ -138,9 +138,6 @@ class MinerUParser:
 
         state = cast(ParseJobState, raw_status)
         middle_json_file_id, file_error_code, file_error_message = _middle_json_output(payload)
-        if state == "completed" and not middle_json_file_id:
-            raise ParseFailed("MinerU 任务 completed，但没有 middle_json 产物")
-
         error_code, error_message = _error_details(payload)
         return ParseJobStatus(
             job_id=job_id,

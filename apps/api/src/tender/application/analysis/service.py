@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from pathlib import PurePosixPath
 from typing import Any
@@ -374,8 +375,8 @@ class AnalysisService:
         report_id: int,
         payload: ContextInput,
     ) -> dict[str, Any]:
-        snapshot = self.data_snapshot(report_id, payload.snapshot_id)
-        report, data = self.context_data(report_id, snapshot)
+        snapshot = await asyncio.to_thread(self.data_snapshot, report_id, payload.snapshot_id)
+        report, data = await asyncio.to_thread(self.context_data, report_id, snapshot)
         try:
             context = build_context(data, payload)
         except ContextError as exc:
@@ -396,13 +397,16 @@ class AnalysisService:
                     embedding_timeout=15,
                 )
                 # 不只重查参考片段；招标依据也可能在等待参考检索时被撤销或重跑。
-                self.context_data(report_id, snapshot)
-                live = self.store.collections_for_project(report["project_id"])
+                await asyncio.to_thread(self.context_data, report_id, snapshot)
+                live = await asyncio.to_thread(
+                    self.store.collections_for_project, report["project_id"],
+                )
                 for row in rows[:12]:
                     if row["collection_id"] not in live:
                         continue
                     try:
-                        citation = self.store.resolve(
+                        citation = await asyncio.to_thread(
+                            self.store.resolve,
                             {
                                 key: row[key]
                                 for key in (

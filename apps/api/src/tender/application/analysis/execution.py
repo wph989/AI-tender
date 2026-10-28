@@ -235,6 +235,9 @@ class AnalysisExecutor:
             async def read(source):
                 return await asyncio.to_thread(db.readable_chunks, source)
 
+            async def read_window(source, offset, limit):
+                return await asyncio.to_thread(db.read_chunk_window, source, offset, limit)
+
             state = runtime.run["state"]
             limits = AgentLimits(**runtime.run["limits"])
             logger.info(
@@ -253,7 +256,7 @@ class AnalysisExecutor:
                 sources,
                 report["project_id"],
                 retrieve,
-                read,
+                read_window,
                 authorize,
                 limits,
                 seen=prior.get("seen", {}),

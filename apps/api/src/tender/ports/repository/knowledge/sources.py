@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkWindow:
+    """有界原文窗口；流式回退未扫描全文时，total 为 None。"""
+
+    rows: list[dict[str, Any]]
+    total: int | None
+    has_more: bool
 
 
 class SourceReader(Protocol):
@@ -34,6 +44,12 @@ class SourceReader(Protocol):
 
     def readable_chunks(self, source: dict[str, Any]) -> list[dict[str, Any]]:
         """资料的检索分块：在元素之上再按长度切分，并带定位信息。"""
+        ...
+
+    def read_chunk_window(
+        self, source: dict[str, Any], offset: int, limit: int,
+    ) -> ChunkWindow:
+        """读取指定分块范围并重新核对权限，不加载整份资料。"""
         ...
 
     def resolve(self, ref: dict[str, Any], *, with_content: bool = False) -> dict[str, Any]:

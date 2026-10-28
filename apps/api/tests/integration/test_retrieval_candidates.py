@@ -123,3 +123,56 @@ def test_old_chunk_version_falls_back_without_using_stale_vectors(environment):
     result = db.search_candidates(sources, "资质", [1.0, 0.0], "test-space",
                                   limit=10, min_similarity=None)
     assert result.rows and result.semantic_source_ids == []
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+@pytest.mark.parametrize("offset", [0, 3, 7, 100])
+def test_chunk_window_matches_full_read_without_loading_full_document(
+    environment, monkeypatch, indexed, offset,
+):
+    db, sources, _ = indexed_sources(environment, count=1)
+    source = sources[0]
+    if not indexed:
+        environment[1].execute(text("UPDATE knowledge_index SET chunk_version='old'"))
+    expected = db.readable_chunks(source)
+    monkeypatch.setattr(db, "readable_chunks", lambda *_: pytest.fail("范围读取不能加载全文"))
+    window = db.read_chunk_window(source, offset, 2)
+    assert [row["block_id"] for row in window.rows] == [
+        row["block_id"] for row in expected[offset:offset + 2]
+    ]
+    assert [row["content"] for row in window.rows] == [
+        row["content"] for row in expected[offset:offset + 2]
+    ]
+    assert window.has_more == (offset + 2 < len(expected))
+    assert window.total == (None if not indexed and window.has_more else len(expected))
+    # 流式选项只影响本次读取，不能污染共享事务内后续的普通写入。
+    environment[1].execute(text("UPDATE project SET name=name WHERE id=:pid"), {
+        "pid": environment[2],
+    })
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+def test_chunk_window_rechecks_revoked_permissions(environment, indexed):
+    db, sources, _ = indexed_sources(environment, count=1)
+    if not indexed:
+        environment[1].execute(text("UPDATE knowledge_index SET chunk_version='old'"))
+    environment[1].execute(text("UPDATE project_file SET deleted_at=now()"))
+    assert db.read_chunk_window(sources[0], 0, 2).rows == []
+
+
+def test_unindexed_window_stops_streaming_at_requested_prefix(environment, monkeypatch):
+    from tender.adapters.pg.repositories.knowledge import retrieval
+
+    db, sources, _ = indexed_sources(environment, count=1)
+    environment[1].execute(text("UPDATE knowledge_index SET chunk_version='old'"))
+    original = retrieval.iter_element_chunks
+    visited = []
+
+    def observe(elements):
+        for element, chunk in original(elements):
+            visited.append(chunk["ordinal"])
+            yield element, chunk
+
+    monkeypatch.setattr(retrieval, "iter_element_chunks", observe)
+    assert len(db.read_chunk_window(sources[0], 0, 1).rows) == 1
+    assert visited == [0, 1]

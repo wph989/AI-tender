@@ -20,7 +20,7 @@ from tender.application.analysis.agent import (
     _relation_unit,
     context_size,
 )
-from tender.application.analysis.research import AgentLimits, Expand, ResearchSession
+from tender.application.analysis.research import AgentLimits, Expand, Read, ResearchSession
 from tender.application.analysis.skills import _module_result, verify_items
 
 
@@ -81,7 +81,7 @@ async def answer_with_agent(
     project_id: int | None,
     question: str,
     retrieve: Callable[[list[dict], str], Awaitable[tuple[list[dict], dict]]],
-    read: Callable[[dict], Awaitable[list[dict]]],
+    read: Read,
     authorize: Callable[[], Awaitable[None]],
     limits: AgentLimits | None = None,
     expand: Expand | None = None,

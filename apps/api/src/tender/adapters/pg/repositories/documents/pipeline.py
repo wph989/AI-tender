@@ -61,7 +61,7 @@ class DocumentPipelineRepository:
                 update(Job).where(
                     Job.id == job_id,
                     Job.stage.in_(stages),
-                    Job.status.in_(("pending", "submitting", "running", "canceling")),
+                    Job.status.in_(("pending", "submitting", "running", "canceling", "draining")),
                     Job.finished_at.is_(None),
                     or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= func.now()),
                 ).values(
@@ -75,7 +75,8 @@ class DocumentPipelineRepository:
         # 先持久化下一轮时间，调度器负责消息；进程退出不会丢掉后续轮询。
         with self.engine.begin() as connection:
             connection.execute(update(Job).where(
-                Job.id == job_id, Job.status.in_(("pending", "submitting", "running", "canceling")),
+                Job.id == job_id,
+                Job.status.in_(("pending", "submitting", "running", "canceling", "draining")),
                 Job.finished_at.is_(None),
             ).values(
                 next_attempt_at=func.now() + timedelta(seconds=delay),
@@ -99,6 +100,31 @@ class DocumentPipelineRepository:
                 return False
             finish_canceled_job(connection, job_id, row["run_id"])
             return True
+
+    def finish_remote_job(self, job_id: str) -> None:
+        """远端确认停止后才释放占用，保留原来的失败原因。"""
+        with self.engine.begin() as connection:
+            row = connection.execute(select(
+                Job.status, Job.run_id, Job.error_code, Job.error_message,
+            ).where(Job.id == job_id).with_for_update()).mappings().first()
+            if row is None:
+                return
+            if row["status"] == "canceling":
+                finish_canceled_job(connection, job_id, row["run_id"])
+            elif row["status"] == "draining":
+                values = dict(
+                    status="failed", error_code=row["error_code"],
+                    error_message=row["error_message"], finished_at=func.now(),
+                )
+                connection.execute(update(Job).where(Job.id == job_id).values(
+                    **values, updated_at=func.now(), next_attempt_at=None,
+                    dispatch_lease_until=None,
+                ))
+                if row["run_id"] is not None:
+                    connection.execute(update(ParseRun).where(
+                        ParseRun.id == row["run_id"],
+                        ParseRun.status.in_(("pending", "running")),
+                    ).values(**values))
 
     def runtime_values(self, job_id: str) -> Mapping[str, Any]:
         """优先使用创建时快照；老任务首次补齐后也不能随重试读取新配置。"""
@@ -455,7 +481,7 @@ class DocumentPipelineRepository:
             )
             if row is None:
                 return
-            if row["status"] == "canceled":
+            if row["status"] in {"canceled", "draining"}:
                 return
             if row["status"] == "canceling":
                 if row["stage"] == "parsing" or code == "parse_submission_unknown":
@@ -466,6 +492,14 @@ class DocumentPipelineRepository:
                     ))
                 else:
                     finish_canceled_job(connection, job_id, row["run_id"])
+                return
+            if row["stage"] == "parsing" or code == "parse_submission_unknown":
+                # 本地失败不代表远端已停止；只排空原任务，不再执行或重新提交。
+                connection.execute(update(Job).where(Job.id == job_id).values(
+                    status="draining", error_code=code, error_message=message[:2000],
+                    updated_at=now, next_attempt_at=now + timedelta(seconds=30),
+                    dispatch_lease_until=None,
+                ))
                 return
             connection.execute(
                 update(Job)

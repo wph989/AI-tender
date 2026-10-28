@@ -203,6 +203,54 @@ def test_cancel_pending_job_finishes_without_dispatch(database):
         assert transaction.pending(("submitting",), 1, 1) == []
 
 
+@pytest.mark.parametrize("code", ["parse_timeout", "parse_failed", "provider_version_changed"])
+def test_local_parse_failure_retains_quota_until_remote_stops(database, code):
+    run_id = seed_parse(database)
+    seed(database, "next")
+    repository = DocumentPipelineRepository(database, Mock())
+    repository.set_job_failure("remote", code, "原始失败")
+    payload = JobRepository(database, 1).payload("remote")
+    assert payload["status"] == "draining" and payload["finished_at"] is None
+    with DispatchRepository(database).transaction() as transaction:
+        assert transaction.inflight(dispatch.STREAMS[1].inflight_stages, 1) == 1
+    with database.connect() as connection:
+        assert ParseTransaction(connection, Mock()).active_job(11) == "remote"
+        assert connection.execute(select(ParseRun.status).where(
+            ParseRun.id == run_id,
+        )).scalar_one() == "running"
+    repository.schedule_attempt("remote", 0)
+    with DispatchRepository(database).transaction() as transaction:
+        assert transaction.recoverable(1, 100, tuple(dispatch.RECOVERY_TASKS)) == [
+            ("remote", "parsing"),
+        ]
+    repository.finish_remote_job("remote")
+    repository.finish_remote_job("remote")
+    payload = JobRepository(database, 1).payload("remote")
+    assert payload["status"] == "failed" and payload["finished_at"] is not None
+    assert payload["error_code"] == code and payload["error_message"] == "原始失败"
+    with database.connect() as connection:
+        assert connection.execute(select(ParseRun.status).where(
+            ParseRun.id == run_id,
+        )).scalar_one() == "failed"
+
+
+@pytest.mark.parametrize("resubmitting", [False, True])
+def test_unknown_submission_failure_keeps_occupancy_and_original_error(database, resubmitting):
+    if resubmitting:
+        seed_parse(database, stage="resubmitting")
+    else:
+        seed(database, "remote", status="submitting", dispatched=True, version_id=11)
+    repository = DocumentPipelineRepository(database, Mock())
+    repository.set_job_failure("remote", "parse_submission_unknown", "需人工核对远端")
+    repository.set_job_failure("remote", "parse_timeout", "不能覆盖原始原因")
+    payload = JobRepository(database, 1).payload("remote")
+    assert payload["status"] == "draining" and payload["finished_at"] is None
+    assert payload["error_code"] == "parse_submission_unknown"
+    assert payload["error_message"] == "需人工核对远端"
+    with DispatchRepository(database).transaction() as transaction:
+        assert transaction.inflight(dispatch.STREAMS[1].inflight_stages, 1) == 1
+
+
 def test_cancel_remote_parse_keeps_quota_and_blocks_reparse(database):
     run_id = seed_parse(database)
     seed(database, "next")
@@ -224,13 +272,20 @@ def test_cancel_remote_parse_keeps_quota_and_blocks_reparse(database):
         assert state == "running"
 
 
+@pytest.mark.parametrize("stopping", ["canceling", "draining"])
 @pytest.mark.parametrize("remote_status", [
     "running", "completed", "partial", "failed", "canceled", "missing", "unavailable",
 ])
-def test_cancel_poll_only_drains_remote_and_recovers(database, monkeypatch, remote_status):
+def test_cancel_poll_only_drains_remote_and_recovers(
+    database, monkeypatch, remote_status, stopping,
+):
     run_id = seed_parse(database)
-    JobRepository(database, 1).cancel("remote")
     repository = DocumentPipelineRepository(database, Mock())
+    if stopping == "canceling":
+        JobRepository(database, 1).cancel("remote")
+    else:
+        repository.set_job_failure("remote", "parse_timeout", "原始超时原因")
+        repository.schedule_attempt("remote", 0)
 
     def job(job_id):
         with database.connect() as connection:
@@ -261,13 +316,17 @@ def test_cancel_poll_only_drains_remote_and_recovers(database, monkeypatch, remo
     store.close.assert_called_once()
     pending = remote_status in {"running", "unavailable"}
     payload = JobRepository(database, 1).payload("remote")
-    assert payload["status"] == ("canceling" if pending else "canceled")
+    finished = "canceled" if stopping == "canceling" else "failed"
+    assert payload["status"] == (stopping if pending else finished)
+    if stopping == "draining":
+        assert payload["error_code"] == "parse_timeout"
+        assert payload["error_message"] == "原始超时原因"
     assert (payload["finished_at"] is None) is pending
     with database.connect() as connection:
         state = connection.execute(
             select(ParseRun.status).where(ParseRun.id == run_id),
         ).scalar_one()
-        assert state == ("running" if pending else "canceled")
+        assert state == ("running" if pending else finished)
     with DispatchRepository(database).transaction() as transaction:
         assert transaction.inflight(dispatch.STREAMS[1].inflight_stages, 1) == int(pending)
     if pending:

@@ -183,8 +183,8 @@ class LlmService:
         return {"status": "deleted"}
 
     async def test_provider(self, provider_id: int) -> dict[str, Any]:
-        row = self._provider_row(provider_id)
-        test_id = self._begin_test(row, "catalog", is_model=False)
+        row = await asyncio.to_thread(self._provider_row, provider_id)
+        test_id = await asyncio.to_thread(self._begin_test, row, "catalog", is_model=False)
         started = time.monotonic()
         status, http_status, error = "ok", None, None
         try:
@@ -210,7 +210,8 @@ class LlmService:
             http_status = getattr(exc, "http_status", None)
             error = str(exc)
         latency_ms = int((time.monotonic() - started) * 1000)
-        self._record_call(
+        await asyncio.to_thread(
+            self._record_call,
             provider_id=provider_id,
             model_id=None,
             feature_key=None,
@@ -223,7 +224,8 @@ class LlmService:
             error=error,
             snapshot=row,
         )
-        self._finish_test(
+        await asyncio.to_thread(
+            self._finish_test,
             row,
             test_id,
             status=status,
@@ -240,7 +242,7 @@ class LlmService:
         }
 
     async def remote_models(self, provider_id: int) -> dict[str, Any]:
-        row = self._provider_row(provider_id)
+        row = await asyncio.to_thread(self._provider_row, provider_id)
         if row["protocol"] == "rerank_http":
             raise Unprocessable(
                 "专用重排协议没有目录接口，请手动添加模型",
@@ -412,7 +414,9 @@ class LlmService:
         return row, self._begin_test(row, selected, is_model=True), selected
 
     async def test_model(self, model_id: int, capability: str | None = None) -> dict[str, Any]:
-        row, test_id, selected = self.begin_model_test(model_id, capability)
+        row, test_id, selected = await asyncio.to_thread(
+            self.begin_model_test, model_id, capability,
+        )
         return await self.run_model_test(row, test_id, selected)
 
     async def run_model_test(
@@ -507,6 +511,16 @@ class LlmService:
             "adapter_version": ADAPTER_VERSION,
             "preview_url": f"/api/v1/llm/tests/{test_id}/preview" if preview else None,
         }
+        await asyncio.to_thread(
+            self._save_model_test, row, test_id, result, preview, prompt_tokens, completion_tokens,
+        )
+        return result
+
+    def _save_model_test(
+        self, row: Mapping[str, Any], test_id: int, result: dict[str, Any],
+        preview: Any, prompt_tokens: int | None, completion_tokens: int | None,
+    ) -> None:
+        # 同一段同步持久化在线程中完成，避免在异步响应收尾时阻塞其它请求。
         with self.repository.transaction() as transaction:
             transaction.store_test_result(
                 test_id,
@@ -519,27 +533,26 @@ class LlmService:
             model_id=row["id"],
             feature_key=None,
             purpose="test",
-            status=status,
-            http_status=http_status,
-            latency_ms=latency_ms,
+            status=result["status"],
+            http_status=result["http_status"],
+            latency_ms=result["latency_ms"],
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            error=error,
+            error=result["error"],
             snapshot=row,
-            vector_count=vector_count,
-            document_count=document_count,
-            image_count=image_count,
+            vector_count=result["vector_count"],
+            document_count=result["document_count"],
+            image_count=result["image_count"],
             test_id=test_id,
         )
         self._finish_test(
             row,
             test_id,
-            status=status,
-            error=error,
-            latency_ms=latency_ms,
+            status=result["status"],
+            error=result["error"],
+            latency_ms=result["latency_ms"],
             is_model=True,
         )
-        return result
 
     def list_features(self) -> dict[str, Any]:
         rows, limits = self.repository.feature_rows()

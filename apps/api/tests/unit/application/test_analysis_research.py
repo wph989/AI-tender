@@ -10,6 +10,7 @@ from tender.application.analysis.research import (
     ResearchSession,
     ToolArgumentError,
 )
+from tender.ports.repository.knowledge.sources import ChunkWindow
 
 
 def source(sid=1, project=10):
@@ -43,8 +44,11 @@ def session(rows, *, auth=allow, limits=None):
         selected = {s["source_id"] for s in sources}
         return [row for row in rows if row["source_id"] in selected], {"mode": "keyword"}
 
-    async def read(s):
-        return [row for row in rows if row["source_id"] == s["source_id"]]
+    async def read(selected_source, offset, limit):
+        selected = [row for row in rows if row["source_id"] == selected_source["source_id"]]
+        return ChunkWindow(
+            selected[offset:offset + limit], len(selected), offset + limit < len(selected),
+        )
 
     return ResearchSession(
         [source(), source(2, 20)], 10, retrieve, read, auth, limits or AgentLimits()
@@ -59,6 +63,28 @@ def test_retrieval_is_autonomous_without_mandatory_fulltext_scan():
         assert [b["source_id"] for b in result["blocks"]] == [1]
         assert set(research.seen) == {"s1r1c0"}
         assert research.tool_calls == 1
+
+    asyncio.run(run())
+
+
+def test_source_and_evidence_reads_request_bounded_windows():
+    async def run():
+        rows = [block() | {"offset": index, "block_id": f"s1r1c{index}"} for index in range(20)]
+        research = session(rows)
+        requests = []
+        original = research.read
+
+        async def read_window(selected_source, offset, limit):
+            requests.append((offset, limit))
+            return await original(selected_source, offset, limit)
+
+        research.read = read_window
+        result = await research.read_source(1, 10, 1)
+        assert requests == [(10, 1)]
+        assert result["total"] == 20 and result["next_offset"] == 11
+        result = await research.read_evidence("s1r1c10", before=2, after=1)
+        assert requests[-1] == (8, 4)
+        assert [row["offset"] for row in result["blocks"]] == [8, 9, 10, 11]
 
     asyncio.run(run())
 
