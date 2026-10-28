@@ -316,8 +316,10 @@ class KnowledgeStore:
             select(running.id.label("active_job_id"), running.stage.label("active_stage"))
             .where(
                 running.project_file_id == ProjectFile.id,
-                running.stage.in_(("probing", "converting", "submitting", "parsing")),
-                running.status.in_(("pending", "running", "submitting")),
+                running.stage.in_((
+                    "probing", "converting", "geometry", "submitting", "parsing", "resubmitting",
+                )),
+                running.status.in_(("pending", "running", "submitting", "canceling")),
                 running.finished_at.is_(None),
             )
             .order_by(running.created_at.desc())
@@ -1678,7 +1680,7 @@ class KnowledgeSession:
             .execute(
                 select(Job.id).where(
                     Job.project_file_id == source_id,
-                    Job.status.in_(("pending", "running", "submitting")),
+                    Job.status.in_(("pending", "running", "submitting", "canceling")),
                     Job.finished_at.is_(None),
                 )
             )

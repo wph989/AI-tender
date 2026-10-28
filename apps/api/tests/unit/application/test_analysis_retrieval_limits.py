@@ -5,9 +5,11 @@ import math
 from dataclasses import asdict
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from test_analysis_research import block, session, source
 
+from tender.adapters.llm.rerank_http import HttpRerankModel
 from tender.application.analysis.research import AgentLimits
 from tender.application.analysis.runtime import limits_snapshot
 from tender.application.knowledge.content import rank_chunks
@@ -179,6 +181,37 @@ def test_rerank_orders_only_qualified_candidates_before_final_limit():
         )
         assert len(order_seen) == 2 and len(hits) == 1 and info["reranked"]
         assert hits[0]["content"] == order_seen[-1]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("count,limit", [(8, 6), (41, 40), (8, 10)])
+def test_partial_rerank_keeps_unselected_candidates_and_truncation(count, limit):
+    async def run():
+        store = Store(rows(count), rerank=True)
+        original = store.search_candidates([SOURCE], "投标保证金", None, None,
+                                           limit=100, min_similarity=None).rows
+        async with httpx.AsyncClient(
+            base_url="https://fixture.invalid/",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
+                "results": [
+                    {"index": 1, "relevance_score": 0.9},
+                    {"index": 0, "relevance_score": 0.8},
+                ],
+            })),
+        ) as client:
+            hits, info = await retrieve_chunks(
+                store, [SOURCE], "投标保证金", lambda: None,
+                lambda _: Embedding(),
+                lambda _: HttpRerankModel(
+                    "https://fixture.invalid", "fixture", top_n_limit=2, client=client,
+                ),
+                max_results=limit,
+            )
+        expected = [original[1], original[0], *original[2:]][:limit]
+        assert [row["element_id"] for row in hits] == [row["element_id"] for row in expected]
+        assert info["reranked"] and info["warning"] is None
+        assert info["search_limited"] is (count > limit)
 
     asyncio.run(run())
 

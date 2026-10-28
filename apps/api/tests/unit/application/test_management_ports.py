@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from tender.api.shared.errors import install_error_handlers
 from tender.application.documents.parsing import ParseService
+from tender.application.jobs.service import JobService
 from tender.application.shared.errors import Conflict
 from tender.ports.configuration.registry import ActiveConfig
 from tender.ports.repository.llm.management import RecordConflict
@@ -80,3 +81,13 @@ def test_repository_conflict_retains_existing_http_contract():
     response = asyncio.run(app.exception_handlers[RecordConflict](None, RecordConflict()))
     assert response.status_code == 409
     assert json.loads(response.body)["error"]["code"] == "version_conflict"
+
+
+def test_canceling_job_is_accepted_and_keeps_progress_stream_open():
+    payload = {"id": "fixture", "status": "canceling", "finished_at": None}
+    service = JobService(SimpleNamespace(
+        cancel=lambda _: (True, "canceling"), payload=lambda _: payload,
+    ), 1)
+    assert service.cancel("fixture") == payload
+    assert not service.is_terminal(payload)
+    assert service.is_terminal(payload | {"status": "canceled"})

@@ -37,6 +37,7 @@ from tender.adapters.pg.models import (
     ProjectFile,
 )
 from tender.adapters.pg.repositories.jobs.dispatch import DISPATCH_LEASE
+from tender.adapters.pg.repositories.jobs.tasks import finish_canceled_job
 from tender.config.registry import ConfigRegistry
 from tender.config.schema import document_execution_snapshot
 from tender.domain.documents.element import NormalizedElement
@@ -60,7 +61,7 @@ class DocumentPipelineRepository:
                 update(Job).where(
                     Job.id == job_id,
                     Job.stage.in_(stages),
-                    Job.status.in_(("pending", "submitting", "running")),
+                    Job.status.in_(("pending", "submitting", "running", "canceling")),
                     Job.finished_at.is_(None),
                     or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= func.now()),
                 ).values(
@@ -74,7 +75,7 @@ class DocumentPipelineRepository:
         # 先持久化下一轮时间，调度器负责消息；进程退出不会丢掉后续轮询。
         with self.engine.begin() as connection:
             connection.execute(update(Job).where(
-                Job.id == job_id, Job.status.in_(("pending", "submitting", "running")),
+                Job.id == job_id, Job.status.in_(("pending", "submitting", "running", "canceling")),
                 Job.finished_at.is_(None),
             ).values(
                 next_attempt_at=func.now() + timedelta(seconds=delay),
@@ -85,6 +86,19 @@ class DocumentPipelineRepository:
                     func.coalesce(Job.progress["retry_attempts"].as_integer(), 0) + 1,
                 )) if retry else Job.progress),
             ))
+
+    def finish_cancellation(self, job_id: str, *, remote_finished: bool = False) -> bool:
+        """本地处理已退出或远端确认结束时才释放取消任务的配额。"""
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(Job.status, Job.stage, Job.run_id).where(Job.id == job_id).with_for_update()
+            ).mappings().first()
+            if row is None or row["status"] != "canceling":
+                return False
+            if not remote_finished and row["stage"] in {"submitting", "parsing", "resubmitting"}:
+                return False
+            finish_canceled_job(connection, job_id, row["run_id"])
+            return True
 
     def runtime_values(self, job_id: str) -> Mapping[str, Any]:
         """优先使用创建时快照；老任务首次补齐后也不能随重试读取新配置。"""
@@ -273,6 +287,12 @@ class DocumentPipelineRepository:
         snapshot = row["config_snapshot"]
         auto_parse = isinstance(snapshot, dict) and bool(snapshot.get("auto_parse", True))
         with self.engine.begin() as connection:
+            status = connection.execute(
+                select(Job.status).where(Job.id == row["id"]).with_for_update()
+            ).scalar_one()
+            if status in {"canceling", "canceled"}:
+                # 转换期间收到取消后不再创建版本或交接解析，外层退出时统一收尾。
+                return 0, 0, False
             if candidate is None:
                 document_id = None
                 replaces_id = row["replaces_id"]
@@ -426,11 +446,26 @@ class DocumentPipelineRepository:
         now = datetime.now(UTC)
         with self.engine.begin() as connection:
             row = (
-                connection.execute(select(Job.run_id).where(Job.id == job_id).with_for_update())
+                connection.execute(
+                    select(Job.run_id, Job.status, Job.stage)
+                    .where(Job.id == job_id).with_for_update()
+                )
                 .mappings()
                 .first()
             )
             if row is None:
+                return
+            if row["status"] == "canceled":
+                return
+            if row["status"] == "canceling":
+                if row["stage"] == "parsing" or code == "parse_submission_unknown":
+                    # 网络故障或未知提交不能证明远端停止；保留占用并等待恢复/人工核对。
+                    connection.execute(update(Job).where(Job.id == job_id).values(
+                        error_code=code, error_message=message[:2000], updated_at=now,
+                        next_attempt_at=now + timedelta(seconds=30), dispatch_lease_until=None,
+                    ))
+                else:
+                    finish_canceled_job(connection, job_id, row["run_id"])
                 return
             connection.execute(
                 update(Job)
@@ -479,6 +514,13 @@ class DocumentPipelineRepository:
 
     def retry_submission(self, job_id: str, code: str, message: str) -> None:
         with self.engine.begin() as connection:
+            row = connection.execute(
+                select(Job.status, Job.run_id).where(Job.id == job_id).with_for_update()
+            ).mappings().one()
+            if row["status"] == "canceling":
+                # 适配器明确返回未受理的可重试错误，此时取消无需再次提交。
+                finish_canceled_job(connection, job_id, row["run_id"])
+                return
             connection.execute(
                 update(Job)
                 .where(Job.id == job_id, Job.status == "submitting")
@@ -501,6 +543,9 @@ class DocumentPipelineRepository:
         now: datetime,
     ) -> None:
         with self.engine.begin() as connection:
+            status = connection.execute(
+                select(Job.status).where(Job.id == job_id).with_for_update()
+            ).scalar_one()
             run_id = connection.execute(
                 insert(ParseRun)
                 .values(
@@ -519,10 +564,10 @@ class DocumentPipelineRepository:
             ).scalar_one()
             connection.execute(
                 update(Job)
-                .where(Job.id == job_id, Job.status == "submitting")
+                .where(Job.id == job_id, Job.status.in_(("submitting", "canceling")))
                 .values(
                     run_id=run_id,
-                    status="running",
+                    status="canceling" if status == "canceling" else "running",
                     stage="parsing",
                     next_attempt_at=now,
                     dispatch_lease_until=None,
@@ -561,7 +606,7 @@ class DocumentPipelineRepository:
         with self.engine.begin() as connection:
             connection.execute(
                 update(Job)
-                .where(Job.id == job_id, Job.status == "running")
+                .where(Job.id == job_id, Job.status.in_(("running", "canceling")))
                 .values(stage="parsing", updated_at=func.now())
             )
 
@@ -574,7 +619,7 @@ class DocumentPipelineRepository:
             )
             connection.execute(
                 update(Job)
-                .where(Job.id == job_id, Job.status == "running")
+                .where(Job.id == job_id, Job.status.in_(("running", "canceling")))
                 .values(stage="parsing", updated_at=func.now())
             )
 
@@ -637,6 +682,15 @@ class DocumentPipelineRepository:
         now: datetime,
     ) -> None:
         with self.engine.begin() as connection:
+            status = connection.execute(
+                select(Job.status).where(Job.id == job_id).with_for_update()
+            ).scalar_one()
+            if status == "canceling":
+                # 轮询返回与取消并发时仍以取消为准，不落元素、不发布解析成果。
+                finish_canceled_job(connection, job_id, row["run_id"])
+                return
+            if status == "canceled":
+                return
             if normalized_elements:
                 # 参数列表交给批量执行，避免 .values([...]) 超出 PostgreSQL 单语句参数上限。
                 connection.execute(

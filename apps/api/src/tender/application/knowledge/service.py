@@ -13,7 +13,7 @@ from tender.application.knowledge.content import align_citation, dedupe_citation
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.projects.files import role_is_parseable
 from tender.application.shared.errors import Conflict, Forbidden, InvalidArgument, NotFound
-from tender.config.schema import document_execution_snapshot
+from tender.config.schema import document_execution_snapshot, parse_options
 from tender.ports.configuration.registry import ConfigReader
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.repository.knowledge.management import KnowledgeRepository
@@ -254,6 +254,7 @@ class KnowledgeService:
                 actor="local-user",
             )
         active = self.configs.active(self.company_id)
+        options = parse_options(active.resolved if active is not None else {})
         job_id = f"job_{uuid4().hex}"
         with self.store.transaction() as tx:
             tx.lock_source(source["id"])
@@ -268,8 +269,7 @@ class KnowledgeService:
                     "status": "pending",
                     "stage": "probing" if suffix == ".pdf" else "converting",
                     "config_snapshot": {
-                        "tier": "standard",
-                        "ocr_mode": "auto",
+                        **options,
                         "auto_parse": True,
                         "execution": document_execution_snapshot(
                             active.resolved if active is not None else None

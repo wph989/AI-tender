@@ -66,7 +66,13 @@ async def retrieve_chunks(
             order = await client.rerank(
                 question, [r["content"] for r in candidates], len(candidates)
             )
-            ranked = [candidates[index] for index, _ in order] + ranked[30:]
+            # 供应商可只返回 top_n；其余合格候选保留原顺序，不能跳过它们直接拼接尾部。
+            selected = {index for index, _ in order}
+            ranked = (
+                [candidates[index] for index, _ in order]
+                + [row for index, row in enumerate(candidates) if index not in selected]
+                + ranked[30:]
+            )
             reranked = True
         except Exception:
             logger.warning("rerank.fail", exc_info=True)

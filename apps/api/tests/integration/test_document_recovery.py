@@ -4,18 +4,22 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, insert, text
+from sqlalchemy import create_engine, insert, select, text
 from sqlalchemy.engine import make_url
 
-from tender.adapters.pg.models import Job
+from tender.adapters.pg.models import Job, ParseRun
+from tender.adapters.pg.repositories.documents.parsing import ParseTransaction
 from tender.adapters.pg.repositories.documents.pipeline import DocumentPipelineRepository
 from tender.adapters.pg.repositories.jobs.coordination import TaskLocks
 from tender.adapters.pg.repositories.jobs.dispatch import DispatchRepository
+from tender.adapters.pg.repositories.jobs.tasks import JobRepository
 from tender.core.settings import database_url
+from tender.domain.shared.errors import ParseUnavailable, ServiceRestarted
+from tender.ports.documents.parser import ParseJobStatus
 from tender.worker import dispatch
 from tender.worker.documents import tasks
 
@@ -31,6 +35,9 @@ def database():
     url = make_url(database_url()).update_query_dict({"options": f"-csearch_path={schema}"})
     engine = create_engine(url)
     Job.__table__.create(engine)
+    ParseRun.__table__.create(engine)
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE parse_run ALTER COLUMN created_at SET DEFAULT now()"))
     try:
         yield engine
     finally:
@@ -173,3 +180,157 @@ def test_retry_count_survives_new_repository_and_message(database):
             row = connection.execute(text("SELECT * FROM job WHERE id='retry'")).mappings().one()
         assert row["progress"]["retry_attempts"] == count
         assert row["next_attempt_at"] is not None and row["dispatch_lease_until"] is None
+
+
+def seed_parse(engine, job_id="remote", *, stage="parsing", status="running"):
+    with engine.begin() as connection:
+        run_id = connection.execute(insert(ParseRun).values(
+            version_id=11, provider="mineru", provider_version="fixture", tier="standard",
+            schema_version="2.0", status="running", provider_job_id="remote-id",
+            config_snapshot={}, started_at=datetime.now(UTC),
+        ).returning(ParseRun.id)).scalar_one()
+    seed(engine, job_id, status=status, stage=stage, dispatched=True, version_id=11, run_id=run_id)
+    return run_id
+
+
+def test_cancel_pending_job_finishes_without_dispatch(database):
+    seed(database, "pending")
+    repository = JobRepository(database, 1)
+    assert repository.cancel("pending") == (True, "canceled")
+    assert repository.cancel("pending") == (True, "canceled")
+    assert repository.payload("pending")["finished_at"] is not None
+    with DispatchRepository(database).transaction() as transaction:
+        assert transaction.pending(("submitting",), 1, 1) == []
+
+
+def test_cancel_remote_parse_keeps_quota_and_blocks_reparse(database):
+    run_id = seed_parse(database)
+    seed(database, "next")
+    repository = JobRepository(database, 1)
+    assert JobRepository(database, 2).cancel("remote") == (False, None)
+    assert repository.cancel("remote") == (True, "canceling")
+    assert repository.cancel("remote") == (True, "canceling")
+    assert repository.payload("remote")["finished_at"] is None
+    with DispatchRepository(database).transaction() as transaction:
+        assert transaction.inflight(dispatch.STREAMS[1].inflight_stages, 1) == 1
+        assert transaction.recoverable(1, 100, tuple(dispatch.RECOVERY_TASKS)) == [
+            ("remote", "parsing"),
+        ]
+    with database.connect() as connection:
+        assert ParseTransaction(connection, Mock()).active_job(11) == "remote"
+        state = connection.execute(
+            select(ParseRun.status).where(ParseRun.id == run_id),
+        ).scalar_one()
+        assert state == "running"
+
+
+@pytest.mark.parametrize("remote_status", [
+    "running", "completed", "partial", "failed", "canceled", "missing", "unavailable",
+])
+def test_cancel_poll_only_drains_remote_and_recovers(database, monkeypatch, remote_status):
+    run_id = seed_parse(database)
+    JobRepository(database, 1).cancel("remote")
+    repository = DocumentPipelineRepository(database, Mock())
+
+    def job(job_id):
+        with database.connect() as connection:
+            return connection.execute(select(Job, ParseRun.provider_job_id).join(
+                ParseRun, ParseRun.id == Job.run_id,
+            ).where(Job.id == job_id)).mappings().one()
+
+    monkeypatch.setattr(repository, "job", job)
+    monkeypatch.setattr(tasks, "_repository", repository)
+    monkeypatch.setattr(tasks, "_locks", TaskLocks(database))
+    parser = AsyncMock()
+    if remote_status == "missing":
+        parser.poll.side_effect = ServiceRestarted("远端已丢失任务")
+    elif remote_status == "unavailable":
+        parser.poll.side_effect = ParseUnavailable("暂时不可用")
+    else:
+        parser.poll.return_value = ParseJobStatus("remote-id", remote_status, None, True)
+    monkeypatch.setattr(tasks, "_parser", lambda _: parser)
+    store = Mock()
+    monkeypatch.setattr(tasks, "_store", lambda: store)
+    # 取消排空不再执行原任务或消耗已用尽的执行预算，也不能下载成果。
+    monkeypatch.setattr(tasks, "_runtime_values", Mock(side_effect=AssertionError("不应恢复解析")))
+    tasks.poll_parse.run("remote")
+    parser.poll.assert_awaited_once_with("remote-id")
+    parser.fetch_middle_json.assert_not_called()
+    parser.submit.assert_not_called()
+    parser.aclose.assert_awaited_once()
+    store.close.assert_called_once()
+    pending = remote_status in {"running", "unavailable"}
+    payload = JobRepository(database, 1).payload("remote")
+    assert payload["status"] == ("canceling" if pending else "canceled")
+    assert (payload["finished_at"] is None) is pending
+    with database.connect() as connection:
+        state = connection.execute(
+            select(ParseRun.status).where(ParseRun.id == run_id),
+        ).scalar_one()
+        assert state == ("running" if pending else "canceled")
+    with DispatchRepository(database).transaction() as transaction:
+        assert transaction.inflight(dispatch.STREAMS[1].inflight_stages, 1) == int(pending)
+    if pending:
+        repository.schedule_attempt("remote", 0)
+        with DispatchRepository(database).transaction() as transaction:
+            assert transaction.recoverable(1, 100, tuple(dispatch.RECOVERY_TASKS)) == [
+                ("remote", "parsing"),
+            ]
+
+
+def test_cancel_during_submission_keeps_returned_remote_handle(database):
+    seed(database, "submit", status="submitting", dispatched=True, version_id=11)
+    JobRepository(database, 1).cancel("submit")
+    repository = DocumentPipelineRepository(database, Mock())
+    repository.save_submission("submit", 11, "fixture", "remote-id", {
+        "tier": "advanced", "ocr_mode": "ocr",
+    }, datetime.now(UTC))
+    with database.connect() as connection:
+        row = connection.execute(select(Job, ParseRun.provider_job_id).join(
+            ParseRun, ParseRun.id == Job.run_id,
+        )).mappings().one()
+    assert row["status"] == "canceling" and row["stage"] == "parsing"
+    assert row["provider_job_id"] == "remote-id" and row["finished_at"] is None
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_cancel_submission_rejected_or_unknown(database, unknown):
+    seed(database, "submit", status="submitting", dispatched=True)
+    JobRepository(database, 1).cancel("submit")
+    repository = DocumentPipelineRepository(database, Mock())
+    if unknown:
+        repository.set_job_failure("submit", "parse_submission_unknown", "需人工核对")
+    else:
+        repository.retry_submission("submit", "unavailable", "远端未受理")
+    payload = JobRepository(database, 1).payload("submit")
+    assert payload["status"] == ("canceling" if unknown else "canceled")
+    with DispatchRepository(database).transaction() as transaction:
+        assert transaction.inflight(dispatch.STREAMS[1].inflight_stages, 1) == int(unknown)
+
+
+def test_cancel_during_conversion_does_not_create_version_or_handoff(database):
+    seed(database, "convert", status="running", stage="converting", dispatched=True)
+    JobRepository(database, 1).cancel("convert")
+    repository = DocumentPipelineRepository(database, Mock())
+    result = repository.finish_file_version(
+        {"id": "convert", "config_snapshot": {}}, candidate=None,
+        pdf_key="fixture", pdf_sha256="fixture", converter=None, converter_version=None,
+        is_converted=True, inspection=None,
+    )
+    assert result == (0, 0, False)
+    assert repository.finish_cancellation("convert")
+    assert JobRepository(database, 1).payload("convert")["status"] == "canceled"
+
+
+def test_cancel_wins_against_completed_parse_write(database):
+    seed_parse(database)
+    JobRepository(database, 1).cancel("remote")
+    with database.connect() as connection:
+        row = connection.execute(select(Job).where(Job.id == "remote")).mappings().one()
+    repository = DocumentPipelineRepository(database, Mock())
+    repository.complete_parse(
+        "remote", row, [object()], terminal_status="completed", raw_middle_key=None,
+        page_count=1, backend=None, schema_version=None, elapsed_ms=1,
+        error_code=None, error_message=None, progress={}, now=datetime.now(UTC),
+    )
+    assert JobRepository(database, 1).payload("remote")["status"] == "canceled"

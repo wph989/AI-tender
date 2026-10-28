@@ -95,6 +95,7 @@ def test_poll_parse_persists_elements_within_parameter_limit(monkeypatch, elemen
                 # 非元素查询不连接业务库，项目类型固定为知识库，避免触发后续模型任务。
                 result = Mock(rowcount=1)
                 result.mappings.return_value.all.return_value = []
+                result.mappings.return_value.first.return_value = job
                 result.scalar_one.return_value = "knowledge"
                 return result
 

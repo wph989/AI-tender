@@ -74,7 +74,13 @@ def _serialize_job(*stages: str) -> Callable:
                 if not acquired:
                     raise task.retry(countdown=1)
                 if _repository.claim_attempt(job_id, stages):
-                    function(task, job_id)
+                    if _repository.finish_cancellation(job_id):
+                        return
+                    try:
+                        function(task, job_id)
+                    finally:
+                        # 处理中收到的本地取消在释放执行锁前落库，恢复消息也走同一收尾。
+                        _repository.finish_cancellation(job_id)
 
         return wrapped
 
@@ -341,7 +347,7 @@ def submit_parse(self: Any, job_id: str) -> None:
     if row is None:
         return
     status = str(row["status"])
-    if status == "submitting":
+    if status in {"submitting", "canceling"}:
         # 上次进程可能在 MinerU 已受理后、provider_job_id 落库前退出，重放会产生重复任务。
         _mark_submission_unknown(
             job_id,
@@ -418,10 +424,46 @@ async def _poll(row: Mapping[str, Any], store: S3BlobStore) -> tuple[Any, Any | 
         await parser.aclose()
 
 
+async def _drain_parse(row: Mapping[str, Any], store: S3BlobStore) -> Any:
+    parser = _parser(store)
+    try:
+        # 取消仅需确认远端释放资源，不下载或归一化即将丢弃的解析结果。
+        return await parser.poll(str(row["provider_job_id"]))
+    finally:
+        await parser.aclose()
+
+
+def _poll_cancellation(row: Mapping[str, Any]) -> None:
+    job_id = str(row["id"])
+    if row["stage"] == "resubmitting" or not row.get("provider_job_id"):
+        _mark_submission_unknown(job_id, "取消中的提交结果未知；需人工核对远端任务后收尾")
+        return
+    store = _store()
+    try:
+        try:
+            status = asyncio.run(_drain_parse(row, store))
+        except ServiceRestarted:
+            # 远端明确丢失原任务，取消流程不能再创建替代任务。
+            _repository.finish_cancellation(job_id, remote_finished=True)
+            return
+        except (ParseUnavailable, ParseFailed, BlobStoreError):
+            _repository.schedule_attempt(job_id, 30)
+            return
+        if status.status in {"queued", "running"}:
+            _repository.schedule_attempt(job_id, 30)
+        else:
+            _repository.finish_cancellation(job_id, remote_finished=True)
+    finally:
+        store.close()
+
+
 @celery_app.task(bind=True, name="tender.worker.tasks.poll_parse", max_retries=None)
 @_serialize_job("parsing", "resubmitting")
 def poll_parse(self: Any, job_id: str) -> None:
     row = _repository.job(job_id)
+    if row is not None and row["status"] == "canceling":
+        _poll_cancellation(row)
+        return
     if row is None or row["status"] != "running" or row["run_id"] is None:
         return
     if row["stage"] == "resubmitting":
@@ -476,6 +518,8 @@ def poll_parse(self: Any, job_id: str) -> None:
             schedule_retry()
             return
 
+        # 远端已受理就先保存句柄；并发取消也必须能追踪这个任务，不能提前释放配额。
+        _repository.replace_provider_job(job_id, int(row["run_id"]), submission.job_id)
         if submission.provider_version != row["provider_version"]:
             _repository.set_job_failure(
                 job_id,
@@ -483,7 +527,6 @@ def poll_parse(self: Any, job_id: str) -> None:
                 "MinerU 重启后版本发生变化；为保留可复现快照，本次任务已停止",
             )
             return
-        _repository.replace_provider_job(job_id, int(row["run_id"]), submission.job_id)
         schedule_retry()
         return
     except ParseFailed as exc:

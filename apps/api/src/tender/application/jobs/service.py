@@ -25,6 +25,6 @@ class JobService:
         found, status = self.repository.cancel(job_id)
         if not found:
             raise NotFound("任务不存在")
-        if status != "canceled":
+        if status not in {"canceled", "canceling"}:
             raise Conflict(f"任务已处于终态：{status}", code="job_not_cancelable")
         return self.payload(job_id)

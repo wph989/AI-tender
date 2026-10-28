@@ -3,7 +3,10 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
+
 from tender.application.documents.parsing import ParseService
+from tender.application.knowledge.service import KnowledgeService
 from tender.config.schema import document_execution_snapshot, resolve_values
 from tender.ports.configuration.registry import ActiveConfig
 
@@ -48,3 +51,36 @@ def test_default_runtime_snapshot_is_independent_of_later_defaults():
     second = document_execution_snapshot(None)
     second["job.timeout.parse_minutes"] = 0
     assert first["job.timeout.parse_minutes"] > 0
+
+
+@pytest.mark.parametrize("suffix,stage", [("pdf", "probing"), ("docx", "converting")])
+@pytest.mark.parametrize("configured", [True, False])
+def test_first_source_processing_uses_active_parse_options(suffix, stage, configured):
+    created = []
+    values = resolve_values({"mineru.tier": "advanced", "mineru.ocr_mode": "ocr"})
+    active = ActiveConfig(1, 1, {}, values) if configured else None
+
+    @contextmanager
+    def transaction():
+        yield SimpleNamespace(
+            lock_source=lambda *_: None,
+            inflight_source_job=lambda *_: False,
+            snapshot_for_job=lambda current: 7 if current is active else None,
+            insert_job=created.append,
+        )
+
+    store = SimpleNamespace(
+        source_for_processing=lambda *_: {
+            "id": 2, "project_id": 1, "version_id": None,
+            "display_name": "资料." + suffix, "role": "main",
+        },
+        mark_source_parseable=lambda *_: None,
+        transaction=transaction,
+    )
+    service = KnowledgeService(store, 1, SimpleNamespace(active=lambda _: active), None, None)
+    service.process_source(2)
+    snapshot = created[0]["config_snapshot"]
+    assert created[0]["stage"] == stage
+    assert snapshot["tier"] == ("advanced" if configured else "standard")
+    assert snapshot["ocr_mode"] == ("ocr" if configured else "auto")
+    assert snapshot["execution"] == document_execution_snapshot(values if configured else None)

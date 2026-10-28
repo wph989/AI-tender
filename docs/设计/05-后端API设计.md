@@ -244,6 +244,12 @@ POST /api/v1/versions/{vid}/reparse 重新生成解析批次，沿用或显式�
 历史任务对用户没有意义；真需要历史时应走任务列表，而不是把版本详情撑成日志。
 ## 4. SSE 进度
 
+`POST /api/v1/jobs/{job_id}/cancel` 返回当前任务状态。尚未执行的 `pending` 任务立即进入 `canceled`；已开始的任务先进入非终态 `canceling`，`finished_at` 保持为空，重复取消幂等。已经完成或失败的任务返回 409。
+
+`canceling` 期间仍占用当前阶段的在途配额，并阻止同版本或知识来源重复解析。本地转换退出后收尾；已提交的远端解析继续轮询到终态或确认任务不存在，再在同一事务内将 Job 和活动 ParseRun 标为 `canceled`。取消后的轮询不下载解析成果，也不因远端任务丢失而重新提交。提交结果不明时保留占用并提示 `parse_submission_unknown`，需人工核对远端任务后处理，不能把取消请求当作远端已经停止。
+
+SSE 对 `canceling` 发送 `progress`，最终进入 `canceled` 才发送 `done` 并关闭连接；客户端应继续按终态判断结束等待。
+
 ```
 GET /api/v1/jobs/job_01HXZ8Q3/events
 Accept: text/event-stream
