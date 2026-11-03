@@ -9,6 +9,7 @@ class AnalysisState(TypedDict, total=False):
     staged_items: list[dict[str, Any]]
     staged_relations: list[dict[str, Any]]
     staged_items_verified: bool
+    staged_prompt_ids: list[str]
     pending_final: dict[str, Any]
     draft: dict[str, Any]
     business_previous: dict[str, Any]
@@ -54,6 +55,8 @@ class AnalysisTransitions:
                 "business_coverage": [],
                 "business_gaps": [],
                 "staged_items_verified": True,
+                # 新证据重建成果后必须重新展示，不能因 ID 相同漏掉改写过的条目。
+                "staged_prompt_ids": [],
             }
         )
 

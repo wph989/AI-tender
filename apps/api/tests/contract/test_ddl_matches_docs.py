@@ -59,6 +59,12 @@ class _MigrationSpec:
 
 _MIGRATIONS: tuple[_MigrationSpec, ...] = (
     _MigrationSpec(
+        "0018_analysis_partial.py",
+        (("设计/16-DeepAgents标书分析运行时.md", 2),),
+        require_tables=False,
+        require_indexes=False,
+    ),
+    _MigrationSpec(
         "0017_document_recovery.py",
         (("设计/03-数据模型与溯源设计.md", 7),),
         require_tables=False,

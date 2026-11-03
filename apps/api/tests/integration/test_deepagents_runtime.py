@@ -24,6 +24,7 @@ from tender.api.projects import routes as projects
 from tender.api.shared.errors import ApiProblem
 from tender.application.analysis import execution as worker
 from tender.application.analysis import runtime as agent_runtime
+from tender.application.analysis.agent import VerificationUnavailable
 from tender.application.analysis.skills import MODULES, skill_snapshot
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
@@ -172,6 +173,35 @@ def prepared_runtimes(env, count: int = 1):
     return [agent_runtime.AgentRuntime(env.db, row, run, sources) for run in runs[:count]]
 
 
+def publishable_state(module_key: str) -> dict:
+    """构造一条已核实、一条未核实的暂存成果，验证 partial 只发布前者。"""
+    ref = {
+        "block_id": "s1r1c0", "quote": "质保三年", "source_id": 1, "project_id": 1,
+        "page_no": 1, "file_name": "fixture.pdf", "bbox": [0, 0, 1, 1],
+    }
+
+    def entry(record_id, key, title, text, verification):
+        business = {
+            "id": record_id, "key": key, "kind": "requirement",
+            "scope": {"kind": "common", "lot_refs": []}, "module_key": module_key,
+            "title": title, "text": text, "structuring": "complete",
+            "citations": [dict(ref)],
+        }
+        return {
+            "id": record_id, "field": title, "group": "", "sort_order": 0,
+            "values": [{"value": text, "citations": [dict(ref)]}], "note": "",
+            "business": business, "verification": verification,
+        }
+
+    return {
+        "staged_items": [
+            entry("keep", "warranty", "质保期限", "质保三年", "supported"),
+            entry("drop", "delivery", "交货期", "交货期30日", "pending"),
+        ],
+        "staged_items_verified": True,
+    }
+
+
 def test_hard_quota_across_reports_and_no_lease_theft(env):
     first, second, third = [prepared_runtime(env) for _ in range(3)]
     try:
@@ -189,6 +219,79 @@ def test_hard_quota_across_reports_and_no_lease_theft(env):
     finally:
         for runtime in (first, second, third):
             runtime.release()
+
+
+def test_claim_backoff_does_not_starve_later_modules(env, monkeypatch):
+    """配额占满时等待模块退避轮询，仍能依次领取，权限复核不随轮询次数增长。"""
+
+    class Model:
+        async def aclose(self):
+            pass
+
+    class CountingRuntime(agent_runtime.AgentRuntime):
+        claims = 0
+        checks = 0
+
+        def claim(self):
+            type(self).claims += 1
+            return super().claim()
+
+        def check_access(self):
+            type(self).checks += 1
+            return super().check_access()
+
+    prepared = prepared_runtimes(env, 3)
+    # 执行器按运行账里的 module_key 建模型；JOIN 回读模块键，与恢复流程测试一致。
+    runs = env.db.rows(
+        """SELECT a.*,m.module_key FROM agent_module_run a
+        JOIN analysis_module m ON m.id=a.module_id
+        WHERE m.report_id=:id ORDER BY a.id LIMIT 3""",
+        {"id": prepared[0].report["id"]},
+    )
+    runtimes = [
+        agent_runtime.AgentRuntime(env.db, prepared[0].report, run, prepared[0].sources)
+        for run in runs
+    ]
+    resolved = env.db.resolved_config
+    monkeypatch.setattr(
+        env.db, "resolved_config", lambda: resolved() | {"analysis.max_inflight": 1}
+    )
+    monkeypatch.setattr(worker, "AgentRuntime", CountingRuntime)
+    monkeypatch.setattr(env.executor, "model_factory", lambda *a, **kw: Model())
+    monkeypatch.setattr(worker, "build_module_agent", lambda **kwargs: (kwargs["key"], {}))
+
+    async def invoke(graph, files, *, state=None, **kwargs):
+        # 每个模块占用配额片刻，后两个必然经历等待与退避轮询。
+        await asyncio.sleep(0.2)
+        state["draft"] = {"fields": [], "relations": [], "business_data": {}}
+
+    monkeypatch.setattr(worker, "invoke_module", invoke)
+
+    async def execute_all():
+        await asyncio.gather(*[
+            env.executor.execute_module(runtime.report, runtime.run, runtime.sources)
+            for runtime in runtimes
+        ])
+
+    run_async(execute_all())
+    ids = {runtime.run["id"] for runtime in runtimes}
+    rows = [
+        row
+        for row in env.db.rows(
+            """SELECT r.id,r.status AS run_status,m.status AS module_status
+            FROM agent_module_run r JOIN analysis_module m ON m.id=r.module_id
+            WHERE m.report_id=:report""",
+            {"report": runtimes[0].report["id"]},
+        )
+        if row["id"] in ids
+    ]
+    assert len(rows) == 3
+    assert all(row["run_status"] == "completed" for row in rows)
+    assert all(row["module_status"] == "completed" for row in rows)
+    # 后两个模块至少各有一次未领取成功的轮询，说明确实等待过而不是一次就抢到。
+    assert CountingRuntime.claims > 3
+    # 等待短于 30 秒时只有领取前的一次权限复核，没有逐轮查询。
+    assert CountingRuntime.checks == 3
 
 
 def test_resume_preserves_budget_evidence_and_deadline(env):
@@ -617,6 +720,90 @@ def test_canceled_report_retries_failed_and_canceled_modules(env):
     assert analysis_api.get_report(report_id, env.request)["status"] == "pending"
 
 
+def test_partial_finish_publishes_only_supported_items(env):
+    """校验不可用时模块以 partial 收尾，未核实条目绝不随已核实成果一起发布。"""
+    runtime = prepared_runtime(env)
+    assert runtime.claim()
+    module_key = next(iter(MODULES))
+    runtime.finish("partial", "校验服务不可用", state=publishable_state(module_key))
+    runtime.release()
+    module = env.db.rows(
+        "SELECT * FROM analysis_module WHERE id=:id", {"id": runtime.run["module_id"]}
+    )[0]
+    assert module["status"] == "partial"
+    assert module["error_message"] == "校验服务不可用"
+    run = env.db.rows(
+        "SELECT status FROM agent_module_run WHERE id=:id", {"id": runtime.run["id"]}
+    )[0]
+    assert run["status"] == "partial"
+    assert [item["record_id"] for item in module["items"]] == ["keep"]
+    records = module["business_data"]["records"]
+    assert [record["id"] for record in records] == ["keep"]
+    assert all(record["verification"] == "supported" for record in records)
+
+
+def test_partial_report_retry_selects_partial_modules(env):
+    """空 module_keys 补跑只选部分完成/失败模块；partial 已发布成果保留。"""
+    runtime = prepared_runtime(env)
+    assert runtime.claim()
+    module_key = next(iter(MODULES))
+    runtime.finish("partial", "校验服务不可用", state=publishable_state(module_key))
+    runtime.release()
+    report_id = runtime.report["id"]
+    env.db.execute(
+        "UPDATE analysis_report SET status='partial' WHERE id=:id", {"id": report_id}
+    )
+    result = analysis_api.retry_report(report_id, analysis_api.RetryInput(), env.request)
+    assert result["status"] == "pending"
+    rows = env.db.rows(
+        """SELECT m.id,a.attempt FROM analysis_module m JOIN agent_module_run a
+        ON a.module_id=m.id AND a.attempt=(
+            SELECT max(attempt) FROM agent_module_run WHERE module_id=m.id)
+        WHERE m.report_id=:id ORDER BY m.id""",
+        {"id": report_id},
+    )
+    assert [row["id"] for row in rows if row["attempt"] == 2] == [runtime.run["module_id"]]
+
+
+def test_report_with_all_partial_modules_is_partial(env, monkeypatch):
+    """全部模块只有已核实成果时报告是 partial，快照为未完成模块登记缺口。"""
+
+    class Model:
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(env.executor, "model_factory", lambda *a, **kw: Model())
+    monkeypatch.setattr(
+        worker, "build_module_agent", lambda **kwargs: (kwargs["key"], {}),
+    )
+
+    async def invoke(graph, files, *, state=None, **kwargs):
+        state.update(publishable_state(graph))
+        raise VerificationUnavailable("校验服务不可用")
+
+    monkeypatch.setattr(worker, "invoke_module", invoke)
+    row = report(env)
+    run_async(env.executor.analyze_report(row))
+
+    result = analysis_api.get_report(row["id"], env.request)
+    assert result["status"] == "partial"
+    assert len(result["modules"]) == 13
+    assert all(module["status"] == "partial" for module in result["modules"])
+    assert all(
+        [item["record_id"] for item in module["items"]] == ["keep"]
+        for module in result["modules"]
+    )
+    snapshot = env.db.rows(
+        "SELECT data FROM analysis_data_snapshot WHERE report_id=:id", {"id": row["id"]}
+    )[0]["data"]
+    incomplete = [gap for gap in snapshot["gaps"] if gap["code"] == "module_incomplete"]
+    assert {gap["module_key"] for gap in incomplete} == {
+        module["module_key"] for module in result["modules"]
+    }
+    # 未核实条目既不能进入模块结果，也不能混进业务数据集。
+    assert "drop" not in json.dumps(snapshot, ensure_ascii=False)
+
+
 def test_cancel_without_worker_closes_queued_and_orphaned_modules(env):
     runtime = prepared_runtime(env)
     report_id = runtime.report["id"]
@@ -718,7 +905,8 @@ def test_cancel_interrupts_active_module_and_releases_quota(env, monkeypatch):
             canceled = await asyncio.to_thread(
                 analysis_api.cancel_report, runtime.report["id"], env.request)
             assert canceled["canceling"]
-            await asyncio.wait_for(task, 5)
+            # 心跳每 15 秒一次，取消最晚在下一次心跳被发现；留出收尾余量。
+            await asyncio.wait_for(task, 20)
             assert stopped.is_set()
         finally:
             if not task.done():

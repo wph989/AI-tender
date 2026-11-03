@@ -3,12 +3,51 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from hashlib import sha256
 
 from tender.application.analysis.data import semantic_payload
 from tender.application.analysis.output import output_schema
 from tender.application.knowledge.content import CATEGORIES, fingerprint, normalized
+
+
+# 完整 Skill 只在首轮、阶段切换和上下文压缩后注入；其余轮次只保留关键小节。
+def _skill_section(content: str, heading: str) -> str:
+    match = re.search(rf"^{re.escape(heading)}\s*$(.*?)(?=^## |\Z)", content, re.M | re.S)
+    if match is None:
+        return ""
+    body = match.group(1).strip()
+    return heading + "\n" + body if body else ""
+
+
+def skill_digest(content: str, *, schema: dict | None, topics: list[dict]) -> str:
+    """从 Skill 正文提取执行流程与检索输出规则，附带输出键和主题清单。
+
+    提取不到足够小节时返回空串，由调用方回退完整 instructions；宁可多注入，
+    也不能让摘要轮次丢掉引用、校验或收尾要求。
+    """
+    flow = _skill_section(content, "## 执行流程") or _skill_section(content, "## 工作方法")
+    retrieval = _skill_section(content, "## 本项目的检索与输出")
+    if not flow or not retrieval:
+        return ""
+    parts = [flow, retrieval]
+    if schema:
+        keys = "；".join(
+            str(section.get("title", "")) + "（"
+            + "、".join(str(column) for column in section.get("columns", [])) + "）"
+            for section in schema.get("sections", [])
+            if section.get("title")
+        )
+        if keys:
+            parts.append("输出分类与内容键（完整schema见提交工具）：" + keys)
+    if topics:
+        parts.append(
+            "必须登记的主题："
+            + "、".join(str(topic.get("title") or topic.get("key")) for topic in topics)
+        )
+    digest = "\n\n".join(parts)
+    return digest if len(digest) >= 200 else ""
 
 
 def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = ()) -> dict:
@@ -45,12 +84,26 @@ def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = (
     for reference in references:
         instructions += "\n\n" + resources[reference]
     coverage_path = key + "/references/coverage.json"
+    topics: list[dict] = []
     if coverage_path in resources:
         instructions += "\n\n必须登记状态的主题（coverage.json）：\n" + resources[coverage_path]
+        try:
+            parsed = json.loads(resources[coverage_path])
+        except ValueError:
+            parsed = None
+        topics = parsed if isinstance(parsed, list) else []
+    try:
+        schema = output_schema(snapshot, key)
+    except ValueError:
+        # 输出声明的完整性由构建入口统一校验；摘要不能因此提前改变错误路径。
+        schema = None
+    prompt_digest = skill_digest(content, schema=schema, topics=topics)
     return {
         "path": "/skills/" + key.replace("_", "-") + "/SKILL.md",
         "sha256": digest.hexdigest(),
         "instructions": instructions,
+        # 提取失败时回退完整正文，保证摘要轮次不会缺少关键规则。
+        "digest": prompt_digest or instructions,
         "references": references,
     }
 
@@ -97,7 +150,12 @@ def correction_count(state: dict, entry: dict) -> int:
 def progress_signature(
     seen: dict, state: dict, *, verified_only: bool = True, research_events: Sequence[dict] = (),
 ) -> str:
-    """新检索、新原文及核实成果算进展；同一检索的重放和草稿改名不能续命。"""
+    """只有新增证据块、新增核实成果或阶段推进才算进展。
+
+    换检索词、修好上一项校验问题都不产生可发布成果，不能用来续命；
+    同一检索的重放和草稿改名同样不改变签名。``research_events`` 仅为兼容既有调用保留，
+    不再参与指纹；签名格式已由旧版升级，旧检查点首次恢复会自然把无进展计数归零一次。
+    """
     facts = sorted(
         {
             fingerprint([value.get("value"), value.get("citations"), business_claim(entry)])
@@ -106,14 +164,7 @@ def progress_signature(
             for value in entry.get("values", [])
         }
     )
-    searches = sorted({
-        fingerprint([e.get("scope"), normalized(e["query"]), e.get("source_ids", [])])
-        for e in research_events if e["action"] == "search_result"
-    })
-    return fingerprint([
-        sorted(seen), facts, bool(state.get("research_completed")), searches,
-        state.get("research_validation_issues", []),
-    ])
+    return fingerprint([sorted(seen), facts, bool(state.get("research_completed"))])
 
 
 def tool_key(name: str, arguments: dict) -> str:

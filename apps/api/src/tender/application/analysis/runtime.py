@@ -30,11 +30,15 @@ def limits_snapshot(db: ReportRepository) -> dict:
     )
 
 
+def check_report_status(db: ReportRepository, report: dict) -> None:
+    """只查报告是否仍可执行；取消检测走轻量主键查询，资料权限另行完整复核。"""
+    if db.accessible_report_status(report["id"]) not in {"waiting", "pending", "running"}:
+        raise InterruptedError("报告已取消或不再执行")
+
+
 def check_report_access(db: ReportRepository, report: dict, sources: list[dict]) -> None:
     """报告可执行性与资料权限的复核；权限变化要立刻中断，不能等到下一个检查点。"""
-    status = db.accessible_report_status(report["id"])
-    if status not in {"waiting", "pending", "running"}:
-        raise InterruptedError("报告已取消或不再执行")
+    check_report_status(db, report)
     allowed = db.collections_for_project(report["project_id"])
     if any(s["collection_id"] not in allowed for s in sources):
         raise PermissionError("知识库关联已撤销，停止使用原会话中的资料")
@@ -71,16 +75,25 @@ class AgentRuntime:
     def event(self, kind: str, detail: dict | None = None) -> None:
         self.store.event(kind, detail)
 
-    def claim(self) -> bool:
+    def check_access(self) -> None:
+        """报告状态与资料权限复核；等待配额与心跳按间隔调用，不能逐轮查询。"""
         check_report_access(self.db, self.report, self.sources)
+
+    def claim(self) -> bool:
+        # 实现自身会在取槽事务里锁定报告状态并判断配额；权限复核由等待循环节流执行。
         return self.store.claim()
 
     def guard(self) -> None:
         check_report_access(self.db, self.report, self.sources)
         self.store.guard()
 
-    def heartbeat(self) -> None:
-        check_report_access(self.db, self.report, self.sources)
+    def heartbeat(self, full_check: bool = True) -> None:
+        # 存储层心跳每次都校验所有权、租约与模块时限；完整资料权限按调用方间隔复核，
+        # 其余心跳只做一次轻量报告状态查询，保证取消在 15 秒心跳内被发现。
+        if full_check:
+            check_report_access(self.db, self.report, self.sources)
+        else:
+            check_report_status(self.db, self.report)
         self.store.heartbeat()
 
     def reserve(self, kind: str) -> None:
@@ -95,14 +108,23 @@ class AgentRuntime:
         self.guard()
         self.store.save(state, publish=self._staged_payload(state))
 
-    def finish(self, status: str, error: str | None = None, draft: dict | None = None) -> None:
-        if status == "completed":
+    def finish(
+        self,
+        status: str,
+        error: str | None = None,
+        draft: dict | None = None,
+        *,
+        state: dict | None = None,
+    ) -> None:
+        if status in {"completed", "partial"}:
+            # 部分发布同样要复核报告状态、所有权、租约与资料权限。
             self.guard()
-        publish = (
-            self._draft_payload(draft)
-            if status == "completed" and draft is not None
-            else None
-        )
+        if status == "completed" and draft is not None:
+            publish = self._draft_payload(draft)
+        elif status == "partial":
+            publish = self._staged_payload(state or {}, include_relations=True)
+        else:
+            publish = None
         self.store.finish(status, error, publish=publish)
 
     def abandon(self, status: str, error: str | None = None) -> None:
@@ -121,11 +143,11 @@ class AgentRuntime:
         }
 
     @staticmethod
-    def _staged_payload(state: dict) -> dict | None:
+    def _staged_payload(state: dict, *, include_relations: bool = False) -> dict | None:
         """未完成也保存已核实字段的展示投影；未通过校验时不发布。"""
         if not state.get("staged_items_verified"):
             return None
-        return {
+        payload = {
             "items": display_items(
                 [
                     item
@@ -135,3 +157,7 @@ class AgentRuntime:
             ),
             "business": module_data(state),
         }
+        if include_relations:
+            # 部分发布只带已通过支持性校验的关系；未审关系不能随暂存成果外泄。
+            payload["relations"] = state.get("staged_relations") or []
+        return payload

@@ -47,6 +47,17 @@ class AgentLimits:
     max_identical_tool_calls: int = 3
     max_validation_failures: int = 3
     max_subagent_retries: int = 2
+    # 参数/来源/证据额度错误可自纠正；达到上限只收窄工具，不终止模块。
+    max_argument_failures: int = 6
+    max_evidence_budget_failures: int = 2
+    # 供应商不可用时在同一 thread/attempt 内的有界恢复次数。
+    max_model_recoveries: int = 2
+    # 同一查询最多翻 5 页；候选窗口按页大小成倍缓存，避免改写同义词续命。
+    max_search_pages: int = 5
+
+
+# 已检索候选按查询缓存，供 offset 翻页复用；进程内有效，不写入检查点。
+SEARCH_CACHE_ENTRIES = 8
 
 
 @dataclass
@@ -63,6 +74,8 @@ class ResearchSession:
     expand: Expand | None = None
     # 问答保留原协议；专题解析在构图时开启，避免把位置和检索分数交给分析模型。
     compact_results: bool = False
+    # 专题解析的候选缓存：同一查询按 offset 翻页时不再重复 embedding/重排/DB 查询。
+    _search_cache: dict[tuple, tuple[list[dict], dict]] = field(default_factory=dict, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def _begin(self, action: str, arguments: dict) -> None:
@@ -181,31 +194,87 @@ class ResearchSession:
             for s in self.sources
         ]
 
-    async def search(self, query: str, scope: str, source_id: int | None = None) -> dict:
+    async def search(
+        self, query: str, scope: str, source_id: int | None = None, offset: int = 0
+    ) -> dict:
         if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:
             raise ToolArgumentError("检索问题须为1到500个字符")
-        await self._begin("search_" + scope, {"query": query, "source_id": source_id})
+        if type(offset) is not int or offset < 0:
+            raise ToolArgumentError("检索分页偏移须为非负整数")
+        # 专题使用运行快照里的数量上限；问答沿用原协议，避免串改其它消费入口。
+        page_size = self.limits.max_search_results if self.compact_results else 12
+        if self.compact_results and offset >= page_size * self.limits.max_search_pages:
+            # 翻页上限属于可纠正的调用方式错误：不消耗工具或证据预算，也不终止模块。
+            return {
+                "blocks": [],
+                "already_read": [],
+                "page": {
+                    "offset": offset,
+                    "limit": page_size,
+                    "next_offset": None,
+                    "has_more": False,
+                },
+                "search_hint": (
+                    f"同一查询最多翻{self.limits.max_search_pages}页；"
+                    "请按未覆盖子主题拆分检索、限定 source_id 或登记缺口，"
+                    "不要继续翻同一查询。"
+                ),
+            }
+        arguments = {"query": query, "source_id": source_id}
+        if self.compact_results:
+            arguments["offset"] = offset
+        await self._begin("search_" + scope, arguments)
         sources = self._sources(scope, source_id)
         if not sources:
             return {"blocks": [], "already_read": [], "warning": "当前没有关联参考资料"}
-        rows, info = await self.retrieve(sources, query.strip())
-        # 专题使用运行快照里的数量上限；问答沿用原协议，避免串改其它消费入口。
-        result_limit = self.limits.max_search_results if self.compact_results else 12
-        search_limited = bool(info.get("search_limited")) or len(rows) > result_limit
-        rows = rows[:result_limit]
         relations: list[dict] = []
+        has_more = False
+        if self.compact_results:
+            cache_key = (
+                scope,
+                normalized(query.strip()),
+                source_id,
+                tuple(sorted(s["source_id"] for s in sources)),
+            )
+            cached = self._search_cache.get(cache_key)
+            if cached is None:
+                retrieved, info = await self.retrieve(sources, query.strip())
+                # 一次取回候选窗口，后续 offset 从缓存切片，不再重复 embedding/重排/查库。
+                window = page_size * self.limits.max_search_pages
+                candidates = [dict(row) for row in retrieved[:window]]
+                info = dict(info) | {
+                    "candidate_limited": bool(info.get("search_limited"))
+                    or len(retrieved) > len(candidates)
+                }
+                info.pop("search_limited", None)
+                cached = (candidates, info)
+                self._search_cache[cache_key] = cached
+                if len(self._search_cache) > SEARCH_CACHE_ENTRIES:
+                    self._search_cache.pop(next(iter(self._search_cache)))
+            candidates, info = cached
+            rows = candidates[offset:offset + page_size]
+            # 即使本页因去重变少也按原始页大小推进游标，避免翻页卡死。
+            has_more = offset + page_size < len(candidates)
+        else:
+            retrieved, info = await self.retrieve(sources, query.strip())
+            search_limited = bool(info.get("search_limited")) or len(retrieved) > page_size
+            rows = retrieved[:page_size]
+        expanded_limited = False
         if self.expand:
             # 扩展必须处于同一次检索工具内，让 Agent 真正读到关联原文；范围仍是本次所选资料。
             rows, relations = await self.expand(sources, rows)
+            if self.compact_results and len(rows) > page_size:
+                expanded_limited = True
         selected_sources = {s["source_id"] for s in sources}
         if any(r["source_id"] not in selected_sources for r in rows):
             raise PermissionError("检索返回了所选范围以外的资料，不能将参考资料混入本项目")
         if self.compact_results:
             # 扩展也不能绕过专题单次输出上限；未返回的关系证据不会登记进证据账。
-            search_limited = search_limited or len(rows) > result_limit
-            rows = rows[:result_limit]
+            rows = rows[:page_size]
+            search_limited = bool(info.get("candidate_limited")) or expanded_limited
         # 查询等待期间可能撤销关联，结果进入模型上下文前再次检查。
         await self.authorize()
+        seen_before = set(self.seen)
         async with self._lock:
             result = self._remember(rows, deduplicate=True)
             # 超预算未进入证据账的块不能通过关系引文旁路进入上下文。
@@ -215,23 +284,42 @@ class ResearchSession:
                 if link.get("citations")
                 and all(str(ref.get("block_id")) in self.seen for ref in link["citations"])
             ]
-        if self.expand and not self.compact_results:
+        page = None
+        next_offset = offset + page_size if has_more else None
+        if self.compact_results:
+            page = {
+                "offset": offset,
+                "limit": page_size,
+                "next_offset": next_offset,
+                "has_more": has_more,
+            }
+            result["page"] = page
+            if search_limited:
+                # 只说明检索窗口未覆盖全部匹配，不把未读原文或检索分数传给模型。
+                # 提示不会替代证据预算警告，也不强制模型把所有相似片段变成业务结果。
+                result.update(
+                    search_limited=True,
+                    search_hint="本次检索的候选窗口已到末尾或扩展结果被截断，仍可能有未返回内容；"
+                    "请按未覆盖子主题拆分查询、限定 source_id，或登记未读缺口。",
+                )
+            elif has_more:
+                result["search_hint"] = (
+                    "同一查询仍有下一页：请用 offset=next_offset 继续读取本查询；"
+                    "不要改写查询词重复检索，也不要把当前页当作全部命中。"
+                )
+            elif not rows and offset:
+                result["search_hint"] = (
+                    "该查询已无更多候选，请拆分主题、限定 source_id 或改用其它查询。"
+                )
+            elif not rows and info.get("mode") == "keyword":
+                # 关键词回退按组合词的命中比例过滤；长查询空命中不能证明单个主题没有条款。
+                # 仅对真正空召回提示，已读证据去重后的空 blocks 仍是成功命中。
+                result["search_hint"] = (
+                    "本次使用关键词检索且未命中，组合查询中的多个词会共同参与匹配；"
+                    "请改用单一核心概念或原文中的短语，按子主题分别检索。未命中不等于原文未约定。"
+                )
+        elif self.expand:
             result["relations"] = relations
-        if self.compact_results and search_limited:
-            # 只说明检索窗口未覆盖全部匹配，不把未读原文或检索分数传给模型。
-            # 提示不会替代证据预算警告，也不强制模型把所有相似片段变成业务结果。
-            result.update(
-                search_limited=True,
-                search_hint="本次仍有匹配内容未返回，请按未覆盖子主题或限定 source_id 继续检索；"
-                "重复同一查询不会翻页，不能仅凭当前返回数量认定主题已穷尽。",
-            )
-        elif self.compact_results and not rows and info.get("mode") == "keyword":
-            # 关键词回退按组合词的命中比例过滤；长查询空命中不能证明单个主题没有条款。
-            # 仅对真正空召回提示，已读证据去重后的空 blocks 仍是成功命中。
-            result["search_hint"] = (
-                "本次使用关键词检索且未命中，组合查询中的多个词会共同参与匹配；"
-                "请改用单一核心概念或原文中的短语，按子主题分别检索。未命中不等于原文未约定。"
-            )
         self.events.append(
             {
                 "action": "search_result",
@@ -241,9 +329,19 @@ class ResearchSession:
                 "block_ids": [
                     b["id" if self.compact_results else "block_id"] for b in result["blocks"]
                 ],
-                **info,
+                **{k: v for k, v in info.items() if k != "candidate_limited"},
                 "search_limited": search_limited,
                 "relations": relations,
+                **(
+                    {
+                        "offset": offset,
+                        "next_offset": next_offset,
+                        "has_more": has_more,
+                        "new_evidence": len(set(self.seen) - seen_before),
+                    }
+                    if self.compact_results
+                    else {}
+                ),
             }
         )
         return result if self.compact_results else result | {"retrieval": info}

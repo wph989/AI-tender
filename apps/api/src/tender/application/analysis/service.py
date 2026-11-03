@@ -549,6 +549,13 @@ class AnalysisService:
                         "correction_failures",
                         "tool_failures",
                         "consecutive_tool_failures",
+                        "research_failure_patterns",
+                        "argument_failures",
+                        "argument_failure_rounds",
+                        "evidence_budget_failures",
+                        "failure_policy_version",
+                        "verification_degraded",
+                        "model_unavailable_retries",
                         "identical_tool_calls",
                         "read_tool_cache",
                         "progress_message_id",
@@ -556,6 +563,12 @@ class AnalysisService:
                         "no_progress_rounds",
                         "finish_only",
                         "subagent_retries",
+                        # 新 attempt 重新注入完整 Skill 与成果摘要，不继承旧提示状态。
+                        "skill_prompt_phase",
+                        "skill_prompt_mode",
+                        "skill_full_summary_id",
+                        "handoff_reference_signature",
+                        "staged_prompt_ids",
                     ):
                         carry.pop(key, None)
                     carry.pop("pending_final", None)

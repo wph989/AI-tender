@@ -137,3 +137,12 @@ INSERT INTO config_item (key,layer,value_type,default_value,description,requires
 ```sql
 ALTER TABLE llm_provider ADD COLUMN rate_limited_until TIMESTAMPTZ;
 ```
+
+0018放宽运行终态，允许校验网关不可用时部分发布已核实成果：
+
+```sql
+ALTER TABLE agent_module_run DROP CONSTRAINT agent_module_run_status_check,
+    ADD CONSTRAINT agent_module_run_status_check CHECK (
+        status IN ('pending','running','completed','failed','canceled','partial')
+    );
+```

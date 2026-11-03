@@ -1416,7 +1416,10 @@ class KnowledgeSession:
             .with_for_update()
         )
         if not explicit:
-            statement = statement.where(AnalysisModule.status.in_(("failed", "canceled")))
+            # 部分完成的模块仍有未核实主题，补跑时与失败模块一样需要重跑。
+            statement = statement.where(
+                AnalysisModule.status.in_(("failed", "canceled", "partial"))
+            )
         return [dict(row) for row in self._connection().execute(statement).mappings().all()]
 
     def report_has_modules(self, report_id: int) -> bool:

@@ -148,6 +148,9 @@ def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cau
 ):
     class Runtime:
         def __init__(self, *args):
+            self.run = {}
+
+        def check_access(self):
             pass
 
         def claim(self):

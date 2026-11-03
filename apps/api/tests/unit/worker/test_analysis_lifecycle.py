@@ -44,6 +44,9 @@ def test_cleanup_failure_stops_controller_and_releases_waiters(
         def __init__(self, db, report, module, sources):
             self.run_id = module["id"]
 
+        def check_access(self):
+            pass
+
         def claim(self):
             if self.run_id == 930:
                 raise RuntimeError("成果写入失败")

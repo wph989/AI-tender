@@ -84,8 +84,9 @@ def test_repeated_topic_descriptions_merge_and_missing_topics_become_gaps():
 
 
 @pytest.mark.parametrize("empty", [True, False])
-def test_five_distinct_topic_searches_can_finish_without_new_evidence(empty):
-    topics = [{"key": f"topic-{i}", "title": f"主题{i}"} for i in range(5)]
+def test_distinct_topic_searches_without_new_evidence_do_not_reset_progress(empty):
+    # 换检索词不是进展（C5）：空召回第3轮进入收尾后只收窄工具，登记主题后仍能完成。
+    topics = [{"key": f"topic-{i}", "title": f"主题{i}"} for i in range(3)]
     checkpoints = [topic(
         "searched_not_found" if empty else "covered", topic=t["key"],
         queries=[t["title"]],
@@ -107,10 +108,12 @@ def test_five_distinct_topic_searches_can_finish_without_new_evidence(empty):
         research=session([] if empty else [block()]),
         snapshot=SKILL | {KEY + "/references/coverage.json": json.dumps(topics)},
     ))
-    assert not state.get("finish_only")
-    assert len([e for e in state["research"]["events"] if e["action"] == "search_result"]) == 5
-    assert len(state["draft"]["business_data"]["gaps"]) == (5 if empty else 0)
-    assert "主题4" in str(router.requests[-1][0])
+    searches = [e for e in state["research"]["events"] if e["action"] == "search_result"]
+    # 三个不同检索词都不产生新证据时进入 finish_only；有首条证据时计数被重置。
+    assert len(searches) == 3
+    assert bool(state.get("finish_only")) is empty
+    assert len(state["draft"]["business_data"]["gaps"]) == (3 if empty else 0)
+    assert "主题2" in str(router.requests[-1][0])
 
 
 def test_different_checkpoint_errors_do_not_share_three_failure_limit():

@@ -53,23 +53,24 @@ def test_dimension_collects_all_evidence_before_synthesizing_independent_records
         # 输出限制来自真实工具 schema，不能仅靠提示词劝模型不要生成大数组。
         tool = next(t for t in router.requests[-1][1]
                     if t["function"]["name"] == "submit_analysis")
-        assert tool["function"]["parameters"]["properties"]["records"]["maxItems"] == 1
+        assert tool["function"]["parameters"]["properties"]["records"]["maxItems"] == 3
 
     asyncio.run(run())
 
 
 def test_large_submission_is_rejected_without_losing_saved_result():
-    first, second = summary_record(), summary_record(key="second")
+    first = summary_record()
+    batch = [first] + [summary_record(key=f"extra-{index}") for index in range(3)]
     state, saved, _ = asyncio.run(execute([
         *research_calls(),
         call("submit_analysis", submission([first], final=False), "first"),
-        call("submit_analysis", submission([first, second]), "large"),
-        call("submit_analysis", submission([second], final=False), "second"),
+        call("submit_analysis", submission(batch), "large"),
+        call("submit_analysis", submission([summary_record(key="second")], final=False), "second"),
         call("submit_analysis", {"records": [], "final": True}, "finish"),
     ]))
     rejected = next(s for s in saved if "call_large" in s.get("tool_results", {}))
     assert len(rejected["staged_items"]) == 1
-    assert "最多一条" in rejected["tool_results"]["call_large"]["data"]["content"]
+    assert "最多三条" in rejected["tool_results"]["call_large"]["data"]["content"]
     assert len(state["draft"]["business_data"]["records"]) == 2
 
 

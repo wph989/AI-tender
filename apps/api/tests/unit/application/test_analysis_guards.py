@@ -359,25 +359,53 @@ def test_finish_mode_before_first_search_keeps_required_project_search_available
     asyncio.run(run())
 
 
-def test_success_in_other_tool_does_not_reset_failing_tool_counter():
+def test_semantic_checkpoint_failures_keep_three_strike_limit_across_other_success():
+    """参数错误改走可纠正账；真正的语义失败仍保留三次终止线，成功调用不能重置。"""
     async def run():
+        invalid_reference = {
+            "topic": "质保", "from_block_id": "missing-block",
+            "target": "第5章", "status": "missing",
+        }
         router = ScriptedRouter(
             [
-                call("read_document", {"block_id": "missing-1"}, 1),
-                call("list_documents", {}, 2),
-                call("read_document", {"block_id": "missing-2"}, 3),
-                call("list_documents", {}, 4),
-                call("read_document", {"block_id": "missing-3"}, 5),
+                call("search_document", {"query": "质保"}, 1),
+                call("complete_research", research_done(references=[invalid_reference]), 2),
+                call("list_documents", {}, 3),
+                call("complete_research", research_done(references=[invalid_reference]), 4),
+                call("list_documents", {}, 5),
+                call("complete_research", research_done(references=[invalid_reference]), 6),
             ]
         )
         state = {}
         graph, files = build(router, session([block()]), state)
         with pytest.raises(ValueError, match="工具连续失败"):
             await invoke_module(graph, files, thread_id="tool-failures", task="分析")
-        feedback = json.loads(state["tool_results"]["call_5"]["data"]["content"])
+        feedback = json.loads(state["tool_results"]["call_6"]["data"]["content"])
         assert feedback["remaining_attempts"] == 0
-        assert feedback["tool"] == "read_document"
-        assert state["tool_failures"]["read_document"] == 3
+        assert feedback["tool"] == "complete_research"
+        assert state["tool_failures"]["complete_research"] == 3
+
+    asyncio.run(run())
+
+
+def test_repeated_argument_errors_correct_businessly_without_terminating_module():
+    """未知证据ID属于可自纠正参数错误；多次出现只收窄工具，不终止整个模块。"""
+    async def run():
+        router = ScriptedRouter(
+            [
+                *[call("read_document", {"block_id": f"missing-{n}"}, n) for n in range(1, 5)],
+                *research_calls(),
+                call("read_document", {"block_id": "s1r1c0", "before": 0, "after": 0}, 20),
+                call("submit_analysis", submission([summary_record()]), 21),
+            ]
+        )
+        state = {}
+        research = session([block()])
+        graph, files = build(router, research, state)
+        await invoke_module(graph, files, thread_id="argument-recovery", task="分析")
+        assert "draft" in state
+        assert state["argument_failures"] == 4
+        assert not state.get("tool_failures", {}).get("read_document")
 
     asyncio.run(run())
 

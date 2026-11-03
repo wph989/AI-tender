@@ -459,8 +459,8 @@ class AgentRunStore:
                 .where(AnalysisReport.id == self.report["id"])
                 .with_for_update()
             ).scalar_one_or_none()
-            if status == "completed" and report_status != "running":
-                # 与取消 API 串行提交；取消已落库后不能再发布刚完成的模块结果。
+            if status in {"completed", "partial"} and report_status != "running":
+                # 与取消 API 串行提交；取消已落库后不能再发布刚完成或部分完成的模块结果。
                 status, should_publish, error = "canceled", False, "报告已停止，未发布模块结果"
             row = conn.execute(
                 select(AgentModuleRun.id)
@@ -473,7 +473,7 @@ class AgentRunStore:
             ).first()
             if row is None:
                 return
-            if status == "completed" and should_publish:
+            if status in {"completed", "partial"} and should_publish:
                 # 成果在 savepoint 内发布：业务库缺少 business_data 等新列时只回滚成果，
                 # 运行终态照常提交。否则异常会连 UPDATE agent_module_run 一起回滚，留下
                 # lease 已过期却永远 status='running' 的僵尸，把该报告后面的模块全部饿死。

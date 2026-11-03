@@ -112,7 +112,7 @@ def test_tool_schema_requires_content_and_has_no_legacy_submission_fields():
         params = tools["submit_analysis"]["parameters"]
         assert params["required"] == ["records"]
         assert "fields" not in params["properties"] and "outline_nodes" not in params["properties"]
-        assert params["properties"]["records"]["maxItems"] == 1
+        assert params["properties"]["records"]["maxItems"] == 3
         assert "content" in json.dumps(params)
 
     asyncio.run(run())

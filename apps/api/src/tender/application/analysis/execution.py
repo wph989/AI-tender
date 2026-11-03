@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import random
 import time
 import traceback
 from collections.abc import Callable
@@ -14,6 +15,7 @@ from typing import Any
 
 from tender.application.analysis.agent import (
     RoutedAgentModel,
+    VerificationUnavailable,
     build_module_agent,
     invoke_module,
     validate_project_claims,
@@ -27,11 +29,73 @@ from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
 from tender.core.error_details import error_detail
 from tender.core.logging import bind_context, get_logger
+from tender.domain.shared.errors import ModelUnavailable
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.llm.rerank import RerankModel
 from tender.ports.repository.analysis.reports import ReportRepository
 
 logger = get_logger(__name__)
+
+# 租约 45 秒：心跳取三分之一，每两次心跳（30 秒）做一次完整权限复核。
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+FULL_ACCESS_HEARTBEATS = 2
+# 等待配额时权限检查与等待事件都按约 30 秒节流，避免 13 个模块逐秒打满权限查询。
+CLAIM_ACCESS_CHECK_SECONDS = 30.0
+CLAIM_WAIT_EVENT_SECONDS = 30.0
+
+
+def next_claim_delay(attempt: int, random_value: float) -> float:
+    """等待配额的下一次轮询间隔：1 秒起步、指数增长、封顶 8 秒，并带 0.5—1.0 抖动。
+
+    抖动避免 13 个模块在同一时刻一起抢锁；领取成功后调用方把轮次归零，恢复 1 秒起步。
+    """
+    base = min(1.0 * 2 ** (max(1, attempt) - 1), 8.0)
+    jitter = 0.5 + 0.5 * min(max(random_value, 0.0), 1.0)
+    return base * jitter
+
+
+async def wait_for_claim(runtime: AgentRuntime) -> None:
+    """等待配额领取运行；退避轮询，权限复核与等待事件按 30 秒节流。
+
+    领取前复核一次报告与资料权限；之后不再逐轮查询，避免 13 个模块以 1 秒间隔
+    打满权限查询。``store.claim`` 自身会在取槽事务里锁定报告状态并判断配额。
+    """
+    await asyncio.to_thread(runtime.check_access)
+    attempt = 0
+    waited = 0.0
+    checked = 0.0
+    notified = False
+    while True:
+        deadline = runtime.run.get("deadline_at")
+        if deadline is not None and deadline <= datetime.now(UTC):
+            raise TimeoutError("模块总时长预算已耗尽，恢复不会重置时限")
+        if await asyncio.to_thread(runtime.claim):
+            return
+        attempt += 1
+        delay = next_claim_delay(attempt, random.random())
+        if waited >= CLAIM_WAIT_EVENT_SECONDS and not notified:
+            notified = True
+            # 只写一条等待事件，不逐轮刷库；等待变长说明配额确实被占满。
+            await asyncio.to_thread(
+                runtime.event,
+                "claim_wait",
+                {"seconds": int(waited), "rounds": attempt - 1},
+            )
+        await asyncio.sleep(delay)
+        waited += delay
+        if waited - checked >= CLAIM_ACCESS_CHECK_SECONDS:
+            checked = waited
+            await asyncio.to_thread(runtime.check_access)
+
+
+def model_recovery_delay(attempt: int, remaining_seconds: float) -> float | None:
+    """同一线程内模型不可用的退避；剩余时限不够等待时直接放弃，不睡到超时。
+
+    指数退避 5 秒、15 秒，封顶 30 秒。恢复次数由 ``AgentLimits.max_model_recoveries``
+    控制；这里只决定下一次等待多久，不改变路由自身的有限重试。
+    """
+    delay = min(5.0 * 3 ** (max(1, attempt) - 1), 30.0)
+    return delay if remaining_seconds > delay else None
 
 
 def prepare_report(db: ReportRepository, report: dict) -> tuple[dict, list[dict]] | None:
@@ -142,7 +206,8 @@ def summarize(modules: list[dict]) -> list[dict]:
     """只合并等价的字段断言；不按上传时间裁决冲突，不同结论各自保留。"""
     grouped = {}
     for module in modules:
-        if module["status"] != "completed":
+        # 部分完成的模块只含已核实条目，同样进入报告摘要并标注来源。
+        if module["status"] not in {"completed", "partial"}:
             continue
         for item in module["items"]:
             key = (
@@ -204,8 +269,7 @@ class AnalysisExecutor:
         started = time.monotonic()
         try:
             logger.info("module.queued")
-            while not await asyncio.to_thread(runtime.claim):
-                await asyncio.sleep(1)
+            await wait_for_claim(runtime)
 
             async def authorize():
                 await asyncio.to_thread(runtime.guard)
@@ -229,7 +293,8 @@ class AnalysisExecutor:
                     self.rerank_gateway,
                     embedding_timeout=15,
                     min_similarity=limits.similarity_threshold,
-                    max_results=limits.max_search_results,
+                    # 一次取回候选窗口供同一查询分页，避免改同义词反复检索。
+                    max_results=max(30, limits.max_search_results),
                 )
 
             async def read(source):
@@ -331,6 +396,7 @@ class AnalysisExecutor:
                             - runtime.run["tool_calls"],
                         },
                         review_support=review_support,
+                        event=runtime.event,
                         # 项目和标段品类可能不同，首次推理前加载全部已明确品类的细则。
                         categories=[
                             report["category"],
@@ -341,30 +407,67 @@ class AnalysisExecutor:
                             ],
                         ],
                     )
-                    await invoke_module(
-                        graph,
-                        files,
-                        thread_id=runtime.run["thread_id"],
-                        state=state,
-                        save=save,
-                        max_retries=limits.max_subagent_retries,
-                        # 每轮可能包含检索、模型、工具和摘要节点，步数随预算增长而非固定卡在256。
-                        recursion_limit=max(
-                            256, 4 * (limits.max_model_calls + limits.max_tool_calls)
-                        ),
-                        task=(
-                            f"分析模块：{MODULES[module['module_key']]}。项目设置："
-                            + encode(
-                                {
-                                    "category": report["category"],
-                                    "topics": report["topics"],
-                                    "lots": report["lot_settings"],
-                                }
+                    attempts = 0
+                    while True:
+                        try:
+                            await invoke_module(
+                                graph,
+                                files,
+                                thread_id=runtime.run["thread_id"],
+                                state=state,
+                                save=save,
+                                max_retries=limits.max_subagent_retries,
+                                # 每轮含检索、模型、工具和摘要节点，步数随预算增长而非固定256。
+                                recursion_limit=max(
+                                    256, 4 * (limits.max_model_calls + limits.max_tool_calls)
+                                ),
+                                task=(
+                                    f"分析模块：{MODULES[module['module_key']]}。项目设置："
+                                    + encode(
+                                        {
+                                            "category": report["category"],
+                                            "topics": report["topics"],
+                                            "lots": report["lot_settings"],
+                                        }
+                                    )
+                                    + "。运行时已加载当前Skill，先列出资料，"
+                                    "自主检索本模块条件并核对补充文件。"
+                                ),
                             )
-                            + "。运行时已加载当前Skill，先列出资料，"
-                            "自主检索本模块条件并核对补充文件。"
-                        ),
-                    )
+                            break
+                        except ModelUnavailable as exc:
+                            # 路由自身的有限重试已经结束；按检查点在同一 thread/attempt 内恢复，
+                            # 不修改 invoke_module 的重试元组，避免与路由重试次数相乘。
+                            if attempts >= limits.max_model_recoveries:
+                                raise
+                            remaining = (
+                                runtime.run["deadline_at"] - datetime.now(UTC)
+                            ).total_seconds()
+                            delay = model_recovery_delay(attempts + 1, remaining)
+                            if delay is None:
+                                raise
+                            attempts += 1
+                            # 计数先落库，恢复过程再失败时补跑仍能看到已用掉的恢复次数。
+                            state["model_unavailable_retries"] = attempts
+                            await save(state)
+                            await asyncio.to_thread(
+                                runtime.event,
+                                "model_unavailable_recovery",
+                                {
+                                    "attempt": attempts,
+                                    "delay_seconds": round(delay, 1),
+                                    "deadline_remaining": int(remaining),
+                                    "error": error_detail(str(exc)),
+                                },
+                            )
+                            logger.warning(
+                                "module.model_recovery",
+                                attempt=attempts,
+                                delay_seconds=round(delay, 1),
+                                deadline_remaining=int(remaining),
+                                error=error_detail(str(exc)),
+                            )
+                            await asyncio.sleep(delay)
                 await authorize()
                 if "draft" not in state:
                     raise ValueError("子 Agent 结束但没有提交通过校验的分析")
@@ -383,11 +486,19 @@ class AnalysisExecutor:
                 )
 
             task = asyncio.create_task(work())
+            heartbeats = 0
             while not task.done():
-                await asyncio.wait({task}, timeout=1)
+                await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SECONDS)
                 if not task.done():
-                    await asyncio.to_thread(runtime.heartbeat)
+                    heartbeats += 1
+                    # 两次心跳做一次完整撤权/取消复核；其余心跳只续租并校验所有权与时限。
+                    await asyncio.to_thread(
+                        runtime.heartbeat, heartbeats % FULL_ACCESS_HEARTBEATS == 0
+                    )
             await task
+        except (VerificationUnavailable, ModelUnavailable) as exc:
+            # 校验网关或模型恢复不可用不等于分析无成果：只发布已核实条目。
+            await self._settle_incomplete(runtime, state, task, started, exc)
         except (Exception, asyncio.CancelledError) as exc:
             if task and not task.done():
                 task.cancel()
@@ -427,6 +538,50 @@ class AnalysisExecutor:
                 # SDK关闭异常也必须释放配额，否则一个失败模块会永久堵住其它报告。
                 await asyncio.to_thread(runtime.release)
 
+    async def _settle_incomplete(
+        self,
+        runtime: AgentRuntime,
+        state: dict,
+        task: asyncio.Task | None,
+        started: float,
+        exc: Exception,
+    ) -> None:
+        """模型或校验不可用时收尾：有已核实成果才是 partial，否则明确失败。"""
+        reason = str(exc)
+        if task and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        supported = sum(
+            entry.get("verification") == "supported"
+            for entry in state.get("staged_items", [])
+        )
+        if supported:
+            await asyncio.to_thread(runtime.finish, "partial", reason[:1000], state=state)
+            await asyncio.to_thread(
+                runtime.event,
+                "partial_publish",
+                {"item_count": supported, "reason_type": type(exc).__name__},
+            )
+            logger.warning(
+                "module.partial",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                saved_item_count=supported,
+                pending_count=state.get("verification_degraded", {}).get("pending_count"),
+                gap_count=len(state.get("business_gaps", [])),
+                reason=error_detail(reason),
+            )
+        else:
+            await asyncio.to_thread(runtime.abandon, "failed", reason[:1000])
+            logger.error(
+                "module.fail",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                saved_item_count=0,
+                reason=error_detail(reason),
+                # 业务异常已脱敏；不串联原始 SDK 原因，避免回显请求或凭证。
+                exception="".join(traceback.format_exception(exc, chain=False)),
+            )
+
     async def analyze_report(self, report: dict) -> None:
         with bind_context(report_id=report["id"]):
             await self._analyze_report(report)
@@ -461,16 +616,17 @@ class AnalysisExecutor:
                 await asyncio.to_thread(db.renew_report_lease, report["id"], 300, status="running")
             await asyncio.gather(*tasks)
             rows = db.report_modules(report["id"])
+            # 部分完成的模块仍有已核实成果，属于可用模块；完全没有可用成果才算失败。
+            usable = any(r["status"] in {"completed", "partial"} for r in rows)
             partial = report["coverage"].get("partial") or any(
                 r["status"] != "completed" for r in rows
             )
-            completed = any(r["status"] == "completed" for r in rows)
-            status = "failed" if not completed else "partial" if partial else "completed"
+            status = "failed" if not usable else "partial" if partial else "completed"
             db.finish_report(
                 report["id"],
                 status=status,
                 summary=summarize(rows),
-                error="没有模块完成，请查看各模块错误并补跑" if not completed else None,
+                error="没有模块完成，请查看各模块错误并补跑" if not usable else None,
             )
             log = logger.info if status == "completed" else logger.warning
             log(
@@ -478,6 +634,7 @@ class AnalysisExecutor:
                 status=status,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 completed_modules=sum(r["status"] == "completed" for r in rows),
+                partial_modules=sum(r["status"] == "partial" for r in rows),
                 module_count=len(rows),
             )
         except (Exception, asyncio.CancelledError) as exc:
