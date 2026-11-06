@@ -118,6 +118,32 @@ def test_tool_schema_requires_content_and_has_no_legacy_submission_fields():
     asyncio.run(run())
 
 
+def test_last_nonempty_batch_finishes_after_verification_with_legacy_frozen_skill():
+    async def run():
+        reviewed = []
+
+        async def review(items):
+            reviewed.append(copy.deepcopy(items))
+            await accept(items)
+
+        legacy_rule = "全部事项处理后用空 records 和 final=true 收尾"
+        snapshot = SKILL | {KEY + "/SKILL.md": SKILL[KEY + "/SKILL.md"] + "\n" + legacy_rule}
+        state, saved, router = await execute([
+            *research_calls(),
+            call("submit_analysis", submission([summary_record()]), "last-batch"),
+        ], snapshot=snapshot, review=review)
+        assert len(router.requests) == 4  # 列资料、检索、登记、最后一批；没有额外空提交轮次。
+        assert len(reviewed) == 1 and len(reviewed[0]) == 1
+        assert len(state["draft"]["business_data"]["records"]) == 1
+        assert all(item["verification"] == "supported" for item in state["draft"]["fields"])
+        assert any(s.get("draft") for s in saved)
+        system = "\n".join(str(m["data"]["content"]) for m in router.requests[-1][0]
+                           if m["type"] == "system")
+        assert system.index(legacy_rule) < system.index("运行时提交规则：最后一批")
+
+    asyncio.run(run())
+
+
 def test_early_submission_is_rejected_then_full_research_can_finish():
     state, saved, router = asyncio.run(
         execute(

@@ -9,6 +9,7 @@ import pytest
 from tender.application.analysis.execution import (
     FULL_ACCESS_HEARTBEATS,
     HEARTBEAT_INTERVAL_SECONDS,
+    model_recovery_delay,
     next_claim_delay,
     wait_for_claim,
 )
@@ -39,6 +40,18 @@ def test_claim_backoff_resets_after_success():
     assert waited[:4] == [0.5, 1.0, 2.0, 4.0] and waited[-1] == 4.0
     # 领取成功后调用方把轮次归零；下一次等待重新从 1 秒档开始。
     assert next_claim_delay(1, 0.0) == 0.5
+
+
+@pytest.mark.parametrize("attempt", [1025, 100_000_000])
+def test_long_wait_backoff_caps_before_integer_to_float_conversion(attempt):
+    assert next_claim_delay(attempt, 1.0) == 8.0
+    assert next_claim_delay(attempt, 0.0) == 4.0
+    assert model_recovery_delay(attempt, 31.0) == 30.0
+    assert model_recovery_delay(attempt, 30.0) is None
+
+
+def test_model_recovery_backoff_keeps_existing_intervals():
+    assert [model_recovery_delay(n, 31.0) for n in range(1, 5)] == [5.0, 15.0, 30.0, 30.0]
 
 
 def test_heartbeat_interval_is_three_times_less_than_lease():
@@ -152,3 +165,19 @@ def test_wait_for_claim_stops_when_module_deadline_passed():
         asyncio.run(wait_for_claim(runtime))
     assert runtime.claims == 0
     assert runtime.checks == 1
+
+
+def test_wait_for_claim_can_acquire_after_over_a_thousand_waits(monkeypatch):
+    delays = []
+
+    async def sleep(seconds):
+        delays.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    monkeypatch.setattr(random, "random", lambda: 1.0)
+    runtime = _WaitingRuntime(failures=1100)
+    asyncio.run(wait_for_claim(runtime))
+    assert runtime.claims == 1101
+    assert len(delays) == 1100 and max(delays) == 8.0
+    assert len(runtime.events) == 1
+    assert 1 < runtime.checks < 300

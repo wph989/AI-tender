@@ -1,12 +1,16 @@
 """综合期提示预算：完整 Skill 只在关键轮次注入，成果摘要按增量下发。"""
 
 import asyncio
+from types import SimpleNamespace
 
+import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 from synthesis_fixtures import noop
+from test_analysis_guards import build
 from test_analysis_research import block, session
-from test_deep_analysis import KEY
+from test_deep_analysis import KEY, ScriptedRouter
 
+from tender.application.analysis import agent
 from tender.application.analysis.agent import ResearchMiddleware
 from tender.application.analysis.policy import load_module_skill
 from tender.application.analysis.skills import skill_snapshot
@@ -182,3 +186,65 @@ def test_digest_fallback_uses_full_skill_when_sections_missing():
     system_prompt(research, state, loaded)
     second = system_prompt(research, state, loaded)
     assert "只写领域知识" in second
+
+
+@pytest.mark.parametrize("duration,remaining,closing", [(300, 1200, True), (2, 301, False)])
+def test_measured_model_time_reserves_closing_rounds_after_restore(
+    monkeypatch, duration, remaining, closing,
+):
+    async def run():
+        clock = [0.0]
+        monkeypatch.setattr(agent, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        research, state = session([block()]), {}
+        # 使用真实构图初始化专题状态，避免把证据数量或自报覆盖当作完成标志。
+        build(ScriptedRouter([]), research, state)
+        await research.search("质保", "project")
+        first = ResearchMiddleware(research, state, noop, noop)
+        response = object()
+
+        async def handler(request):
+            clock[0] += duration
+            return response
+
+        assert await first.awrap_model_call(FakeRequest(), handler) is response
+        assert state["model_round_seconds"] == duration
+        # 重新创建中间件模拟恢复，统计来自应用状态而非进程内计时器。
+        restored = ResearchMiddleware(
+            research, state, noop, noop,
+            budget_status=lambda: {"seconds_remaining": remaining, "finish_reserve_seconds": 300},
+        )
+        captured = []
+
+        async def capture(request):
+            captured.append(request)
+
+        tools = [{"type": "function", "function": {"name": name}} for name in
+                 ("search_document", "read_document", "complete_research", "submit_analysis")]
+        await restored.awrap_model_call(FakeRequest(tools=tools), capture)
+        names = [t["function"]["name"] for t in captured[0].tools]
+        assert names == (
+            ["complete_research"] if closing else [t["function"]["name"] for t in tools]
+        )
+        if closing:
+            assert "unresolved/missing" in captured[0].system_message.text
+        assert "draft" not in state and not state.get("research_completed")
+
+    asyncio.run(run())
+
+
+def test_failed_model_request_does_not_update_measured_round_time(monkeypatch):
+    async def run():
+        clock = [0.0]
+        monkeypatch.setattr(agent, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        state = {"model_round_seconds": 30.0}
+        middleware = ResearchMiddleware(session([block()]), state, noop, noop)
+
+        async def fail(request):
+            clock[0] += 600
+            raise ConnectionError("模型不可用")
+
+        with pytest.raises(ConnectionError):
+            await middleware.awrap_model_call(FakeRequest(), fail)
+        assert state["model_round_seconds"] == 30.0
+
+    asyncio.run(run())

@@ -49,7 +49,8 @@ def next_claim_delay(attempt: int, random_value: float) -> float:
 
     抖动避免 13 个模块在同一时刻一起抢锁；领取成功后调用方把轮次归零，恢复 1 秒起步。
     """
-    base = min(1.0 * 2 ** (max(1, attempt) - 1), 8.0)
+    # 必须先限制指数；长队列可能等待上千轮，先乘浮点数再封顶仍会溢出。
+    base = 2.0 ** min(max(1, attempt) - 1, 3)
     jitter = 0.5 + 0.5 * min(max(random_value, 0.0), 1.0)
     return base * jitter
 
@@ -94,7 +95,7 @@ def model_recovery_delay(attempt: int, remaining_seconds: float) -> float | None
     指数退避 5 秒、15 秒，封顶 30 秒。恢复次数由 ``AgentLimits.max_model_recoveries``
     控制；这里只决定下一次等待多久，不改变路由自身的有限重试。
     """
-    delay = min(5.0 * 3 ** (max(1, attempt) - 1), 30.0)
+    delay = min(5.0 * 3 ** min(max(1, attempt) - 1, 2), 30.0)
     return delay if remaining_seconds > delay else None
 
 

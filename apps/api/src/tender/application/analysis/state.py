@@ -4,6 +4,7 @@ from typing import Any, Literal, TypedDict, cast
 
 
 class AnalysisState(TypedDict, total=False):
+    model_round_seconds: float
     research_completed: dict[str, Any]
     research: dict[str, Any]
     staged_items: list[dict[str, Any]]

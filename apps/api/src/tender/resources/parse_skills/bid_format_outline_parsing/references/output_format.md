@@ -19,7 +19,7 @@
 完成本专题检索和 complete_research 后调用 submit_analysis，每次 records 最多三条完整事项，final=false。
 记录 key 稳定，纠正同一事项沿用原 key。content 仅填当前分类的中文键，缺少依据的键省略；多条并列要求用字符串数组。
 同一事项可以综合多处原文，citations 分别填写已读 block_id 和连续 quote；不要填写服务端生成的页码、坐标、text 或 evidence_ids。
-不能用无依据的“未提及/无”占位。所有事项完成后以 records=[]、final=true 收尾，未决事项留在 coverage/gaps。
+不能用无依据的“未提及/无”占位。最后一批可携带 records、final=true，通过校验即收尾；仅确认收尾时可用 records=[]，未决事项留在 coverage/gaps。
 通用 scope、conditions、materials、scoring 等结构以运行时工具 schema 为准，填写后同样接受原文校验。
 
 ## JSON 示例
@@ -27,7 +27,7 @@
 以下是模拟原文块与工具提交样例，名称、数值及证据ID仅用于说明，不能用于实际项目。
 每个 JSON 容器的 blocks 表示检索/补读已返回的原文；submissions 是按顺序调用 submit_analysis 的参数，不是一次提交的大数组。
 样例假定已按 coverage.json 完成主题检索和转引登记并调用 complete_research；实际仍须记录未决主题。
-正文由 content 承载，citations 独立溯源；最后一次空 records、final=true 明确收尾。
+正文由 content 承载，citations 独立溯源；最后一批可携带 records、final=true，通过校验即收尾，无需另发空提交。
 
 ## 保留四层目录与独立附件
 
