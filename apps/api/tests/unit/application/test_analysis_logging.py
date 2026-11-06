@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from dataclasses import replace
 from unittest.mock import Mock
 
@@ -16,6 +17,7 @@ from test_llm_routing import _candidate, _ScriptedGateway
 from tender.application.analysis import execution as deep_analysis
 from tender.application.llm.routing import RoutingModel
 from tender.core.logging import bind_context, get_context, get_logger
+from tender.core.logging.formatters import make_formatter
 from tender.domain.shared.errors import ModelUnavailable
 
 
@@ -88,6 +90,7 @@ def test_real_agent_logs_tool_parameters_once_with_research_synthesis_and_verifi
     assert state["draft"]["fields"]
     events = [log["event"] for log in logs]
     assert "skill.load" in events
+    assert all(log["log_level"] == "info" for log in logs if log["event"] == "skill.load")
     assert "review.start" in events and "review.end" in events
     phases = {log.get("agent_phase") for log in logs}
     assert {"research", "synthesis", "verification"} <= phases
@@ -161,6 +164,9 @@ def test_parallel_modules_keep_context_in_child_tasks_and_threads(monkeypatch, e
 def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cause(
     monkeypatch, executor,
 ):
+    # 多模型错误可能超过自动摘要的500字符，尾部的后备失败原因仍需在普通日志可见。
+    reason = "上游断连（已脱敏）：" + "连接错误详情；" * 90 + "后备模型余额不足（HTTP 403）"
+
     class Runtime:
         def __init__(self, *args):
             self.run = {}
@@ -170,7 +176,7 @@ def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cau
 
         def claim(self):
             cause = RuntimeError("raw-sdk-secret")
-            raise ModelUnavailable("上游断连（已脱敏）") from cause
+            raise ModelUnavailable(reason) from cause
 
         def abandon(self, status, error):
             assert status == "failed"
@@ -183,6 +189,14 @@ def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cau
         asyncio.run(executor.execute_module({"id": 18, "project_id": 15}, {"id": 99}, []))
     failure = next(log for log in logs if log["event"] == "module.fail")
     assert failure["project_id"] == 15 and failure["report_id"] == 18
+    assert "reason" not in failure
+    assert failure["error"] == reason
     assert "run_id" not in failure and "ModelUnavailable" in failure["exception"]
     assert "上游断连" in failure["exception"] and "claim" in failure["exception"]
     assert "raw-sdk-secret" not in json.dumps(logs, ensure_ascii=False)
+    entry = logging.makeLogRecord(failure | {
+        "msg": failure["event"], "levelno": logging.ERROR, "levelname": "ERROR",
+    })
+    payload = json.loads(make_formatter(json_output=True, include_exception=False).format(entry))
+    assert payload["error"] == reason and "reason" not in payload
+    assert "exception" not in payload

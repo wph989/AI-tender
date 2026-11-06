@@ -305,12 +305,12 @@ class AnalysisExecutor:
 
             state = runtime.run["state"]
             limits = AgentLimits(**runtime.run["limits"])
+            # 各专题共用报告来源，数量在 report.start 记录一次即可。
             logger.info(
                 "module.start",
                 resumed=module.get("started_at") is not None,
                 attempt=module.get("attempt"),
                 queue_ms=int((time.monotonic() - started) * 1000),
-                source_count=len(sources),
                 thread_id=runtime.run["thread_id"],
                 timeout_seconds=limits.timeout_seconds,
                 max_model_calls=limits.max_model_calls,
@@ -577,7 +577,8 @@ class AnalysisExecutor:
                 "module.fail",
                 duration_ms=int((time.monotonic() - started) * 1000),
                 saved_item_count=0,
-                reason=error_detail(reason),
+                # 显式保留脱敏原因，避免仅依赖500字符异常摘要丢失后备模型的错误。
+                error=error_detail(reason),
                 # 业务异常已脱敏；不串联原始 SDK 原因，避免回显请求或凭证。
                 exception="".join(traceback.format_exception(exc, chain=False)),
             )

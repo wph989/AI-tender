@@ -92,11 +92,12 @@ def make_formatter(
             # 其他 handler 可能先格式化同一 LogRecord；这些缓存会被 ExtraAdder 重复带入。
             event.pop("message", None)
             event.pop("asctime", None)
+        # 只缩短展示名称，保留 WARNING 级别供日志过滤和错误文件分流使用。
         event.update(
             timestamp=datetime.fromtimestamp(record.created, _BEIJING).isoformat(
                 timespec="milliseconds"
             ),
-            level=record.levelname.lower(),
+            level="warn" if record.levelno == logging.WARNING else record.levelname.lower(),
         )
         # 访问摘要可指定接口定义处；其余日志使用实际调用行，而非 logger 的名称。
         event.setdefault("location", format_location(record.pathname, record.lineno))
@@ -110,6 +111,15 @@ def make_formatter(
             "skill_path", "sha256",
         ):
             event.pop(key, None)
+        # 只省略事件已表达的核验阶段和约定的默认值，模型调用阶段及其他 False 仍有意义。
+        name = event.get("event")
+        if name in ("review.start", "review.end", "review.fail", "record.reject"):
+            if event.get("agent_phase") == "verification":
+                event.pop("agent_phase")
+        if name == "module.start" and event.get("resumed") is False:
+            event.pop("resumed")
+        if name == "review.end" and event.get("needs_correction") is False:
+            event.pop("needs_correction")
         if not include_exception and (trace := event.pop("exception", None)):
             # 普通日志只显示错误摘要；完整堆栈由同目录的文本错误文件承载。
             lines = str(trace).rstrip().splitlines()

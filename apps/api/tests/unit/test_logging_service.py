@@ -415,6 +415,7 @@ def test_log_order_and_error_text_file_keep_summaries_compact(options, monkeypat
         "a_flag", "z_count",
     ]
     assert logs[0]["a_flag"] is False and logs[0]["z_count"] == 0
+    assert logs[-1]["level"] == "warn"
     assert "exception" not in logs[-1] and "RuntimeError" in logs[-1]["error"]
     assert [json.loads(line) for line in output.getvalue().splitlines()] == logs
     files = [path for path in (options.directory / "worker").iterdir()
@@ -422,6 +423,7 @@ def test_log_order_and_error_text_file_keep_summaries_compact(options, monkeypat
     assert len(files) == 2 and all(path.is_file() for path in files)
     details = read_errors(options.directory)
     assert details.startswith(logs[-1]["timestamp"])
+    assert "[warn" in details
     assert "\nTraceback (most recent call last):\n" in details
     assert "project_id=15" in details and "report_id=18" in details
     assert all(key not in details for key in internal)
@@ -908,7 +910,7 @@ def test_access_logs_sample_successes_but_keep_errors_and_request_context(
     assert [log["status_code"] for log in summaries[6:]] == [
         400, 400, 404, 404, 429, 429, 500, 500, 503, 503, 500, 500,
     ]
-    assert all(log["level"] == "warning" for log in summaries[6:12])
+    assert all(log["level"] == "warn" for log in summaries[6:12])
     assert all(log["level"] == "error" for log in summaries[12:])
     assert len([log for log in logs if log["event"] == "poll_business_event"]) == 31
     assert read_errors(options.directory).count("Traceback (most recent call last)") == 2
@@ -1283,7 +1285,7 @@ def test_periodic_dispatch_is_quiet_but_keeps_warnings_failures_and_retries(
         assert all(log["level"] == "debug" for log in successful_lifecycle)
     assert any(
         log["event"] == "dispatch_probe_warning" and log.get("project_id") == 15
-        and "task_name" not in log and log["level"] == "warning"
+        and "task_name" not in log and log["level"] == "warn"
         for log in logs
     )
     assert any(
@@ -1296,7 +1298,7 @@ def test_periodic_dispatch_is_quiet_but_keeps_warnings_failures_and_retries(
         for log in logs
     )
     assert any(
-        log["event"] == "task.retry" and log.get("project_id") == 17 and log["level"] == "warning"
+        log["event"] == "task.retry" and log.get("project_id") == 17 and log["level"] == "warn"
         for log in logs
     )
     details = read_errors(options.directory)
