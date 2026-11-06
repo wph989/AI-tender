@@ -76,3 +76,13 @@ it("显示文案相同的未知标段缺口仍按原始范围区分", () => {
     scope: { kind: "unknown" as const, lot_refs: [ref], lot_ids: [] } }));
   expect(groupGaps(gaps).map((group) => group.gaps.length)).toEqual([1, 1]);
 });
+
+
+it("新增证据影响的旧核实事项保留正文并进入待核对筛选", () => {
+  const old = item("old", { review_status: "needs_review" });
+  const current = item("current", { review_status: "current" });
+  expect(needsAttention(old)).toBe(true);
+  expect(needsAttention(current)).toBe(false);
+  expect(filterResults([old, current], { query: "", scope: "", attention: true })
+    .map((entry) => entry.id)).toEqual(["old"]);
+});

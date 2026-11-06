@@ -122,6 +122,9 @@ class AnalysisService:
         rules = skill_snapshot()
         rules["__deep_contract__"] = CONTRACT
         rules["__analysis_data_version__"] = DATA_VERSION
+        from tender.application.analysis.topic_flow import FLOW_KEY, FLOW_VERSION
+
+        rules[FLOW_KEY] = FLOW_VERSION
         references = [
             source
             for source in self.store.sources(self.store.collections_for_project(project_id))
@@ -313,7 +316,17 @@ class AnalysisService:
             "records": records,
             "evidence": evidence,
             "output_schema": output_schema(report["skill_snapshot"], module_key),
+            **({"progress": business["progress"]} if business.get("progress")
+               and self.progress_accessible(report, allowed) else {}),
         }
+
+    def progress_accessible(self, report: dict, allowed: list[int]) -> bool:
+        # 待办和核对说明也可能包含资料内容，与原文一样校验冻结身份及当前授权。
+        live = {s["source_id"]: s for s in self.store.sources(allowed)}
+        return all(s["source_id"] in live and all(
+            s.get(k) == live[s["source_id"]].get(k)
+            for k in ("collection_id", "version_id", "parse_run_id")
+        ) for s in report["source_snapshot"] + report["reference_snapshot"])
 
     def get_analysis_data(
         self,
@@ -573,9 +586,24 @@ class AnalysisService:
                         "skill_full_summary_id",
                         "handoff_reference_signature",
                         "staged_prompt_ids",
+                        "topic_skill_prompted",
+                        "topic_summary_id",
+                        "topic_final_requested",
+                        "topic_budget_exhausted",
                     ):
                         carry.pop(key, None)
                     carry.pop("pending_final", None)
+                    if carry.get("topic_flow"):
+                        # 显式补跑是新运行：重新打开受阻待办，独立查漏次数按本次预算计算。
+                        carry["topic_flow"]["audit"] = {"round": 0, "results": {}}
+                        carry["business_gaps"] = [g for g in carry.get("business_gaps", [])
+                                                  if g["key"] != "execution:incomplete"]
+                        for entry in carry["topic_flow"]["entries"].values():
+                            if entry["status"] == "blocked":
+                                entry.update(status="researching", requested_status="researching")
+                            for task in entry["tasks"].values():
+                                if task["status"] == "blocked":
+                                    task["status"] = "pending"
                     try:
                         validate_project_claims(
                             carry.get("draft", {}).get("fields", carry.get("staged_items", [])),

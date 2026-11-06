@@ -20,16 +20,18 @@ from tender.application.analysis.agent import (
     invoke_module,
     validate_project_claims,
 )
+from tender.application.analysis.completeness import review_completeness
 from tender.application.analysis.data_store import publish_data_snapshot
 from tender.application.analysis.research import AgentLimits, ResearchSession
 from tender.application.analysis.runtime import AgentRuntime, check_report_access
 from tender.application.analysis.skills import MODULES, verify_items
+from tender.application.analysis.topic_flow import TopicIncomplete, enabled
 from tender.application.knowledge.content import encode, normalized, source_state
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
 from tender.core.error_details import error_detail
 from tender.core.logging import bind_context, get_logger
-from tender.domain.shared.errors import ModelUnavailable
+from tender.domain.shared.errors import BudgetExhausted, ModelBudgetExhausted, ModelUnavailable
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.llm.rerank import RerankModel
 from tender.ports.repository.analysis.reports import ReportRepository
@@ -373,6 +375,9 @@ class AnalysisExecutor:
                                     {k: resolved[key][k] for k in ("page_no", "file_name", "bbox")}
                                 )
 
+                async def review_coverage(payload):
+                    return await review_completeness(model, payload)
+
                 async with self.checkpoints() as saver:
                     graph, files = build_module_agent(
                         key=module["module_key"],
@@ -397,6 +402,8 @@ class AnalysisExecutor:
                             - runtime.run["tool_calls"],
                         },
                         review_support=review_support,
+                        review_coverage=review_coverage,
+                        lots=report["lot_settings"],
                         event=runtime.event,
                         # 项目和标段品类可能不同，首次推理前加载全部已明确品类的细则。
                         categories=[
@@ -497,10 +504,15 @@ class AnalysisExecutor:
                         runtime.heartbeat, heartbeats % FULL_ACCESS_HEARTBEATS == 0
                     )
             await task
-        except (VerificationUnavailable, ModelUnavailable) as exc:
+        except (VerificationUnavailable, ModelUnavailable, TopicIncomplete) as exc:
             # 校验网关或模型恢复不可用不等于分析无成果：只发布已核实条目。
             await self._settle_incomplete(runtime, state, task, started, exc)
         except (Exception, asyncio.CancelledError) as exc:
+            if isinstance(exc, (TimeoutError, ModelBudgetExhausted, BudgetExhausted)) and enabled(
+                report.get("skill_snapshot", {})
+            ):
+                await self._settle_incomplete(runtime, state, task, started, exc)
+                return
             if task and not task.done():
                 task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
@@ -553,10 +565,15 @@ class AnalysisExecutor:
             task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await task
-        supported = sum(
-            entry.get("verification") == "supported"
-            for entry in state.get("staged_items", [])
-        )
+        from tender.application.analysis.state import published_items
+
+        supported = len(published_items(state, final=bool(state.get("topic_flow"))))
+        if state.get("topic_flow"):
+            state["business_gaps"] = [*state.get("business_gaps", []), {
+                "key": "execution:incomplete", "topic": "运行收尾",
+                "scope": {"kind": "unknown", "lot_refs": []},
+                "code": "search_exhausted", "detail": reason[:2000],
+            }]
         if supported:
             await asyncio.to_thread(runtime.finish, "partial", reason[:1000], state=state)
             await asyncio.to_thread(
@@ -573,7 +590,10 @@ class AnalysisExecutor:
                 reason=error_detail(reason),
             )
         else:
-            await asyncio.to_thread(runtime.abandon, "failed", reason[:1000])
+            if state.get("topic_flow"):
+                await asyncio.to_thread(runtime.finish, "failed", reason[:1000], state=state)
+            else:
+                await asyncio.to_thread(runtime.abandon, "failed", reason[:1000])
             logger.error(
                 "module.fail",
                 duration_ms=int((time.monotonic() - started) * 1000),

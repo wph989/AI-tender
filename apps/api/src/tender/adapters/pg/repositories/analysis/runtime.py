@@ -315,6 +315,13 @@ class AgentRunStore:
                 conn.close()
 
     def guard(self) -> None:
+        if self._guard_execution() <= datetime.now(UTC):
+            raise TimeoutError("模块总时长预算已耗尽，恢复不会重置时限")
+
+    def guard_settlement(self) -> None:
+        self._guard_execution()
+
+    def _guard_execution(self) -> datetime:
         # 单独开短连接复核：锁连接随时可能被判定失效，不能拿它证明自己仍然合法。
         with self.engine.connect() as conn:
             deadline = conn.execute(
@@ -327,8 +334,7 @@ class AgentRunStore:
             ).scalar_one_or_none()
         if deadline is None:
             raise InterruptedError("模块租约或配额锁已失效")
-        if deadline <= datetime.now(UTC):
-            raise TimeoutError("模块总时长预算已耗尽，恢复不会重置时限")
+        return deadline
 
     def heartbeat(self) -> None:
         # 原连接断开时即使连接池能重连也不延续所有权，防止旧执行者越过 fencing。
@@ -368,7 +374,9 @@ class AgentRunStore:
             ).scalar_one_or_none()
             if used is None:
                 label = "模型请求" if kind == "model" else "工具调用"
-                raise ValueError(f"模块{label}预算已耗尽")
+                from tender.domain.shared.errors import BudgetExhausted
+
+                raise BudgetExhausted(f"模块{label}预算已耗尽")
             self.run[column] = used
             conn.execute(
                 insert(AgentRunEvent).values(
@@ -396,6 +404,12 @@ class AgentRunStore:
 
     def save(self, state: dict[str, Any], *, publish: dict[str, Any] | None = None) -> None:
         with self.engine.begin() as conn:
+            if state.get("topic_flow"):
+                status = conn.execute(select(AnalysisReport.status).where(
+                    AnalysisReport.id == self.report["id"]
+                ).with_for_update()).scalar_one_or_none()
+                if status != "running":
+                    raise InterruptedError("报告已停止，不能写入增量成果")
             previous = conn.execute(
                 select(AgentModuleRun.state)
                 .where(
@@ -450,16 +464,19 @@ class AgentRunStore:
         error: str | None = None,
         *,
         publish: dict[str, Any] | None = None,
+        state: dict[str, Any] | None = None,
     ) -> None:
         publish_error: Exception | None = None
         should_publish = publish is not None
+        topic_settlement = bool(state and state.get("topic_flow"))
         with self.engine.begin() as conn:
             report_status = conn.execute(
                 select(AnalysisReport.status)
                 .where(AnalysisReport.id == self.report["id"])
                 .with_for_update()
             ).scalar_one_or_none()
-            if status in {"completed", "partial"} and report_status != "running":
+            if (status in {"completed", "partial"} or topic_settlement
+                    ) and report_status != "running":
                 # 与取消 API 串行提交；取消已落库后不能再发布刚完成或部分完成的模块结果。
                 status, should_publish, error = "canceled", False, "报告已停止，未发布模块结果"
             row = conn.execute(
@@ -473,7 +490,17 @@ class AgentRunStore:
             ).first()
             if row is None:
                 return
-            if status in {"completed", "partial"} and should_publish:
+            if state is not None:
+                # 到期仅豁免时间，收尾事务仍复核租约和锁；与状态、展示投影一次提交。
+                valid = conn.execute(text("""SELECT 1 FROM agent_module_run a
+                    WHERE a.id=:id AND a.lease_until>now() AND EXISTS
+                    (SELECT 1 FROM pg_locks l WHERE l.locktype='advisory'
+                     AND l.classid=:ns AND l.objid=a.id AND l.objsubid=2 AND l.granted)"""),
+                    {"id": self.run["id"], "ns": QUOTA_NAMESPACE}).first()
+                if valid is None:
+                    raise InterruptedError("模块租约或配额锁已失效")
+            if should_publish and (status in {"completed", "partial"}
+                                   or topic_settlement and status == "failed"):
                 # 成果在 savepoint 内发布：业务库缺少 business_data 等新列时只回滚成果，
                 # 运行终态照常提交。否则异常会连 UPDATE agent_module_run 一起回滚，留下
                 # lease 已过期却永远 status='running' 的僵尸，把该报告后面的模块全部饿死。
@@ -494,6 +521,7 @@ class AgentRunStore:
                     error_message=error,
                     finished_at=func.now(),
                     lease_until=None,
+                    **({"state": state} if state is not None else {}),
                 )
             )
             conn.execute(

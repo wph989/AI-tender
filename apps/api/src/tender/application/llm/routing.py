@@ -15,6 +15,7 @@ from tender.core.error_details import error_detail
 from tender.core.logging import bind_context, get_logger
 from tender.domain.shared.errors import (
     InvalidModelOutput,
+    ModelBudgetExhausted,
     ModelCallFailed,
     ModelOutputTruncated,
     ModelRefused,
@@ -243,6 +244,7 @@ class RoutingModel:
         if self._remaining_seconds:
             duration = min(duration, self._remaining_seconds())
         deadline = time.monotonic() + duration
+        budget_error = ModelBudgetExhausted if self._remaining_seconds else ModelCallFailed
         request_count = candidate_count = 0
         first_error: TenderError | None = None
         unavailable_only = True
@@ -270,13 +272,13 @@ class RoutingModel:
             retry = 0
             while retry <= max(snapshot.extra_retries, 2):
                 if request_count >= self._max_total or time.monotonic() >= deadline:
-                    raise ModelCallFailed("模型调用已达到总请求次数或时间上限，请查看调用记录")
+                    raise budget_error("模型调用已达到总请求次数或时间上限，请查看调用记录")
                 delay = await self._remaining(snapshot)
                 if delay and await self._has_available(candidates[position + 1 :]):
                     break
                 while delay > 0:
                     if time.monotonic() + delay >= deadline:
-                        raise ModelCallFailed("模型调用时间预算不足以等待供应商限流恢复")
+                        raise budget_error("模型调用时间预算不足以等待供应商限流恢复")
                     # 短等待便于取消；跨worker新收到的429可以继续延长当前等待。
                     await asyncio.sleep(min(delay, 1))
                     delay = await self._remaining(snapshot)
@@ -386,7 +388,7 @@ class RoutingModel:
                         if time.monotonic() + min(delay, remaining_wait) >= deadline:
                             if await self._has_available(candidates[position + 1 :]):
                                 break
-                            raise ModelCallFailed(
+                            raise budget_error(
                                 "模型调用时间预算不足以等待供应商限流恢复"
                             ) from exc
                         delay = min(delay, remaining_wait)
@@ -458,7 +460,7 @@ class RoutingModel:
                         if time.monotonic() + delay >= deadline:
                             if await self._has_available(candidates[position + 1 :]):
                                 break
-                            raise ModelCallFailed("模型调用时间预算不足以再次请求") from exc
+                            raise budget_error("模型调用时间预算不足以再次请求") from exc
                         await asyncio.sleep(delay)
                         retry += 1
                         continue

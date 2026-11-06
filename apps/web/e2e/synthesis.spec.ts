@@ -648,11 +648,17 @@ test("父子材料同时命中关键词时展开全部命中节点", async ({ pa
 
 test("模块标签和三种重解析操作直接可用，提交范围互不混淆", async ({ page }) => {
   const requests: unknown[] = [];
+  const retryModules = modules.map((module, index) => ({ ...module,
+    status: ["completed", "failed", "canceled"][index]!,
+  }));
   await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
-    status: "partial", modules: modules.map((module, index) => ({ ...module, items: [],
-      status: ["completed", "failed", "canceled"][index]!,
-    })),
+    status: "partial", modules: retryModules.map((module) => ({ ...module, items: [] })),
   }) }));
+  // 页面以记录接口的最新状态更新按钮，两个接口需描述同一次运行。
+  await page.route("**/api/v1/analysis/reports/1/modules/*/records", (route) => {
+    const key = route.request().url().split("/").at(-2);
+    return route.fulfill({ json: records(retryModules.find((module) => module.module_key === key)!) });
+  });
   await page.route("**/api/v1/analysis/reports/1/retry", (route) => {
     requests.push(route.request().postDataJSON());
     return route.fulfill({ json: { id: 1, status: "pending" } });
@@ -915,4 +921,46 @@ test.describe("每次分析的时间与原因", () => {
     await expect(history).not.toContainText("09:30:00");
     await expect(page.getByRole("button", { name: "重新解析本模块", exact: true })).toBeDisabled();
   });
+});
+
+
+test("子主题增量轮询保留已有正文、原文位置并显示待复核和部分完成", async ({ page }, info) => {
+  let revised = false;
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+    status: "running", modules: [{ ...modules[0]!, status: "running", items: [] }],
+  }) }));
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => {
+    const data = records(modules[0]!);
+    data.status = revised ? "partial" : "running";
+    data.records = revised ? data.records : data.records.slice(0, 1);
+    if (revised) data.records[0]!.review_status = "needs_review";
+    data.progress = { audit_round: 0, topics: [{
+      topic: "scope", title: "项目背景", scope: { kind: "common", lot_refs: [] },
+      status: revised ? "needs_review" : "ready", checks: ["建设目标"], checked: ["建设目标"],
+      detail: revised ? "新增补遗，目标待核对" : "已核对建设目标", tasks: [],
+    }, { topic: "tasks", title: "技术任务", scope: { kind: "common", lot_refs: [] },
+      status: revised ? "blocked" : "researching", checks: ["全部独立任务"], checked: [],
+      detail: "附件B缺失", tasks: [{ detail: "核对附件B接口条件", status: "blocked" }],
+    }] };
+    return route.fulfill({ json: data });
+  });
+  await page.reload();
+  await expect(page.locator('[data-report-item="background"]')).toContainText("完成现有平台升级");
+  await expect(page.getByText("子主题进度 · 1/2 已处理")).toBeVisible();
+  await expect(page.locator(".coverage-details")).toContainText("分析中");
+  await page.locator('[data-report-item="background"]').getByRole("button", { name: /^定位：/ }).first().click();
+  const viewer = page.getByRole("region", { name: "引用原文", exact: true });
+  await expect(viewer).toBeVisible();
+  revised = true;
+  if (info.project.name === "mobile") await page.getByRole("button", { name: "分析内容", exact: true }).click();
+  await expect(page.getByText("新增依据影响部分结果，以下事项待复核")).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator('[data-report-item="background"]')).toContainText("完成现有平台升级");
+  await expect(page.locator('[data-report-item="migration"]')).toContainText("回退方案");
+  await expect(page.locator(".coverage-details")).toContainText("部分完成");
+  if (info.project.name === "mobile") await page.getByRole("button", { name: "引用原文", exact: true }).click();
+  await expect(viewer).toBeVisible();
+  if (info.project.name === "mobile") await page.getByRole("button", { name: "分析内容", exact: true }).click();
+  await page.getByLabel("仅待核对条目").check();
+  await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+  await expect(page.locator('[data-report-item="migration"]')).toHaveCount(0);
 });

@@ -102,6 +102,14 @@ class ModelCallFailed(TenderError):
     code: ClassVar[str] = "model_call_failed"
 
 
+class BudgetExhausted(ValueError):
+    """持久预算用尽；允许已核实成果收尾，但不能再发送模型或工具请求。"""
+
+
+class ModelBudgetExhausted(ModelCallFailed):
+    """模型路由窗口用尽，与供应商拒绝区分，便于增量流程保存部分成果。"""
+
+
 class InvalidModelOutput(ModelCallFailed):
     """文本已返回但不满足 JSON 协议，可由调用方给出纠正提示；不代表连接或权限失败。"""
 

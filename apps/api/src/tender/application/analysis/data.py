@@ -10,6 +10,7 @@ from uuid import UUID, uuid4, uuid5
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tender.application.analysis.output import canonical_topic, record_output
+from tender.application.analysis.state import published_items
 from tender.application.knowledge.content import (
     dedupe_citations,
     fingerprint,
@@ -277,11 +278,13 @@ def module_records(data: dict) -> list[dict]:
 def module_data(state: dict) -> dict:
     records = []
     evidence = {}
-    for item in state.get("staged_items", []):
+    for item in published_items(state):
         if item.get("verification") != "supported" or not item.get("business"):
             continue
         record = copy.deepcopy(item["business"])
         record["verification"] = "supported"
+        if state.get("topic_flow"):
+            record["review_status"] = item.get("review_status", "current")
         refs = dedupe_citations([
             ref for value in item["values"] for ref in value["citations"]
         ])
@@ -311,6 +314,12 @@ def module_data(state: dict) -> dict:
             "research_summary", state.get("research_completed", {}).get("research_summary", "")
         ),
         "research": copy.deepcopy(state.get("research_completed", {})),
+        **({"progress": {"topics": [{**{k: v for k, v in e.items()
+                                         if k not in {"placeholder", "requested_status"}},
+                                      "tasks": list(e["tasks"].values())}
+                                     for e in state["topic_flow"]["entries"].values()],
+                         "audit_round": state["topic_flow"]["audit"]["round"]}}
+           if state.get("topic_flow") else {}),
     }
 
 
@@ -434,6 +443,12 @@ def assemble_dataset(
         key = module["module_key"]
         available = []
         for record in (hydrated or {}).get(key) or module_records(data):
+            if record.get("review_status") == "needs_review":
+                result["gaps"].append(data_gap(
+                    "record_needs_review", "新增证据影响该事项，尚待复核", record_id=record["id"],
+                    module_key=key,
+                ))
+                continue
             # 必要证据缺失的记录整条不可用，只登记缺口，不能让剩余引用冒充完整依据。
             if record.get("verification") == "unavailable":
                 result["gaps"].append(data_gap(

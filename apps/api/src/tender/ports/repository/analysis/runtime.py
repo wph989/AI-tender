@@ -35,6 +35,10 @@ class AgentRunStore(Protocol):
         """保活：先证锁连接仍然有效，再续租并复核运行合法性。"""
         ...
 
+    def guard_settlement(self) -> None:
+        """到期后仅允许核实成果收尾，仍须验证所有权、租约与配额锁。"""
+        ...
+
     def reserve(self, kind: str) -> None:
         """预占一次模型或工具调用；预算耗尽时抛 ``ValueError``。``kind`` 取 model/tool。"""
         ...
@@ -53,6 +57,7 @@ class AgentRunStore(Protocol):
         error: str | None = None,
         *,
         publish: dict[str, Any] | None = None,
+        state: dict[str, Any] | None = None,
     ) -> None:
         """按终态收口本次运行；``publish`` 给出 ``completed`` 时要发布的成果。"""
         ...

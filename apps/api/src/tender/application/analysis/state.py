@@ -23,6 +23,26 @@ class AnalysisState(TypedDict, total=False):
 Phase = Literal["research", "synthesis", "verification", "completed"]
 
 
+def clear_record_gaps(state: dict, item_ids: set[str]) -> None:
+    """事项重新核实或其证明范围被替代后，展示不能继续沿用旧拒绝原因。"""
+    resolved = [g for g in state.get("business_gaps", [])
+                if g["key"].removeprefix("record:") in item_ids and g["key"].startswith("record:")]
+    state["business_gaps"] = [g for g in state.get("business_gaps", []) if g not in resolved]
+    notes = tuple(g["topic"] + "：" + g["detail"] for g in resolved)
+    state["gap_notes"] = [note for note in state.get("gap_notes", []) if not note.startswith(notes)]
+
+
+def published_items(snapshot: dict, *, final: bool = False) -> list[dict]:
+    """待修订版本校验期间仍显示旧核实内容；最终成果只消费当前有效版本。"""
+    items = {item["id"]: item for item in snapshot.get("staged_items", [])}
+    if snapshot.get("topic_flow"):
+        for key, old in snapshot.get("business_previous", {}).items():
+            if items.get(key, {}).get("verification") != "supported":
+                items[key] = old
+    return [item for item in items.values() if item.get("verification") == "supported"
+            and not (final and item.get("review_status") == "needs_review")]
+
+
 class AnalysisTransitions:
     def __init__(self, snapshot: dict[str, Any]) -> None:
         # 保留原字典身份与未知的历史字段，检查点、工具重放和预算继续共享同一份状态。

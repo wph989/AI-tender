@@ -86,7 +86,10 @@ def test_every_frozen_module_has_usable_synthesis_format(key):
     for section in schema["sections"]:
         assert section["columns"] and "序号" not in section["columns"]
     rules = snapshot[key + "/SKILL.md"]
-    assert "complete_research" in rules and "content" in rules
+    assert "topic_updates" in rules and "content" in rules
+    assert all(topic.get("checks") for topic in json.loads(
+        snapshot[key + "/references/coverage.json"]
+    ))
     assert "field/group/sort_order/values/note" not in rules
     assert "每批最多3条" not in rules
 

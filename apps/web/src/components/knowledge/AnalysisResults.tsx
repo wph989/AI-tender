@@ -47,7 +47,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       ...(data?.format_nodes ?? []), ...(data?.relations ?? []), ...(data?.lots ?? [])]
       .map((record) => [record.id, record]));
     return report.modules.map((module) => ({ ...module, items: module.items.map((item) => ({
-      ...item, record: byId.get(item.id) ?? item.record,
+      ...item, record: item.record?.review_status === "needs_review" ? item.record : byId.get(item.id) ?? item.record,
     })) }));
   }, [report.modules, data]);
   const allItems = useMemo(() => modules.flatMap((module) => module.items), [modules]);
@@ -257,6 +257,23 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           </ol>}
           {module.research_summary && <details className="research-process"><summary>查看分析过程</summary><p>{module.research_summary}</p></details>}
         </details>
+        {module.progress && <details className="coverage-details" open={isActive(module.status)
+          || module.progress.topics.some((topic) => ["blocked", "needs_review"].includes(topic.status))}>
+          <summary>子主题进度 · {module.progress.topics.filter((topic) => topic.status === "ready").length}/{module.progress.topics.length} 已处理</summary>
+          <ul>{module.progress.topics.map((topic, index) => <li key={`${topic.topic}:${index}`}>
+            <strong>{topic.title}</strong>{" · "}
+            {({ pending: "待处理", researching: "分析中", ready: "已处理", blocked: "部分完成", needs_review: "待复核" })[topic.status]}
+            {" · "}{scopeLabel(topic.scope)}
+            <p>{topic.detail}（核对项 {topic.checked.length}/{topic.checks.length}）</p>
+            {topic.tasks.filter((task) => task.status !== "resolved").map((task, taskIndex) => <p key={taskIndex}>
+              {task.status === "blocked" ? "未完成：" : "待核对："}{task.detail}
+            </p>)}
+          </li>)}</ul>
+        </details>}
+        {module.items.some((item) => item.record?.review_status === "needs_review") && <Alert type="warning"
+          title="新增依据影响部分结果，以下事项待复核"
+          description={module.items.filter((item) => item.record?.review_status === "needs_review")
+            .map((item) => item.field).join("、")} />}
         {module.records_loading ? <p role="status">正在加载专题结果…</p> : module.records_error ? <Alert type="error" title="专题结果读取失败"
           description={module.records_error} action={<Button onClick={onRefresh}>重新加载</Button>} /> : module.items.length ? <ModuleMarkdown
           items={module.items} relatedItems={allItems} resolvedRelations={data?.relations}

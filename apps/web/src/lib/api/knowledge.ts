@@ -35,7 +35,8 @@ export function loadReportRecords(report: AnalysisReport, signal?: AbortSignal):
       `/analysis/reports/${report.id}/modules/${encodeURIComponent(module.module_key)}/records`,
       "GET", undefined, signal,
     ).then(
-      (data) => ({ ...module, items: recordItems(data), records_error: undefined, records_loading: false }),
+      (data) => ({ ...module, status: data.status, progress: data.progress,
+        items: recordItems(data), records_error: undefined, records_loading: false }),
     ).catch((reason: unknown) => ({
       ...module, items: [], records_loading: false,
       records_error: message(reason, "专题结果读取失败，请重试"),

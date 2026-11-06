@@ -77,7 +77,8 @@ def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
             if module["module_key"] != "project_basic_info_parsing":
                 continue
             for record in records_by_module[module["module_key"]]:
-                if record["kind"] != "lot" or record.get("verification") != "supported":
+                if (record["kind"] != "lot" or record.get("verification") != "supported"
+                        or record.get("review_status") == "needs_review"):
                     continue
                 # 项目目录需要稳定查找键；无原文编号时用已核实名称，分析记录中的 code 仍留空。
                 catalog_key = record["code"] or record["title"]

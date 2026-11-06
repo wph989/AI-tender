@@ -139,7 +139,7 @@ def env(monkeypatch):
         base.dispose()
 
 
-def report(env):
+def report(env, *, topic_flow=False):
     project = projects.create_project(projects.ProjectCreate(name="DeepAgents专项"), env.request)
     with env.engine.begin() as conn:
         add_source(conn, project["id"], "采购交换机10台，质保三年。")
@@ -147,11 +147,15 @@ def report(env):
         project["id"], analysis_api.AnalysisSettings(category="goods"), env.request
     )
     created = analysis_api.start_analysis(project["id"], analysis_api.AnalysisInput(), env.request)
+    if not topic_flow:
+        # 既有脚本专门回归历史协议；新报告冻结与增量协议由 topic_flow 集成用例覆盖。
+        env.db.execute("""UPDATE analysis_report SET skill_snapshot=
+            skill_snapshot - '__analysis_flow_version__' WHERE id=:id""", {"id": created["id"]})
     return analysis_api.report_row(env.request, created["id"])
 
 
-def prepared_runtime(env):
-    row = report(env)
+def prepared_runtime(env, *, topic_flow=False):
+    row = report(env, topic_flow=topic_flow)
     row, sources = worker.prepare_report(env.db, row)
     run = env.db.rows(
         """SELECT a.* FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id

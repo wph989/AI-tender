@@ -495,6 +495,16 @@ async def verify_items(
     for batch in batches:
         # 仅扩展送审视图，避免逐条正文被误当成同一字段的多个冲突值写回公开投影。
         review_batch = [_content_review(item) for item in batch] if select_evidence else batch
+        revision_context = [
+            {"record_key": item.get("business", {}).get("key"),
+             "evidence": [{"id": key, "text": evidence[key]["content"]}
+                          for key in item.get("review_evidence_ids", [])
+                          if evidence and key in evidence]}
+            for item in batch if item.get("review_evidence_ids")
+        ]
+        if sum(len(e["text"]) for row in revision_context for e in row["evidence"]) > 24000:
+            # 不截断修订条件来换取通过；过大输入交给 partial 收尾，保留旧版待复核提示。
+            raise InvalidModelOutput("修订原文超过单批复核预算，请按具体主题缩小复核范围")
         # 邻近块总量按调用封顶，避免个别长条目把校验提示重新推回超时区间；
         # 批量送审时按条目数放大，单条仍保留原额度，避免多条字段互相挤占章节上下文。
         neighbour_budget = [max(8000, 4000 * len(batch))]
@@ -589,6 +599,11 @@ async def verify_items(
         verdict = await json_completion(
             model,
             "校验每个解析值是否由其引用原文支持。"
+            + ("同时检查新增证据是否修订、否定或限制该结果；旧引文成立但已被修订时须判false。"
+               "新增证据不能替代所提交引用，应纠正正文和引用后重新提交。新增证据："
+               + json.dumps(revision_context, ensure_ascii=False, separators=(",", ":"))
+               if revision_context else "")
+            +
             "逐一检查 field 名称与每个 value 的全部断言及其相互一致性，不能只核对关键词。"
             "允许不改变含义的同义改写和简洁表述，不因缺少完全相同的词语就判无依据；"
             "content及其正文单元中的Markdown加粗、分段和列表标记只用于展示，按去掉排版后的语义核对；"

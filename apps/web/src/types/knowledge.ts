@@ -91,6 +91,17 @@ export interface AnalysisModule {
   research_gaps?: { key: string; detail: string }[];
   records_loading?: boolean;
   records_error?: string;
+  progress?: TopicProgress;
+}
+
+export interface TopicProgress {
+  audit_round: number;
+  topics: {
+    topic: string; title: string; scope: Omit<AnalysisScope, "lot_ids">;
+    status: "pending" | "researching" | "ready" | "blocked" | "needs_review";
+    checks: string[]; checked: string[]; detail: string;
+    tasks: { detail: string; status: "pending" | "resolved" | "blocked" }[];
+  }[];
 }
 
 export interface AgentRun {
@@ -141,6 +152,7 @@ export interface AnalysisScope {
 
 /** 正式业务记录与展示字段分离，编制任务固定快照和记录身份。 */
 export interface BusinessRecord {
+  review_status?: "current" | "needs_review";
   id: string;
   key: string;
   kind: "fact" | "requirement" | "lot" | "format_node" | "relation";
@@ -192,12 +204,14 @@ export interface BusinessRecord {
 
 /** 维度原始业务记录未解析标段目录，引用通过独立证据集合关联。 */
 export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"> {
+  review_status?: "current" | "needs_review";
   evidence_ids: string[];
   content_evidence?: Record<string, string[][]>;
   scope: Omit<AnalysisScope, "lot_ids">;
 }
 
 export interface ModuleRecords {
+  progress?: TopicProgress;
   // schema_version 与 status 仅随契约透传，前端尚无版本分支；读取方不要据此推断兼容性。
   schema_version: string;
   module_key: string;

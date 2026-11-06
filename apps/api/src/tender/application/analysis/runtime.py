@@ -12,6 +12,7 @@ from dataclasses import asdict
 
 from tender.application.analysis.data import display_items, module_data
 from tender.application.analysis.research import AgentLimits
+from tender.application.analysis.state import published_items
 from tender.ports.repository.analysis.reports import ReportRepository
 from tender.ports.repository.analysis.runtime import AgentRunStore
 
@@ -116,16 +117,26 @@ class AgentRuntime:
         *,
         state: dict | None = None,
     ) -> None:
-        if status in {"completed", "partial"}:
+        topic_settlement = bool(state and state.get("topic_flow")
+                                and status in {"partial", "failed"})
+        if status in {"completed", "partial"} or topic_settlement:
             # 部分发布同样要复核报告状态、所有权、租约与资料权限。
-            self.guard()
+            if topic_settlement:
+                check_report_access(self.db, self.report, self.sources)
+                self.store.guard_settlement()
+            else:
+                self.guard()
         if status == "completed" and draft is not None:
             publish = self._draft_payload(draft)
-        elif status == "partial":
+        elif status == "partial" or topic_settlement:
+            # 只有待复核旧版时仍同步展示投影，不能让失败前的 current 标记进入正式快照。
             publish = self._staged_payload(state or {}, include_relations=True)
         else:
             publish = None
-        self.store.finish(status, error, publish=publish)
+        if state and state.get("topic_flow"):
+            self.store.finish(status, error, publish=publish, state=state)
+        else:
+            self.store.finish(status, error, publish=publish)
 
     def abandon(self, status: str, error: str | None = None) -> None:
         """异常收尾；未领取配额时同样形成终态，避免排队行永远显示等待配额。"""
@@ -145,15 +156,11 @@ class AgentRuntime:
     @staticmethod
     def _staged_payload(state: dict, *, include_relations: bool = False) -> dict | None:
         """未完成也保存已核实字段的展示投影；未通过校验时不发布。"""
-        if not state.get("staged_items_verified"):
+        if not state.get("staged_items_verified") and not state.get("topic_flow"):
             return None
         payload = {
             "items": display_items(
-                [
-                    item
-                    for item in state.get("staged_items", [])
-                    if item.get("verification") == "supported"
-                ]
+                published_items(state)
             ),
             "business": module_data(state),
         }

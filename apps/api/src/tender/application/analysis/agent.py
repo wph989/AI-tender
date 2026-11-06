@@ -69,7 +69,14 @@ from tender.application.analysis.research import (
     ToolArgumentError,
 )
 from tender.application.analysis.skills import MODULES
-from tender.application.analysis.state import AnalysisTransitions
+from tender.application.analysis.state import AnalysisTransitions, clear_record_gaps
+from tender.application.analysis.topic_flow import (
+    TOPIC_CONTRACT,
+    TopicFlow,
+    TopicIncomplete,
+    TopicUpdate,
+    enabled,
+)
 from tender.application.knowledge.content import fingerprint, merge_field_entries
 from tender.core.error_details import error_detail
 from tender.core.logging import bind_context, get_logger
@@ -363,6 +370,8 @@ class ResearchMiddleware(AgentMiddleware):
         is_outline: bool = False,
         skill: dict | None = None,
         event: Callable[[str, dict], None] | None = None,
+        topic_flow: TopicFlow | None = None,
+        review_coverage: Callable[[dict], Awaitable[dict]] | None = None,
     ) -> None:
         self.research, self.state = research, state
         self.reserve_tool, self.save = reserve_tool, save
@@ -373,6 +382,7 @@ class ResearchMiddleware(AgentMiddleware):
         self.is_outline = is_outline
         self.skill = skill
         self.event = event
+        self.topic_flow, self.review_coverage = topic_flow, review_coverage
 
         async def load_skill() -> dict:
             """读取当前模块冻结的 Skill 和输出清单，供运行时在分析前强制调用。"""
@@ -383,6 +393,8 @@ class ResearchMiddleware(AgentMiddleware):
 
     def budget_needs_synthesis(self, status: dict) -> bool:
         """按已冻结总预算预留收尾空间，避免快速检索先耗尽次数、来不及逐条提交。"""
+        if self.topic_flow:
+            return False
         if status.get("seconds_remaining", 99999) <= self.synthesis_reserve_seconds(status):
             return True
         if not self.state.get("output_schema"):
@@ -410,6 +422,8 @@ class ResearchMiddleware(AgentMiddleware):
 
     async def awrap_model_call(self, request, handler):
         await self.research.authorize()
+        if self.topic_flow:
+            return await self.topic_model_call(request, handler)
         status = self.budget_status() if self.budget_status else {}
         if self.state.get("output_schema"):
             status = status | {"finish_reserve_seconds": self.synthesis_reserve_seconds(status)}
@@ -649,6 +663,65 @@ class ResearchMiddleware(AgentMiddleware):
             )
             return response
 
+    async def topic_model_call(self, request, handler):
+        """增量流程只提供当前进度和必要规则，不重复注入全专题检索流水。"""
+        status = self.budget_status() if self.budget_status else {}
+        full = not self.state.get("topic_skill_prompted") or any(
+            getattr(m, "additional_kwargs", {}).get("lc_source") == "summarization"
+            and m.id != self.state.get("topic_summary_id") for m in request.messages
+        )
+        for message in request.messages:
+            if getattr(message, "additional_kwargs", {}).get("lc_source") == "summarization":
+                self.state["topic_summary_id"] = message.id
+        self.state["topic_skill_prompted"] = True
+        hint = TOPIC_CONTRACT + "\n当前子主题进度：" + self.topic_flow.prompt()
+        hint += "\n剩余硬预算（不足时保留缺口）：" + json.dumps(status, ensure_ascii=False)
+        if self.skill:
+            hint += "\n当前Skill：" + self.skill["instructions" if full else "digest"]
+        staged = [i for i in self.state.get("staged_items", [])
+                  if i.get("verification") == "supported"]
+        if staged:
+            payload, _ = _bounded_staged_payload(staged)
+            hint += "\n已核实成果摘要（不能用作原文引用）：" + payload
+        hint += "\n当前执行规则以子主题增量协议为准，有据事项立即提交，缺口只定向补查。"
+        content = request.system_message.content if request.system_message else ""
+        content = content + "\n" + hint if isinstance(content, str) else [
+            *content, {"type": "text", "text": hint}]
+        return await handler(request.override(system_message=SystemMessage(content=content)))
+
+    async def advance_topics(self) -> dict | None:
+        flow = self.topic_flow
+        flow.sync()
+        pending = flow.pending()
+        final = self.state.pop("topic_final_requested", None)
+        if pending:
+            if final:
+                return self.feedback("尚未完成：" + "；".join(pending[:8]))
+            return None
+        if self.review_coverage is None:
+            raise TopicIncomplete("独立查漏服务未配置，已核实内容保留")
+        with bind_context(agent_phase="completeness"):
+            try:
+                done = await flow.audit(self.review_coverage, self.save)
+            except (InvalidModelOutput, ModelCallFailed, ModelUnavailable) as exc:
+                raise TopicIncomplete("独立查漏未完成：" + str(exc)) from exc
+        if not done:
+            return self.feedback(
+                "查漏发现具体待办，请处理topic_updates中的待办，再定向复核一次"
+            )
+        if any(e["status"] != "ready" for e in flow.entries):
+            raise TopicIncomplete("子主题仍有未完成内容，详见主题进度和查漏待办")
+        if flow.data["audit"].get("remaining"):
+            raise TopicIncomplete("定向复核后仍有遗漏，已核实内容保留")
+        from tender.application.analysis.state import published_items
+
+        feedback = self.build_draft(
+            {"research_summary": "全部子主题核对及独立查漏完成"},
+            published_items(self.state, final=True),
+        )
+        await self.save(self.state)
+        return feedback
+
     def feedback(self, text: str, remaining: int = 2) -> dict:
         """把校验结论作为运行时反馈交回主 Agent，由它决定如何修正。"""
         return {
@@ -807,6 +880,9 @@ class ResearchMiddleware(AgentMiddleware):
         支持性判定必须由独立模型请求完成（提交者自证不可靠），但它属于 Agent 图自己的
         步骤而不是工具内部调用：一次提交只发一批请求，未通过时给出可执行的纠正反馈。
         """
+        if self.topic_flow:
+            if request := self.transitions.take_final():
+                self.state["topic_final_requested"] = request
         if self.review_support is None:
             # 未配置校验器（降级/旧路径）时按登记结果收尾，行为与内联校验前一致。
             if final_request := self.state.get("pending_final"):
@@ -885,6 +961,10 @@ class ResearchMiddleware(AgentMiddleware):
                 kept.append(entry)
                 continue
             if entry.get("verification") == "supported":
+                if self.topic_flow:
+                    entry.pop("review_evidence_ids", None)
+                    entry["review_status"] = "current"
+                    clear_record_gaps(self.state, {entry["id"]})
                 kept.append(entry)
                 self.state.get("business_previous", {}).pop(entry["id"], None)
                 continue
@@ -967,6 +1047,8 @@ class ResearchMiddleware(AgentMiddleware):
     @hook_config(can_jump_to=["end"])
     async def abefore_model(self, state, runtime):
         await self.research.authorize()
+        if self.topic_flow and self.state.get("topic_budget_exhausted"):
+            raise TopicIncomplete(self.state["topic_budget_exhausted"])
         if self.skill:
             loaded = self.state.get("loaded_skill")
             if loaded and loaded["sha256"] != self.skill["sha256"]:
@@ -980,6 +1062,25 @@ class ResearchMiddleware(AgentMiddleware):
                 logger.info("skill.load", skill_path=result["path"],
                             sha256=result["sha256"])
         feedback = await self.run_review_step()
+        if self.topic_flow:
+            if not feedback:
+                feedback = await self.advance_topics()
+            if "draft" in self.state:
+                return {"jump_to": "end"}
+            message = next((m for m in reversed(state["messages"])
+                            if isinstance(m, AIMessage)), None)
+            if message and message.id != self.state.get("progress_message_id"):
+                signature = self.topic_flow.signature()
+                idle = (self.state.get("no_progress_rounds", 0) + 1
+                        if signature == self.state.get("progress_signature") else 0)
+                self.state.update(progress_signature=signature, progress_message_id=message.id,
+                                  no_progress_rounds=idle)
+                if idle >= self.research.limits.max_no_progress_rounds:
+                    self.topic_flow.block_stalled()
+                    self.state["no_progress_rounds"] = 0
+                    feedback = self.feedback("当前待办连续无法推进，已登记缺口；继续其他未处理主题")
+                await self.save(self.state)
+            return feedback
         if "draft" in self.state:
             return {"jump_to": "end"}
         # 逐轮检查并幂等持久化；恢复同一图节点不能再次扣除无进展机会。
@@ -1043,7 +1144,7 @@ class ResearchMiddleware(AgentMiddleware):
                         "分析尚未提交。自然语言或Markdown总结不能作为完成结果。"
                         + (
                             "请先 complete_research 登记所有主题与转引；"
-                            if self.state.get("output_schema") else ""
+                            if self.state.get("output_schema") and not self.topic_flow else ""
                         )
                         + "请按 submit_analysis 的 schema 提交带原文引用的 JSON；"
                         "每次最多三条完整事项并携带原文引用，最后一批可携带records和final=true结束。"
@@ -1225,7 +1326,7 @@ class ResearchMiddleware(AgentMiddleware):
                     was_synthesis = bool(self.state.get("research_completed"))
                     status = self.budget_status() if self.budget_status else {}
                     if name in {"search_document", "search_knowledge"} and (
-                        self.state.get("finish_only")
+                        (self.state.get("finish_only") and not self.topic_flow)
                         or self.budget_needs_synthesis(status)
                     ) and not (name == "search_document" and not any(
                         e["action"] == "search_result" and e.get("scope") == "project"
@@ -1260,6 +1361,8 @@ class ResearchMiddleware(AgentMiddleware):
                         content=str(exc), tool_call_id=call_id, name=name, status="error",
                     )
                 except EvidenceBudgetError as exc:
+                    if self.topic_flow:
+                        raise TopicIncomplete("证据额度已耗尽：" + str(exc)) from exc
                     failure_class = "budget"
                     result = ToolMessage(
                         content=str(exc), tool_call_id=call_id, name=name, status="error",
@@ -1365,6 +1468,8 @@ def build_module_agent(
     review_support: Callable[[list[dict]], Awaitable[None]] | None = None,
     event: Callable[[str, dict], None] | None = None,
     categories: Sequence[str] = (),
+    review_coverage: Callable[[dict], Awaitable[dict]] | None = None,
+    lots: Sequence[dict] = (),
 ):
     if key not in MODULES:
         raise ValueError("未注册的分析模块")
@@ -1372,6 +1477,9 @@ def build_module_agent(
     state["business_protocol"] = True
     state["business_topics"] = json.loads(snapshot.get(key + "/references/coverage.json", "[]"))
     state["output_schema"] = output_schema(snapshot, key)
+    flow = TopicFlow(state, research) if enabled(snapshot) else None
+    if flow:
+        state["topic_lots"] = list(lots)
     skill["instructions"] += (
         "\n\n汇总 JSON 的分类、布局和内容键（*代表原文具体岗位或格式层级）：\n"
         + json.dumps(state["output_schema"], ensure_ascii=False)
@@ -1414,12 +1522,18 @@ def build_module_agent(
             ] + [gap for gap in research_gaps(checkpoint) if gap["key"].startswith("source:")]
 
     async def search_document(
-        query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0
+        query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
+        topic_keys: list[str] | None = None,
     ) -> dict:
         """检索本项目原文；同一查询用 offset=next_offset 翻页，补充检索会回到检索阶段。"""
+        keys = flow.topic_keys(topic_keys) if flow else []
+        if flow:
+            flow.data["active_topics"] = keys
         before_ids = set(research.seen)
         result = await research.search(query, "project", source_id, offset)
-        if set(research.seen) != before_ids:
+        if flow:
+            flow.evidence(before_ids, keys, result)
+        elif set(research.seen) != before_ids:
             invalidate_summary()
         else:
             # 只有真实新增原文才要求重汇总；空检索也要更新过程账，避免已完成的检索记录丢失。
@@ -1427,12 +1541,18 @@ def build_module_agent(
         return result
 
     async def search_knowledge(
-        query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0
+        query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
+        topic_keys: list[str] | None = None,
     ) -> dict:
         """检索已关联参考资料；同一查询用 offset=next_offset 翻页，不能替代本项目要求。"""
+        keys = flow.topic_keys(topic_keys) if flow else []
+        if flow:
+            flow.data["active_topics"] = keys
         before_ids = set(research.seen)
         result = await research.search(query, "reference", source_id, offset)
-        if set(research.seen) != before_ids:
+        if flow:
+            flow.evidence(before_ids, keys, result)
+        elif set(research.seen) != before_ids:
             invalidate_summary()
         return result
 
@@ -1440,8 +1560,12 @@ def build_module_agent(
         block_id: str,
         before: Annotated[int, Field(ge=0, le=11)] = 2,
         after: Annotated[int, Field(ge=0, le=11)] = 2,
+        topic_keys: list[str] | None = None,
     ) -> dict:
         """补读已知证据的邻近原文；合计超过11块时由运行时按顺序截断并回报实际窗口。"""
+        keys = flow.topic_keys(topic_keys, block_id=block_id) if flow else []
+        if flow:
+            flow.data["active_topics"] = keys
         requested = {"before": before, "after": after}
         if any(type(n) is not int or n < 0 for n in (before, after)):
             raise ToolArgumentError("before/after 必须为非负整数")
@@ -1472,7 +1596,9 @@ def build_module_agent(
                 "补读窗口连同当前块最多12块，已按顺序截断；不要扩大窗口重试，"
                 "未读部分用相邻块继续补读或登记缺口。"
             )
-        if set(research.seen) != before_ids:
+        if flow:
+            flow.evidence(before_ids, keys, result)
+        elif set(research.seen) != before_ids:
             invalidate_summary()
         return result
 
@@ -1517,11 +1643,15 @@ def build_module_agent(
             "research_summary"
         ]
         previous = {entry["id"]: entry for entry in state.get("staged_items", [])}
+        submitted = {entry["id"] for entry in items}
         staged, errors = [], []
         exhausted = False
         for entry in (previous | {entry["id"]: entry for entry in items}).values():
             entry = dict(entry)
             old = previous.get(entry["id"], {})
+            if flow and entry["id"] not in submitted:
+                staged.append(old)
+                continue
             if state.get("rejected_records", {}).get(entry["id"]):
                 if old.get("verification") == "supported":
                     staged.append(old)
@@ -1552,13 +1682,16 @@ def build_module_agent(
             } == {
                 k: v for k, v in old.get("output", {}).items() if k != "citations"
             }
-            if unchanged:
+            if unchanged and old.get("review_status") != "needs_review":
                 # 复用已核实版本并保留绑定，避免额外请求或丢掉正文单元的原文定位。
                 staged.append(old)
                 continue
             if old.get("verification") == "supported":
                 state.setdefault("business_previous", {})[entry["id"]] = old
             entry["verification"] = "pending"
+            if old.get("review_status") == "needs_review":
+                entry["review_status"] = "needs_review"
+                entry["review_evidence_ids"] = old.get("review_evidence_ids", [])
             staged.append(entry)
         transitions.replace_items(staged)
         if errors:
@@ -1566,7 +1699,7 @@ def build_module_agent(
             if exhausted:
                 raise RuntimeError("同一事项纠正已达上限。" + message)
             raise ToolException(message)
-        if final:
+        if final and not flow:
             transitions.request_final(research_summary, gaps)
         state["research"] = research.checkpoint()
         await save(state)
@@ -1582,12 +1715,13 @@ def build_module_agent(
         gaps: Annotated[list[GapInput] | None, Field(max_length=20)] = None,
         research_summary: str = "",
         final: bool = False,
+        topic_updates: Annotated[list[TopicUpdate] | None, Field(max_length=30)] = None,
     ) -> dict:
         """检索完成后提交符合当前 Skill 的汇总 JSON；未结束检索不能提交。"""
         try:
-            if not state.get("research_completed"):
+            if not flow and not state.get("research_completed"):
                 raise ValueError("请先完成全部主题检索与转引追踪，并调用 complete_research")
-            if state["research_completed"]["evidence_ids"] != sorted(research.seen):
+            if not flow and state["research_completed"]["evidence_ids"] != sorted(research.seen):
                 raise ValueError("检索依据已变化，请重新 complete_research 后综合")
             if len({record.key for record in records}) != len(records):
                 raise ValueError("同批业务记录 key 重复")
@@ -1610,6 +1744,14 @@ def build_module_agent(
                 if records and not prepared:
                     raise batch_error
             # 辅助说明可沿用检索账或由服务端补齐；缺少一份空清单不应丢掉有依据的正文。
+            if flow:
+                updates = flow.isolate_rejected(topic_updates or [], {r["key"] for r in rejected})
+                flow.validate_records(prepared, updates)
+                available = {i["business"]["key"] for i in state.get("staged_items", [])
+                             if i.get("business")}
+                available.update(i["business"]["key"] for i in prepared if i.get("business"))
+                flow.apply(updates, available)
+                flow.bind_records(prepared)
             research_summary = research_summary or state["research_completed"]["research_summary"]
             checked_coverage, reviews = prepare_coverage(
                 coverage or [], state, research.seen, state["business_topics"], key,
@@ -1633,6 +1775,11 @@ def build_module_agent(
                 prepared + reviews, research_summary, final=final and not rejected,
                 gaps=None if gaps is None else [gap.model_dump() for gap in gaps],
             )
+            if flow:
+                flow.sync()
+                if final and not rejected:
+                    transitions.request_final(research_summary, None)
+                staged["progress"] = flow.progress()
             if rejected:
                 detail = "；".join(
                     f"{item['key'] or item['title'] or '第' + str(item['index'] + 1) + '条'}"
@@ -1673,10 +1820,11 @@ def build_module_agent(
         StructuredTool.from_function(coroutine=f, handle_validation_error=validation_feedback)
         for f in (list_documents, search_document, search_knowledge, read_document)
     ]
-    tools.append(StructuredTool.from_function(
-        coroutine=complete_research, handle_tool_error=True,
-        handle_validation_error=validation_feedback,
-    ))
+    if not flow:
+        tools.append(StructuredTool.from_function(
+            coroutine=complete_research, handle_tool_error=True,
+            handle_validation_error=validation_feedback,
+        ))
     # 完成意图在全部汇总条目校验通过后才结束子图。
     tools.append(
         StructuredTool.from_function(
@@ -1686,10 +1834,27 @@ def build_module_agent(
             handle_validation_error=validation_feedback,
         )
     )
+    if flow:
+        tools[-1].description = (
+            "增量提交完整事项及topic_updates；逐批校验保存，主题处理完自动查漏。"
+        )
+    else:
+        # 历史快照继续暴露原工具schema，模型恢复时不会突然收到新流程字段。
+        from pydantic import create_model
+
+        for tool in tools:
+            fields = tool.args_schema.model_fields
+            if {"topic_keys", "topic_updates"} & fields.keys():
+                tool.args_schema = create_model(
+                    tool.args_schema.__name__,
+                    **{name: (field.annotation, field) for name, field in fields.items()
+                       if name not in {"topic_keys", "topic_updates"}},
+                )
     limits = research.limits
     middleware = ResearchMiddleware(
         research, state, reserve_tool, save, budget_status, review_support,
         is_outline=key == "bid_format_outline_parsing", skill=skill, event=event,
+        topic_flow=flow, review_coverage=review_coverage,
     )
     graph = create_deep_agent(
         model=model,
@@ -1699,7 +1864,9 @@ def build_module_agent(
         checkpointer=checkpointer,
         skills=["/skills/"],
         permissions=permissions,
-        system_prompt=CONTRACT + "\n" + DATA_CONTRACT,
+        system_prompt=((TOPIC_CONTRACT + "\n" + DATA_CONTRACT.split("研究完成后每次")[0]
+                        + "每批最多三条完整事项，按子主题协议提交并自动检查完成条件。")
+                       if flow else CONTRACT + "\n" + DATA_CONTRACT),
         middleware=[
             FilesystemMiddleware(
                 backend=backend,
