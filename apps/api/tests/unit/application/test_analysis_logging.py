@@ -40,7 +40,7 @@ def test_routing_logs_once_with_final_model_and_aggregated_usage(failover_limit)
     )
 
     async def check():
-        with bind_context(report_id=18, run_id=99):
+        with bind_context(project_id=15, report_id=18):
             try:
                 if failover_limit == 1:
                     with pytest.raises(ModelUnavailable):
@@ -53,7 +53,7 @@ def test_routing_logs_once_with_final_model_and_aggregated_usage(failover_limit)
 
     with capture_logs(processors=[merge_contextvars]) as logs:
         asyncio.run(check())
-    assert all(log["run_id"] == 99 and log["report_id"] == 18 for log in logs)
+    assert all(log["project_id"] == 15 and log["report_id"] == 18 for log in logs)
     assert len({log["invocation_id"] for log in logs}) == 1
     finished = [log for log in logs if log["event"] == "model.call"]
     assert len(finished) == 1
@@ -77,7 +77,7 @@ def test_routing_logs_once_with_final_model_and_aggregated_usage(failover_limit)
 
 def test_real_agent_logs_tool_parameters_once_with_research_synthesis_and_verification():
     async def check():
-        with bind_context(report_id=18, run_id=99):
+        with bind_context(project_id=15, report_id=18):
             return await execute([
                 *research_calls(),
                 call("submit_analysis", submission([summary_record()]), "finish"),
@@ -95,9 +95,14 @@ def test_real_agent_logs_tool_parameters_once_with_research_synthesis_and_verifi
     assert {"list_documents", "search_document", "complete_research", "submit_analysis"} <= {
         log["tool"] for log in tools
     }
-    assert all(log["run_id"] == 99 and log["report_id"] == 18 for log in logs)
+    assert all(log["project_id"] == 15 and log["report_id"] == 18 for log in logs)
     assert all(log["duration_ms"] >= 0 for log in tools)
     assert all("tool_parameters" in log for log in tools)
+    assert all("tool_call_id" not in log for log in tools)
+    rounds = [log for log in logs if log["event"] == "agent.round"]
+    assert rounds and all(log["log_level"] == "debug" for log in rounds)
+    # 精简展示不能破坏工具消息与调用的绑定，恢复仍需按原 ID 重放。
+    assert state["tool_results"]["call_finish"]["data"]["tool_call_id"] == "call_finish"
     assert any(
         log["tool"] == "search_document" and log["tool_parameters"] == {"query": "质保"}
         for log in tools
@@ -124,22 +129,32 @@ def test_validation_rejection_logs_item_reason_and_correction_count():
 def test_parallel_modules_keep_context_in_child_tasks_and_threads(monkeypatch, executor):
     async def probe(report, module, sources):
         await asyncio.sleep(0)
-        await asyncio.to_thread(get_logger(__name__).info, "thread_probe", expected=module["id"])
+        await asyncio.to_thread(
+            get_logger(__name__).info, "thread_probe", expected_project=report["project_id"],
+            expected_report=report["id"], expected_module=module["module_key"],
+        )
 
     monkeypatch.setattr(executor, "_execute_module", probe)
 
     async def check():
         with bind_context(task_id="celery-parent"):
             await asyncio.gather(*(
-                executor.execute_module({"id": 18}, {"id": run_id}, [])
-                for run_id in (99, 100)
+                executor.execute_module(
+                    {"id": project_id + 3, "project_id": project_id},
+                    {"id": run_id, "module_key": module_key}, [],
+                )
+                for project_id in (15, 16)
+                for run_id, module_key in ((99, "basic"), (100, "deposit"))
             ))
             assert get_context() == {"task_id": "celery-parent"}
 
     with capture_logs(processors=[merge_contextvars]) as logs:
         asyncio.run(check())
-    assert len(logs) == 2
-    assert all(log["run_id"] == log["expected"] for log in logs)
+    assert len(logs) == 4
+    assert all(log["project_id"] == log["expected_project"] for log in logs)
+    assert all(log["report_id"] == log["expected_report"] for log in logs)
+    assert all(log["module_key"] == log["expected_module"] for log in logs)
+    assert all("run_id" not in log for log in logs)
     assert all(log["task_id"] == "celery-parent" for log in logs)
 
 
@@ -165,8 +180,9 @@ def test_handled_module_failure_logs_before_database_cleanup_without_raw_sdk_cau
 
     monkeypatch.setattr(deep_analysis, "AgentRuntime", Runtime)
     with capture_logs(processors=[merge_contextvars]) as logs:
-        asyncio.run(executor.execute_module({"id": 18}, {"id": 99}, []))
+        asyncio.run(executor.execute_module({"id": 18, "project_id": 15}, {"id": 99}, []))
     failure = next(log for log in logs if log["event"] == "module.fail")
-    assert failure["run_id"] == 99 and "ModelUnavailable" in failure["exception"]
+    assert failure["project_id"] == 15 and failure["report_id"] == 18
+    assert "run_id" not in failure and "ModelUnavailable" in failure["exception"]
     assert "上游断连" in failure["exception"] and "claim" in failure["exception"]
     assert "raw-sdk-secret" not in json.dumps(logs, ensure_ascii=False)

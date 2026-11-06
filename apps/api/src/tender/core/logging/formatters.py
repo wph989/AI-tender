@@ -19,8 +19,8 @@ MAX_RECORD_BYTES = 64 * 1024
 _BEIJING = ZoneInfo("Asia/Shanghai")
 _SOURCE_ROOT = Path(__file__).resolve().parents[3]
 _LEADING_FIELDS = (
-    "timestamp", "level", "event", "location", "request_id", "task_id", "job_id",
-    "report_id", "run_id", "module_key", "invocation_id",
+    "timestamp", "level", "event", "location", "request_id", "job_id",
+    "project_id", "report_id", "module_key",
 )
 _PRIVATE_KEYS = {
     "authorization", "cookie", "setcookie", "apikey", "xapikey", "xgoogapikey",
@@ -103,6 +103,13 @@ def make_formatter(
         return event
 
     def scrub(_, __, event):
+        # 展示使用项目/报告身份；账本、检查点与 Skill 元数据留在内部，不再逐条输出。
+        # 两种渲染器共用此边界，错误文件也不会重新带出这些字段。
+        for key in (
+            "task_id", "run_id", "tool_call_id", "invocation_id", "thread_id",
+            "skill_path", "sha256",
+        ):
+            event.pop(key, None)
         if not include_exception and (trace := event.pop("exception", None)):
             # 普通日志只显示错误摘要；完整堆栈由同目录的文本错误文件承载。
             lines = str(trace).rstrip().splitlines()

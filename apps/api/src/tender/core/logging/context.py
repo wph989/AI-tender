@@ -13,7 +13,7 @@ from structlog.contextvars import (
     reset_contextvars,
 )
 
-CONTEXT_KEYS = frozenset({"request_id", "task_id", "job_id", "report_id", "run_id"})
+CONTEXT_KEYS = frozenset({"request_id", "task_id", "job_id", "project_id", "report_id", "run_id"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 
 

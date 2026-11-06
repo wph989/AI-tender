@@ -397,7 +397,12 @@ def test_log_order_and_error_text_file_keep_summaries_compact(options, monkeypat
     configure_logging("worker", replace(options, output="both", console_format="json"))
     configure_logging("worker", replace(options, output="both", console_format="json"))
     metadata = {"z_count": 0, "a_flag": False, "unused": None, "empty": ""}
-    with bind_context(task_id="task-order", report_id=18, run_id=99):
+    internal = {
+        "task_id": "task-order", "run_id": 99, "tool_call_id": "call-order",
+        "invocation_id": "invocation-order", "thread_id": "analysis:18:99:1",
+        "skill_path": "/skills/project-basic-info-parsing/SKILL.md", "sha256": "skill-hash",
+    }
+    with bind_context(project_id=15, report_id=18, **internal):
         for values in (metadata, dict(reversed(metadata.items()))):
             get_logger("tender.test").info("probe", **values)
         try:
@@ -406,7 +411,7 @@ def test_log_order_and_error_text_file_keep_summaries_compact(options, monkeypat
             get_logger("tender.test").warning("probe.fail", exc_info=True)
     logs = read_logs(options.directory)
     assert list(logs[0]) == list(logs[1]) == [
-        "timestamp", "level", "event", "location", "task_id", "report_id", "run_id",
+        "timestamp", "level", "event", "location", "project_id", "report_id",
         "a_flag", "z_count",
     ]
     assert logs[0]["a_flag"] is False and logs[0]["z_count"] == 0
@@ -418,7 +423,8 @@ def test_log_order_and_error_text_file_keep_summaries_compact(options, monkeypat
     details = read_errors(options.directory)
     assert details.startswith(logs[-1]["timestamp"])
     assert "\nTraceback (most recent call last):\n" in details
-    assert "task_id=task-order" in details and "run_id=99" in details
+    assert "project_id=15" in details and "report_id=18" in details
+    assert all(key not in details for key in internal)
     assert "order-hidden-secret" not in details + output.getvalue()
 
 
@@ -495,7 +501,7 @@ def test_handled_worker_exception_writes_trace_before_marking_failed(options, mo
     db.finish_task.assert_called_once()
     entry = read_logs(options.directory)[0]
     assert entry["event"] == f"{kind}.fail" and entry[f"{kind}_id"] == 12
-    assert entry["task_id"] == "worker-probe" and "exception" not in entry
+    assert "task_id" not in entry and "exception" not in entry
     assert "worker-secret" not in read_errors(options.directory) + json.dumps(entry)
     assert "OSError: 底层存储故障" in read_errors(options.directory)
 
@@ -1246,9 +1252,14 @@ def test_periodic_dispatch_is_quiet_but_keeps_warnings_failures_and_retries(
     probe = app.register_task(DispatchProbe())
     try:
         with bind_context(request_id="outer-request"):
-            success = probe.apply()
-            failure = probe.apply(args=["failure"])
-            retry = probe.apply(args=["retry"])
+            # 使用真实传递的项目上下文区分探针；输出不再依赖内部 Celery task_id。
+            success = probe.apply(headers={"tender_log_context": {"project_id": 15}})
+            failure = probe.apply(
+                args=["failure"], headers={"tender_log_context": {"project_id": 16}},
+            )
+            retry = probe.apply(
+                args=["retry"], headers={"tender_log_context": {"project_id": 17}},
+            )
             assert success.successful() and failure.failed() and retry.successful()
             assert get_context() == {"request_id": "outer-request"}
         assert get_context() == {}
@@ -1257,7 +1268,7 @@ def test_periodic_dispatch_is_quiet_but_keeps_warnings_failures_and_retries(
     logs = read_logs(options.directory)
     successful_lifecycle = [
         log for log in logs
-        if log.get("task_id") == success.id
+        if log.get("project_id") == 15
         and log["event"] in {"task.start", "task.end"}
     ]
     if level == "INFO":
@@ -1271,21 +1282,21 @@ def test_periodic_dispatch_is_quiet_but_keeps_warnings_failures_and_retries(
         assert {log["event"] for log in successful_lifecycle} == {"task.start", "task.end"}
         assert all(log["level"] == "debug" for log in successful_lifecycle)
     assert any(
-        log["event"] == "dispatch_probe_warning" and log["task_id"] == success.id
+        log["event"] == "dispatch_probe_warning" and log.get("project_id") == 15
         and "task_name" not in log and log["level"] == "warning"
         for log in logs
     )
     assert any(
-        log["event"] == "task.fail" and log["task_id"] == failure.id
+        log["event"] == "task.fail" and log.get("project_id") == 16
         and log["level"] == "error" and "dispatch failed" in log["error"]
         for log in logs
     )
     assert not any(
-        log["event"] == "task.end" and log["task_id"] == failure.id
+        log["event"] == "task.end" and log.get("project_id") == 16
         for log in logs
     )
     assert any(
-        log["event"] == "task.retry" and log["task_id"] == retry.id and log["level"] == "warning"
+        log["event"] == "task.retry" and log.get("project_id") == 17 and log["level"] == "warning"
         for log in logs
     )
     details = read_errors(options.directory)
@@ -1327,7 +1338,7 @@ def test_celery_failure_preserves_exception_and_context(options, traceback_kind)
     ]
     assert len(failures) == 1
     entry = failures[0]
-    assert entry["task_id"] == "lost-task"
+    assert "task_id" not in entry
     assert entry["task"] == sender.name
     assert entry["request_id"] == "parent-request"
     details = read_errors(options.directory)

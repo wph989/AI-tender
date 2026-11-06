@@ -252,10 +252,10 @@ class AnalysisExecutor:
         self.checkpoints = checkpoints
 
     async def execute_module(self, report: dict, module: dict, sources: list[dict]) -> None:
-        # module 是运行账行，id 是 run_id；独立绑定可避免并发专题和后续任务串号。
+        # 按项目、报告和专题直接定位；协程与线程继承独立上下文，避免并发项目串号。
         with bind_context(
+            project_id=report.get("project_id"),
             report_id=report["id"],
-            run_id=module["id"],
             module_key=module.get("module_key"),
         ):
             await self._execute_module(report, module, sources)
@@ -583,7 +583,7 @@ class AnalysisExecutor:
             )
 
     async def analyze_report(self, report: dict) -> None:
-        with bind_context(report_id=report["id"]):
+        with bind_context(project_id=report.get("project_id"), report_id=report["id"]):
             await self._analyze_report(report)
 
     async def _analyze_report(self, report: dict) -> None:

@@ -605,7 +605,8 @@ class ResearchMiddleware(AgentMiddleware):
         with bind_context(
             agent_phase=self.transitions.phase,
         ):
-            logger.info(
+            # 逐轮预算快照仅供诊断，默认 INFO 保留模型与工具调用摘要即可。
+            logger.debug(
                 "agent.round", evidence_count=len(self.research.seen),
                 staged_item_count=len(self.state.get("staged_items", [])),
                 no_progress_rounds=self.state.get("no_progress_rounds", 0), budget=status,
@@ -1170,14 +1171,15 @@ class ResearchMiddleware(AgentMiddleware):
             name = request.tool_call["name"]
             cached = self.state.setdefault("tool_results", {}).get(call_id)
             if cached is not None:
-                logger.bind(tool_call_id=call_id, tool=name).info(
+                logger.bind(tool=name).info(
                     "tool.call", tool_parameters=request.tool_call.get("args"),
                     status="cached", duration_ms=0,
                 )
                 return messages_from_dict([cached])[0]
             await self.reserve_tool()
             started = time.monotonic()
-            tool_log = logger.bind(tool_call_id=call_id, tool=name)
+            # 调用 ID 留在工具协议和检查点中用于重放，运行日志只记录动作摘要。
+            tool_log = logger.bind(tool=name)
             tool_error: BaseException | None = None
             result = None
             failure_class: str | None = None
