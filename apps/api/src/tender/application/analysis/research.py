@@ -55,6 +55,11 @@ class AgentLimits:
     # 同一查询最多翻 5 页；候选窗口按页大小成倍缓存，避免改写同义词续命。
     max_search_pages: int = 5
 
+    @property
+    def search_window(self) -> int:
+        """召回与分页共用一个候选窗口，避免调整单页数量后提前丢掉后续页。"""
+        return self.max_search_results * self.max_search_pages
+
 
 # 已检索候选按查询缓存，供 offset 翻页复用；进程内有效，不写入检查点。
 SEARCH_CACHE_ENTRIES = 8
@@ -76,6 +81,8 @@ class ResearchSession:
     compact_results: bool = False
     # 专题解析的候选缓存：同一查询按 offset 翻页时不再重复 embedding/重排/DB 查询。
     _search_cache: dict[tuple, tuple[list[dict], dict]] = field(default_factory=dict, repr=False)
+    # 同一查询的并发分页只召回一次；不同查询仍可并行。锁的数量受本轮工具预算约束。
+    _search_locks: dict[tuple, asyncio.Lock] = field(default_factory=dict, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def _begin(self, action: str, arguments: dict) -> None:
@@ -232,25 +239,26 @@ class ResearchSession:
         if self.compact_results:
             cache_key = (
                 scope,
-                normalized(query.strip()),
+                # 空格、HTML 实体会改变关键词拆分与嵌入语义，不能沿用引文匹配的归一化。
+                query.strip(),
                 source_id,
                 tuple(sorted(s["source_id"] for s in sources)),
             )
-            cached = self._search_cache.get(cache_key)
-            if cached is None:
-                retrieved, info = await self.retrieve(sources, query.strip())
-                # 一次取回候选窗口，后续 offset 从缓存切片，不再重复 embedding/重排/查库。
-                window = page_size * self.limits.max_search_pages
-                candidates = [dict(row) for row in retrieved[:window]]
-                info = dict(info) | {
-                    "candidate_limited": bool(info.get("search_limited"))
-                    or len(retrieved) > len(candidates)
-                }
-                info.pop("search_limited", None)
-                cached = (candidates, info)
-                self._search_cache[cache_key] = cached
-                if len(self._search_cache) > SEARCH_CACHE_ENTRIES:
-                    self._search_cache.pop(next(iter(self._search_cache)))
+            async with self._search_locks.setdefault(cache_key, asyncio.Lock()):
+                cached = self._search_cache.get(cache_key)
+                if cached is None:
+                    retrieved, info = await self.retrieve(sources, query.strip())
+                    # 失败或取消时不写缓存，等待者仍可重试；不启动脱离模块生命周期的后台请求。
+                    candidates = [dict(row) for row in retrieved[:self.limits.search_window]]
+                    info = dict(info) | {
+                        "candidate_limited": bool(info.get("search_limited"))
+                        or len(retrieved) > len(candidates)
+                    }
+                    info.pop("search_limited", None)
+                    cached = (candidates, info)
+                    self._search_cache[cache_key] = cached
+                    if len(self._search_cache) > SEARCH_CACHE_ENTRIES:
+                        self._search_cache.pop(next(iter(self._search_cache)))
             candidates, info = cached
             rows = candidates[offset:offset + page_size]
             # 即使本页因去重变少也按原始页大小推进游标，避免翻页卡死。
@@ -295,17 +303,17 @@ class ResearchSession:
             }
             result["page"] = page
             if search_limited:
-                # 只说明检索窗口未覆盖全部匹配，不把未读原文或检索分数传给模型。
-                # 提示不会替代证据预算警告，也不强制模型把所有相似片段变成业务结果。
-                result.update(
-                    search_limited=True,
-                    search_hint="本次检索的候选窗口已到末尾或扩展结果被截断，仍可能有未返回内容；"
-                    "请按未覆盖子主题拆分查询、限定 source_id，或登记未读缺口。",
-                )
-            elif has_more:
+                result["search_limited"] = True
+            if has_more:
+                # 窗口外还有匹配不代表缓存已读完；先翻页才能复用已有召回，避免反复付费改写查询。
                 result["search_hint"] = (
                     "同一查询仍有下一页：请用 offset=next_offset 继续读取本查询；"
                     "不要改写查询词重复检索，也不要把当前页当作全部命中。"
+                )
+            elif search_limited:
+                result["search_hint"] = (
+                    "本次检索的候选窗口已到末尾或扩展结果被截断，仍可能有未返回内容；"
+                    "请按未覆盖子主题拆分查询、限定 source_id，或登记未读缺口。"
                 )
             elif not rows and offset:
                 result["search_hint"] = (

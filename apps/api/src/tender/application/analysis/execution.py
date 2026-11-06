@@ -294,7 +294,7 @@ class AnalysisExecutor:
                     embedding_timeout=15,
                     min_similarity=limits.similarity_threshold,
                     # 一次取回候选窗口供同一查询分页，避免改同义词反复检索。
-                    max_results=max(30, limits.max_search_results),
+                    max_results=limits.search_window,
                 )
 
             async def read(source):

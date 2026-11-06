@@ -1,6 +1,5 @@
 "use client";
 import type { ReactNode } from "react";
-import { AppRail } from "@/components/AppRail";
 import { Icon } from "@/components/Icon";
 
 interface Props {
@@ -17,7 +16,6 @@ interface Props {
 export function PageShell({ breadcrumb, eyebrow, title, description, actions, width = "wide", children }: Props) {
   return (
     <div className="page-shell">
-      <AppRail />
       <main id="main-content" tabIndex={-1} className={"page-content sheet-in " + (width === "narrow" ? "page-content-narrow" : "")}>
         <header className="page-heading">
           <div className="min-w-0">

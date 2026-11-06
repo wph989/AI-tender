@@ -3,7 +3,6 @@ import { Button } from "antd";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { AppRail } from "@/components/AppRail";
 import { Icon } from "@/components/Icon";
 import { ProjectAnalysis } from "@/components/knowledge/ProjectAnalysis";
 import { FilePipeline } from "@/components/projects/FilePipeline";
@@ -66,7 +65,6 @@ function FileWorkspace({ projectId }: { projectId: number }) {
 
   return (
     <div className="workspace">
-      <AppRail />
       <header className="workspace-heading">
         <Link
           href="/projects"

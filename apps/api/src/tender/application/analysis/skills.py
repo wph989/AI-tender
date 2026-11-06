@@ -652,6 +652,8 @@ async def verify_items(
                     for item in review_batch
                 ],
                 ensure_ascii=False,
+                # 仅删除 JSON 的格式空白，保留引文及正文原样，减少每次独立校验的输入 token。
+                separators=(",", ":"),
             ),
             validate=validate_review,
         )

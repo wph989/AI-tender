@@ -43,6 +43,8 @@ def test_cleanup_failure_stops_controller_and_releases_waiters(
     class Runtime:
         def __init__(self, db, report, module, sources):
             self.run_id = module["id"]
+            # 领取逻辑会读取运行时限；夹具需到达预期的收尾故障，不能先因缺少状态退出。
+            self.run = {}
 
         def check_access(self):
             pass

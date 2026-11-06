@@ -354,6 +354,19 @@ export function ModelsPanel({ providers, models, profiles, fields = {}, onChange
                   <p className="mt-1">{formatTime(m.last_test_at)}</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
+                  <Switch
+                    aria-label={`${m.display_name}启用状态`}
+                    checked={m.enabled}
+                    checkedChildren="启用"
+                    unCheckedChildren="停用"
+                    disabled={busy || editing !== null}
+                    onChange={(enabled) =>
+                      void run(async () => {
+                        await updateModel(m.id, { enabled, revision: m.revision });
+                        void toast.success(`模型已${enabled ? "启用" : "停用"}`);
+                      })
+                    }
+                  />
                   <Select
                     aria-label={`${m.display_name} 测试能力`}
                     value={
@@ -564,11 +577,11 @@ function ModelForm({
         display_name: model?.display_name ?? "",
         timeout_seconds: model?.timeout_seconds ?? 90,
         extra_retries: model?.extra_retries ?? 1,
-        enabled: model?.enabled ?? false,
       }}
       onFinish={(values) => {
         if (!selected) return;
         // 空值明确发送 null，才能清除编辑前的可选参数；版本号保持打开时的快照。
+        // 启停由列表单独修改，编辑配置不回写打开表单时的启停状态。
         const input = {
           display_name: values.display_name?.trim() || values.model_id.trim(),
           kind: selected.kind,
@@ -582,7 +595,6 @@ function ModelForm({
           ),
           timeout_seconds: values.timeout_seconds,
           extra_retries: values.extra_retries,
-          enabled: values.enabled,
           temperature:
             configuration.values.temperature == null
               ? null
@@ -599,6 +611,7 @@ function ModelForm({
                 ...input,
                 provider_id: providerId,
                 model_id: values.model_id.trim(),
+                enabled: true,
               },
         );
       }}
@@ -719,9 +732,6 @@ function ModelForm({
         ]}
       >
         <InputNumber min={fields.extra_retries?.min} max={fields.extra_retries?.max} />
-      </Form.Item>
-      <Form.Item label="启用模型" name="enabled" valuePropName="checked">
-        <Switch />
       </Form.Item>
     </Form>
   );

@@ -205,5 +205,14 @@ def test_tool_budget_counts_concurrent_requests_and_survives_checkpoint():
         )
         assert sum(isinstance(result, ValueError) for result in results) == 1
         assert research.checkpoint()["tool_calls"] == 1
+        checkpoint = research.checkpoint()
+        restored = ResearchSession(
+            research.sources, research.project_id, research.retrieve, research.read,
+            research.authorize, research.limits, **checkpoint,
+        )
+        # 同一 attempt 的检查点恢复仍沿用计数，不能借进程重启获得新预算。
+        with pytest.raises(ValueError, match="工具调用预算"):
+            await restored.documents()
+        assert restored.tool_calls == 1
 
     asyncio.run(run())

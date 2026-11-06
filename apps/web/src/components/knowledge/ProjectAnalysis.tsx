@@ -5,7 +5,6 @@ import { Alert, Button, Segmented, Select } from "antd";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { message as errorMessage } from "@/lib/errors";
-import { AppRail } from "@/components/AppRail";
 import { Icon } from "@/components/Icon";
 import { BUTTON_CLASS } from "@/components/ui";
 import {
@@ -206,7 +205,6 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
 
   return (
     <div className="workspace analysis-workspace">
-      <AppRail />
       <header className="workspace-heading">
         <Link
           href="/projects"

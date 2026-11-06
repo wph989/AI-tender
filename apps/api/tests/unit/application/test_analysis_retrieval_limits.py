@@ -2,14 +2,18 @@
 
 import asyncio
 import math
+from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 from test_analysis_research import block, session, source
 
 from tender.adapters.llm.rerank_http import HttpRerankModel
+from tender.application.analysis import execution
 from tender.application.analysis.research import AgentLimits
 from tender.application.analysis.runtime import limits_snapshot
 from tender.application.knowledge.content import rank_chunks
@@ -255,6 +259,61 @@ def test_failed_embedding_or_rerank_does_not_drop_threshold_or_backfill():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("embedding_fails", [False, True])
+def test_client_close_failure_preserves_retrieval_result_and_fallback(embedding_fails):
+    async def run():
+        closed = []
+
+        class ClosingEmbedding(Embedding):
+            async def embed(self, texts):
+                if embedding_fails:
+                    raise RuntimeError("向量服务不可用")
+                return await super().embed(texts)
+
+            async def aclose(self):
+                closed.append("embedding")
+                raise RuntimeError("向量连接关闭失败")
+
+        class ClosingRerank:
+            async def rerank(self, _query, _documents, _top_n):
+                return [(1, 0.9), (0, 0.8)]
+
+            async def aclose(self):
+                closed.append("rerank")
+                raise RuntimeError("重排连接关闭失败")
+
+        store = Store(rows(2), vectors=[[1, 0], [1, 0]], rerank=True)
+        original = store.search_candidates(
+            [SOURCE], "投标保证金", None, None, limit=30, min_similarity=0.6,
+        ).rows
+        hits, info = await retrieve_chunks(
+            store,
+            [SOURCE], "投标保证金", lambda: None,
+            lambda _: ClosingEmbedding(), lambda _: ClosingRerank(),
+            min_similarity=0.6, max_results=2,
+        )
+        assert closed == ["embedding", "rerank"]
+        assert [row["block_id"] for row in hits] == [r["block_id"] for r in reversed(original)]
+        assert info["mode"] == ("keyword" if embedding_fails else "hybrid")
+        assert info["reranked"]
+        if embedding_fails:
+            assert "语义检索暂不可用" in info["warning"]
+
+    asyncio.run(run())
+
+
+def test_cancellation_during_client_cleanup_is_propagated():
+    class CanceledEmbedding(Embedding):
+        async def aclose(self):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(retrieve_chunks(
+            Store(rows(2), vectors=[[1, 0], [1, 0]]), [SOURCE], "投标保证金", lambda: None,
+            lambda _: CanceledEmbedding(), max_results=2,
+        ))
+
+
 def test_compact_tool_only_delivers_qualified_id_and_text_under_limit():
     async def run():
         research = session(rows(20), limits=AgentLimits(max_search_results=3))
@@ -281,6 +340,85 @@ def test_compact_tool_only_delivers_qualified_id_and_text_under_limit():
         assert research.events[-1]["search_limited"] is True
         empty = await research.search("alpha beta gamma", "project")
         assert empty["blocks"] == [] and "search_limited" not in empty
+
+    asyncio.run(run())
+
+
+def test_limited_candidate_window_guides_cached_pages_before_new_queries():
+    async def run():
+        research = session(rows(6), limits=AgentLimits(max_search_results=2, max_search_pages=3))
+        research.compact_results = True
+        original = research.retrieve
+
+        async def retrieve(sources, query):
+            hits, info = await original(sources, query)
+            return hits, info | {"search_limited": True}
+
+        research.retrieve = retrieve
+        for offset in (0, 2):
+            result = await research.search("投标保证金", "project", offset=offset)
+            assert result["page"]["has_more"] and result["search_limited"]
+            assert "offset=next_offset" in result["search_hint"]
+            assert "末尾" not in result["search_hint"]
+        last = await research.search("投标保证金", "project", offset=4)
+        assert not last["page"]["has_more"]
+        assert "子主题" in last["search_hint"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("page_size", [2, 6, 20])
+def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
+    async def run():
+        limits = AgentLimits(max_search_results=page_size)
+        runtime = Mock()
+        runtime.claim.return_value = True
+        runtime.run = {
+            "state": {}, "limits": asdict(limits), "thread_id": "pages",
+            "deadline_at": datetime.now(UTC) + timedelta(seconds=60),
+            "model_calls": 0, "tool_calls": 0,
+        }
+        monkeypatch.setattr(execution, "AgentRuntime", lambda *_: runtime)
+        research = None
+
+        def build(**kwargs):
+            nonlocal research
+            research = kwargs["research"]
+            research.compact_results = True
+            return object(), {}
+
+        async def invoke(*_args, state, **_kwargs):
+            collected = []
+            offset = 0
+            for _ in range(limits.max_search_pages):
+                result = await research.search("投标保证金", "project", offset=offset)
+                collected.extend(b["id"] for b in result["blocks"])
+                offset = result["page"]["next_offset"]
+            assert len(set(collected)) == page_size * limits.max_search_pages
+            assert offset is None
+            state["draft"] = {"fields": [], "relations": [], "research_summary": "分页验收"}
+
+        @asynccontextmanager
+        async def saver():
+            yield None
+
+        monkeypatch.setattr(execution, "build_module_agent", build)
+        monkeypatch.setattr(execution, "invoke_module", invoke)
+        store = Store(rows(101))
+        store.search_candidates = Mock(wraps=store.search_candidates)
+        executor = execution.AnalysisExecutor(
+            store, model_factory=Mock(return_value=AsyncMock()),
+            embedding_gateway=Mock(), rerank_gateway=Mock(), checkpoints=saver,
+        )
+        await executor.execute_module(
+            {"id": 1, "project_id": 10, "skill_snapshot": {}, "category": "goods",
+             "topics": [], "lot_settings": []},
+            {"id": 2, "module_key": "deposit_requirement_parsing", "attempt": 1}, [SOURCE],
+        )
+        runtime.abandon.assert_not_called()
+        runtime.finish.assert_called_once()
+        assert runtime.finish.call_args.args[0] == "completed"
+        store.search_candidates.assert_called_once()
 
     asyncio.run(run())
 

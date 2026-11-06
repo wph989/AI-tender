@@ -12,6 +12,15 @@ from tender.ports.repository.knowledge.retrieval import RetrievalRepository
 logger = get_logger(__name__)
 
 
+async def _close_client(client: EmbeddingModel | RerankModel | None, kind: str) -> None:
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:
+            # 关闭连接失败不应覆盖已经取得的结果或关键词回退；任务取消仍向上传播。
+            logger.warning("retrieval.close_fail", client_kind=kind, exc_info=True)
+
+
 async def retrieve_chunks(
     db: RetrievalRepository,
     sources: list[dict],
@@ -43,8 +52,7 @@ async def retrieve_chunks(
             logger.warning("embedding.fail", exc_info=True)
             warning = f"语义检索暂不可用，使用全文检索：{str(exc)[:200]}"
         finally:
-            if client:
-                await client.aclose()
+            await _close_client(client, "embedding")
     usable = [source for source in sources if source_state(source) in {"ready", "partial"}]
     await asyncio.to_thread(heartbeat)
     # 召回与排名在仓储内完成，事件循环只接收有界候选；多取一项判断是否截断。
@@ -78,8 +86,7 @@ async def retrieve_chunks(
             logger.warning("rerank.fail", exc_info=True)
             warning = (warning + "；" if warning else "") + "重排服务不可用，保留混合检索顺序"
         finally:
-            if rerank_client:
-                await rerank_client.aclose()
+            await _close_client(rerank_client, "rerank")
     search_limited = max_results is not None and len(ranked) > max_results
     if max_results is not None:
         ranked = ranked[:max_results]

@@ -80,6 +80,7 @@ def test_model_crud_binding_revision_and_history(env):
     request, _ = env
     p = provider(request)
     m = model(request, p["id"])
+    assert m["enabled"] is True
     result = asyncio.run(llm.test_model(m["id"], request))
     assert result["status"] == "ok"
     assert llm.get_test(result["test_id"], request)["status"] == "ok"
@@ -174,7 +175,7 @@ def test_latest_started_test_wins_and_old_provider_revision_cannot_write_back(en
     )
 
 
-def test_import_is_disabled_deduplicated_and_requires_matching_kind(env):
+def test_import_is_enabled_deduplicated_and_requires_matching_kind(env):
     request, _ = env
     p = provider(request)
     payload = llm.ImportRequest(
@@ -184,9 +185,14 @@ def test_import_is_disabled_deduplicated_and_requires_matching_kind(env):
         capabilities=["text_input", "embedding"],
     )
     assert llm.import_models(p["id"], payload, request)["created"] == 2
-    assert llm.import_models(p["id"], payload, request)["skipped"] == 2
     models = llm.list_models(request)["items"]
-    assert all(not m["enabled"] for m in models)
+    assert all(m["enabled"] for m in models)
+    llm.update_model(
+        models[0]["id"], llm.ModelPatch(enabled=False, revision=models[0]["revision"]), request
+    )
+    assert llm.import_models(p["id"], payload, request)["skipped"] == 2
+    # 重复导入只跳过已有模型，不能覆盖用户手动停用的状态。
+    assert llm.list_models(request)["items"][0]["enabled"] is False
     with pytest.raises(ApiProblem):
         llm.replace_bindings(
             "analysis", llm.BindingsRequest(model_ids=[models[0]["id"]], revision=1), request

@@ -77,6 +77,77 @@ test("模型超时允许小数并移除预算人工上限", async ({ page }) => 
   expect(saved).toMatchObject({ timeout_seconds: 1200.5, extra_retries: 99, max_tokens: 262144 });
 });
 
+test("新增模型默认启用，编辑配置不改变启停状态", async ({ page }) => {
+  let created: Record<string, unknown> | undefined;
+  let edited: Record<string, unknown> | undefined;
+  const disabledModel = { ...models[0], enabled: false };
+  await page.route("**/api/v1/llm/models", async (route) => {
+    if (route.request().method() === "GET") {
+      return route.fulfill({ json: { items: [disabledModel] } });
+    }
+    created = route.request().postDataJSON();
+    await route.fulfill({ json: { ...models[0], id: 100 } });
+  });
+  await page.route("**/api/v1/llm/models/1", async (route) => {
+    edited = route.request().postDataJSON();
+    await route.fulfill({ json: disabledModel });
+  });
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: /管理模型/ }).click();
+  await page.getByRole("button", { name: "新增模型", exact: true }).click();
+  const createDialog = page.getByRole("dialog", { name: "新增模型", exact: true });
+  await createDialog.getByLabel("模型 ID", { exact: true }).fill("new-model");
+  await createDialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(createDialog).not.toBeVisible();
+  expect(created).toMatchObject({ model_id: "new-model", enabled: true });
+  await page.getByRole("button", { name: "编辑", exact: true }).click();
+  const editDialog = page.getByRole("dialog", { name: "编辑模型", exact: true });
+  await expect(editDialog.getByRole("switch")).toHaveCount(0);
+  await editDialog.getByLabel("名称", { exact: true }).fill("仍然停用的模型");
+  await editDialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(editDialog).not.toBeVisible();
+  expect(edited).toMatchObject({ display_name: "仍然停用的模型", revision: 7 });
+  expect(edited).not.toHaveProperty("enabled");
+  await expect(page.getByRole("switch", { name: "测试模型 1启用状态" })).not.toBeChecked();
+});
+
+test("模型列表直接启停，失败保留原状态并使用当前版本", async ({ page }) => {
+  let current = { ...models[0] };
+  const updates: { enabled: boolean; revision: number }[] = [];
+  await page.route("**/api/v1/llm/models", (route) =>
+    route.fulfill({ json: { items: [current] } }),
+  );
+  await page.route("**/api/v1/llm/models/1", async (route) => {
+    const update = route.request().postDataJSON();
+    updates.push(update);
+    if (updates.length === 2) {
+      return route.fulfill({
+        status: 412, json: { error: { message: "模型状态更新失败，请重试" } },
+      });
+    }
+    current = { ...current, enabled: update.enabled, revision: current.revision + 1 };
+    await route.fulfill({ json: current });
+  });
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: /管理模型/ }).click();
+  const toggle = page.getByRole("switch", { name: "测试模型 1启用状态", exact: true });
+  await expect(toggle).toBeChecked();
+  await toggle.click();
+  await expect(toggle).not.toBeChecked();
+  await expect(toggle).toBeEnabled();
+  await toggle.click();
+  await expect(page.getByRole("alert").filter({ hasText: "模型状态更新失败，请重试" }).first()).toBeVisible();
+  await expect(toggle).not.toBeChecked();
+  await expect(toggle).toBeEnabled();
+  await toggle.click();
+  await expect(toggle).toBeChecked();
+  expect(updates).toEqual([
+    { enabled: false, revision: 7 }, { enabled: true, revision: 8 },
+    { enabled: true, revision: 8 },
+  ]);
+  await expect(page.getByRole("dialog", { name: "编辑模型", exact: true })).toHaveCount(0);
+});
+
 test("功能大预算可保存，候选上限继续读取服务端规则", async ({ page }) => {
   let saved: unknown;
   await page.route("**/api/v1/llm/settings", (route) => route.fulfill({ json: {

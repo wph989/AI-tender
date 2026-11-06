@@ -280,7 +280,8 @@ class LlmService:
                         "kind": values["kind"],
                         "api_mode": values["api_mode"],
                         "capabilities": values["capabilities"],
-                        "enabled": False,
+                        # 导入前已确认接口与能力，与手动创建保持相同的启用默认值。
+                        "enabled": True,
                         "timeout_seconds": values.get("timeout_seconds") or 90,
                         "temperature": values.get("temperature"),
                         "max_tokens": values.get("max_tokens"),

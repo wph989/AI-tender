@@ -594,6 +594,7 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     runtime = prepared_runtime(env)
     assert runtime.claim()
     runtime.reserve("model")
+    runtime.reserve("tool")
     carried_field = {
         "id": "part1",
         "field": "质保",
@@ -635,6 +636,10 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
             "consecutive_unsubmitted_responses": 2,
             "last_unsubmitted_message_id": "old-response",
         }
+    saved_state["research"] = {
+        "seen": {}, "events": [{"action": "search_result", "scope": "project"}],
+        "tool_calls": 1,
+    }
     runtime.save(saved_state)
     if staged:
         # 逐字段落库：已核实成果写进模块结果，模块失败后前端仍能展示。
@@ -661,6 +666,10 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
         {"id": runtime.run["module_id"]},
     )
     assert [r["model_calls"] for r in rows] == [1, 0]
+    assert [r["tool_calls"] for r in rows] == [1, 0]
+    assert rows[0]["state"]["research"]["tool_calls"] == 1
+    assert rows[1]["state"]["research"]["tool_calls"] == 0
+    assert rows[1]["state"]["research"]["events"] == rows[0]["state"]["research"]["events"]
     assert [r["attempt"] for r in rows] == [1, 2]
     assert rows[0]["limits"]["max_output_tokens"] == 8192
     assert rows[1]["limits"]["max_output_tokens"] == 262144

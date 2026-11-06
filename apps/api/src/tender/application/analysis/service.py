@@ -530,6 +530,10 @@ class AnalysisService:
                     else {}
                 )
                 if carry:
+                    if "research" in carry:
+                        # 新 attempt 已获得独立预算；保留证据与检索过程，但不继承旧调用次数。
+                        # 同一 attempt 的中断恢复不经过补跑入口，仍累计原计数。
+                        carry["research"] = {**carry["research"], "tool_calls": 0}
                     draft = carry.pop("draft", None)
                     if draft:
                         carry["staged_items"] = draft["fields"]

@@ -144,7 +144,7 @@ export function ProvidersPanel({
             : Number(config.values.max_tokens),
       });
       void toast.success(
-        `已导入 ${count} 个模型，跳过 ${selected.length - count} 个已有模型。新模型默认停用。`,
+        `已导入 ${count} 个模型，跳过 ${selected.length - count} 个已有模型。新模型默认启用。`,
       );
       setImporting(null);
       await refresh();
@@ -432,7 +432,7 @@ export function ProvidersPanel({
             onFinish={importSelected}
           >
             <p className="mb-4 text-sm text-slate-500">
-              选择模型并核对能力。已有模型会跳过，新模型默认停用。
+              选择模型并核对能力。已有模型会跳过，新模型默认启用。
             </p>
             <Form.Item label="导入模型能力">
               <Select

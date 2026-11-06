@@ -1,0 +1,98 @@
+"""补跑保留成果，但新 attempt 的调用预算不能被历史研究计数占用。"""
+
+import asyncio
+import copy
+from unittest.mock import AsyncMock, MagicMock, Mock
+
+import pytest
+
+from tender.application.analysis.contract import RUNTIME_VERSION
+from tender.application.analysis.research import AgentLimits, ResearchSession
+from tender.application.analysis.service import AnalysisService
+from tender.ports.repository.analysis.reports import ReportRepository, ReportTransaction
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("previous_tool_calls", [76, 100])
+def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
+    monkeypatch, staged, previous_tool_calls
+):
+    source = {
+        "source_id": 1, "collection_id": 1, "project_id": 10, "file_name": "采购.pdf",
+        "purpose": "tender", "parse_run_id": 1, "version_id": 1,
+    }
+    evidence = source | {
+        "block_id": "s1r1c0", "element_id": 1, "content": "质保三年", "offset": 0,
+        "chapter": "质保",
+    }
+    field = {
+        "id": "warranty", "field": "质保", "verification": "supported",
+        "values": [{"value": "质保三年", "citations": [{
+            "block_id": "s1r1c0", "source_id": 1, "project_id": 10, "quote": "质保三年",
+        }]}],
+    }
+    saved_state = {
+        "research": {
+            "seen": {"s1r1c0": evidence},
+            "events": [{"action": "search_result", "scope": "project"}],
+            "tool_calls": previous_tool_calls,
+        },
+        "research_completed": True,
+        "research_summary": "已核对质保要求",
+    }
+    if staged:
+        saved_state.update(staged_items=[field], staged_items_verified=True)
+    else:
+        saved_state["draft"] = {"fields": [field], "relations": []}
+    repository = MagicMock(spec=ReportRepository)
+    transaction = Mock(spec=ReportTransaction)
+    repository.transaction.return_value.__enter__.return_value = transaction
+    repository.resolved_config.return_value = {"analysis.max_tool_calls": 100}
+    transaction.report_status.return_value = "partial"
+    transaction.execution_active.return_value = False
+    transaction.try_lock_execution.return_value = True
+    transaction.other_active_report.return_value = None
+    transaction.modules_for_retry.return_value = [{"id": 20, "status": "partial"}]
+    transaction.report_has_modules.return_value = True
+    transaction.module_attempt.return_value = 3
+    # 仓储返回反序列化状态；新运行不能回写旧 attempt 的审计记录。
+    transaction.previous_run_state.return_value = copy.deepcopy(saved_state)
+    service = AnalysisService(repository, 1, Mock(), Mock(), Mock())
+    monkeypatch.setattr(service, "report_row", lambda _: {
+        "id": 27, "project_id": 10, "status": "partial", "runtime_version": RUNTIME_VERSION,
+        "coverage": {"mode": "agent_research"},
+    })
+
+    result = service.retry_report(
+        27, module_keys=["project_basic_info_parsing"], max_output_tokens=None,
+        timeout_seconds=None,
+    )
+
+    assert result == {"id": 27, "status": "pending"}
+    arguments = transaction.insert_module_run.call_args.kwargs
+    assert arguments["attempt"] == 3
+    assert arguments["thread_id"] == "analysis:27:20:3"
+    carried = arguments["state"]
+    assert carried["staged_items"] == [field]
+    assert carried["staged_items_verified"] is True
+    assert "draft" not in carried
+    assert carried["research_completed"] is True
+    assert carried["research_summary"] == saved_state["research_summary"]
+    assert carried["research"]["seen"] == saved_state["research"]["seen"]
+    assert carried["research"]["events"] == saved_state["research"]["events"]
+    assert carried["research"]["tool_calls"] == 0
+    assert saved_state["research"]["tool_calls"] == previous_tool_calls
+
+    async def run():
+        research = ResearchSession(
+            [source], 10, AsyncMock(), AsyncMock(), AsyncMock(),
+            limits=AgentLimits(**arguments["limits"]), **carried["research"],
+        )
+        # 实际执行完整研究预算，验证不会在第 26 次或首次调用时提前失败。
+        for _ in range(100):
+            await research.documents()
+        with pytest.raises(ValueError, match="工具调用预算"):
+            await research.documents()
+        assert research.tool_calls == 100
+
+    asyncio.run(run())
