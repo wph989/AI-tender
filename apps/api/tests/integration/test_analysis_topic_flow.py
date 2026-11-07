@@ -166,6 +166,93 @@ def test_scope_revision_persists_current_progress_and_review_state_across_reload
         runtime.release()
 
 
+def test_exhausted_search_work_is_persisted_and_settles_without_audit_requests(env):
+    from tender.application.analysis.research import AgentLimits, ToolArgumentError
+    from tender.application.analysis.search_control import TopicSearch
+
+    runtime = prepared_runtime(env, topic_flow=True)
+    assert runtime.claim()
+    try:
+        common = {"kind": "common", "lot_refs": []}
+        state = publishable_state("project_basic_info_parsing")
+        state["staged_items"] = state["staged_items"][:1]
+        state["business_topics"] = [{"key": "warranty", "title": "质保", "checks": ["期限"]}]
+        research = SimpleNamespace(seen={"s1r1c0": {"content": "质保三年"}}, limits=AgentLimits())
+        flow = TopicFlow(state, research)
+        task = {"detail": "核对起算点", "record_keys": ["warranty"]}
+        progress = {"topic": "warranty", "scope": common, "status": "researching",
+                    "checked": ["期限"], "evidence_ids": ["s1r1c0"], "tasks": [task],
+                    "record_keys": ["warranty"], "detail": "起算点待核对"}
+        flow.apply([TopicUpdate.model_validate(progress)], {"warranty"})
+        control = TopicSearch(flow)
+        for index in range(3):
+            target = control.begin("search_document", {"topic_keys": ["warranty"],
+                                                       "query": f"起算点换词{index}"})
+            control.end(target, {"blocks": [], "already_read": ["s1r1c0"]}, {"s1r1c0"})
+            runtime.save(state)
+        stored = env.db.rows("SELECT state FROM agent_module_run WHERE id=:id",
+                             {"id": runtime.run["id"]})[0]["state"]
+        restored = TopicFlow(stored, research)
+        restored.apply([TopicUpdate.model_validate(progress)], {"warranty"})
+        with pytest.raises(ToolArgumentError, match="耗尽"):
+            TopicSearch(restored).begin("search_document", {"topic_keys": ["warranty"]})
+        assert TopicSearch.summary(stored)["research_calls"] == 3
+        assert stored["topic_flow"]["audit"]["results"] == {}
+        runtime.finish("partial", "起算点检索无进展", state=stored)
+        module = env.db.rows("SELECT status,business_data FROM analysis_module WHERE id=:id",
+                             {"id": runtime.run["module_id"]})[0]
+        assert module["status"] == "partial" and len(module["business_data"]["records"]) == 1
+    finally:
+        runtime.release()
+
+
+def test_check_exhaustion_preserves_other_work_and_stable_task_ids_across_reload(env):
+    from tender.application.analysis.research import AgentLimits, ToolArgumentError
+    from tender.application.analysis.search_control import TopicSearch
+
+    runtime = prepared_runtime(env, topic_flow=True)
+    assert runtime.claim()
+    try:
+        state = publishable_state("project_basic_info_parsing")
+        state["staged_items"] = state["staged_items"][:1]
+        state["business_topics"] = [{"key": "a", "title": "质保", "checks": ["期限", "起算点"]}]
+        research = SimpleNamespace(seen={"s1r1c0": {"content": "质保三年"}}, limits=AgentLimits())
+        flow = TopicFlow(state, research)
+        progress = {"topic": "a", "scope": {"kind": "common", "lot_refs": []},
+                    "status": "researching", "checked": [], "record_keys": ["warranty"],
+                    "evidence_ids": ["s1r1c0"], "detail": "继续核对",
+                    "tasks": [{"detail": "找附件"}]}
+        flow.apply([TopicUpdate.model_validate(progress)], {"warranty"})
+        task_id = next(iter(flow.entries[0]["tasks"]))
+        control = TopicSearch(flow)
+        for index in range(3):
+            work = control.begin("search_document", {"topic_keys": ["a"], "work": "期限",
+                                                     "query": str(index)})
+            control.end(work, {"blocks": []}, set(research.seen))
+        with pytest.raises(ToolArgumentError):
+            control.begin("search_document", {"topic_keys": ["a"], "work": "期限", "query": "再找"})
+        runtime.save(state)
+        stored = env.db.rows("SELECT state FROM agent_module_run WHERE id=:id",
+                             {"id": runtime.run["id"]})[0]["state"]
+        restored = TopicFlow(stored, research)
+        assert restored.entries[0]["blocked_checks"] == ["期限"]
+        assert restored.entries[0]["status"] in {"researching", "needs_review"}
+        assert TopicSearch(restored).begin("search_document", {
+            "topic_keys": ["a"], "work": "起算点",
+        })
+        renamed = progress | {"tasks": [{"task_id": task_id, "detail": "核对附件原文"}]}
+        restored.apply([TopicUpdate.model_validate(renamed)], {"warranty"})
+        runtime.save(stored)
+        projected = env.db.rows("SELECT business_data FROM analysis_module WHERE id=:id",
+                                {"id": runtime.run["module_id"]})[0]["business_data"]
+        topic = projected["progress"]["topics"][0]
+        assert topic["tasks"][0]["task_id"] == task_id
+        assert topic["tasks"][0]["detail"] == "核对附件原文"
+        assert topic["blocked_checks"] == ["期限"]
+    finally:
+        runtime.release()
+
+
 @pytest.mark.parametrize("max_calls", [4, 40])
 def test_new_report_runs_incremental_graph_and_independent_audit(env, monkeypatch, max_calls):
     import json

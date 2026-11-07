@@ -24,6 +24,7 @@ from tender.application.analysis.completeness import review_completeness
 from tender.application.analysis.data_store import publish_data_snapshot
 from tender.application.analysis.research import AgentLimits, ResearchSession
 from tender.application.analysis.runtime import AgentRuntime, check_report_access
+from tender.application.analysis.search_control import TopicSearch
 from tender.application.analysis.skills import MODULES, verify_items
 from tender.application.analysis.topic_flow import TopicIncomplete, enabled
 from tender.application.knowledge.content import encode, normalized, source_state
@@ -539,6 +540,8 @@ class AnalysisExecutor:
 
         finally:
             try:
+                if state.get("topic_flow"):
+                    logger.info("module.efficiency", **TopicSearch.summary(state))
                 if model:
                     try:
                         await model.aclose()

@@ -590,20 +590,28 @@ class AnalysisService:
                         "topic_summary_id",
                         "topic_final_requested",
                         "topic_budget_exhausted",
+                        "topic_research_round",
                     ):
                         carry.pop(key, None)
                     carry.pop("pending_final", None)
                     if carry.get("topic_flow"):
                         # 显式补跑是新运行：重新打开受阻待办，独立查漏次数按本次预算计算。
                         carry["topic_flow"]["audit"] = {"round": 0, "results": {}}
+                        # 仅显式补跑开启新研究额度；同attempt恢复仍保留耗尽状态及统计。
+                        for key in ("search_work", "efficiency", "active_work", "active_topics"):
+                            carry["topic_flow"].pop(key, None)
                         carry["business_gaps"] = [g for g in carry.get("business_gaps", [])
                                                   if g["key"] != "execution:incomplete"]
                         for entry in carry["topic_flow"]["entries"].values():
+                            entry["blocked_checks"] = []
                             if entry["status"] == "blocked":
                                 entry.update(status="researching", requested_status="researching")
                             for task in entry["tasks"].values():
                                 if task["status"] == "blocked":
                                     task["status"] = "pending"
+                            for trace in entry.get("references", []):
+                                if trace["status"] == "budget_exhausted":
+                                    trace["status"] = "missing"
                     try:
                         validate_project_claims(
                             carry.get("draft", {}).get("fields", carry.get("staged_items", [])),

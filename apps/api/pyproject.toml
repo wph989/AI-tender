@@ -67,6 +67,7 @@ files = [
     "src/tender/ports", "src/tender/core/di.py", "src/tender/application/analysis/state.py",
     "src/tender/application/analysis/research.py", "src/tender/application/knowledge/retrieval.py",
     "src/tender/application/analysis/topic_flow.py", "src/tender/application/analysis/completeness.py",
+    "src/tender/application/analysis/search_control.py",
     "src/tender/application/jobs/service.py", "src/tender/domain/knowledge/text.py",
     "src/tender/adapters/pg/repositories/analysis/reports.py",
     "src/tender/adapters/pg/repositories/llm/retrieval.py",

@@ -14,8 +14,9 @@ from tender.ports.repository.analysis.reports import ReportRepository, ReportTra
 
 @pytest.mark.parametrize("staged", [False, True])
 @pytest.mark.parametrize("previous_tool_calls", [76, 100])
+@pytest.mark.parametrize("topic_flow", [False, True])
 def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
-    monkeypatch, staged, previous_tool_calls
+    monkeypatch, staged, previous_tool_calls, topic_flow
 ):
     source = {
         "source_id": 1, "collection_id": 1, "project_id": 10, "file_name": "采购.pdf",
@@ -40,6 +41,16 @@ def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
         "research_completed": True,
         "research_summary": "已核对质保要求",
     }
+    if topic_flow:
+        saved_state.update(topic_research_round="old-round", topic_flow={
+            "entries": {"a": {"status": "blocked", "requested_status": "blocked", "tasks": {
+                "task": {"status": "blocked"},
+            }, "blocked_checks": ["截止时点"], "references": [{"status": "budget_exhausted"}]}},
+            "audit": {"round": 1, "results": {"old": {"issues": []}}},
+            "search_work": {"old-work": {"exhausted": True, "attempts": 3}},
+            "efficiency": {"research_calls": 3},
+            "active_work": [{"work": "旧待办"}], "active_topics": ["a"],
+        })
     if staged:
         saved_state.update(staged_items=[field], staged_items_verified=True)
     else:
@@ -82,6 +93,17 @@ def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
     assert carried["research"]["events"] == saved_state["research"]["events"]
     assert carried["research"]["tool_calls"] == 0
     assert saved_state["research"]["tool_calls"] == previous_tool_calls
+    if topic_flow:
+        assert carried["topic_flow"]["entries"]["a"]["status"] == "researching"
+        assert carried["topic_flow"]["entries"]["a"]["tasks"]["task"]["status"] == "pending"
+        assert carried["topic_flow"]["entries"]["a"]["blocked_checks"] == []
+        assert carried["topic_flow"]["entries"]["a"]["references"][0]["status"] == "missing"
+        assert carried["topic_flow"]["audit"] == {"round": 0, "results": {}}
+        assert not set(carried["topic_flow"]) & {
+            "search_work", "efficiency", "active_work", "active_topics",
+        }
+        assert "topic_research_round" not in carried
+        assert saved_state["topic_flow"]["search_work"]["old-work"]["exhausted"]
 
     async def run():
         research = ResearchSession(

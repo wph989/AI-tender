@@ -25,6 +25,8 @@ class TopicIncomplete(RuntimeError):
 
 
 class TopicTask(DataInput):
+    task_id: str | None = Field(default=None, min_length=1, max_length=100,
+                                description="更新或改名时沿用进度返回的task_id；新增独立待办省略")
     detail: str = Field(min_length=1, max_length=1000)
     status: Literal["pending", "resolved", "blocked"] = "pending"
     evidence_ids: list[str] = Field(default_factory=list, max_length=160)
@@ -48,6 +50,9 @@ TOPIC_CONTRACT = """你是当前专题的分析Agent，按子主题增量研究�
 运行时已加载Skill与内容schema；其中全专题检索后才能提交、额外空提交收尾的旧流程说明，
 以本运行时规则为准。先list_documents核对授权资料，search_document/read_document使用topic_keys
 关联具体主题；按具体未决问题检索，不逐个穷举关键词，不反复搜索已确认的事实原值。
+检索及扩展补读用work选择search_work中的具体核对项、待办或转引；仅一项时可省略。
+已完成及受阻事项不能重复搜索；有新的具体转引或修订线索时，随提交登记具体待办再处理。
+只复制引文可before=0、after=0回读；参数纠错额度耗尽后停止扩展，提交已有核实成果。
 某个主题已有可靠事项即可submit_analysis，每批最多三条完整事项，无须complete_research。
 提交同时提供topic_updates：topic、scope、status、checked、evidence_ids、record_keys、detail；
 checked填写该主题已核对的checks原文；record_keys关联累计已提交事项，不能遗漏独立事项。
@@ -58,6 +63,7 @@ replaces_scopes列出同主题被替代的scope，沿用key重提修改的事项
 ready表示核对项、独立事项和转引均已处理，引用支持全部条件、例外、单位、起算点和范围。
 查不到、附件缺失或预算不足时用blocked并说明缺口；未命中不能证明不存在或不适用。
 tasks逐项登记具体待办及pending/resolved/blocked，resolved须有已读证据或核实事项。
+更新或改名待办时沿用进度中的task_id；仅新增独立待办时省略，不能改名重开旧研究额度。
 新证据可能修订旧结论：待复核事项需沿用key重新提交，正文不变也要核对新增证据的影响。
 全部主题已处理后运行时自动独立查漏，不用为了结束多发空提交；final=true只请求检查完成条件。
 查漏发现的audit任务必须逐项回应，最多补查一轮；无法解决则如实blocked，不能删除任务。
@@ -106,6 +112,7 @@ class TopicFlow:
         return {"topic": topic["key"], "title": topic.get("title", topic["key"]),
                 "scope": scope, "status": "pending", "checked": [],
                 "checks": topic.get("checks") or [topic.get("title", topic["key"])],
+                "blocked_checks": [],
                 "evidence_ids": [], "record_keys": [], "tasks": {}, "references": [],
                 "detail": "尚未核对", "requested_status": "researching"}
 
@@ -132,8 +139,14 @@ class TopicFlow:
         # 补遗或澄清可能改变同一专题的多个主题，不能只信请求者选择的一个主题。
         revisions = [self.research.seen[k] for k in associated if k in added
                      or set(keys) - set(self.data["evidence_topics"].get(k, []))]
-        if any(any(word in row.get("file_name", "") for word in ("补遗", "澄清", "更正"))
-               for row in revisions):
+        global_revision = any(
+            any(word in row.get("file_name", "") for word in ("补遗", "澄清", "更正"))
+            or any(word in row.get("content", "") for word in (
+                "本项目全部", "所有标段", "统一调整", "更正", "修改为", "调整为", "废止", "替代",
+            ))
+            for row in revisions
+        )
+        if global_revision:
             keys = [t["key"] for t in self.state["business_topics"]]
         # 原文可能先被另一主题读过；是否需要复核以本主题首次接收该证据为准。
         changed = {topic: {k for k in associated if k in added
@@ -149,6 +162,7 @@ class TopicFlow:
             entry["status"] = "needs_review" if entry["record_keys"] else "researching"
             entry["requested_status"] = "researching"
         affected = {k for e in self.entries if e["topic"] in keys for k in e["record_keys"]}
+        # 待办描述检索目的，不能证明返回原文只影响其record_keys；混合条款须按关联主题复核。
         affected.update(i["business"]["key"] for i in self.state.get("staged_items", [])
                         if i.get("business", {}).get("kind") == "coverage"
                         and i["business"]["topic"] in keys)
@@ -346,8 +360,10 @@ class TopicFlow:
                     raise ValueError("待办关联记录尚未提交")
                 if task.status == "resolved" and not (task.evidence_ids or task.record_keys):
                     raise ValueError("resolved待办必须关联证据或已提交记录")
-                task_id = fingerprint(normalized(task.detail))
-                entry["tasks"][task_id] = task.model_dump()
+                task_id = task.task_id or fingerprint(normalized(task.detail))
+                if task.task_id and task_id not in entry["tasks"]:
+                    raise ValueError("task_id须引用当前主题及范围已有的待办；新增待办请省略task_id")
+                entry["tasks"][task_id] = task.model_dump() | {"task_id": task_id}
             for trace in update.references:
                 if trace.status == "resolved" and not trace.evidence_ids:
                     raise ValueError("转引resolved必须关联目标实质证据")
@@ -391,18 +407,31 @@ class TopicFlow:
                  if e.get("business")}
         coverage, gaps = [], []
         for entry in self.entries:
+            for task_id, task in entry["tasks"].items():
+                task["task_id"] = task_id
             records = [items.get(k, {}) for k in entry["record_keys"]]
             reviewed = all(r.get("verification") == "supported"
                            and r.get("review_status") != "needs_review"
                            and covers_topic_scope(r["business"]["scope"], entry["scope"])
                            for r in records)
             tasks = list(entry["tasks"].values())
+            # 耗尽的核对项及转引仍是缺口；其余可处理工作不能随之被封锁。
+            blocked_checks = set(entry.get("blocked_checks", [])) - set(entry["checked"])
+            entry["blocked_checks"] = sorted(blocked_checks)
             pending = any(t["status"] == "pending" or t["status"] == "resolved" and any(
                 items.get(k, {}).get("verification") != "supported"
                 or items.get(k, {}).get("review_status") == "needs_review"
                 for k in t["record_keys"]
             ) for t in tasks)
             unresolved = any(r["status"] != "resolved" for r in entry["references"])
+            research_pending = (pending or any(check not in entry["checked"]
+                                               and check not in blocked_checks
+                                               for check in entry["checks"])
+                                or any(r["status"] not in {"resolved", "budget_exhausted"}
+                                       for r in entry["references"]))
+            blocked = [*blocked_checks, *(t["detail"] for t in tasks if t["status"] == "blocked"),
+                       *(r["target"] for r in entry["references"]
+                         if r["status"] == "budget_exhausted")]
             proof = any(c["topic"] == entry["topic"] and c["scope"] == entry["scope"]
                         and c["status"] == "not_applicable" and any(
                             i.get("id") == c.get("review_id")
@@ -417,9 +446,11 @@ class TopicFlow:
                      and not any(t["status"] == "blocked" for t in tasks))
             if ready:
                 entry["status"] = "ready"
-            elif (entry["requested_status"] == "blocked"
-                  or any(t["status"] == "blocked" for t in tasks)) and not pending:
+            elif (entry["requested_status"] == "blocked" and not pending
+                  or blocked and not research_pending):
                 entry["status"] = "blocked"
+                if entry["requested_status"] != "blocked":
+                    entry["detail"] = "研究受阻：" + "；".join(blocked)
             elif any(r.get("review_status") == "needs_review" for r in records):
                 entry["status"] = "needs_review"
             elif entry["status"] != "pending":
@@ -489,7 +520,7 @@ class TopicFlow:
 
     def progress(self) -> dict:
         fields = ("topic", "title", "scope", "status", "checked", "checks", "evidence_ids",
-                  "record_keys", "references", "detail")
+                  "record_keys", "references", "detail", "blocked_checks")
         return {"topics": [{**{k: e[k] for k in fields}, "tasks": list(e["tasks"].values())}
                            for e in self.entries],
                 "audit_round": self.data["audit"]["round"]}
@@ -524,11 +555,20 @@ class TopicFlow:
         self.sync()
 
     def prompt(self) -> str:
+        from tender.application.analysis.search_control import TopicSearch
+
         progress = self.progress()
         # 日常提示只带活动待办与核对项；已读全文仍通过按需回读取得。
         for entry in progress["topics"]:
             entry.pop("evidence_ids", None)
             entry["tasks"] = [t for t in entry["tasks"] if t["status"] != "resolved"]
+            if entry["status"] == "ready":
+                for key in ("checks", "checked", "references", "detail"):
+                    entry.pop(key, None)
+        progress["search_work"] = [{k: v for k, v in work.items() if k != "id"}
+                                   for work in TopicSearch(self).choices([
+                                       t["key"] for t in self.state["business_topics"]
+                                   ])]
         return json.dumps(progress, ensure_ascii=False, separators=(",", ":"))
 
     def audit_batches(self, issues: list[dict]) -> list[dict]:

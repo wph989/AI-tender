@@ -68,6 +68,7 @@ from tender.application.analysis.research import (
     SourceNotAllowed,
     ToolArgumentError,
 )
+from tender.application.analysis.search_control import TopicSearch
 from tender.application.analysis.skills import MODULES
 from tender.application.analysis.state import AnalysisTransitions, clear_record_gaps
 from tender.application.analysis.topic_flow import (
@@ -698,6 +699,8 @@ class ResearchMiddleware(AgentMiddleware):
             if final:
                 return self.feedback("尚未完成：" + "；".join(pending[:8]))
             return None
+        if any(e["status"] == "blocked" for e in flow.entries):
+            raise TopicIncomplete("仍有受阻内容，保留已核实成果及具体缺口")
         if self.review_coverage is None:
             raise TopicIncomplete("独立查漏服务未配置，已核实内容保留")
         with bind_context(agent_phase="completeness"):
@@ -855,6 +858,9 @@ class ResearchMiddleware(AgentMiddleware):
             return await self._run_review_step()
         started = time.monotonic()
         with bind_context(agent_phase="verification"):
+            if self.topic_flow:
+                stats = self.topic_flow.data.setdefault("efficiency", {})
+                stats["reviewed_records"] = stats.get("reviewed_records", 0) + pending
             logger.info("review.start", pending_item_count=pending)
             try:
                 feedback = await self._run_review_step()
@@ -1075,7 +1081,8 @@ class ResearchMiddleware(AgentMiddleware):
                         if signature == self.state.get("progress_signature") else 0)
                 self.state.update(progress_signature=signature, progress_message_id=message.id,
                                   no_progress_rounds=idle)
-                if idle >= self.research.limits.max_no_progress_rounds:
+                research_turn = self.state.get("topic_research_round") == message.id
+                if idle >= self.research.limits.max_no_progress_rounds and not research_turn:
                     self.topic_flow.block_stalled()
                     self.state["no_progress_rounds"] = 0
                     feedback = self.feedback("当前待办连续无法推进，已登记缺口；继续其他未处理主题")
@@ -1321,10 +1328,28 @@ class ResearchMiddleware(AgentMiddleware):
                                self.state.get("read_tool_cache", {}))
                 if (not cached_read
                         and counts[signature] > self.research.limits.max_identical_tool_calls):
+                    if self.topic_flow:
+                        raise TopicIncomplete("相同工具与参数重复调用已达上限：" + name)
                     raise RuntimeError("相同工具与参数重复调用已达上限：" + name)
                 try:
                     was_synthesis = bool(self.state.get("research_completed"))
                     status = self.budget_status() if self.budget_status else {}
+                    control, work = None, []
+                    before = set(self.research.seen)
+                    if self.topic_flow and name in {
+                        "search_document", "search_knowledge", "read_document",
+                    }:
+                        quote_only = (name == "read_document"
+                                      and request.tool_call["args"].get("before", 2) == 0
+                                      and request.tool_call["args"].get("after", 2) == 0)
+                        if (not quote_only and self.state.get("argument_failures", 0)
+                                >= self.research.limits.max_argument_failures):
+                            raise TopicIncomplete("参数纠错额度已耗尽，停止新增检索并保留核实成果")
+                        if not quote_only:
+                            # 关闭一个耗尽待办的反馈轮也由工作账收敛，不能连带封锁其他待办。
+                            self.state["topic_research_round"] = self._round_id(request)
+                        control = TopicSearch(self.topic_flow)
+                        work = control.begin(name, request.tool_call["args"])
                     if name in {"search_document", "search_knowledge"} and (
                         (self.state.get("finish_only") and not self.topic_flow)
                         or self.budget_needs_synthesis(status)
@@ -1344,11 +1369,21 @@ class ResearchMiddleware(AgentMiddleware):
                     }
                     prior = self.state.setdefault("read_tool_cache", {}).get(signature)
                     if reusable and prior is not None:
+                        if control:
+                            stats = self.topic_flow.data.setdefault("efficiency", {})
+                            stats["reused_tools"] = stats.get("reused_tools", 0) + 1
                         result = messages_from_dict([prior])[0].model_copy(
                             update={"tool_call_id": call_id, "id": None}
                         )
                     else:
                         result = await handler(request)
+                    if (control and result.status != "error"
+                            and not str(result.content).startswith(TOOL_ARGUMENT_PREFIX)):
+                        payload = json.loads(result.content)
+                        control.end(work, payload, before)
+                        result = result.model_copy(update={"content": json.dumps(
+                            payload, ensure_ascii=False,
+                        )})
                 except SourceNotAllowed as exc:
                     failure_class = "scope"
                     result = ToolMessage(
@@ -1423,6 +1458,9 @@ class ResearchMiddleware(AgentMiddleware):
                 raise
             finally:
                 try:
+                    if self.topic_flow:
+                        # 参数错误或取消同样结束当前归因，防止后续提交误用上次的局部范围。
+                        self.topic_flow.data.pop("active_work", None)
                     self.state["research"] = self.research.checkpoint()
                     await self.save(self.state)
                 except BaseException as exc:
@@ -1524,6 +1562,7 @@ def build_module_agent(
     async def search_document(
         query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
         topic_keys: list[str] | None = None,
+        work: str | None = None,
     ) -> dict:
         """检索本项目原文；同一查询用 offset=next_offset 翻页，补充检索会回到检索阶段。"""
         keys = flow.topic_keys(topic_keys) if flow else []
@@ -1543,6 +1582,7 @@ def build_module_agent(
     async def search_knowledge(
         query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
         topic_keys: list[str] | None = None,
+        work: str | None = None,
     ) -> dict:
         """检索已关联参考资料；同一查询用 offset=next_offset 翻页，不能替代本项目要求。"""
         keys = flow.topic_keys(topic_keys) if flow else []
@@ -1561,6 +1601,7 @@ def build_module_agent(
         before: Annotated[int, Field(ge=0, le=11)] = 2,
         after: Annotated[int, Field(ge=0, le=11)] = 2,
         topic_keys: list[str] | None = None,
+        work: str | None = None,
     ) -> dict:
         """补读已知证据的邻近原文；合计超过11块时由运行时按顺序截断并回报实际窗口。"""
         keys = flow.topic_keys(topic_keys, block_id=block_id) if flow else []
@@ -1844,11 +1885,11 @@ def build_module_agent(
 
         for tool in tools:
             fields = tool.args_schema.model_fields
-            if {"topic_keys", "topic_updates"} & fields.keys():
+            if {"topic_keys", "topic_updates", "work"} & fields.keys():
                 tool.args_schema = create_model(
                     tool.args_schema.__name__,
                     **{name: (field.annotation, field) for name, field in fields.items()
-                       if name not in {"topic_keys", "topic_updates"}},
+                       if name not in {"topic_keys", "topic_updates", "work"}},
                 )
     limits = research.limits
     middleware = ResearchMiddleware(
