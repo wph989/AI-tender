@@ -13,8 +13,12 @@ from dataclasses import asdict
 from tender.application.analysis.data import display_items, module_data
 from tender.application.analysis.research import AgentLimits
 from tender.application.analysis.state import published_items
+from tender.core.logging import get_logger
+from tender.ports.analysis.archive import AnalysisArchive
 from tender.ports.repository.analysis.reports import ReportRepository
 from tender.ports.repository.analysis.runtime import AgentRunStore
+
+logger = get_logger(__name__)
 
 
 def limits_snapshot(db: ReportRepository) -> dict:
@@ -63,10 +67,13 @@ class AgentRuntime:
     """模块执行的门面：在运行账状态机上叠加权限复核与成果投影。"""
 
     def __init__(
-        self, db: ReportRepository, report: dict, run: dict, sources: list[dict]
+        self, db: ReportRepository, report: dict, run: dict, sources: list[dict],
+        *, archive: AnalysisArchive | None = None,
     ) -> None:
         self.db, self.report, self.sources = db, report, sources
         self.store: AgentRunStore = db.agent_run_store(report, run)
+        self.archive = archive
+        self._last_state: dict = run.get("state") or {}
 
     @property
     def run(self) -> dict:
@@ -108,6 +115,7 @@ class AgentRuntime:
     def save(self, state: dict) -> None:
         self.guard()
         self.store.save(state, publish=self._staged_payload(state))
+        self._last_state = state
 
     def finish(
         self,
@@ -126,9 +134,15 @@ class AgentRuntime:
                 self.store.guard_settlement()
             else:
                 self.guard()
+        publish: dict | None
         if status == "completed" and draft is not None:
             publish = self._draft_payload(draft)
         elif status == "partial" or topic_settlement:
+            if status == "partial" and state:
+                flow = state.get("topic_flow", {})
+                if flow.get("output_mode") == "after-research":
+                    # 权限和所有权核对通过后才发布已核实批次，正常暂存不提前展示。
+                    flow.update(phase="partial", release_results=True)
             # 只有待复核旧版时仍同步展示投影，不能让失败前的 current 标记进入正式快照。
             publish = self._staged_payload(state or {}, include_relations=True)
         else:
@@ -137,10 +151,45 @@ class AgentRuntime:
             self.store.finish(status, error, publish=publish, state=state)
         else:
             self.store.finish(status, error, publish=publish)
+        self._archive(state)
+
+    def _archive(self, state: dict | None = None) -> None:
+        if (self.archive is None or self.run.get("status") not in {
+            "completed", "partial", "failed", "canceled",
+        } or not self.run.get("finished_at")):
+            return
+        current = state if state is not None else self._last_state
+        try:
+            # 只导出复盘需要的研究、审查及草稿，不复制密钥、冻结配置和重复工具原文缓存。
+            self.archive.write({
+                "version": 1,
+                "execution": {"company_id": self.db.company_id,
+                              "project_id": self.report["project_id"],
+                              "report_id": self.report["id"],
+                              "module_key": self.run["module_key"], "run_id": self.run["id"],
+                              "attempt": self.run["attempt"], "status": self.run["status"],
+                              "started_at": str(self.run.get("started_at")),
+                              "finished_at": self.run["finished_at"].isoformat(),
+                              "error": self.run.get("error_message"),
+                              **{k: self.run.get(k) for k in (
+                                  "model_calls", "tool_calls", "prompt_tokens", "completion_tokens",
+                              )}},
+                "research": current.get("research", {}),
+                "topics": current.get("topic_flow", {}),
+                "drafts": current.get("staged_items", []),
+                "gaps": current.get("business_gaps", []),
+                "research_conclusion": current.get("research_completed", {}),
+                "tool_errors": [value["data"] for value in current.get("tool_results", {}).values()
+                                if value.get("data", {}).get("status") == "error"],
+            })
+        except Exception as exc:
+            # 复盘副本失败不能撤销已经提交的业务终态；错误单独可观察，下一次清理仍继续。
+            logger.warning("analysis.archive_fail", error_type=type(exc).__name__)
 
     def abandon(self, status: str, error: str | None = None) -> None:
         """异常收尾；未领取配额时同样形成终态，避免排队行永远显示等待配额。"""
         self.store.abandon(status, error)
+        self._archive()
 
     def release(self) -> None:
         self.store.release()

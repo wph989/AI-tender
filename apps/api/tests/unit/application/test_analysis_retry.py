@@ -118,3 +118,35 @@ def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
         assert research.tool_calls == 100
 
     asyncio.run(run())
+
+
+def test_retry_preserves_examined_notes_todos_and_evidence_without_complete_findings():
+    from test_analysis_compact_protocol import ledger
+    from test_analysis_verification_degradation import _RetryStore, _RetryTx
+
+    from tender.application.analysis.protocol import ResearchDelta, ResearchLedger
+    from tender.application.analysis.topic_flow import TopicFlow
+
+    book, flow, previous, research = ledger()
+    work_id = book.works()[0]["id"]
+    book.update([ResearchDelta(
+        work_ids=[work_id], status="examined", detail="已读质保条款，还需核对附件例外",
+        examined_ids=["s1r1c0"],
+        followups=[{"detail": "核对附件例外", "from_block_id": "s1r1c0"}],
+    )])
+    previous["research"] = research.checkpoint() | {"tool_calls": 20}
+    original = copy.deepcopy(previous)
+    assert not flow.entries[0].get("findings") and not previous.get("staged_items")
+    tx = _RetryTx([{"id": 9, "status": "failed"}], previous)
+    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
+    service.retry_report(3, module_keys=[], max_output_tokens=None, timeout_seconds=None)
+    carried = tx.inserted[0]["state"]
+    assert carried["research"]["seen"] == previous["research"]["seen"]
+    assert carried["research"]["tool_calls"] == 0
+    assert carried["topic_flow"]["work_registry"] == previous["topic_flow"]["work_registry"]
+    restored = ResearchLedger(TopicFlow(carried, research))
+    assert restored.flow.entries[0]["dispositions"] == flow.entries[0]["dispositions"]
+    assert restored.flow.entries[0]["tasks"] == flow.entries[0]["tasks"]
+    assert restored.works()[0]["id"] == work_id
+    assert "还需核对附件例外" in str(restored.context([work_id]))
+    assert previous == original

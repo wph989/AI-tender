@@ -21,6 +21,24 @@ SAMPLE = json.loads((Path(__file__).parents[2] / "fixtures/analysis/topic_increm
                     .read_text(encoding="utf-8"))
 
 
+def metrics(router, prompts, tools_used, rows, started):
+    encoder = tiktoken.get_encoding("cl100k_base")
+    main_inputs = [json.dumps(request, ensure_ascii=False) for request in router.requests]
+    inputs = prompts + main_inputs
+    # 固定轨迹没有摘要和格式纠错；只统计实际经过替身的请求，不能外推供应商账单。
+    repeated = sum(max(0, sum(s.count(row["content"]) for s in inputs) - 1)
+                   * len(row["content"]) for row in rows)
+    return {"model_requests": len(router.requests) + len(prompts),
+            "main_requests": len(router.requests), "review_requests": len(prompts),
+            "correction_requests": 0, "summary_requests": 0,
+            "tool_calls": len(tools_used),
+            "input_tokens_estimate_cl100k_base": sum(len(encoder.encode(s)) for s in inputs),
+            "main_input_tokens_estimate": sum(len(encoder.encode(s)) for s in main_inputs),
+            "review_input_tokens_estimate": sum(len(encoder.encode(s)) for s in prompts),
+            "repeated_full_evidence_characters": repeated,
+            "offline_duration_ms": round((time.monotonic() - started) * 1000)}
+
+
 async def run_sample(incremental):
     rows = [block() | value for value in SAMPLE["blocks"]]
     research = session(rows)
@@ -90,7 +108,6 @@ async def run_sample(incremental):
         return await review_completeness(Reviewer(), payload)
 
     router, state = ScriptedRouter(script), {}
-    encoder = tiktoken.get_encoding("cl100k_base")
     started = time.monotonic()
     graph, files = build_module_agent(key=KEY, model=RoutedAgentModel(router=router),
                                      research=research, state=state, snapshot=snapshot,
@@ -98,11 +115,7 @@ async def run_sample(incremental):
                                      save=noop,
                                      review_support=review, review_coverage=audit)
     await invoke_module(graph, files, thread_id="sample", task="解析预算和日期")
-    inputs = prompts + [json.dumps(request, ensure_ascii=False) for request in router.requests]
-    return state, {"model_requests": len(router.requests) + len(prompts),
-                   "tool_calls": len(tools_used),
-                   "input_tokens_estimate_cl100k_base": sum(len(encoder.encode(s)) for s in inputs),
-                   "offline_duration_ms": round((time.monotonic() - started) * 1000)}
+    return state, metrics(router, prompts, tools_used, rows, started)
 
 
 def test_annotated_sample_preserves_all_items_and_avoids_old_result_resubmission(tmp_path):
@@ -124,3 +137,75 @@ def test_annotated_sample_preserves_all_items_and_avoids_old_result_resubmission
     path.write_text(json.dumps({"legacy": before, "topic_v1": after}, ensure_ascii=False, indent=2),
                     encoding="utf-8")
     print(path.read_text(encoding="utf-8"))
+
+
+async def run_combined_sample():
+    from tender.application.analysis.protocol import PROTOCOL_VERSION
+    from tender.application.analysis.review import review_combined
+
+    rows = [block() | value for value in SAMPLE["blocks"]]
+    research = session(rows)
+    async def retrieve(sources, query):
+        return [rows[0 if query == "预算" else 1]], {"mode": "keyword"}
+    research.retrieve = retrieve
+    topics = [{"key": "budget", "title": "预算", "checks": ["金额与单位"]},
+              {"key": "dates", "title": "日期", "checks": ["截止时点"]}]
+    records = [{"key": r["key"], "title": r["title"], "kind": "requirement",
+                "group": "项目基本信息", "scope": r.get("scope", COMMON),
+                "conditions": r.get("conditions", {}),
+                "content": {"字段": r["title"], "内容": r["text"]},
+                "citations": [{"block_id": r["block_id"], "quote": r["quote"]}]}
+               for r in SAMPLE["expected"]]
+    for index, record in enumerate(records):
+        record["work_ids"] = [f"w{index + 1}"]
+    script = [call("list_documents", {}, "docs")]
+    script.extend(call("search_document", {"query": query, "topic_keys": [topic]}, str(index))
+                  for index, (query, topic) in enumerate((("预算", "budget"), ("截止", "dates"))))
+    script.append(call("update_research", {"updates": [{
+        "work_ids": [f"w{index + 1}"], "detail": r["text"],
+        "scope": r.get("scope", COMMON), "evidence_ids": [r["block_id"]],
+    } for index, r in enumerate(SAMPLE["expected"])]}, "notes"))
+    script.append(call("submit_analysis", {"records": records,
+                                           "final": True}, "finish"))
+    prompts, tool_calls = [], []
+    class Reviewer:
+        async def complete(self, prompt):
+            prompts.append(prompt)
+            payload = json.loads(prompt.rsplit("\n", 1)[-1])
+            reviews = {row["record_id"]: {"supported": True, "issues": [],
+                       "bindings": {v["value_id"]: v["candidate_ids"] for v in row["values"]}}
+                       for row in payload["records"]}
+            return Completion(content=json.dumps({"reviews": reviews, "issues": [],
+                                                   "context_requests": []}), model="offline")
+    async def review(payload):
+        return await review_combined(Reviewer(), payload)
+    async def reserve():
+        tool_calls.append(1)
+    router, state = ScriptedRouter(script), {}
+    snapshot = SKILL | {FLOW_KEY: PROTOCOL_VERSION,
+                       KEY + "/references/coverage.json": json.dumps(topics, ensure_ascii=False)}
+    graph, files = build_module_agent(key=KEY, model=RoutedAgentModel(router=router),
+                                     research=research, state=state, snapshot=snapshot,
+                                     checkpointer=InMemorySaver(), reserve_tool=reserve,
+                                     save=noop, review_combined=review)
+    started = time.monotonic()
+    await invoke_module(graph, files, thread_id="combined-sample", task="解析预算和日期")
+    return state, metrics(router, prompts, tool_calls, rows, started)
+
+
+def test_combined_review_keeps_annotated_conditions_scope_and_quotes_with_fewer_requests(tmp_path):
+    _, before = asyncio.run(run_sample(False))
+    current, after = asyncio.run(run_combined_sample())
+    actual = {i["business"]["key"]: i["business"] for i in current["draft"]["fields"]}
+    assert set(actual) == {r["key"] for r in SAMPLE["expected"]}
+    for expected in SAMPLE["expected"]:
+        item = actual[expected["key"]]
+        assert item["content"]["内容"] == expected["text"]
+        assert item["scope"] == expected.get("scope", COMMON)
+        assert item["conditions"] == expected.get("conditions", item["conditions"])
+        assert item["citations"][0]["quote"] == expected["quote"]
+    assert after["model_requests"] < before["model_requests"]
+    (tmp_path / "combined-sample-metrics.json").write_text(json.dumps(
+        {"fixture": "topic_incremental.json", "legacy": before, "combined": after,
+         "measurement": "离线固定轨迹与输入token估算；真实模型输出token和费用须另行验收"},
+        ensure_ascii=False, indent=2), encoding="utf-8")

@@ -234,6 +234,17 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           {!!gaps.filter((gap) => gap.moduleKey === module.module_key).length && <button type="button" className="module-gap-link"
             onClick={() => { onChooseModule(module.id); setView("gaps"); }}>查看本专题待核对事项</button>}
         </div>
+        {module.progress && <div className="module-progress-summary" role="status" aria-label="解析进展">
+          <p>{module.progress.phase === "research" ? "正在研究原文" : module.progress.phase === "synthesis" ? "正在综合结果" : module.progress.phase === "review" ? "正在独立审查" : `已展示 ${module.items.length} 条结果`} · 已核对 {module.progress.topics.filter((topic) => module.progress?.phase
+            ? topic.checks.every((check) => topic.checked.includes(check)) && topic.scope.kind !== "unknown"
+            : topic.status === "ready").length}/{module.progress.topics.length} 个子主题</p>
+          {isActive(module.status) && module.progress.topics.some((topic) => ["researching", "needs_review"].includes(topic.status)) && <p>
+            正在处理：{module.progress.topics.filter((topic) => ["researching", "needs_review"].includes(topic.status)).map((topic) => topic.title).join("、")}
+          </p>}
+          {module.progress.topics.filter((topic) => topic.status === "blocked").slice(0, 2).map((topic, index) => <p key={index}>
+            研究受阻 · {topic.title}：{topic.tasks.find((task) => task.status === "blocked")?.detail || topic.detail}
+          </p>)}
+        </div>}
         <details className="module-operations"><summary>{module.status === "completed" ? "分析记录" : `${STATE_LABELS[module.status] ?? module.status} · 查看原因与运行记录`}</summary>
           {["failed", "canceled"].includes(module.status) && <AnalysisFailureNotice message={module.error_message}
             canceled={module.status === "canceled"} />}
@@ -257,19 +268,6 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           </ol>}
           {module.research_summary && <details className="research-process"><summary>查看分析过程</summary><p>{module.research_summary}</p></details>}
         </details>
-        {module.progress && <details className="coverage-details" open={isActive(module.status)
-          || module.progress.topics.some((topic) => ["blocked", "needs_review"].includes(topic.status))}>
-          <summary>子主题进度 · {module.progress.topics.filter((topic) => topic.status === "ready").length}/{module.progress.topics.length} 已处理</summary>
-          <ul>{module.progress.topics.map((topic, index) => <li key={`${topic.topic}:${index}`}>
-            <strong>{topic.title}</strong>{" · "}
-            {({ pending: "待处理", researching: "分析中", ready: "已处理", blocked: "部分完成", needs_review: "待复核" })[topic.status]}
-            {" · "}{scopeLabel(topic.scope)}
-            <p>{topic.detail}（核对项 {topic.checked.length}/{topic.checks.length}）</p>
-            {topic.tasks.filter((task) => task.status !== "resolved").map((task, taskIndex) => <p key={taskIndex}>
-              {task.status === "blocked" ? "未完成：" : "待核对："}{task.detail}
-            </p>)}
-          </li>)}</ul>
-        </details>}
         {module.items.some((item) => item.record?.review_status === "needs_review") && <Alert type="warning"
           title="新增依据影响部分结果，以下事项待复核"
           description={module.items.filter((item) => item.record?.review_status === "needs_review")
@@ -281,7 +279,24 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           locationRevision={locationRevision} onLocate={onLocate} onRevealItem={reveal} />
           : <p className="result-empty">{query || scope || group || attention ? "当前筛选没有匹配结果。" : module.status === "completed"
             ? "本次未形成已核实结果，请结合待核对事项了解检索范围。" : isActive(module.status)
-              ? "正在检索与核对原文，已有可靠结果会持续保存。" : "本次还没有可用的分析结果，可展开上方记录查看原因。"}</p>}
+              ? module.progress?.phase === "review" ? "正在独立核对结论依据、引用与内容完整性，完成后统一展示。"
+                : module.progress?.phase === "synthesis" ? "研究已结束，正在统一整理结果。"
+                : module.progress?.phase === "research" ? "正在根据核对清单研究原文，完成后统一展示结果。"
+                  : "正在检索与核对原文，已有可靠结果会持续保存。"
+              : "本次还没有可用的分析结果，可展开上方记录查看原因。"}</p>}
+        {/* 详细工作账供需要时展开；轮询不自动打开，避免打断正文阅读。 */}
+        {module.progress && <details className="coverage-details">
+          <summary>查看核对详情</summary>
+          <ul>{module.progress.topics.map((topic, index) => <li key={`${topic.topic}:${index}`}>
+            <strong>{topic.title}</strong>{" · "}
+            {({ pending: "待处理", researching: "分析中", ready: "已处理", blocked: "研究受阻", needs_review: "待复核" })[topic.status]}
+            {" · "}{scopeLabel(topic.scope)}
+            <p>{topic.detail}（核对项 {topic.checked.length}/{topic.checks.length}）</p>
+            {topic.tasks.filter((task) => task.status !== "resolved").map((task, taskIndex) => <p key={taskIndex}>
+              {task.status === "blocked" ? "未完成：" : "待核对："}{task.detail}
+            </p>)}
+          </li>)}</ul>
+        </details>}
       </section>)}
       {!modules.length && <p className="result-empty">{isActive(report.status) ? "专题尚未生成，请等待任务就绪。"
         : ["failed", "partial", "canceled"].includes(report.status) && !report.runtime_retired

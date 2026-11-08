@@ -72,6 +72,14 @@ def skill_version(snapshot: dict | None = None) -> str:
 
 
 async def json_completion(model: StructuredTextModel, prompt: str, *, validate=None) -> dict:
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise InvalidModelOutput("JSON对象包含重复ID或字段：" + key)
+            value[key] = item
+        return value
+
     for attempt in range(3):
         try:
             result = await model.complete(prompt)
@@ -80,7 +88,7 @@ async def json_completion(model: StructuredTextModel, prompt: str, *, validate=N
             if fenced:
                 content = fenced.group(1)
             try:
-                parsed = json.loads(content)
+                parsed = json.loads(content, object_pairs_hook=unique_object)
             except ValueError as exc:
                 raise InvalidModelOutput("模型必须返回 JSON 对象") from exc
             if not isinstance(parsed, dict):

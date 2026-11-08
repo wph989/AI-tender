@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from tender.adapters.jobs.celery_queue import create_celery_app
+from tender.worker.analysis.maintenance import install_analysis_maintenance
 from tender.worker.logging import install_worker_logging
 
 install_worker_logging()
+install_analysis_maintenance()
 celery_app = create_celery_app()
 celery_app.conf.update(
     imports=(

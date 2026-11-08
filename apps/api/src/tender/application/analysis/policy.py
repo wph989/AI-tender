@@ -12,13 +12,59 @@ from tender.application.analysis.output import output_schema
 from tender.application.knowledge.content import CATEGORIES, fingerprint, normalized
 
 
-# 完整 Skill 只在首轮、阶段切换和上下文压缩后注入；其余轮次只保留关键小节。
+# 小节提取供通用契约复用；生产解析另按冻结资源中的显式主题关联选择细则。
 def _skill_section(content: str, heading: str) -> str:
     match = re.search(rf"^{re.escape(heading)}\s*$(.*?)(?=^## |\Z)", content, re.M | re.S)
     if match is None:
         return ""
     body = match.group(1).strip()
     return heading + "\n" + body if body else ""
+
+
+def _model_domain_rules(content: str) -> str:
+    # 只剔除已由运行时提供的导航和通用协议；未知小节完整保留，不能按长度删业务规则。
+    body = re.sub(r"\A---\s*\n.*?\n---\s*\n", "", content, count=1, flags=re.S)
+    sections = re.split(r"(?=^## )", body, flags=re.M)
+    generic = ("按 coverage.json 核对业务内容，保留范围、条件、例外及完整清单。"
+               "研究与提交协议以运行时工具为准；本文件只定义本专题的业务判断。")
+    sections = [section.replace(generic, "") for section in sections]
+    redundant = {"## 参考文件", "## 本项目的检索与输出"}
+    return "\n\n".join(section.strip() for section in sections
+                       if section.strip() and not (
+                           section.splitlines()[0].strip() == "## 参考文件"
+                           or section.strip() in redundant
+                       ))
+
+
+def _rule_parts(path: str, content: str, topics: set[str], *, complete: bool) -> dict:
+    parts = []
+    for line in content.splitlines():
+        match = re.fullmatch(r"(.*?)\s*<!-- topics: (.*?) -->\s*", line)
+        selected = []
+        if match:
+            line = match[1].rstrip()
+            selected = [key.strip() for key in match[2].split(",")]
+            if not selected or set(selected) - topics:
+                # 自定义冻结清单可能更换主题；无法识别的关联只能扩大供给，不能误删业务约束。
+                selected = []
+        elif "<!-- topics:" in line:
+            raise ValueError(path + "的规则关联格式错误")
+        parts.append({"text": line, "topics": selected})
+    return {"path": path, "parts": parts, "complete": complete}
+
+
+def select_skill_rules(
+    skill: dict, topics: set[str], *, full: bool = False,
+) -> tuple[str, set[str]]:
+    """只用冻结资源的明确关联筛选；未归类业务规则常驻，审查及综合使用全集。"""
+    blocks, paths = [], set()
+    for group in skill["rule_parts"]:
+        included = [part for part in group["parts"]
+                    if full or not part["topics"] or set(part["topics"]) & topics]
+        blocks.append("\n".join(part["text"] for part in included))
+        if group["complete"] and len(included) == len(group["parts"]):
+            paths.add(group["path"])
+    return "\n\n".join(blocks), paths
 
 
 def skill_digest(content: str, *, schema: dict | None, topics: list[dict]) -> str:
@@ -31,7 +77,7 @@ def skill_digest(content: str, *, schema: dict | None, topics: list[dict]) -> st
     retrieval = _skill_section(content, "## 本项目的检索与输出")
     if not flow or not retrieval:
         return ""
-    parts = [flow, retrieval]
+    parts = [flow, retrieval, "citations只使用已读ID及逐字原文；结构与支持性校验通过后保存成果。"]
     if schema:
         keys = "；".join(
             str(section.get("title", "")) + "（"
@@ -83,6 +129,11 @@ def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = (
     )
     for reference in references:
         instructions += "\n\n" + resources[reference]
+    # 请求级系统提示不会进入下一轮历史；领域判别规则必须每轮存在，示例仍按需读取。
+    domain_rules = "\n\n".join([
+        *(_skill_section(content, heading) for heading in ("## 领域知识", "## 识别规则")),
+        *(resources[p] for p in references if p != output_path),
+    ])
     coverage_path = key + "/references/coverage.json"
     topics: list[dict] = []
     if coverage_path in resources:
@@ -98,13 +149,32 @@ def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = (
         # 输出声明的完整性由构建入口统一校验；摘要不能因此提前改变错误路径。
         schema = None
     prompt_digest = skill_digest(content, schema=schema, topics=topics)
+    topic_keys = {topic["key"] for topic in topics}
+    parts = [_rule_parts("/skills/" + key.replace("_", "-") + "/SKILL.md",
+                         _model_domain_rules(content), topic_keys, complete=False)]
+    parts.extend(_rule_parts("/skills/" + p.replace(key, key.replace("_", "-"), 1),
+                             resources[p], topic_keys, complete=True)
+                 for p in references if p != output_path)
+    model_rules, _ = select_skill_rules({"rule_parts": parts}, set(), full=True)
     return {
         "path": "/skills/" + key.replace("_", "-") + "/SKILL.md",
         "sha256": digest.hexdigest(),
         "instructions": instructions,
         # 提取失败时回退完整正文，保证摘要轮次不会缺少关键规则。
         "digest": prompt_digest or instructions,
+        "domain_rules": domain_rules,
+        "model_rules": model_rules,
+        "rule_parts": parts,
+        "output_rules": (_skill_section(resources.get(output_path, ""), "## 事项组织")
+                         or resources.get(output_path, "")),
+        "domain_paths": ["/skills/" + p.replace(key, key.replace("_", "-"), 1)
+                         for p in references if p != output_path],
         "references": references,
+        "loaded_paths": ["/skills/" + p.replace(key, key.replace("_", "-"), 1)
+                         for p in [*references, coverage_path, ref_dir + "output_schema.json"]
+                         if p in resources],
+        "line_counts": {"/skills/" + p.replace(key, key.replace("_", "-"), 1):
+                        len(text.splitlines()) for p, text in resources.items()},
     }
 
 
@@ -168,10 +238,10 @@ def progress_signature(
 
 
 def tool_key(name: str, arguments: dict) -> str:
-    # 空白变化不应触发昂贵的重复检索；其它工具保留原参数，避免改动引用原文。
+    # 查询内部空格和HTML实体会改变召回语义；不能复用逐字引用的归一化。
     args = dict(arguments)
     if name in {"search_document", "search_knowledge"} and isinstance(args.get("query"), str):
-        args["query"] = normalized(args["query"])
+        args["query"] = args["query"].strip()
         args.setdefault("source_id", None)
     if name == "read_document":
         args.setdefault("before", 2)

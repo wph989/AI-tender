@@ -86,7 +86,10 @@ def test_every_frozen_module_has_usable_synthesis_format(key):
     for section in schema["sections"]:
         assert section["columns"] and "序号" not in section["columns"]
     rules = snapshot[key + "/SKILL.md"]
-    assert "topic_updates" in rules and "content" in rules
+    from tender.application.analysis.protocol import CONTRACT as RESEARCH_RULES
+
+    assert "coverage.json" in rules and "逐字" in RESEARCH_RULES
+    assert "work_ids" in snapshot[key + "/references/output_format.md"]
     assert all(topic.get("checks") for topic in json.loads(
         snapshot[key + "/references/coverage.json"]
     ))

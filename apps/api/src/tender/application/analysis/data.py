@@ -75,16 +75,16 @@ class Scoring(DataInput):
     deductions: list[str] = Field(default_factory=list)
 
 
-class BusinessRecord(DataInput):
+class RecordContent(DataInput):
+    """模型表达的业务内容；生成字段留在内部记录契约，避免模型重复填写。"""
+
     key: str = Field(min_length=1, max_length=100)
     kind: Literal["fact", "requirement", "lot", "format_node", "relation"]
     title: str = Field(min_length=1, max_length=300)
-    text: str = Field(min_length=1)
     content: dict[str, str | list[str]] = Field(default_factory=dict)
     scope: DataScope
     citations: list[DataCitation] = Field(min_length=1)
     group: str = ""
-    sort_order: int = Field(default=0, ge=0)
     category: str = "other"
     structuring: Literal["complete", "partial"] = "partial"
     conditions: Conditions = Field(default_factory=Conditions)
@@ -114,6 +114,11 @@ class BusinessRecord(DataInput):
         if self.kind != "relation" and (self.predicate or self.subject_key or self.object_key):
             raise ValueError("仅关系记录可声明关系端点")
         return self
+
+
+class BusinessRecord(RecordContent):
+    text: str = Field(min_length=1)
+    sort_order: int = Field(default=0, ge=0)
 
 
 class SynthesisRecord(BusinessRecord):
@@ -318,7 +323,9 @@ def module_data(state: dict) -> dict:
                                          if k not in {"placeholder", "requested_status"}},
                                       "tasks": list(e["tasks"].values())}
                                      for e in state["topic_flow"]["entries"].values()],
-                         "audit_round": state["topic_flow"]["audit"]["round"]}}
+                         "audit_round": state["topic_flow"]["audit"]["round"],
+                         **({"phase": state["topic_flow"].get("phase", "research")}
+                            if state["topic_flow"].get("output_mode") == "after-research" else {})}}
            if state.get("topic_flow") else {}),
     }
 

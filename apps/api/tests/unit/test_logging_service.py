@@ -1210,10 +1210,15 @@ def test_celery_real_execution_and_publication_without_external_services(options
     finally:
         app.close()
     logs = read_logs(options.directory)
-    starts = [log for log in logs if log["event"] == "task.start"]
-    assert len(starts) == 2
-    assert starts[0]["request_id"] == "task-request"
-    assert "request_id" not in starts[1]
+    completed = [log for log in logs if log["event"] == "task.result"]
+    assert len(completed) == 1
+    assert completed[0]["request_id"] == "task-request"
+    assert completed[0]["task"] == job.name
+    assert completed[0]["duration_ms"] >= 0
+    assert not any(log["event"] in {"task.start", "task.end"} for log in logs)
+    assert next(i for i, log in enumerate(logs) if log["event"] == "inside_task") < next(
+        i for i, log in enumerate(logs) if log["event"] == "task.result"
+    )
     assert len([log for log in logs if log["event"] == "task.fail"]) == 1
     assert "private-result" not in json.dumps(logs)
     assert "task-secret" not in json.dumps(logs)
@@ -1271,17 +1276,16 @@ def test_periodic_dispatch_is_quiet_but_keeps_warnings_failures_and_retries(
     successful_lifecycle = [
         log for log in logs
         if log.get("project_id") == 15
-        and log["event"] in {"task.start", "task.end"}
+        and log["event"] == "task.result"
     ]
     if level == "INFO":
         assert successful_lifecycle == []
-        assert not any(log["event"] == "task.start" for log in logs)
         assert not any(
-            log["event"] == "task.end"
+            log["event"] == "task.result"
             for log in logs
         )
     else:
-        assert {log["event"] for log in successful_lifecycle} == {"task.start", "task.end"}
+        assert len(successful_lifecycle) == 1
         assert all(log["level"] == "debug" for log in successful_lifecycle)
     assert any(
         log["event"] == "dispatch_probe_warning" and log.get("project_id") == 15
@@ -1294,7 +1298,7 @@ def test_periodic_dispatch_is_quiet_but_keeps_warnings_failures_and_retries(
         for log in logs
     )
     assert not any(
-        log["event"] == "task.end" and log.get("project_id") == 16
+        log["event"] == "task.result" and log.get("project_id") == 16
         for log in logs
     )
     assert any(
@@ -1379,5 +1383,5 @@ def test_celery_nested_eager_and_thread_pool_restore_their_own_context(options):
     finally:
         app.close()
     logs = read_logs(options.directory)
-    assert len([log for log in logs if log["event"] == "task.start"]) == 8
-    assert len([log for log in logs if log["event"] == "task.end"]) == 8
+    assert len([log for log in logs if log["event"] == "task.result"]) == 8
+    assert not any(log["event"] in {"task.start", "task.end"} for log in logs)

@@ -20,20 +20,19 @@
 
 ## 提交方式
 
-子主题具备可靠依据即可调用 submit_analysis，每批 records 最多三条完整事项，topic_updates 同时关联主题、范围、已核对 checks、证据和事项 key。通过校验后实时展示。
-记录 key 稳定，纠正同一事项沿用原 key。content 仅填当前分类的中文键，缺少依据的键省略；多条并列要求用字符串数组。
-同一事项可以综合多处原文，citations 分别填写已读 block_id 和连续 quote；不要填写服务端生成的页码、坐标、text 或 evidence_ids。
-不能用无依据的“未提及/无”占位。通过校验的事项立即保存；全部主题处理后自动独立查漏，final=true 只请求检查完成条件，未决事项留在 topic_updates 与 gaps。
-通用 scope、conditions、materials、scoring 等结构以运行时工具 schema 为准，填写后同样接受原文校验。
+研究结束后统一综合。content 只使用本专题声明的中文键，citations 使用已读原文；业务范围、条件、材料和评分属性同样需要依据。
+工作ID、分批及审查规则以运行时工具为准，样例中的 work_ids 须换为实际返回的ID。
 
 ## JSON 示例
 
 以下是模拟原文块与工具提交样例，名称、数值及证据ID仅用于说明，不能用于实际项目。
-每个 JSON 容器的 blocks 表示检索/补读已返回的原文；submissions 是按顺序调用 submit_analysis 的参数，不是一次提交的大数组。
-样例展示 content 及引用结构；实际增量提交还须提供 topic_updates，登记子主题核对项、证据、事项 key 和未决待办。
-正文由 content 承载，citations 独立溯源；各批独立校验，全部子主题处理后自动查漏，无需另发空提交。
+每个 JSON 容器的 blocks 表示检索/补读已返回的原文；submissions 是研究结束、进入 synthesis 后按顺序调用 submit_analysis 的参数，不是检索期间逐项输出。
+样例展示综合阶段的 content 与引用结构；研究阶段登记轻量事实线索和具体问题；work_ids 使用程序返回的工作ID。
+正文由 content 承载，citations 独立溯源；综合各批暂存，最后一批 final=true 后合并审查支持性与完整性并统一展示，无需另发空提交。
 
 ## 项目事实与独立标段
+
+以下仅展示综合阶段的局部输出结构。实际运行先完成本专题全部可处理核对项，明确受阻原因和适用范围，再统一输出；final=true 声明本轮综合已提交完毕，运行时仍核验覆盖与查漏结果。unknown 不能作为公共或指定标段要求使用。
 
 ```json
 {
@@ -68,6 +67,10 @@
               "block_id": "example-1",
               "quote": "项目名称：示例园区升级项目。"
             }
+          ],
+          "work_ids": [
+            "w1",
+            "w2"
           ]
         }
       ],
@@ -94,6 +97,10 @@
               "block_id": "example-2",
               "quote": "本项目分为东区标段与西区标段，东区标段编号A。"
             }
+          ],
+          "work_ids": [
+            "w9",
+            "w10"
           ]
         }
       ],
@@ -119,13 +126,13 @@
               "block_id": "example-2",
               "quote": "本项目分为东区标段与西区标段，东区标段编号A。"
             }
+          ],
+          "work_ids": [
+            "w9",
+            "w10"
           ]
         }
       ],
-      "final": false
-    },
-    {
-      "records": [],
       "final": true
     }
   ]

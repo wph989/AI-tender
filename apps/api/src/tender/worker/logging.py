@@ -44,11 +44,7 @@ def _prerun(task_id=None, task=None, **kwargs) -> None:
         and (valid_identifier(value) or type(value) is int)
     } if isinstance(raw, dict) else {}
     bind_contextvars(**context, task_id=task_id)
-    log = logger.debug if task.name in _PERIODIC_DISPATCH_TASKS else logger.info
-    # 任务名只在生命周期记录一次，业务日志用 task_id 关联，避免每条重复完整模块名。
-    retries = getattr(task.request, "retries", 0)
-    log("task.start", task=task.name.removeprefix("tender.worker."),
-        **({"retry_count": retries} if retries else {}))
+    # 开始时只建立上下文与计时，操作完成后才记录一次结果。
 
 
 def _postrun(task=None, state=None, **kwargs) -> None:
@@ -63,7 +59,11 @@ def _postrun(task=None, state=None, **kwargs) -> None:
         )
         # 失败与重试信号已记录详情，不再跟一条 INFO 的“结束”，以免被误读为成功。
         if state == "SUCCESS":
-            log("task.end", duration_ms=round((time.perf_counter() - started) * 1000, 3))
+            retries = getattr(task.request, "retries", 0)
+            log("task.result", task=task.name.removeprefix("tender.worker."),
+                status="success",
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                **({"retry_count": retries} if retries else {}))
         elif state not in {"FAILURE", "RETRY"}:
             logger.warning("task.stop", status=state,
                            duration_ms=round((time.perf_counter() - started) * 1000, 3))
@@ -75,6 +75,8 @@ def _postrun(task=None, state=None, **kwargs) -> None:
 
 def _failure(sender=None, task_id=None, exception=None, traceback=None, **kwargs) -> None:
     if sender is not None and sender.name.startswith("tender."):
+        duration_ms = (round((time.perf_counter() - _stack.get()[-1][1]) * 1000, 3)
+                       if _stack.get() else None)
         # 子进程异常退出时，此信号可能由没有执行上下文的主进程发出。
         with bind_context(task_id=task_id):
             if isinstance(traceback, str):
@@ -82,11 +84,13 @@ def _failure(sender=None, task_id=None, exception=None, traceback=None, **kwargs
                 # 显式异常字段仍经过统一脱敏与限长，格式化器会保留长堆栈的首尾。
                 logger.error(
                     "task.fail", exception=traceback,
+                    duration_ms=duration_ms,
                     task=sender.name.removeprefix("tender.worker."),
                 )
             else:
                 logger.error(
                     "task.fail", task=sender.name.removeprefix("tender.worker."),
+                    duration_ms=duration_ms,
                     exc_info=(type(exception), exception, traceback or exception.__traceback__)
                     if exception is not None else None,
                 )
@@ -96,6 +100,8 @@ def _retry(sender=None, reason=None, einfo=None, **kwargs) -> None:
     if sender is not None and sender.name.startswith("tender."):
         # Retry 包装器的类型恒为 Retry；保留实际重试原因及 Celery 提供的堆栈。
         logger.warning("task.retry", exception=getattr(einfo, "traceback", None),
+                       duration_ms=(round((time.perf_counter() - _stack.get()[-1][1]) * 1000, 3)
+                                    if _stack.get() else None),
                        reason=str(reason) if einfo is None else None,
                        task=sender.name.removeprefix("tender.worker."))
 

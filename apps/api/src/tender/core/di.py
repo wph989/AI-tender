@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any
 
 from sqlalchemy import Engine
 
+from tender.adapters.analysis.file_archive import FileAnalysisArchive
 from tender.adapters.configuration.redis_cache import RedisConfigCache
 from tender.adapters.documents.gotenberg import GotenbergConverter
 from tender.adapters.documents.mineru import MinerUParser
@@ -319,8 +321,20 @@ def create_analysis_executor(db: ReportRepository) -> AnalysisExecutor:
     return AnalysisExecutor(
         db, model_factory=create_routing_model_factory(),
         embedding_gateway=create_embedding_gateway, rerank_gateway=create_rerank_gateway,
-        checkpoints=open_analysis_checkpoints,
+        checkpoints=open_analysis_checkpoints, archive=create_analysis_archive(),
     )
+
+
+@lru_cache(maxsize=8)
+def _analysis_archive(process_id: int) -> FileAnalysisArchive:
+    # prefork后按PID重新建立线程，不能复用父进程中已不存在的维护线程。
+    options = settings.analysis_archive_settings()
+    return FileAnalysisArchive(options.directory, retention_days=options.retention_days,
+                               cleanup_interval_seconds=options.cleanup_interval_seconds)
+
+
+def create_analysis_archive() -> FileAnalysisArchive:
+    return _analysis_archive(os.getpid())
 
 
 def create_knowledge_executor(db: KnowledgeExecutionRepository) -> KnowledgeExecutor:

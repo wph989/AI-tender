@@ -411,7 +411,8 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
             embedding_gateway=Mock(), rerank_gateway=Mock(), checkpoints=saver,
         )
         await executor.execute_module(
-            {"id": 1, "project_id": 10, "skill_snapshot": {}, "category": "goods",
+            {"id": 1, "project_id": 10,
+             "skill_snapshot": {"__analysis_flow_version__": "research-v2"}, "category": "goods",
              "topics": [], "lot_settings": []},
             {"id": 2, "module_key": "deposit_requirement_parsing", "attempt": 1}, [SOURCE],
         )

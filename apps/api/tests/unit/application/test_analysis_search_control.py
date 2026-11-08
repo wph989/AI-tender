@@ -372,8 +372,7 @@ def test_same_first_page_with_more_results_cannot_extend_research_by_rephrasing(
     assert any(w.get("pending_stop") for w in control.ledger.values())
 
 
-def test_multiple_checks_require_explicit_work_and_show_only_unfinished_checks():
-    from tender.application.analysis.research import ToolArgumentError
+def test_multiple_checks_can_share_one_search_and_show_only_unfinished_checks():
     from tender.application.analysis.search_control import TopicSearch
 
     flow, _, _ = prepared_flow()
@@ -381,8 +380,8 @@ def test_multiple_checks_require_explicit_work_and_show_only_unfinished_checks()
                            requested_status="researching")
     flow.sync()
     control = TopicSearch(flow)
-    with pytest.raises(ToolArgumentError, match="条件.*例外"):
-        control.begin("search_document", {"topic_keys": ["a"]})
+    selected = control.begin("search_document", {"topic_keys": ["a"], "work": ["条件", "例外"]})
+    assert [w["work"] for w in selected] == ["条件", "例外"]
     assert [w["work"] for w in control.begin("search_document", {
         "topic_keys": ["a"], "work": "条件",
     })] == ["条件"]
@@ -446,7 +445,8 @@ def test_cached_read_still_obeys_completed_work_gate():
         result = await middleware.awrap_tool_call(
             request("read_document", args, call_id="new"), handler,
         )
-        assert result.status == "error" and "已完成" in result.content
+        assert result.status == "success" and json.loads(result.content)["work_closed"]
+        assert not state.get("argument_failures")
         assert len(invoked) == 1
 
     asyncio.run(run())

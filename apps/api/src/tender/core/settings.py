@@ -209,6 +209,32 @@ class LoggingSettings:
     cleanup_interval_seconds: int = 3600
 
 
+@dataclass(frozen=True)
+class AnalysisArchiveSettings:
+    directory: Path
+    retention_days: int = 1
+    cleanup_interval_seconds: int = 3600
+
+
+def analysis_archive_settings() -> AnalysisArchiveSettings:
+    """复盘档案按模块完成时间保留，独立于普通日志的按日轮转。"""
+    log_directory = logging_settings().directory
+    directory = Path(_setting("ANALYSIS_ARCHIVE_DIR") or log_directory / "analysis").expanduser()
+    if not directory.is_absolute():
+        directory = log_directory.parent / directory
+    values = []
+    for key, default in (("ANALYSIS_ARCHIVE_RETENTION_DAYS", 1),
+                         ("ANALYSIS_ARCHIVE_CLEANUP_INTERVAL_SECONDS", 3600)):
+        try:
+            value = int(_setting(key) or default)
+        except ValueError as exc:
+            raise ValueError(key + "必须是正整数") from exc
+        if value < 1:
+            raise ValueError(key + "必须是正整数")
+        values.append(value)
+    return AnalysisArchiveSettings(directory.resolve(), *values)
+
+
 def logging_settings() -> LoggingSettings:
     """日志不依赖数据库；相对目录按部署根目录解析，避免三种入口各写一份。"""
     api_dir = _ENV_FILE.parent

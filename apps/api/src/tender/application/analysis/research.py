@@ -23,6 +23,10 @@ class ToolArgumentError(ValueError):
     """工具参数越界或类型不符；属于可自纠正错误，回传给模型修正而不是终止模块。"""
 
 
+class WorkClosed(ToolArgumentError):
+    """正常工作关闭反馈；不占用非法参数纠错额度，硬调用预算仍然生效。"""
+
+
 class EvidenceBudgetError(ValueError):
     """证据块预算已满；拒绝新增原文但允许模型基于已有证据完成分析，属于可自纠正错误。"""
 

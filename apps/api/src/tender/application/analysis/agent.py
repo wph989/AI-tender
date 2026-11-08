@@ -7,6 +7,8 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from functools import partial
+from types import SimpleNamespace
 from typing import Annotated, Any
 
 from deepagents import (
@@ -19,6 +21,7 @@ from deepagents.backends import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain.agents.middleware import AgentMiddleware, hook_config
+from langchain_core.exceptions import ContextOverflowError
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -34,8 +37,14 @@ from langchain_core.tools import StructuredTool, ToolException
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langsmith import tracing_context
 from psycopg import OperationalError
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
+from tender.application.analysis.context import (
+    evidence_message,
+    model_message,
+    rule_topics,
+    stamp_evidence,
+)
 from tender.application.analysis.data import (
     CoverageInput,
     GapInput,
@@ -59,19 +68,33 @@ from tender.application.analysis.policy import (
     error_feedback,
     load_module_skill,
     progress_signature,
+    select_skill_rules,
     select_verified_repeats,
     tool_key,
+)
+from tender.application.analysis.protocol import (
+    CONTRACT as COMPACT_CONTRACT,
+)
+from tender.application.analysis.protocol import (
+    PROTOCOL_VERSION,
+    ResearchDelta,
+    ResearchLedger,
+    ResearchRecord,
 )
 from tender.application.analysis.research import (
     EvidenceBudgetError,
     ResearchSession,
     SourceNotAllowed,
     ToolArgumentError,
+    WorkClosed,
 )
 from tender.application.analysis.search_control import TopicSearch
 from tender.application.analysis.skills import MODULES
 from tender.application.analysis.state import AnalysisTransitions, clear_record_gaps
 from tender.application.analysis.topic_flow import (
+    OUTPUT_MODE,
+    OUTPUT_MODE_KEY,
+    RESEARCH_CONTRACT,
     TOPIC_CONTRACT,
     TopicFlow,
     TopicIncomplete,
@@ -214,6 +237,8 @@ register_harness_profile(
     "tender:analysis",
     HarnessProfile(
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        # 自定义摘要在动态提示后执行，避免默认摘要再运行一次或先漏算完整请求。
+        excluded_middleware={"SummarizationMiddleware"},
     ),
 )
 
@@ -236,7 +261,7 @@ class RoutedAgentModel(BaseChatModel):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         result = await self.router.chat(
-            [message_to_dict(m) for m in messages], kwargs.get("tools", [])
+            [model_message(m) for m in messages], kwargs.get("tools", [])
         )
         if result.agent_message is None:
             raise ValueError("模型没有返回原生 Agent 消息")
@@ -246,9 +271,45 @@ class RoutedAgentModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
-def context_size(messages: Sequence[BaseMessage]) -> int:
-    # 中文标书按字符保守估算，不能使用英文每4字符一token导致压缩触发过晚。
-    return sum(len(json.dumps(message_to_dict(m), ensure_ascii=False)) + 8 for m in messages)
+def context_size(messages: Sequence[BaseMessage], *, tools=None) -> int:
+    # 中文按字符、ASCII按三字符估算；工具schema必须与系统提示一起参与预算。
+    payload = json.dumps([model_message(m) for m in messages], ensure_ascii=False)
+    if tools:
+        payload += json.dumps([convert_to_openai_tool(t) for t in tools], ensure_ascii=False)
+    ascii_count = sum(ord(c) < 128 for c in payload)
+    return len(payload) - ascii_count + (ascii_count + 2) // 3 + 8 * len(messages)
+
+
+class AnalysisSummarizationMiddleware(SummarizationMiddleware):
+    """在完整请求组装后压缩；自定义路由也执行冻结的输入与输出预算。"""
+
+    def __init__(self, *args, context_tokens: int | None, output_tokens: int,
+                 on_context_changed: Callable[[], None] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.on_context_changed = on_context_changed
+        self.input_limit = (None if context_tokens is None else
+                            max(0, context_tokens * 95 // 100 - output_tokens))
+
+    def _input_budget(self, request):
+        provider_limit = super()._input_budget(request)
+        if self.input_limit is None:
+            return provider_limit
+        return (self.input_limit if provider_limit is None
+                else min(self.input_limit, provider_limit))
+
+    async def awrap_model_call(self, request, handler):
+        try:
+            result = await super().awrap_model_call(request, handler)
+            update = getattr(getattr(result, "command", None), "update", {}) or {}
+            if self.on_context_changed and (
+                "_summarization_event" in update or "messages" in update
+            ):
+                # 工具执行前清除已被压缩的完整文件标记，系统提示中的常驻规则继续有效。
+                self.on_context_changed()
+            return result
+        except ContextOverflowError as exc:
+            # 已尽力压缩仍超限时保留核实成果，禁止发送已知放不下的请求。
+            raise TopicIncomplete("完整请求超过上下文预算：" + str(exc)) from exc
 
 
 ABSENCE_TERMS = (
@@ -373,6 +434,7 @@ class ResearchMiddleware(AgentMiddleware):
         event: Callable[[str, dict], None] | None = None,
         topic_flow: TopicFlow | None = None,
         review_coverage: Callable[[dict], Awaitable[dict]] | None = None,
+        review_combined: Callable[[dict], Awaitable[dict]] | None = None,
     ) -> None:
         self.research, self.state = research, state
         self.reserve_tool, self.save = reserve_tool, save
@@ -384,6 +446,7 @@ class ResearchMiddleware(AgentMiddleware):
         self.skill = skill
         self.event = event
         self.topic_flow, self.review_coverage = topic_flow, review_coverage
+        self.review_combined = review_combined
 
         async def load_skill() -> dict:
             """读取当前模块冻结的 Skill 和输出清单，供运行时在分析前强制调用。"""
@@ -638,12 +701,6 @@ class ResearchMiddleware(AgentMiddleware):
         with bind_context(
             agent_phase=self.transitions.phase,
         ):
-            # 逐轮预算快照仅供诊断，默认 INFO 保留模型与工具调用摘要即可。
-            logger.debug(
-                "agent.round", evidence_count=len(self.research.seen),
-                staged_item_count=len(self.state.get("staged_items", [])),
-                no_progress_rounds=self.state.get("no_progress_rounds", 0), budget=status,
-            )
             overridden = request.override(
                 system_message=SystemMessage(content=content), tools=tools,
             )
@@ -658,6 +715,13 @@ class ResearchMiddleware(AgentMiddleware):
                 )
             started = time.monotonic()
             response = await handler(overridden)
+            # 调用完成后才输出轮次诊断，模型／工具的常规结果仍由各自单条日志记录。
+            logger.debug(
+                "agent.round", evidence_count=len(self.research.seen),
+                staged_item_count=len(self.state.get("staged_items", [])),
+                no_progress_rounds=self.state.get("no_progress_rounds", 0), budget=status,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
             # 只统计完成的主模型请求，不计领取名额、工具执行和请求前权限检查；状态随正常保存恢复。
             self.state["model_round_seconds"] = max(
                 self.state.get("model_round_seconds", 0), time.monotonic() - started,
@@ -665,36 +729,125 @@ class ResearchMiddleware(AgentMiddleware):
             return response
 
     async def topic_model_call(self, request, handler):
-        """增量流程只提供当前进度和必要规则，不重复注入全专题检索流水。"""
+        """子主题流程提供进度、研究发现和必要规则，不重复注入检索流水。"""
+        # 历史仍保存在图中，读取标记必须看压缩后的有效消息，不能把归档文件当作仍在场。
+        messages = (self.summarizer._get_effective_messages(request)
+                    if hasattr(self, "summarizer") else request.messages)
+        self.evidence_batch_messages = []
         status = self.budget_status() if self.budget_status else {}
+        summaries = [m for m in messages
+                     if getattr(m, "additional_kwargs", {}).get("lc_source") == "summarization"]
+        # 框架生成的摘要可能没有message.id，使用内容指纹保持恢复后的识别稳定。
+        summary_id = ((summaries[-1].id or fingerprint(message_to_dict(summaries[-1])))
+                      if summaries else None)
         full = not self.state.get("topic_skill_prompted") or any(
-            getattr(m, "additional_kwargs", {}).get("lc_source") == "summarization"
-            and m.id != self.state.get("topic_summary_id") for m in request.messages
+            (m.id or fingerprint(message_to_dict(m))) != self.state.get("topic_summary_id")
+            for m in summaries
         )
-        for message in request.messages:
-            if getattr(message, "additional_kwargs", {}).get("lc_source") == "summarization":
-                self.state["topic_summary_id"] = message.id
+        if summary_id:
+            self.state["topic_summary_id"] = summary_id
         self.state["topic_skill_prompted"] = True
-        hint = TOPIC_CONTRACT + "\n当前子主题进度：" + self.topic_flow.prompt()
+        selected_rules, selected_paths = (select_skill_rules(
+            self.skill, rule_topics(
+                self.topic_flow, messages, ResearchLedger(self.topic_flow).works(),
+            ),
+            full=not self.topic_flow.researching,
+        ) if self.skill and self.topic_flow.simplified else ("", set()))
+        # 只有本轮系统提示或尚在对话中的完整文件才算已提供；摘要不能冒充完整细则。
+        self.loaded_skill_paths = (selected_paths
+                                   if self.topic_flow.simplified else
+                                   {self.skill["path"], *self.skill.get("loaded_paths", [])}
+                                   if full and self.skill else
+                                   set((self.skill or {}).get("domain_paths", [])))
+        self.injected_skill_paths = set(self.loaded_skill_paths)
+        file_calls = {c["id"]: c.get("args", {}) for m in messages
+                      for c in getattr(m, "tool_calls", []) if c["name"] == "read_file"}
+        for message in messages:
+            args = file_calls.get(getattr(message, "tool_call_id", None), {})
+            path = args.get("file_path")
+            lines = ((self.skill or {}).get("line_counts", {}).get(path)
+                     if isinstance(path, str) else None)
+            if (lines is not None and isinstance(message, ToolMessage) and message.status != "error"
+                    and args.get("offset", 0) == 0 and isinstance(args.get("limit"), int)
+                    and args["limit"] >= lines
+                    and '"already_loaded"' not in str(message.content)):
+                self.loaded_skill_paths.add(path)
+        # 固定协议已在系统提示中；日常只追加变化的工作与成果，避免每轮重复注入。
+        hint = "当前子主题进度：" + self.topic_flow.prompt()
         hint += "\n剩余硬预算（不足时保留缺口）：" + json.dumps(status, ensure_ascii=False)
         if self.skill:
-            hint += "\n当前Skill：" + self.skill["instructions" if full else "digest"]
+            hint += "\n当前Skill路径：" + self.skill["path"]
+            if self.topic_flow.simplified:
+                hint += "\n领域规则：\n" + selected_rules
+                if not self.topic_flow.researching:
+                    hint += "\n成果组织：\n" + self.skill["output_rules"]
+                    hint += "\n输出格式声明：" + json.dumps(
+                        self.state["output_schema"], ensure_ascii=False, separators=(",", ":"),
+                    )
+            else:
+                hint += "\n当前Skill：" + self.skill["instructions" if full else "digest"]
+                if not full and self.skill.get("domain_rules"):
+                    hint += "\n持续适用的领域判别规则：\n" + self.skill["domain_rules"]
         staged = [i for i in self.state.get("staged_items", [])
                   if i.get("verification") == "supported"]
-        if staged:
+        if staged and not self.topic_flow.simplified:
             payload, _ = _bounded_staged_payload(staged)
             hint += "\n已核实成果摘要（不能用作原文引用）：" + payload
-        hint += "\n当前执行规则以子主题增量协议为准，有据事项立即提交，缺口只定向补查。"
         content = request.system_message.content if request.system_message else ""
         content = content + "\n" + hint if isinstance(content, str) else [
             *content, {"type": "text", "text": hint}]
-        return await handler(request.override(system_message=SystemMessage(content=content)))
+        tools = request.tools
+        if self.topic_flow.simplified:
+            allowed = {"list_documents", "read_file", "get_research_context",
+                       "update_research", "read_document"}
+            allowed.update({"search_document", "search_knowledge", "complete_research"}
+                           if self.topic_flow.researching else {"submit_analysis"})
+            tools = [t for t in tools if (
+                t.get("function", {}).get("name") if isinstance(t, dict) else t.name
+            ) in allowed]
+        return await handler(request.override(
+            system_message=SystemMessage(content=content), tools=tools,
+        ))
+
+    def skill_context_compacted(self) -> None:
+        """同轮摘要可能移走已读文件；只有当前系统提示中的规则可继续返回短回执。"""
+        self.loaded_skill_paths = set(getattr(self, "injected_skill_paths", set()))
+        self.evidence_batch_messages = []
+
+    def evidence_response(self, request, result: ToolMessage) -> ToolMessage:
+        if not self.topic_flow or not self.topic_flow.simplified:
+            return result
+        graph_state = request.state if isinstance(request.state, dict) else {}
+        messages = graph_state.get("messages", [])
+        if hasattr(self, "summarizer"):
+            messages = self.summarizer._get_effective_messages(SimpleNamespace(
+                messages=messages, state=graph_state,
+            ))
+        round_id = self._round_id(request)
+        if getattr(self, "evidence_batch_id", None) != round_id:
+            self.evidence_batch_id, self.evidence_batch_messages = round_id, []
+        rendered = evidence_message(
+            result, [m for m in [*messages, *self.evidence_batch_messages]
+                     if getattr(m, "tool_call_id", None) != result.tool_call_id],
+            self.research.seen,
+        )
+        self.evidence_batch_messages.append(rendered)
+        return rendered
 
     async def advance_topics(self) -> dict | None:
         flow = self.topic_flow
+        if flow.simplified:
+            return await self.advance_research()
         flow.sync()
+        if flow.researching:
+            return None
         pending = flow.pending()
         final = self.state.pop("topic_final_requested", None)
+        if flow.research_first:
+            if final:
+                flow.data["synthesis_finished"] = True
+            if not flow.data.get("synthesis_finished"):
+                return None
         if pending:
             if final:
                 return self.feedback("尚未完成：" + "；".join(pending[:8]))
@@ -722,6 +875,46 @@ class ResearchMiddleware(AgentMiddleware):
             {"research_summary": "全部子主题核对及独立查漏完成"},
             published_items(self.state, final=True),
         )
+        await self.save(self.state)
+        return feedback
+
+    async def advance_research(self) -> dict | None:
+        """草稿齐备后只进入合并审查，避免每次暂存触发一次支持性模型请求。"""
+        from tender.application.analysis.review import audit_combined
+        from tender.application.analysis.state import published_items
+
+        flow = self.topic_flow
+        if flow.researching:
+            return None
+        final = self.state.pop("topic_final_requested", None)
+        if final:
+            flow.data["synthesis_finished"] = True
+        if not flow.data.get("synthesis_finished"):
+            return None
+        pending = []
+        owned = {key for entry in flow.entries for key in entry["record_keys"]}
+        # 内容是否充分交给独立审查；不能要求先补齐一套与正文重复的研究完成声明。
+        pending.extend("事项尚未关联工作：" + item["business"]["key"]
+                       for item in self.state.get("staged_items", [])
+                       if item["business"]["key"] not in owned)
+        if set(self.research.seen) - flow.data["evidence_topics"].keys():
+            pending.append("仍有未归属证据")
+        if pending:
+            return self.feedback("；".join(pending))
+        if self.review_combined is None:
+            raise TopicIncomplete("独立合并审查未配置")
+        with bind_context(agent_phase="review"):
+            try:
+                done = await audit_combined(flow, self.review_combined, self.save)
+            except (InvalidModelOutput, ModelCallFailed, ModelUnavailable) as exc:
+                raise TopicIncomplete("独立合并审查未完成：" + str(exc)) from exc
+        if not done:
+            return self.feedback("独立审查发现具体待办；用update_research处理后只定向复核一次")
+        flow.sync()
+        if flow.data["audit"].get("remaining") or any(e["status"] != "ready" for e in flow.entries):
+            raise TopicIncomplete("仍有未解决内容，保留通过合并审查的有效成果及具体缺口")
+        feedback = self.build_draft({"research_summary": "研究、综合及独立合并审查完成"},
+                                    published_items(self.state, final=True))
         await self.save(self.state)
         return feedback
 
@@ -844,12 +1037,18 @@ class ResearchMiddleware(AgentMiddleware):
             "relations": self.state.get("staged_relations", []),
             "research_summary": summary,
         }
+        if self.topic_flow and self.topic_flow.research_first:
+            self.topic_flow.data.update(phase="completed", release_results=True)
         if self.state.get("business_protocol"):
             draft["business_data"] = module_data(self.state)
         self.transitions.publish_draft(draft)
         return None
 
     async def run_review_step(self) -> dict | None:
+        if self.topic_flow and self.topic_flow.simplified:
+            if request := self.transitions.take_final():
+                self.state["topic_final_requested"] = request
+            return None
         pending = sum(entry.get("verification") == "pending"
                       for entry in self.state.get("staged_items", []))
         if self.review_support is None or not (
@@ -861,7 +1060,6 @@ class ResearchMiddleware(AgentMiddleware):
             if self.topic_flow:
                 stats = self.topic_flow.data.setdefault("efficiency", {})
                 stats["reviewed_records"] = stats.get("reviewed_records", 0) + pending
-            logger.info("review.start", pending_item_count=pending)
             try:
                 feedback = await self._run_review_step()
             except Exception as exc:
@@ -873,7 +1071,8 @@ class ResearchMiddleware(AgentMiddleware):
                 raise
             log = logger.warning if feedback else logger.info
             log(
-                "review.end", needs_correction=feedback is not None,
+                "review.result", needs_correction=feedback is not None,
+                pending_item_count=pending,
                 saved_item_count=sum(i.get("verification") == "supported"
                                      for i in self.state.get("staged_items", [])),
                 duration_ms=int((time.monotonic() - started) * 1000),
@@ -1077,13 +1276,20 @@ class ResearchMiddleware(AgentMiddleware):
                             if isinstance(m, AIMessage)), None)
             if message and message.id != self.state.get("progress_message_id"):
                 signature = self.topic_flow.signature()
+                research_turn = self.state.get("topic_research_round") == message.id
+                # 成功采集由独立工作账限制；不把其轮数积攒后转嫁给下一次正常关闭反馈。
                 idle = (self.state.get("no_progress_rounds", 0) + 1
-                        if signature == self.state.get("progress_signature") else 0)
+                        if not research_turn and signature == self.state.get("progress_signature")
+                        else 0)
                 self.state.update(progress_signature=signature, progress_message_id=message.id,
                                   no_progress_rounds=idle)
-                research_turn = self.state.get("topic_research_round") == message.id
                 if idle >= self.research.limits.max_no_progress_rounds and not research_turn:
                     self.topic_flow.block_stalled()
+                    if self.topic_flow.simplified and self.topic_flow.researching:
+                        # 所有可处理工作都已受阻时直接尝试转综合，避免关闭回执反复空转。
+                        self.topic_flow.record_research(
+                            [], "研究受阻，保留具体缺口并综合已有可靠内容",
+                        )
                     self.state["no_progress_rounds"] = 0
                     feedback = self.feedback("当前待办连续无法推进，已登记缺口；继续其他未处理主题")
                 await self.save(self.state)
@@ -1144,6 +1350,11 @@ class ResearchMiddleware(AgentMiddleware):
             )
         if self.state.get("consecutive_unsubmitted_responses", 0) >= 3:
             raise ValueError("模型连续三次未调用分析工具，无法获得通过校验的提交")
+        if self.topic_flow and self.topic_flow.researching:
+            return {"messages": [HumanMessage(content=(
+                "研究尚未结束。请用update_research登记带证据的研究发现和具体待办，"
+                "围绕尚未解决的问题继续定向检索；进入synthesis后再统一提交业务结果。"
+            ))], "jump_to": "model"}
         return {
             "messages": [
                 HumanMessage(
@@ -1154,8 +1365,12 @@ class ResearchMiddleware(AgentMiddleware):
                             if self.state.get("output_schema") and not self.topic_flow else ""
                         )
                         + "请按 submit_analysis 的 schema 提交带原文引用的 JSON；"
-                        "每次最多三条完整事项并携带原文引用，最后一批可携带records和final=true结束。"
-                        "缺口写入检索总结与 gaps，不把刚才的总结当作原文证据。"
+                        + ("按输出容量提交完整事项并携带work_ids和原文引用，最后一批final=true。"
+                         if self.topic_flow and self.topic_flow.simplified else
+                         "每次最多三条完整事项并携带原文引用，最后一批可携带records和final=true结束。")
+                        + ("具体缺口用update_research登记，不把刚才的总结当作原文证据。"
+                           if self.topic_flow and self.topic_flow.simplified else
+                           "缺口写入检索总结与 gaps，不把刚才的总结当作原文证据。")
                     )
                 )
             ],
@@ -1307,7 +1522,7 @@ class ResearchMiddleware(AgentMiddleware):
                     "tool.call", tool_parameters=request.tool_call.get("args"),
                     status="cached", duration_ms=0,
                 )
-                return messages_from_dict([cached])[0]
+                return self.evidence_response(request, messages_from_dict([cached])[0])
             await self.reserve_tool()
             started = time.monotonic()
             # 调用 ID 留在工具协议和检查点中用于重放，运行日志只记录动作摘要。
@@ -1320,6 +1535,9 @@ class ResearchMiddleware(AgentMiddleware):
                     # 同轮工具串行执行：后续暂存或无效提交撤销前一提交的完成意图，
                     # 否则它尚未纠正就会借用旧 final 发布残缺成果；同ID重放已在上方返回。
                     self.transitions.take_final()
+                    if self.topic_flow and self.topic_flow.research_first:
+                        self.topic_flow.data.pop("synthesis_finished", None)
+                        self.state.pop("topic_final_requested", None)
                 signature = tool_key(name, request.tool_call["args"])
                 counts = self.state.setdefault("identical_tool_calls", {})
                 counts[signature] = counts.get(signature, 0) + 1
@@ -1345,9 +1563,6 @@ class ResearchMiddleware(AgentMiddleware):
                         if (not quote_only and self.state.get("argument_failures", 0)
                                 >= self.research.limits.max_argument_failures):
                             raise TopicIncomplete("参数纠错额度已耗尽，停止新增检索并保留核实成果")
-                        if not quote_only:
-                            # 关闭一个耗尽待办的反馈轮也由工作账收敛，不能连带封锁其他待办。
-                            self.state["topic_research_round"] = self._round_id(request)
                         control = TopicSearch(self.topic_flow)
                         work = control.begin(name, request.tool_call["args"])
                     if name in {"search_document", "search_knowledge"} and (
@@ -1375,12 +1590,26 @@ class ResearchMiddleware(AgentMiddleware):
                         result = messages_from_dict([prior])[0].model_copy(
                             update={"tool_call_id": call_id, "id": None}
                         )
+                    elif (self.topic_flow and name == "read_file"
+                          and request.tool_call["args"].get("file_path") in
+                          getattr(self, "loaded_skill_paths", set())):
+                        # 不重复返回本轮已有的完整规则；压缩后不在上下文的细则仍允许按需读取。
+                        result = ToolMessage(content=json.dumps({
+                            "already_loaded": True,
+                            "note": ("该规则已在当前上下文加载；"
+                                     "直接分析原文并更新当前进度，无须重复读取。"),
+                        }, ensure_ascii=False), tool_call_id=call_id, name=name)
                     else:
                         result = await handler(request)
+                        if self.topic_flow and self.topic_flow.simplified:
+                            result = stamp_evidence(result, self.research.seen)
                     if (control and result.status != "error"
                             and not str(result.content).startswith(TOOL_ARGUMENT_PREFIX)):
                         payload = json.loads(result.content)
                         control.end(work, payload, before)
+                        if work:
+                            # 只有实际完成采集才交给工作账收敛；关闭／暂停回执不能豁免无进展。
+                            self.state["topic_research_round"] = self._round_id(request)
                         result = result.model_copy(update={"content": json.dumps(
                             payload, ensure_ascii=False,
                         )})
@@ -1389,6 +1618,16 @@ class ResearchMiddleware(AgentMiddleware):
                     result = ToolMessage(
                         content=str(exc), tool_call_id=call_id, name=name, status="error",
                     )
+                except WorkClosed as exc:
+                    # 工作关闭属于正常进度，不让它耗尽其他主题的参数纠错机会。
+                    failure_class = "work_closed"
+                    result = ToolMessage(content=json.dumps({
+                        "work_closed": True, "message": str(exc),
+                        "next_action": (
+                            "用update_research登记研究发现，或选择其他具体工作"
+                            if self.topic_flow and self.topic_flow.researching else
+                            "提交已读事项，或选择当前search_work中的其他具体工作"),
+                    }, ensure_ascii=False), tool_call_id=call_id, name=name)
                 except ToolArgumentError as exc:
                     # 可自纠正的参数错误回传提示给模型修正，不终止模块。
                     failure_class = "argument"
@@ -1423,7 +1662,7 @@ class ResearchMiddleware(AgentMiddleware):
                         "search_knowledge",
                         "read_document",
                         "list_documents",
-                    }:
+                    } and failure_class != "work_closed":
                         self.state["read_tool_cache"][signature] = message_to_dict(result)
                     if name in {"search_document", "search_knowledge", "read_document"} and (
                         was_synthesis and not self.state.get("research_completed")
@@ -1432,8 +1671,12 @@ class ResearchMiddleware(AgentMiddleware):
                         result = result.model_copy(update={"content": json.dumps(
                             json.loads(result.content) | {
                                 "phase": "research",
-                                "next_action": "本次新增原文，此前综合登记和暂存事项已失效。"
-                                "请重新核对主题、调用 complete_research，再综合提交全部事项。",
+                                "next_action": (
+                                    "新增原文已关联研究待办，原研究笔记和已核实版本保留；"
+                                    "用update_research核对新增依据后再综合修正相关事项。"
+                                    if self.topic_flow else
+                                    "本次新增原文，此前综合登记和暂存事项已失效。"
+                                    "请重新核对主题、调用 complete_research，再综合提交全部事项。"),
                             }, ensure_ascii=False,
                         )})
                 # 先保留最后一次失败反馈，终止时也能定位具体条目，而不是只剩“三次无效”。
@@ -1452,7 +1695,7 @@ class ResearchMiddleware(AgentMiddleware):
                     else:
                         # 分批已成功后不能把后续独立错误累计成“连续三次”。总请求预算仍不重置。
                         self.state["consecutive_invalid_submissions"] = 0
-                return result
+                return self.evidence_response(request, result)
             except BaseException as exc:
                 tool_error = exc
                 raise
@@ -1507,10 +1750,16 @@ def build_module_agent(
     event: Callable[[str, dict], None] | None = None,
     categories: Sequence[str] = (),
     review_coverage: Callable[[dict], Awaitable[dict]] | None = None,
+    review_combined: Callable[[dict], Awaitable[dict]] | None = None,
     lots: Sequence[dict] = (),
 ):
     if key not in MODULES:
         raise ValueError("未注册的分析模块")
+    if (snapshot.get("__analysis_flow_version__") == PROTOCOL_VERSION
+            and state.get("topic_flow")
+            and state["topic_flow"].get("protocol") != PROTOCOL_VERSION):
+        # 报告标记不能把不兼容的工作账静默升级，否则旧草稿可能继承新审查资格。
+        raise ValueError("解析协议已升级，旧检查点不能恢复；请重新创建报告")
     skill = load_module_skill(snapshot, key, categories=categories)
     state["business_protocol"] = True
     state["business_topics"] = json.loads(snapshot.get(key + "/references/coverage.json", "[]"))
@@ -1518,10 +1767,20 @@ def build_module_agent(
     flow = TopicFlow(state, research) if enabled(snapshot) else None
     if flow:
         state["topic_lots"] = list(lots)
+        if snapshot.get("__analysis_flow_version__") == PROTOCOL_VERSION:
+            flow.data["protocol"] = PROTOCOL_VERSION
+        if snapshot.get(OUTPUT_MODE_KEY) == OUTPUT_MODE or flow.simplified:
+            # 输出时序冻结于报告快照；恢复沿用同一阶段及研究账，不另建Agent实现。
+            flow.data["output_mode"] = OUTPUT_MODE
+            flow.data.setdefault("phase", "research")
+            flow.sync()
     skill["instructions"] += (
         "\n\n汇总 JSON 的分类、布局和内容键（*代表原文具体岗位或格式层级）：\n"
         + json.dumps(state["output_schema"], ensure_ascii=False)
     )
+    if flow and flow.simplified:
+        # 独立上下文也需要领域工作方法及成果组织约束，不能只核对抽取细则。
+        state["review_rules"] = skill["model_rules"] + "\n\n" + skill["output_rules"]
     research.compact_results = True
     # 数据库模块键保持兼容，虚拟Skill名称遵循Agent Skills的连字符规范。
     skill_name = key.replace("_", "-")
@@ -1562,10 +1821,10 @@ def build_module_agent(
     async def search_document(
         query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
         topic_keys: list[str] | None = None,
-        work: str | None = None,
+        work: str | list[str] | None = None,
     ) -> dict:
         """检索本项目原文；同一查询用 offset=next_offset 翻页，补充检索会回到检索阶段。"""
-        keys = flow.topic_keys(topic_keys) if flow else []
+        keys = flow.topic_keys(topic_keys, work=work) if flow else []
         if flow:
             flow.data["active_topics"] = keys
         before_ids = set(research.seen)
@@ -1582,10 +1841,10 @@ def build_module_agent(
     async def search_knowledge(
         query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
         topic_keys: list[str] | None = None,
-        work: str | None = None,
+        work: str | list[str] | None = None,
     ) -> dict:
         """检索已关联参考资料；同一查询用 offset=next_offset 翻页，不能替代本项目要求。"""
-        keys = flow.topic_keys(topic_keys) if flow else []
+        keys = flow.topic_keys(topic_keys, work=work) if flow else []
         if flow:
             flow.data["active_topics"] = keys
         before_ids = set(research.seen)
@@ -1601,10 +1860,10 @@ def build_module_agent(
         before: Annotated[int, Field(ge=0, le=11)] = 2,
         after: Annotated[int, Field(ge=0, le=11)] = 2,
         topic_keys: list[str] | None = None,
-        work: str | None = None,
+        work: str | list[str] | None = None,
     ) -> dict:
         """补读已知证据的邻近原文；合计超过11块时由运行时按顺序截断并回报实际窗口。"""
-        keys = flow.topic_keys(topic_keys, block_id=block_id) if flow else []
+        keys = flow.topic_keys(topic_keys, block_id=block_id, work=work) if flow else []
         if flow:
             flow.data["active_topics"] = keys
         requested = {"before": before, "after": after}
@@ -1642,6 +1901,63 @@ def build_module_agent(
         elif set(research.seen) != before_ids:
             invalidate_summary()
         return result
+
+    async def update_research(
+        topic_updates: Annotated[list[TopicUpdate], Field(min_length=1, max_length=30)],
+        research_summary: str = "",
+        complete: bool = False,
+    ) -> dict:
+        """批量记录研究发现及todo；全部核对后进入统一综合，提前complete返回具体缺口。"""
+        try:
+            pending = flow.record_research(topic_updates, research_summary)
+            state["research"] = research.checkpoint()
+            await save(state)
+            return {"phase": flow.data["phase"], "progress": flow.progress(),
+                    "pending": pending,
+                    "note": ("研究结束，请统一综合所有研究发现，再分批submit_analysis。"
+                             if not pending else "先分析现有原文，继续处理具体未完成项。"),
+                    "complete": complete and not pending}
+        except ValueError as exc:
+            raise ToolException(str(exc)) from exc
+
+    async def update_compact_research(
+        updates: Annotated[list[ResearchDelta], Field(min_length=1, max_length=50)],
+    ) -> dict:
+        """保存必要事实线索和具体问题，程序自动维护覆盖及阶段。"""
+        try:
+            book = ResearchLedger(flow)
+            previous = {w["id"]: w for w in book.works()}
+            pending = book.update(updates)
+            state["research"] = research.checkpoint()
+            await save(state)
+            changed = [w for w in book.works() if w != previous.get(w["id"])]
+            return {"phase": flow.data["phase"], "pending": pending,
+                    "changed_works": book.work_index(changed)}
+        except ValueError as exc:
+            raise ToolException(str(exc)) from exc
+
+    async def get_research_context(
+        work_ids: list[str], offset: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=256, le=12000)] = 6000,
+        revision: str | None = None,
+    ) -> dict:
+        """按工作读取完整片段；续页沿用revision及next_offset，变化时从0重读。"""
+        try:
+            return ResearchLedger(flow).context(work_ids, offset, limit, revision=revision)
+        except ValueError as exc:
+            raise ToolException(str(exc)) from exc
+
+    async def finish_compact_research(
+        research_summary: Annotated[str, Field(min_length=1, max_length=4000)],
+    ) -> dict:
+        """已理解原文且依据充分时立即结束检索，进入最后统一综合；无需逐项登记研究笔记。"""
+        try:
+            ResearchLedger(flow).finish(research_summary)
+            state["research"] = research.checkpoint()
+            await save(state)
+            return {"phase": "synthesis", "note": "按Skill统一综合，最后一批final=true进入独立审查"}
+        except ValueError as exc:
+            raise ToolException(str(exc)) from exc
 
     async def complete_research(
         topics: list[ResearchTopic] | None = None,
@@ -1725,11 +2041,14 @@ def build_module_agent(
             }
             if unchanged and old.get("review_status") != "needs_review":
                 # 复用已核实版本并保留绑定，避免额外请求或丢掉正文单元的原文定位。
-                staged.append(old)
+                staged.append(old | {"work_ids": entry["work_ids"]}
+                              if "work_ids" in entry else old)
                 continue
             if old.get("verification") == "supported":
                 state.setdefault("business_previous", {})[entry["id"]] = old
             entry["verification"] = "pending"
+            if flow and flow.simplified:
+                flow.data["audit"].get("record_topics", {}).pop(entry["id"], None)
             if old.get("review_status") == "needs_review":
                 entry["review_status"] = "needs_review"
                 entry["review_evidence_ids"] = old.get("review_evidence_ids", [])
@@ -1757,9 +2076,19 @@ def build_module_agent(
         research_summary: str = "",
         final: bool = False,
         topic_updates: Annotated[list[TopicUpdate] | None, Field(max_length=30)] = None,
+        work_ids: list[str] | None = None,
+        record_work: dict[str, list[str]] | None = None,
     ) -> dict:
-        """检索完成后提交符合当前 Skill 的汇总 JSON；未结束检索不能提交。"""
+        """按冻结的输出时序提交完整事项；复用同一结构、引用与支持性校验链。"""
         try:
+            if flow and flow.researching:
+                raise ValueError(
+                    "当前仍在研究阶段，依据充分时先complete_research再统一综合；"
+                    "尚有缺口则继续定向研究"
+                    if flow.simplified else
+                    "当前仍在研究阶段，请用update_research登记发现并核对具体todo，"
+                    "研究结束后再统一提交"
+                )
             if not flow and not state.get("research_completed"):
                 raise ValueError("请先完成全部主题检索与转引追踪，并调用 complete_research")
             if not flow and state["research_completed"]["evidence_ids"] != sorted(research.seen):
@@ -1786,12 +2115,39 @@ def build_module_agent(
                     raise batch_error
             # 辅助说明可沿用检索账或由服务端补齐；缺少一份空清单不应丢掉有依据的正文。
             if flow:
+                if flow.simplified:
+                    original_works = ResearchLedger(flow).submission_works()
+                    merged = {}
+                    for item in prepared:
+                        ids = (record_work or {}).get(item["business"]["key"], work_ids or [])
+                        item["work_ids"] = list(dict.fromkeys(ids))
+                        for update in ResearchLedger(flow).record_updates([item], ids):
+                            identity_key = (update.topic, fingerprint(update.scope_value()))
+                            if identity_key in merged:
+                                merged[identity_key].record_keys.extend(update.record_keys)
+                            else:
+                                merged[identity_key] = update
+                    topic_updates = list(merged.values())
                 updates = flow.isolate_rejected(topic_updates or [], {r["key"] for r in rejected})
+                updates = flow.prepare_updates(prepared, updates)
                 flow.validate_records(prepared, updates)
                 available = {i["business"]["key"] for i in state.get("staged_items", [])
                              if i.get("business")}
                 available.update(i["business"]["key"] for i in prepared if i.get("business"))
                 flow.apply(updates, available)
+                if flow.simplified:
+                    current_works = ResearchLedger(flow).works()
+                    for item in prepared:
+                        previous_works = [original_works[wid] for wid in item["work_ids"]]
+                        # 初次综合可把未知范围拆为多个标段，记录须绑定迁移后各自的稳定工作ID。
+                        item["work_ids"] = [w["id"] for w in current_works
+                                            if w["scope"] == item["business"]["scope"] and any(
+                                                w["topic"] == old["topic"]
+                                                and w["kind"] == old["kind"]
+                                                and (w["task_id"] == old["task_id"]
+                                                     if w["kind"] == "task" else
+                                                     w["check"] == old["check"])
+                                                for old in previous_works)]
                 flow.bind_records(prepared)
             research_summary = research_summary or state["research_completed"]["research_summary"]
             checked_coverage, reviews = prepare_coverage(
@@ -1841,7 +2197,29 @@ def build_module_agent(
         except ValueError as exc:
             raise ToolException(str(exc)) from exc
 
-    def validation_feedback(error):
+    async def submit_compact(
+        records: list[ResearchRecord], final: bool = False,
+    ) -> dict:
+        """研究结束后按输出容量暂存完整事项；最后一批final=true自动进入独立合并审查。"""
+        positions = {item["business"]["key"]: item["business"].get("sort_order", index)
+                     for index, item in enumerate(state.get("staged_items", []))
+                     if item.get("business")}
+        next_position = max(positions.values(), default=-1) + 1
+        prepared = []
+        for record in records:
+            if record.key not in positions:
+                positions[record.key] = next_position
+                next_position += 1
+            # 首次提交顺序即展示顺序；修改既有事项保留位置，不让模型维护排序号。
+            prepared.append(SynthesisRecord.model_validate(
+                record.model_dump(exclude={"work_ids"}) | {"sort_order": positions[record.key]},
+            ))
+        return await submit_business(
+            prepared,
+            final=final, record_work={r.key: r.work_ids for r in records},
+        )
+
+    def validation_feedback(error, *, tool_name: str = "submit_analysis"):
         # 只给字段路径无法区分类型错误与范围冲突；保留schema／业务校验原因，
         # 排除input和ctx，避免把完整坏草稿重复塞回上下文并浪费纠正预算。
         # 固定前缀让工具包装层把schema失败归入可纠正参数错误，不靠中文文案猜测。
@@ -1849,38 +2227,76 @@ def build_module_agent(
         fields = "；".join(
             ".".join(map(str, e["loc"])) + "：" + e["msg"] for e in issues[:6]
         )[:1000]
-        required = "records（每次最多三条完整事项，条目包含 content 和原文 citations）"
+        if tool_name != "submit_analysis":
+            hint = (
+                '参数示例：{"updates":[{"work_ids":["w1"],"status":"examined",'
+                '"detail":"仅见标题，需补读正文","examined_ids":["实际已读ID"]}]}。'
+                "status、scope、work_ids均属于updates的每条增量，不放在顶层。"
+                if tool_name == "update_research" and flow and flow.simplified else
+                "按当前工具schema修正对应字段。"
+            )
+            return TOOL_ARGUMENT_PREFIX + "工具参数缺失或类型不符：" + fields + "。" + hint
+        required = (
+            "records（每条包含work_ids、业务content和原文citations，按输出容量分批）"
+            if flow and flow.simplified else
+            "records（每次最多三条完整事项，条目包含 content 和原文 citations）"
+        )
         return (
             TOOL_ARGUMENT_PREFIX + "工具参数缺失或类型不符：" + fields
             + "。请按当前工具schema修正。"
-            "若调用submit_analysis，必须提供 " + required + "；辅助覆盖与缺口清单可省略。"
+            "若调用submit_analysis，必须提供 " + required + "。"
             "中间批次final=false暂存，最后一批可携带records和final=true，通过校验即完成，无需额外空提交。"
         )
 
     tools = [
-        StructuredTool.from_function(coroutine=f, handle_validation_error=validation_feedback)
+        StructuredTool.from_function(coroutine=f, handle_validation_error=partial(
+            validation_feedback, tool_name=f.__name__,
+        ))
         for f in (list_documents, search_document, search_knowledge, read_document)
     ]
     if not flow:
         tools.append(StructuredTool.from_function(
             coroutine=complete_research, handle_tool_error=True,
-            handle_validation_error=validation_feedback,
+            handle_validation_error=partial(validation_feedback, tool_name="complete_research"),
         ))
+    elif flow.research_first:
+        tools.append(StructuredTool.from_function(
+            name="update_research",
+            coroutine=update_compact_research if flow.simplified else update_research,
+            handle_tool_error=True,
+            handle_validation_error=partial(validation_feedback, tool_name="update_research"),
+        ))
+        if flow.simplified:
+            tools.append(StructuredTool.from_function(
+                name="complete_research", coroutine=finish_compact_research,
+                handle_tool_error=True,
+                handle_validation_error=partial(validation_feedback, tool_name="complete_research"),
+            ))
+            tools.append(StructuredTool.from_function(
+                coroutine=get_research_context, handle_tool_error=True,
+                handle_validation_error=partial(
+                    validation_feedback, tool_name="get_research_context",
+                ),
+            ))
     # 完成意图在全部汇总条目校验通过后才结束子图。
     tools.append(
         StructuredTool.from_function(
             name="submit_analysis",
-            coroutine=submit_business,
+            coroutine=submit_compact if flow and flow.simplified else submit_business,
             handle_tool_error=True,
             handle_validation_error=validation_feedback,
         )
     )
-    if flow:
+    if flow and not flow.simplified:
         tools[-1].description = (
-            "增量提交完整事项及topic_updates；逐批校验保存，主题处理完自动查漏。"
+            "研究结束后统一综合输出；可每批最多三条暂存。全部校验及查漏结束后统一发布。"
+            "topic_updates可补充归属和具体修正待办，已核实事项沿用key，无需重复送审。"
+        ) if flow.research_first else (
+            "有据事项立即增量提交，每批最多三条。topic_updates通常只需topic、checked及待办；"
+            "记录、证据、范围和状态由程序补齐，范围未知也可保存正文；核对充分后自动查漏。"
         )
-    else:
-        # 历史快照继续暴露原工具schema，模型恢复时不会突然收到新流程字段。
+    elif not flow:
+        # 通用问答及内部协议测试不暴露专题工作参数。
         from pydantic import create_model
 
         for tool in tools:
@@ -1891,21 +2307,53 @@ def build_module_agent(
                     **{name: (field.annotation, field) for name, field in fields.items()
                        if name not in {"topic_keys", "topic_updates", "work"}},
                 )
+    if flow and flow.simplified:
+        from pydantic import create_model
+
+        for tool in tools:
+            # 顶层也禁止未知字段，否则放错层级的status会被静默丢弃并按found执行。
+            tool.args_schema = create_model(
+                tool.args_schema.__name__, __config__=ConfigDict(extra="forbid"),
+                **{name: (field.annotation, field)
+                   for name, field in tool.args_schema.model_fields.items()},
+            )
     limits = research.limits
     middleware = ResearchMiddleware(
         research, state, reserve_tool, save, budget_status, review_support,
         is_outline=key == "bid_format_outline_parsing", skill=skill, event=event,
-        topic_flow=flow, review_coverage=review_coverage,
+        topic_flow=flow, review_coverage=review_coverage, review_combined=review_combined,
     )
+    summary = AnalysisSummarizationMiddleware(
+        model, backend=backend,
+        # 冻结的旧流程继续原摘要时序；新流程按最终提示与工具定义执行完整预算。
+        context_tokens=limits.context_tokens if flow else None,
+        output_tokens=limits.max_output_tokens,
+        on_context_changed=middleware.skill_context_compacted if flow else None,
+        summary_prompt=ANALYSIS_SUMMARY_PROMPT.format(
+            module_title=MODULES[key], messages="{messages}",
+        ),
+        trigger=("tokens", max(1, (limits.context_tokens * 95 // 100
+                                  - limits.max_output_tokens) * 4 // 5)
+                 if flow else max(1, limits.context_tokens * 4 // 5)),
+        keep=("messages", 4),
+        token_counter=(context_size if flow else lambda messages: sum(
+            len(json.dumps(message_to_dict(m), ensure_ascii=False)) + 8 for m in messages
+        )),
+        trim_tokens_to_summarize=limits.context_tokens,
+    )
+    middleware.summarizer = summary
     graph = create_deep_agent(
         model=model,
         name=key,
         tools=tools,
         backend=backend,
         checkpointer=checkpointer,
-        skills=["/skills/"],
+        # 专题已由冻结快照选定并加载，无需再叠加通用Skill发现提示和动态披露。
+        skills=None if flow else ["/skills/"],
         permissions=permissions,
-        system_prompt=((TOPIC_CONTRACT + "\n" + DATA_CONTRACT.split("研究完成后每次")[0]
+        system_prompt=(COMPACT_CONTRACT if flow and flow.simplified else
+                       ((RESEARCH_CONTRACT if flow.research_first else TOPIC_CONTRACT)
+                        + "\n" + DATA_CONTRACT.split("研究完成后每次")[0]
                         + "每批最多三条完整事项，按子主题协议提交并自动检查完成条件。")
                        if flow else CONTRACT + "\n" + DATA_CONTRACT),
         middleware=[
@@ -1915,19 +2363,7 @@ def build_module_agent(
                 _permissions=permissions,
                 tool_token_limit_before_evict=None,
             ),
-            SummarizationMiddleware(
-                model,
-                backend=backend,
-                # 通用摘要会反复扩写检索日志；保留事项和证据线索，原文仍在服务端证据账。
-                summary_prompt=ANALYSIS_SUMMARY_PROMPT.format(
-                    module_title=MODULES[key], messages="{messages}",
-                ),
-                trigger=("tokens", max(1, limits.context_tokens * 4 // 5)),
-                keep=("messages", 4),
-                token_counter=context_size,
-                trim_tokens_to_summarize=limits.context_tokens,
-            ),
-            middleware,
+            *([middleware, summary] if flow else [summary, middleware]),
         ],
     )
     files = {

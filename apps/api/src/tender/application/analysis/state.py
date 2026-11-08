@@ -4,6 +4,7 @@ from typing import Any, Literal, TypedDict, cast
 
 
 class AnalysisState(TypedDict, total=False):
+    topic_flow: dict[str, Any]
     model_round_seconds: float
     research_completed: dict[str, Any]
     research: dict[str, Any]
@@ -34,13 +35,34 @@ def clear_record_gaps(state: dict, item_ids: set[str]) -> None:
 
 def published_items(snapshot: dict, *, final: bool = False) -> list[dict]:
     """待修订版本校验期间仍显示旧核实内容；最终成果只消费当前有效版本。"""
+    flow = snapshot.get("topic_flow", {})
+    deferred = flow.get("output_mode") == "after-research"
+    if deferred and not final and not flow.get("release_results"):
+        return []
     items = {item["id"]: item for item in snapshot.get("staged_items", [])}
     if snapshot.get("topic_flow"):
         for key, old in snapshot.get("business_previous", {}).items():
             if items.get(key, {}).get("verification") != "supported":
                 items[key] = old
-    return [item for item in items.values() if item.get("verification") == "supported"
-            and not (final and item.get("review_status") == "needs_review")]
+    valid = [item for item in items.values() if item.get("verification") == "supported"
+             and not ((final or deferred) and item.get("review_status") == "needs_review")]
+    if flow.get("protocol") == "research-v2":
+        reviewed = flow.get("audit", {}).get("record_topics", {})
+        valid = [item for item in valid if item.get("review_status") == "current" and {
+            e["topic"] for e in flow["entries"].values()
+            if item.get("business", {}).get("key") in e["record_keys"]
+        } <= set(reviewed.get(item["id"], []))]
+        # 父节点及关系端点未经审查时，下游记录不能借独立支持判定进入部分成果。
+        while True:
+            keys = {item["business"]["key"] for item in valid}
+            filtered = [item for item in valid if {
+                item["business"].get(k) for k in ("parent_key", "subject_key", "object_key")
+                if item["business"].get(k)
+            } <= keys]
+            if len(filtered) == len(valid):
+                break
+            valid = filtered
+    return valid
 
 
 class AnalysisTransitions:
@@ -50,6 +72,8 @@ class AnalysisTransitions:
 
     @property
     def phase(self) -> Phase:
+        if self.state.get("topic_flow", {}).get("phase") == "research":
+            return "research"
         if not self.state.get("research_completed"):
             return "research"
         if any(

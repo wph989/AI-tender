@@ -167,7 +167,7 @@ def prepared_runtime(env, *, topic_flow=False):
 
 def prepared_runtimes(env, count: int = 1):
     """同一报告里按模块顺序取前若干个运行账，用于验证同报告内部的抢槽与收殓。"""
-    row = report(env)
+    row = report(env, topic_flow=True)
     row, sources = worker.prepare_report(env.db, row)
     runs = env.db.rows(
         """SELECT a.* FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
@@ -336,33 +336,41 @@ class NativeRouter:
 
     async def chat(self, messages, tools):
         await self.reserve()
-        await asyncio.sleep(0.01)
         self.calls += 1
+        all_works = [
+            f"w{i}"
+            for i in range(1, 1 + sum(len(t.get("checks") or [t["title"]]) for t in self.topics))
+        ]
         if self.calls == 1:
             name, args = "list_documents", {}
         elif self.calls == 2:
-            name, args = "search_document", {"query": "质保"}
-        elif self.calls == 3:
-            name, args = "complete_research", {
-                "topics": [{"topic": topic["key"], "status": "searched_not_found",
-                            "queries": ["质保"], "evidence_ids": [], "detail": "本次未识别新增事项"}
-                           for topic in self.topics],
-                "references": [], "research_summary": "已检查项目资料和各专题检索范围",
-            }
-        else:
             name, args = (
-                "submit_analysis",
+                "search_document",
+                {"query": "质保", "topic_keys": [t["key"] for t in self.topics]},
+            )
+        elif self.calls == 3:
+            name, args = (
+                "update_research",
                 {
-                    "records": [], "coverage": [
-                        {"topic": topic["key"], "status": "searched_not_found",
-                         "scope": {"kind": "common", "lot_refs": []},
-                         "record_keys": [], "detail": "本次未识别新增事项"}
-                        for topic in self.topics
-                    ], "gaps": [],
-                    "research_summary": "已检索质保，当前专题无新增事项",
-                    "final": True,
+                    "updates": [
+                        {
+                            "work_ids": all_works,
+                            "status": "not_found",
+                            "detail": "已核对测试资料，当前专题未找到更多事项",
+                            "scope": {"kind": "common", "lot_refs": []},
+                            "examined_ids": [
+                                block["id"]
+                                for m in messages
+                                if m["type"] == "tool"
+                                and m["data"].get("name") == "search_document"
+                                for block in json.loads(m["data"]["content"])["blocks"]
+                            ],
+                        }
+                    ]
                 },
             )
+        else:
+            name, args = "submit_analysis", {"records": [], "final": True}
         return Completion(
             content="",
             model="fixture",
@@ -373,13 +381,25 @@ class NativeRouter:
             ),
         )
 
+    async def complete(self, prompt):
+        await self.reserve()
+        return Completion(
+            content='{"reviews":{},"issues":[],"context_requests":[]}', model="fixture"
+        )
+
+
     async def aclose(self):
         pass
 
 
 def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypatch):
     """真实图、检查点和元素表串联，证明模型看不到位置且只解析最终选中的证据。"""
-    row = report(env)
+    row = report(env, topic_flow=True)
+    topics = [{"key": "warranty", "title": "质保", "checks": ["期限"]}]
+    path = "project_basic_info_parsing/references/coverage.json"
+    row["skill_snapshot"][path] = json.dumps(topics)
+    env.db.execute("UPDATE analysis_report SET skill_snapshot=CAST(:s AS JSONB) WHERE id=:id",
+                   {"s": json.dumps(row["skill_snapshot"]), "id": row["id"]})
     with env.engine.begin() as conn:
         conn.execute(
             text("""INSERT INTO element
@@ -398,8 +418,12 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
         return original_resolve(ref, **kwargs)
 
     class EvidenceRouter(NativeRouter):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.topics = topics
+
         async def chat(self, messages, tools):
-            if self.calls < 3:
+            if self.calls < 2:
                 return await super().chat(messages, tools)
             await self.reserve()
             self.calls += 1
@@ -410,59 +434,39 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
             )
             assert "retrieval" not in result
             assert all(set(b) == {"id", "text"} for b in result["blocks"])
-            args = {
-                "records": [{
+            if self.calls == 3:
+                name, args = "update_research", {"updates": [{
+                    "work_ids": ["w1"], "detail": "已核对质保期限",
+                    "scope": {"kind": "common", "lot_refs": []},
+                    "evidence_ids": [b["id"] for b in result["blocks"]],
+                }]}
+            else:
+                name, args = "submit_analysis", {"records": [{
                     "key": "warranty", "kind": "requirement", "title": "质保",
-                    "group": "项目基本信息",
+                    "work_ids": ["w1"], "group": "项目基本信息",
                     "content": {"字段": "质保期限", "内容": "质保期限为三年"},
                     "scope": {"kind": "common", "lot_refs": []},
-                    "citations": [
-                        {"block_id": b["id"], "quote": "质保三年"} for b in result["blocks"]
-                    ],
-                }],
-                "coverage": [
-                    {"topic": topic["key"], "status": "searched_not_found",
-                     "scope": {"kind": "common", "lot_refs": []},
-                     "record_keys": [], "detail": "仅核实质保条款"}
-                    for topic in self.topics
-                ], "gaps": [],
-                "research_summary": "已核对质保",
-                "final": True,
-            }
-            return Completion(
-                content="",
-                model="fixture",
-                agent_message=message_to_dict(
-                    AIMessage(
-                        content="",
-                        tool_calls=[{"name": "submit_analysis", "args": args, "id": "submit"}],
-                    )
-                ),
-            )
+                    "citations": [{"block_id": b["id"], "quote": "质保三年"}
+                                  for b in result["blocks"]],
+                }], "final": True}
+            return Completion(content="", model="fixture", agent_message=message_to_dict(
+                AIMessage(content="", tool_calls=[{"name": name, "args": args,
+                                                   "id": f"evidence-{self.calls}"}])
+            ))
 
         async def complete(self, prompt):
             await self.reserve()
-            items = json.loads(prompt.rsplit("\n", 1)[-1])
-            refs = items[0]["evidence_sets"][items[0]["values"][0]["evidence_set"]]["citations"]
-            assert len(refs) == 2 and all(set(r) == {"id", "text"} for r in refs)
-            # 校验请求包含业务属性，不能只核对展示文字后把标段范围直接落库。
-            assert items[0]["business"]["scope"] == {"kind": "common", "lot_refs": []}
-            selected.append(refs[-1]["id"])
-            return Completion(
-                content=json.dumps(
-                    {
-                        "reviews": [
-                            {
-                                "supported": True,
-                                "unsupported_claims": [],
-                                "unresolved_references": [],
-                                "evidence_ids": [[selected[-1]] for _ in items[0]["values"]],
-                            }
-                        ]
-                    }
-                ),
-                model="fixture",
-            )
+            payload = json.loads(prompt.rsplit("\n", 1)[-1])
+            assert len(payload["citations"]) == 2
+            assert not any("bbox" in c for c in payload["citations"].values())
+            row = payload["records"][0]
+            assert row["values"][0]["business"]["scope"] == {"kind": "common", "lot_refs": []}
+            cid = max(payload["citations"], key=lambda c: payload["citations"][c]["block_id"])
+            selected.append(payload["citations"][cid]["block_id"])
+            return Completion(content=json.dumps({"reviews": {row["record_id"]: {
+                "supported": True, "issues": [],
+                "bindings": {v["value_id"]: [cid] for v in row["values"]},
+            }}, "issues": [], "context_requests": []}), model="fixture")
 
     async def retrieve(db, selected_sources, query, *args, **kwargs):
         return db.readable_chunks(selected_sources[0]), {"mode": "keyword"}
@@ -506,7 +510,7 @@ def test_guard_migration_seeds_isolated_config_catalog(env):
 
 
 def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, monkeypatch):
-    row = report(env)
+    row = report(env, topic_flow=True)
     routers = []
 
     def model(feature_key, purpose, **kwargs):
@@ -536,7 +540,12 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     assert len(routers) == len(result["modules"]) == 13
     runs = env.db.rows("SELECT * FROM agent_module_run")
     assert len({r["thread_id"] for r in runs}) == 13
-    assert all(r["status"] == "completed" and r["model_calls"] == 4 for r in runs)
+    assert all(r["status"] == "completed" for r in runs)
+    for module in result["modules"]:
+        path = module["module_key"] + "/references/coverage.json"
+        checks = json.loads(row["skill_snapshot"][path])
+        current = next(r for r in runs if r["module_id"] == module["id"])
+        assert current["model_calls"] == 4 + len(checks)
     assert all(r["state"]["research"]["seen"] for r in runs)
     assert all(r["state"]["loaded_skill"]["sha256"] for r in runs)
     assert len(env.db.rows("SELECT id FROM agent_run_event WHERE kind='skill_loaded'")) == 13
@@ -795,7 +804,7 @@ def test_report_with_all_partial_modules_is_partial(env, monkeypatch):
         raise VerificationUnavailable("校验服务不可用")
 
     monkeypatch.setattr(worker, "invoke_module", invoke)
-    row = report(env)
+    row = report(env, topic_flow=True)
     run_async(env.executor.analyze_report(row))
 
     result = analysis_api.get_report(row["id"], env.request)
@@ -890,7 +899,7 @@ def test_retry_waits_for_canceled_controller_to_exit(env):
 
 
 def test_cancel_interrupts_active_module_and_releases_quota(env, monkeypatch):
-    runtime = prepared_runtime(env)
+    runtime = prepared_runtime(env, topic_flow=True)
     started, stopped = asyncio.Event(), asyncio.Event()
 
     class Model:

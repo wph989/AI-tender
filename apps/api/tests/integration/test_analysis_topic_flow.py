@@ -8,8 +8,9 @@ import pytest
 import test_deepagents_runtime
 from test_deepagents_runtime import prepared_runtime, publishable_state, report
 
+from tender.application.analysis.protocol import PROTOCOL_VERSION
 from tender.application.analysis.service import AnalysisService
-from tender.application.analysis.topic_flow import FLOW_KEY, FLOW_VERSION, TopicFlow, TopicUpdate
+from tender.application.analysis.topic_flow import FLOW_KEY, TopicFlow, TopicUpdate
 
 env = test_deepagents_runtime.env
 pytestmark = pytest.mark.skipif(
@@ -31,9 +32,60 @@ def progress_state(runtime):
 def test_new_report_freezes_topic_flow_and_old_report_remains_legacy(env):
     current = report(env, topic_flow=True)
     old = report(env)
-    assert current["skill_snapshot"][FLOW_KEY] == FLOW_VERSION
+    assert current["skill_snapshot"][FLOW_KEY] == PROTOCOL_VERSION
     assert FLOW_KEY not in old["skill_snapshot"]
     assert current["runtime_version"] == old["runtime_version"]
+
+
+def test_audit_target_and_checked_version_survive_database_reload(env):
+    from tender.adapters.pg.analysis.checkpoints import run_async
+    from tender.application.analysis.research import AgentLimits
+    from tender.application.analysis.topic_flow import TopicIncomplete
+
+    runtime = prepared_runtime(env, topic_flow=True)
+    assert runtime.claim()
+    try:
+        state = publishable_state("project_basic_info_parsing")
+        state["staged_items"] = state["staged_items"][:1]
+        state["business_topics"] = [{"key": "a", "title": "质保", "checks": ["期限"]}]
+        research = SimpleNamespace(seen={"s1r1c0": {"content": "质保三年"}},
+                                   sources=[], limits=AgentLimits())
+        flow = TopicFlow(state, research)
+        flow.apply([TopicUpdate.model_validate({
+            "topic": "a", "scope": {"kind": "common", "lot_refs": []},
+            "checked": ["期限"], "evidence_ids": ["s1r1c0"], "record_keys": ["warranty"],
+        })], {"warranty"})
+        calls = []
+
+        async def save(value):
+            runtime.save(value)
+
+        async def first(payload):
+            return {"issues": [{"topic": "a", "detail": "核对附件例外",
+                                "target": "合同附件九第七条", "evidence_ids": [],
+                                "record_keys": []}]}
+
+        assert not run_async(flow.audit(first, save))
+        stored = env.db.rows("SELECT state FROM agent_module_run WHERE id=:id",
+                             {"id": runtime.run["id"]})[0]["state"]
+        restored = TopicFlow(stored, research)
+        assert "合同附件九第七条" in restored.prompt()
+        assert stored["topic_flow"]["audit"]["topic_signatures"]
+
+        async def repaired(payload):
+            calls.append(payload)
+            return {"issues": []}
+
+        assert run_async(restored.audit(repaired, save))
+        current = env.db.rows("SELECT state FROM agent_module_run WHERE id=:id",
+                              {"id": runtime.run["id"]})[0]["state"]
+        restored = TopicFlow(current, research)
+        assert run_async(restored.audit(repaired, save)) and len(calls) == 1
+        research.seen["s1r1c0"]["content"] += "但易损件一年"
+        with pytest.raises(TopicIncomplete, match="发生变化"):
+            run_async(restored.audit(repaired, save))
+    finally:
+        runtime.release()
 
 
 def test_expired_incremental_run_preserves_verified_projection_and_state_atomically(env):
@@ -121,6 +173,43 @@ def test_progress_is_hidden_after_source_access_is_revoked(env):
     runtime.release()
 
 
+def test_verified_unknown_scope_is_saved_and_reloaded_without_becoming_complete(env):
+    from tender.application.knowledge.content import citation
+
+    runtime = prepared_runtime(env, topic_flow=True)
+    assert runtime.claim()
+    try:
+        state = publishable_state("project_basic_info_parsing")
+        state["staged_items"] = state["staged_items"][:1]
+        item = state["staged_items"][0]
+        item["business"]["scope"] = {"kind": "unknown", "lot_refs": []}
+        original = env.db.readable_chunks(runtime.sources[0])[0]
+        ref = citation(original, "质保三年")
+        item["values"][0]["citations"] = [ref]
+        item["business"]["citations"] = [ref]
+        state["business_topics"] = [{"key": "warranty", "title": "质保", "checks": ["范围"]}]
+        research = SimpleNamespace(seen={original["block_id"]: original})
+        flow = TopicFlow(state, research)
+        flow.data["evidence_topics"][original["block_id"]] = ["warranty"]
+        updates = flow.prepare_updates([item], [TopicUpdate(topic="warranty")])
+        flow.validate_records([item], updates)
+        flow.apply(updates, {"warranty"})
+        runtime.save(state)
+        service = AnalysisService(env.db, 1, None, None, None)
+        payload = service.get_module_records(runtime.report["id"], "project_basic_info_parsing")
+        assert len(payload["records"]) == 1
+        assert payload["records"][0]["scope"]["kind"] == "unknown"
+        assert payload["progress"]["topics"][0]["status"] != "ready"
+        stored = env.db.rows("SELECT state FROM agent_module_run WHERE id=:id",
+                             {"id": runtime.run["id"]})[0]["state"]
+        restored = TopicFlow(stored, research)
+        assert restored.pending()
+        assert restored.entries[0]["record_keys"] == ["warranty"]
+        runtime.finish("partial", "适用范围待确认，保留核实正文", state=stored)
+    finally:
+        runtime.release()
+
+
 def test_scope_revision_persists_current_progress_and_review_state_across_reload(env):
     runtime = prepared_runtime(env, topic_flow=True)
     assert runtime.claim()
@@ -187,7 +276,8 @@ def test_exhausted_search_work_is_persisted_and_settles_without_audit_requests(e
         control = TopicSearch(flow)
         for index in range(3):
             target = control.begin("search_document", {"topic_keys": ["warranty"],
-                                                       "query": f"起算点换词{index}"})
+                                                       "query": f"起算点换词{index}",
+                                                       "work": task["detail"]})
             control.end(target, {"blocks": [], "already_read": ["s1r1c0"]}, {"s1r1c0"})
             runtime.save(state)
         stored = env.db.rows("SELECT state FROM agent_module_run WHERE id=:id",
@@ -195,7 +285,8 @@ def test_exhausted_search_work_is_persisted_and_settles_without_audit_requests(e
         restored = TopicFlow(stored, research)
         restored.apply([TopicUpdate.model_validate(progress)], {"warranty"})
         with pytest.raises(ToolArgumentError, match="耗尽"):
-            TopicSearch(restored).begin("search_document", {"topic_keys": ["warranty"]})
+            TopicSearch(restored).begin("search_document", {"topic_keys": ["warranty"],
+                                                           "work": task["detail"]})
         assert TopicSearch.summary(stored)["research_calls"] == 3
         assert stored["topic_flow"]["audit"]["results"] == {}
         runtime.finish("partial", "起算点检索无进展", state=stored)
@@ -253,8 +344,8 @@ def test_check_exhaustion_preserves_other_work_and_stable_task_ids_across_reload
         runtime.release()
 
 
-@pytest.mark.parametrize("max_calls", [4, 40])
-def test_new_report_runs_incremental_graph_and_independent_audit(env, monkeypatch, max_calls):
+@pytest.mark.parametrize("max_calls", [4, 5, 6, 40])
+def test_new_report_researches_before_synthesis_and_independent_audit(env, monkeypatch, max_calls):
     import json
 
     from langchain_core.messages import AIMessage, message_to_dict
@@ -285,15 +376,20 @@ def test_new_report_runs_incremental_graph_and_independent_audit(env, monkeypatc
             self.calls += 1
             if self.calls == 1:
                 name, args = "list_documents", {}
-            elif self.calls in (2, 4):
-                topic = "warranty" if self.calls == 2 else "quantity"
-                if self.calls == 4:
+            elif self.calls == 2:
+                name, args = "search_document", {"query": "质保", "topic_keys": [
+                    "warranty", "quantity"]}
+            elif self.calls == 3:
+                name, args = "update_research", {"updates": [{
+                    "work_ids": ["w1", "w2"], "scope": {"kind": "common", "lot_refs": []},
+                    "detail": "已核对完整条款", "evidence_ids": ["s1r1c0"],
+                }]}
+            else:
+                index = 0 if self.calls == 4 else 1
+                if index == 1:
                     saved = env.db.rows("SELECT business_data FROM analysis_module WHERE id=:id",
                                         {"id": runtime.run["module_id"]})[0]
                     observed.append(saved["business_data"])
-                name, args = "search_document", {"query": "质保", "topic_keys": [topic]}
-            else:
-                index = 0 if self.calls == 3 else 1
                 topic = topics[index]
                 result = next(json.loads(m["data"]["content"]) for m in reversed(messages)
                               if m["type"] == "tool" and m["data"].get("name") == "search_document")
@@ -305,9 +401,8 @@ def test_new_report_runs_incremental_graph_and_independent_audit(env, monkeypatc
                     "key": topic["key"], "kind": "requirement", "title": topic["title"],
                     "group": "项目基本信息", "content": {"字段": topic["title"], "内容": quote},
                     "scope": scope, "citations": [{"block_id": block_id, "quote": quote}],
-                }], "topic_updates": [{"topic": topic["key"], "scope": scope, "status": "ready",
-                                      "checked": topic["checks"], "evidence_ids": [block_id],
-                                      "record_keys": [topic["key"]], "detail": "已核对完整条款"}]}
+                    "work_ids": [f"w{index + 1}"],
+                }], "final": index == 1}
             return Completion(content="", model="offline", agent_message=message_to_dict(
                 AIMessage(content="", tool_calls=[{"name": name, "args": args,
                                                    "id": f"incremental-{self.calls}"}])))
@@ -315,16 +410,12 @@ def test_new_report_runs_incremental_graph_and_independent_audit(env, monkeypatc
         async def complete(self, prompt):
             await self.reserve()
             payload = json.loads(prompt.rsplit("\n", 1)[-1])
-            if isinstance(payload, dict):
-                completed.append(payload)
-                return Completion(content='{"issues":[]}', model="offline")
-            reviews = []
-            for item in payload:
-                evidence_id = item["evidence_sets"][0]["citations"][0]["id"]
-                reviews.append({"supported": True, "unsupported_claims": [],
-                                "unresolved_references": [],
-                                "evidence_ids": [[evidence_id] for _ in item["values"]]})
-            return Completion(content=json.dumps({"reviews": reviews}), model="offline")
+            completed.append(payload)
+            reviews = {row["record_id"]: {"supported": True, "issues": [],
+                       "bindings": {v["value_id"]: v["candidate_ids"] for v in row["values"]}}
+                       for row in payload["records"]}
+            return Completion(content=json.dumps({"reviews": reviews, "issues": [],
+                                                   "context_requests": []}), model="offline")
 
         async def aclose(self):
             pass
@@ -335,20 +426,40 @@ def test_new_report_runs_incremental_graph_and_independent_audit(env, monkeypatc
     run_async(env.executor.execute_module(runtime.report, run, runtime.sources))
     module = env.db.rows("SELECT status,business_data FROM analysis_module WHERE id=:id",
                          {"id": run["module_id"]})[0]
-    if max_calls == 4:
-        assert module["status"] == "partial"
-        assert len(module["business_data"]["records"]) == 1
+    if max_calls in {4, 5, 6}:
+        assert module["status"] == ("partial" if max_calls == 6 else "failed")
+        assert len(module["business_data"]["records"]) == (1 if max_calls == 6 else 0)
         stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
                              {"id": run["id"]})[0]
-        assert stored["model_calls"] == 4 and not completed
+        assert stored["model_calls"] == max_calls and len(completed) == (1 if max_calls == 6 else 0)
+        assert all(e["findings"] for e in stored["state"]["topic_flow"]["entries"].values())
         assert any(g["key"] == "execution:incomplete"
                    for g in stored["state"]["business_gaps"])
         return
     assert module["status"] == "completed"
-    assert len(observed) == 1 and len(observed[0]["records"]) == 1
+    assert len(observed) == 1 and len(observed[0]["records"]) == 0
     assert len(module["business_data"]["records"]) == 2
     assert len(completed) == 2
     stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
                          {"id": run["id"]})[0]
     assert stored["state"]["topic_flow"]["audit"]["done"]
-    assert stored["model_calls"] == 9
+    assert stored["model_calls"] == 7
+    # JSON审查账从真实数据库恢复后复用已完成请求，资料版本变化则拒绝旧完成状态。
+    from tender.application.analysis.research import AgentLimits
+    from tender.application.analysis.review import audit_combined
+    from tender.application.analysis.topic_flow import TopicIncomplete
+
+    research = SimpleNamespace(seen=stored["state"]["research"]["seen"],
+                               sources=runtime.sources, limits=AgentLimits())
+    restored = TopicFlow(stored["state"], research)
+
+    async def forbidden(_):
+        raise AssertionError("恢复不应新增模型请求")
+
+    async def save(_):
+        pass
+
+    assert run_async(audit_combined(restored, forbidden, save))
+    research.seen["s1r1c0"]["content"] += "但补遗变更质保期限"
+    with pytest.raises(TopicIncomplete, match="数据变化"):
+        run_async(audit_combined(restored, forbidden, save))

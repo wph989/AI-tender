@@ -95,6 +95,7 @@ export interface AnalysisModule {
 }
 
 export interface TopicProgress {
+  phase?: "research" | "synthesis" | "review" | "completed" | "partial";
   audit_round: number;
   topics: {
     topic: string; title: string; scope: Omit<AnalysisScope, "lot_ids">;

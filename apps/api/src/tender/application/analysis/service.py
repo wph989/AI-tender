@@ -122,9 +122,15 @@ class AnalysisService:
         rules = skill_snapshot()
         rules["__deep_contract__"] = CONTRACT
         rules["__analysis_data_version__"] = DATA_VERSION
-        from tender.application.analysis.topic_flow import FLOW_KEY, FLOW_VERSION
+        from tender.application.analysis.protocol import PROTOCOL_VERSION
+        from tender.application.analysis.topic_flow import (
+            FLOW_KEY,
+            OUTPUT_MODE,
+            OUTPUT_MODE_KEY,
+        )
 
-        rules[FLOW_KEY] = FLOW_VERSION
+        rules[FLOW_KEY] = PROTOCOL_VERSION
+        rules[OUTPUT_MODE_KEY] = OUTPUT_MODE
         references = [
             source
             for source in self.store.sources(self.store.collections_for_project(project_id))
@@ -536,10 +542,12 @@ class AnalysisService:
             for module_id in sorted(retried):
                 attempt = tx.module_attempt(module_id)
                 previous_state = tx.previous_run_state(module_id)
+                # 轻量研究可能只有examined笔记和待办；尚无完整发现也须保留身份及已读证据。
                 carry = (
                     previous_state
                     if module_id not in restarted
-                    and (previous_state.get("draft") or previous_state.get("staged_items"))
+                    and (previous_state.get("draft") or previous_state.get("staged_items")
+                         or previous_state.get("topic_flow"))
                     else {}
                 )
                 if carry:
@@ -595,6 +603,8 @@ class AnalysisService:
                         carry.pop(key, None)
                     carry.pop("pending_final", None)
                     if carry.get("topic_flow"):
+                        if carry["topic_flow"].get("output_mode") == "after-research":
+                            carry["topic_flow"].update(phase="research", release_results=False)
                         # 显式补跑是新运行：重新打开受阻待办，独立查漏次数按本次预算计算。
                         carry["topic_flow"]["audit"] = {"round": 0, "results": {}}
                         # 仅显式补跑开启新研究额度；同attempt恢复仍保留耗尽状态及统计。

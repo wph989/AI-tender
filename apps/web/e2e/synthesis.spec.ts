@@ -924,7 +924,7 @@ test.describe("每次分析的时间与原因", () => {
 });
 
 
-test("子主题增量轮询保留已有正文、原文位置并显示待复核和部分完成", async ({ page }, info) => {
+test("子主题增量轮询保留正文和原文位置，折叠详细进度并显示具体缺口", async ({ page }, info) => {
   let revised = false;
   await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
     status: "running", modules: [{ ...modules[0]!, status: "running", items: [] }],
@@ -946,8 +946,10 @@ test("子主题增量轮询保留已有正文、原文位置并显示待复核�
   });
   await page.reload();
   await expect(page.locator('[data-report-item="background"]')).toContainText("完成现有平台升级");
-  await expect(page.getByText("子主题进度 · 1/2 已处理")).toBeVisible();
-  await expect(page.locator(".coverage-details")).toContainText("分析中");
+  await expect(page.getByRole("status", { name: "解析进展" })).toContainText("已核对 1/2 个子主题");
+  await expect(page.getByText("正在处理：技术任务", { exact: true })).toBeVisible();
+  await expect(page.locator(".coverage-details")).not.toHaveAttribute("open", "");
+  await page.screenshot({ path: `../../.tmp/protocol-progress-${info.project.name}.png`, fullPage: true });
   await page.locator('[data-report-item="background"]').getByRole("button", { name: /^定位：/ }).first().click();
   const viewer = page.getByRole("region", { name: "引用原文", exact: true });
   await expect(viewer).toBeVisible();
@@ -956,11 +958,78 @@ test("子主题增量轮询保留已有正文、原文位置并显示待复核�
   await expect(page.getByText("新增依据影响部分结果，以下事项待复核")).toBeVisible({ timeout: 15_000 });
   await expect(page.locator('[data-report-item="background"]')).toContainText("完成现有平台升级");
   await expect(page.locator('[data-report-item="migration"]')).toContainText("回退方案");
-  await expect(page.locator(".coverage-details")).toContainText("部分完成");
+  await expect(page.getByRole("status", { name: "解析进展" })).toContainText("研究受阻 · 技术任务：核对附件B接口条件");
+  await expect(page.locator(".coverage-details")).not.toHaveAttribute("open", "");
+  await page.getByText("查看核对详情", { exact: true }).click();
+  await expect(page.locator(".coverage-details")).toContainText("研究受阻");
+  await expect(page.locator(".coverage-details")).not.toContainText("部分完成");
   if (info.project.name === "mobile") await page.getByRole("button", { name: "引用原文", exact: true }).click();
   await expect(viewer).toBeVisible();
   if (info.project.name === "mobile") await page.getByRole("button", { name: "分析内容", exact: true }).click();
   await page.getByLabel("仅待核对条目").check();
   await expect(page.locator('[data-report-item="background"]')).toBeVisible();
   await expect(page.locator('[data-report-item="migration"]')).toHaveCount(0);
+});
+
+test("没有成果的受阻主题显示缺口，默认不展开工作账", async ({ page }) => {
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+    status: "running", modules: [{ ...modules[0]!, status: "running", items: [] }],
+  }) }));
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => {
+    const data = records(modules[0]!);
+    data.status = "running";
+    data.records = [];
+    data.progress = { audit_round: 0, topics: [{
+      topic: "scope", title: "项目背景", scope: { kind: "unknown", lot_refs: [] },
+      status: "blocked", checks: ["建设目标"], checked: [], tasks: [], detail: "附件B未提供",
+    }] };
+    return route.fulfill({ json: data });
+  });
+  await page.reload();
+  const progress = page.getByRole("status", { name: "解析进展" });
+  await expect(progress).toContainText("已展示 0 条结果");
+  await expect(progress).toContainText("研究受阻 · 项目背景：附件B未提供");
+  await expect(progress).not.toContainText("部分完成");
+  await expect(page.locator(".coverage-details")).not.toHaveAttribute("open", "");
+});
+
+test("研究与综合阶段只展示进度，结束后统一展示结果并保留定位", async ({ page }, info) => {
+  let phase: "research" | "synthesis" | "review" | "completed" = "research";
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+    status: phase === "completed" ? "completed" : "running",
+    modules: [{ ...modules[0]!, status: phase === "completed" ? "completed" : "running", items: [] }],
+  }) }));
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => {
+    const data = records(modules[0]!);
+    data.status = phase === "completed" ? "completed" : "running";
+    if (phase !== "completed") { data.records = []; data.evidence = {}; }
+    data.progress = { phase, audit_round: 0, topics: [{
+      topic: "scope", title: "项目背景", scope: { kind: "common", lot_refs: [] },
+      status: phase === "completed" ? "ready" : "researching", checks: ["建设目标"],
+      checked: ["建设目标"], detail: "已核对建设目标及范围", tasks: [],
+    }] };
+    return route.fulfill({ json: data });
+  });
+  await page.reload();
+  const progress = page.getByRole("status", { name: "解析进展" });
+  await expect(progress).toContainText("正在研究原文 · 已核对 1/1 个子主题");
+  await expect(page.getByText("正在根据核对清单研究原文，完成后统一展示结果。", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-report-item]")).toHaveCount(0);
+  phase = "synthesis";
+  await expect(progress).toContainText("正在综合结果", { timeout: 15_000 });
+  await expect(page.getByText("研究已结束，正在统一整理结果。", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-report-item]")).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath("research-first-synthesis.png"), fullPage: true });
+  phase = "review";
+  await expect(progress).toContainText("正在独立审查", { timeout: 15_000 });
+  await expect(page.getByText("正在独立核对结论依据、引用与内容完整性，完成后统一展示。", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-report-item]")).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath("combined-review.png"), fullPage: true });
+  phase = "completed";
+  await expect(page.locator('[data-report-item="background"]')).toContainText("完成现有平台升级", { timeout: 15_000 });
+  await expect(page.locator('[data-report-item="migration"]')).toContainText("回退方案");
+  await expect(progress).toContainText("已展示 2 条结果");
+  await page.locator('[data-report-item="background"]').getByRole("button", { name: /^定位：/ }).first().click();
+  await expect(page.getByRole("region", { name: "引用原文", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });

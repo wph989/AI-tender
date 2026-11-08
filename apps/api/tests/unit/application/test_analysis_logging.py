@@ -91,7 +91,8 @@ def test_real_agent_logs_tool_parameters_once_with_research_synthesis_and_verifi
     events = [log["event"] for log in logs]
     assert "skill.load" in events
     assert all(log["log_level"] == "info" for log in logs if log["event"] == "skill.load")
-    assert "review.start" in events and "review.end" in events
+    assert events.count("review.result") == 1
+    assert not any(event.endswith((".start", ".end", ".queued")) for event in events)
     phases = {log.get("agent_phase") for log in logs}
     assert {"research", "synthesis", "verification"} <= phases
     tools = [log for log in logs if log["event"] == "tool.call"]

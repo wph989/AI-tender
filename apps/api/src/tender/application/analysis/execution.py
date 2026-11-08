@@ -20,12 +20,11 @@ from tender.application.analysis.agent import (
     invoke_module,
     validate_project_claims,
 )
-from tender.application.analysis.completeness import review_completeness
 from tender.application.analysis.data_store import publish_data_snapshot
 from tender.application.analysis.research import AgentLimits, ResearchSession
 from tender.application.analysis.runtime import AgentRuntime, check_report_access
 from tender.application.analysis.search_control import TopicSearch
-from tender.application.analysis.skills import MODULES, verify_items
+from tender.application.analysis.skills import MODULES
 from tender.application.analysis.topic_flow import TopicIncomplete, enabled
 from tender.application.knowledge.content import encode, normalized, source_state
 from tender.application.knowledge.retrieval import retrieve_chunks
@@ -33,6 +32,7 @@ from tender.application.llm.routing import RoutingModel
 from tender.core.error_details import error_detail
 from tender.core.logging import bind_context, get_logger
 from tender.domain.shared.errors import BudgetExhausted, ModelBudgetExhausted, ModelUnavailable
+from tender.ports.analysis.archive import AnalysisArchive
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.llm.rerank import RerankModel
 from tender.ports.repository.analysis.reports import ReportRepository
@@ -247,6 +247,7 @@ class AnalysisExecutor:
         embedding_gateway: Callable[[dict], EmbeddingModel],
         rerank_gateway: Callable[[dict], RerankModel],
         checkpoints: Callable[[], AbstractAsyncContextManager[Any]],
+        archive: AnalysisArchive | None = None,
     ) -> None:
         # 外部能力由装配点选择，业务流程无需认识 Celery 或数据库连接。
         self.db = db
@@ -254,6 +255,7 @@ class AnalysisExecutor:
         self.embedding_gateway = embedding_gateway
         self.rerank_gateway = rerank_gateway
         self.checkpoints = checkpoints
+        self.archive = archive
 
     async def execute_module(self, report: dict, module: dict, sources: list[dict]) -> None:
         # 按项目、报告和专题直接定位；协程与线程继承独立上下文，避免并发项目串号。
@@ -266,14 +268,15 @@ class AnalysisExecutor:
 
     async def _execute_module(self, report: dict, module: dict, sources: list[dict]) -> None:
         db = self.db
-        runtime = AgentRuntime(db, report, module, sources)
+        runtime = (AgentRuntime(db, report, module, sources, archive=self.archive)
+                   if self.archive is not None else AgentRuntime(db, report, module, sources))
         model = None
         task = None
         state = {}
         started = time.monotonic()
         try:
-            logger.info("module.queued")
             await wait_for_claim(runtime)
+            queue_ms = int((time.monotonic() - started) * 1000)
 
             async def authorize():
                 await asyncio.to_thread(runtime.guard)
@@ -301,25 +304,15 @@ class AnalysisExecutor:
                     max_results=limits.search_window,
                 )
 
-            async def read(source):
-                return await asyncio.to_thread(db.readable_chunks, source)
-
             async def read_window(source, offset, limit):
                 return await asyncio.to_thread(db.read_chunk_window, source, offset, limit)
 
             state = runtime.run["state"]
+            from tender.application.analysis.protocol import PROTOCOL_VERSION
+
+            if report["skill_snapshot"].get("__analysis_flow_version__") != PROTOCOL_VERSION:
+                raise ValueError("解析协议已升级，旧检查点不能恢复；请重新创建报告")
             limits = AgentLimits(**runtime.run["limits"])
-            # 各专题共用报告来源，数量在 report.start 记录一次即可。
-            logger.info(
-                "module.start",
-                resumed=module.get("started_at") is not None,
-                attempt=module.get("attempt"),
-                queue_ms=int((time.monotonic() - started) * 1000),
-                thread_id=runtime.run["thread_id"],
-                timeout_seconds=limits.timeout_seconds,
-                max_model_calls=limits.max_model_calls,
-                max_tool_calls=limits.max_tool_calls,
-            )
             prior = state.get("research", {})
             research = ResearchSession(
                 sources,
@@ -348,36 +341,22 @@ class AnalysisExecutor:
             )
 
             async def work():
-                async def verification_evidence(items):
-                    return await expand_evidence(
-                        items, seen=research.seen, sources=sources, read=read
-                    )
+                async def review_all(payload):
+                    from tender.application.analysis.review import review_combined
+                    from tender.application.knowledge.content import citation
 
-                async def review_support(items):
-                    # 校验需要同块原文与邻近块才能判断章节归属，不能只看摘录文本。
-                    # 结论（supported / verification_issues）由 verify_items 写在条目上，
-                    # 由 Agent 图的校验节点按条目归因到字段纠正次数；整批抛错会让同批字段反复重审。
-                    evidence = await verification_evidence(items)
-                    await verify_items(
-                        model, items, explain=True, evidence=evidence, select_evidence=True
-                    )
-                    # 只对最终被选中且通过支持性校验的ID解析位置，模型不能提供或修改定位字段。
+                    result = await review_combined(model, payload)
                     await authorize()
-                    resolved = {}
-                    for item in items:
-                        if item.get("verification") != "supported":
-                            continue
-                        for value in item["values"]:
-                            for ref in value["citations"]:
-                                key = str(ref["block_id"])
-                                if key not in resolved:
-                                    resolved[key] = await asyncio.to_thread(db.resolve, ref)
-                                ref.update(
-                                    {k: resolved[key][k] for k in ("page_no", "file_name", "bbox")}
-                                )
-
-                async def review_coverage(payload):
-                    return await review_completeness(model, payload)
+                    selected = {cid for verdict in result["reviews"].values()
+                                if verdict["supported"] for ids in verdict["bindings"].values()
+                                for cid in ids}
+                    locations = {}
+                    for cid in selected:
+                        raw = payload["citations"][cid]
+                        ref = citation(research.seen[raw["block_id"]], raw["quote"])
+                        locations[cid] = await asyncio.to_thread(db.resolve, ref)
+                    result["locations"] = locations
+                    return result
 
                 async with self.checkpoints() as saver:
                     graph, files = build_module_agent(
@@ -402,8 +381,7 @@ class AnalysisExecutor:
                             "tool_calls_remaining": limits.max_tool_calls
                             - runtime.run["tool_calls"],
                         },
-                        review_support=review_support,
-                        review_coverage=review_coverage,
+                        review_combined=review_all,
                         lots=report["lot_settings"],
                         event=runtime.event,
                         # 项目和标段品类可能不同，首次推理前加载全部已明确品类的细则。
@@ -416,7 +394,8 @@ class AnalysisExecutor:
                             ],
                         ],
                     )
-                    attempts = 0
+                    # 同一次执行恢复必须沿用已落库的次数，不能因Worker重启重获额度。
+                    attempts = state.get("model_unavailable_retries", 0)
                     while True:
                         try:
                             await invoke_module(
@@ -483,15 +462,19 @@ class AnalysisExecutor:
                 draft = state["draft"]
                 # 字段与关系的支持性校验都在子 Agent 的提交工具内完成，此处只做最终权限复核。
                 validate_project_claims(draft["fields"], report["project_id"])
-                await asyncio.to_thread(runtime.finish, "completed", draft=draft)
+                await asyncio.to_thread(runtime.finish, "completed", draft=draft, state=state)
                 logger.info(
-                    "module.end",
+                    "module.result",
+                    status="completed",
+                    attempt=module.get("attempt"),
+                    queue_ms=queue_ms,
                     duration_ms=int((time.monotonic() - started) * 1000),
                     item_count=len(draft["fields"]),
                     evidence_count=len(research.seen),
                     gap_count=len(state.get("business_gaps", [])),
                     model_calls=runtime.run["model_calls"],
                     tool_calls=runtime.run["tool_calls"],
+                    **TopicSearch.summary(state),
                 )
 
             task = asyncio.create_task(work())
@@ -528,6 +511,7 @@ class AnalysisExecutor:
                 saved_item_count=sum(
                     i.get("verification") == "supported" for i in state.get("staged_items", [])
                 ),
+                **TopicSearch.summary(state),
                 # 适配器已对业务异常脱敏；不串联原始 SDK 异常，以免回显其请求或凭证。
                 exception=None
                 if canceled
@@ -540,8 +524,6 @@ class AnalysisExecutor:
 
         finally:
             try:
-                if state.get("topic_flow"):
-                    logger.info("module.efficiency", **TopicSearch.summary(state))
                 if model:
                     try:
                         await model.aclose()
@@ -591,6 +573,7 @@ class AnalysisExecutor:
                 pending_count=state.get("verification_degraded", {}).get("pending_count"),
                 gap_count=len(state.get("business_gaps", [])),
                 reason=error_detail(reason),
+                **TopicSearch.summary(state),
             )
         else:
             if state.get("topic_flow"):
@@ -603,6 +586,7 @@ class AnalysisExecutor:
                 saved_item_count=0,
                 # 显式保留脱敏原因，避免仅依赖500字符异常摘要丢失后备模型的错误。
                 error=error_detail(reason),
+                **TopicSearch.summary(state),
                 # 业务异常已脱敏；不串联原始 SDK 原因，避免回显请求或凭证。
                 exception="".join(traceback.format_exception(exc, chain=False)),
             )
@@ -621,12 +605,6 @@ class AnalysisExecutor:
                 return
             report, sources = prepared
             modules = db.report_active_modules(report["id"])
-            logger.info(
-                "report.start",
-                project_id=report.get("project_id"),
-                module_count=len(modules),
-                source_count=len(sources),
-            )
             tasks = [
                 asyncio.create_task(self.execute_module(report, module, sources))
                 for module in modules
@@ -655,12 +633,13 @@ class AnalysisExecutor:
             )
             log = logger.info if status == "completed" else logger.warning
             log(
-                "report.end",
+                "report.result",
                 status=status,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 completed_modules=sum(r["status"] == "completed" for r in rows),
                 partial_modules=sum(r["status"] == "partial" for r in rows),
                 module_count=len(rows),
+                source_count=len(sources),
             )
         except (Exception, asyncio.CancelledError) as exc:
             for task in tasks:
@@ -674,6 +653,7 @@ class AnalysisExecutor:
             )
             log(
                 "report.abort",
+                duration_ms=int((time.monotonic() - started) * 1000),
                 exception="".join(traceback.format_exception(exc, chain=False)),
             )
             db.finish_task("report", report["id"], "failed", str(exc)[:1000])

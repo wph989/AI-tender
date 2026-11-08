@@ -15,7 +15,9 @@ from test_deep_analysis import call
 from tender.application.analysis.data import GapInput, SynthesisRecord, prepare_records
 from tender.application.analysis.output import output_schema
 from tender.application.analysis.policy import load_module_skill
+from tender.application.analysis.protocol import ResearchLedger
 from tender.application.analysis.skills import MODULES, RESOURCE_ROOT, skill_snapshot
+from tender.application.analysis.topic_flow import TopicFlow
 
 LEGACY = json.loads((
     Path(__file__).resolve().parents[2] / "fixtures/analysis/legacy_skill_formats.json"
@@ -30,6 +32,16 @@ def examples(path):
     return [json.loads(body) for body in re.findall(
         r"```json\s*\n(.*?)\n```", path.read_text(encoding="utf-8"), re.S
     )]
+
+
+
+def business_record(record):
+    return SynthesisRecord.model_validate({k: v for k, v in record.items() if k != "work_ids"})
+
+
+def legacy_submission(submission):
+    return {**submission, "records": [{k: v for k, v in r.items() if k != "work_ids"}
+                                      for r in submission["records"]]}
 
 
 def example_rows(value, *, cross_file=False):
@@ -115,11 +127,10 @@ def test_packaged_examples_pass_real_record_and_citation_validation(path):
         seen = {row["block_id"]: row for row in example_rows(value)}
         state = {"output_schema": output_schema(SNAPSHOT, key), "staged_items": []}
         assert value["submissions"][-1]["final"] is True
-        assert value["submissions"][-1]["records"] == []
         for index, submission in enumerate(value["submissions"]):
             assert len(submission["records"]) <= 1
             assert submission["final"] == (index == len(value["submissions"]) - 1)
-            raw = [SynthesisRecord.model_validate(r) for r in submission["records"]]
+            raw = [business_record(r) for r in submission["records"]]
             entries = prepare_records(raw, state, seen, key)
             state["staged_items"].extend(entries)
             for gap in submission.get("gaps", []):
@@ -129,6 +140,75 @@ def test_packaged_examples_pass_real_record_and_citation_validation(path):
                 for ref in item["business"]["citations"]:
                     assert ref["quote"] in seen[ref["block_id"]]["content"]
                     assert ref["page_no"] == seen[ref["block_id"]]["page_no"]
+
+
+@pytest.mark.parametrize("path", EXAMPLE_PATHS, ids=lambda p: str(p.relative_to(RESOURCE_ROOT)))
+def test_packaged_examples_accept_minimal_topic_progress_without_extra_empty_submission(path):
+    from types import SimpleNamespace
+
+    key = path.relative_to(RESOURCE_ROOT).parts[0]
+    topics = json.loads(SNAPSHOT[key + "/references/coverage.json"])
+    for value in examples(path):
+        seen = {row["block_id"]: row for row in example_rows(value)}
+        state = {"output_schema": output_schema(SNAPSHOT, key), "business_topics": topics}
+        flow = TopicFlow(state, SimpleNamespace(seen=seen))
+        # 模拟此前检索已经归档原文；局部样例不声明整份文件所有主题已完成。
+        for block_id in seen:
+            flow.associate(block_id, [topic["key"] for topic in topics])
+        for submission in value["submissions"]:
+            prepared = prepare_records([business_record(r)
+                                        for r in submission["records"]], state, seen, key)
+            updates = [u for item, record in zip(prepared, submission["records"], strict=True)
+                       for u in ResearchLedger(flow).record_updates([item], record["work_ids"])]
+            updates = flow.prepare_updates(prepared, updates)
+            flow.validate_records(prepared, updates)
+            available = {i["business"]["key"] for i in [*state.get("staged_items", []), *prepared]}
+            flow.apply(updates, available)
+            state.setdefault("staged_items", []).extend(prepared)
+        if any(s["records"] for s in value["submissions"]):
+            assert value["submissions"][-1]["records"], "有据批次可直接请求完成检查"
+
+
+@pytest.mark.parametrize("key", MODULES)
+def test_thirteen_topic_review_packets_keep_domain_rules_properties_and_quotes(key):
+    from tender.application.analysis.data import semantic_payload
+    from tender.application.analysis.review import batches, fits, validate
+
+    # 使用随项目人工编写的领域样例验证传输完整性；不以模型替身证明语义准确率。
+    path = next(p for p in EXAMPLE_PATHS if p.relative_to(RESOURCE_ROOT).parts[0] == key
+                and any(s["records"] for v in examples(p) for s in v["submissions"]))
+    value = next(v for v in examples(path) if any(s["records"] for s in v["submissions"]))
+    research = session(example_rows(value))
+    research.seen = {row["block_id"]: row for row in example_rows(value)}
+    topics = json.loads(SNAPSHOT[key + "/references/coverage.json"])
+    skill = load_module_skill(SNAPSHOT, key)
+    rules = skill["model_rules"] + "\n\n" + skill["output_rules"]
+    state = {"output_schema": output_schema(SNAPSHOT, key), "business_topics": topics,
+             "review_rules": rules}
+    flow = TopicFlow(state, research)
+    flow.data["protocol"] = "research-v2"
+    records = [business_record(r) for s in value["submissions"] for r in s["records"]]
+    prepared = prepare_records(records, state, research.seen, key)
+    state["staged_items"] = prepared
+    flow.entries[0].update(record_keys=[i["business"]["key"] for i in prepared],
+                           evidence_ids=list(research.seen))
+    packets, _ = batches(flow, topics[0]["key"], [])
+    seen = {}
+    for packet in packets:
+        assert fits(packet, research.limits)
+        assert packet["domain_rules"] == rules
+        for row in packet["records"]:
+            seen.setdefault(row["record_id"], []).extend(row["values"])
+        validate({"reviews": {}, "issues": [],
+                  "context_requests": [packet["available_context"][0]]}, packet)
+        assert all(c["quote"] in research.seen[c["block_id"]]["content"]
+                   for c in packet["citations"].values())
+    assert seen.keys() == {i["id"] for i in prepared}
+    for item in prepared:
+        expected = {k: v for k, v in semantic_payload(item["business"]).items()
+                    if k not in {"text", "content", "content_evidence"}
+                    and v not in (None, "", [], {})}
+        assert seen[item["id"]][0]["business"] == expected
 
 
 @pytest.mark.parametrize("key", [
@@ -142,7 +222,8 @@ def test_native_example_survives_real_agent_graph_and_evidence_storage(key):
     research = session(rows)
     research.sources = [source(sid) for sid in sorted({row["source_id"] for row in rows})]
     script = [*research_calls(query=MODULES[key]), *[
-        call("submit_analysis", submission, f"record-{i}")
+        call("submit_analysis", legacy_submission(submission),
+             f"record-{i}")
         for i, submission in enumerate(value["submissions"])
     ]]
     state, _, _ = asyncio.run(execute(script, research=research, snapshot=SNAPSHOT, key=key))
@@ -175,7 +256,10 @@ def test_no_deposit_hit_keeps_gap_instead_of_emitting_exemption():
     value = examples(path)[1]
     state, _, _ = asyncio.run(execute([
         *research_calls(query="保证金"),
-        call("submit_analysis", value["submissions"][0], "finish"),
+        call("submit_analysis", legacy_submission(value["submissions"][0]) | {"gaps": [{
+            "key": "deposit-search", "topic": "amount", "scope": {"kind": "common", "lot_refs": []},
+            "code": "search_exhausted", "detail": "本次未找到保证金依据",
+        }]}, "finish"),
     ], research=session(example_rows(value)), snapshot=SNAPSHOT, key=key))
     business = state["draft"]["business_data"]
     assert business["records"] == []
@@ -190,10 +274,10 @@ def test_example_cannot_cite_unread_or_invented_quote():
     state = {"output_schema": output_schema(SNAPSHOT, key)}
     raw["citations"][0]["block_id"] = "unread"
     with pytest.raises(ValueError, match="未读取"):
-        prepare_records([SynthesisRecord.model_validate(raw)], state, seen, key)
+        prepare_records([business_record(raw)], state, seen, key)
     raw["citations"][0] = {"block_id": "example-1", "quote": "预付全部价款"}
     with pytest.raises(ValueError, match="引用"):
-        prepare_records([SynthesisRecord.model_validate(raw)], state, seen, key)
+        prepare_records([business_record(raw)], state, seen, key)
 
 
 def test_fact_labels_cannot_be_parallel_arrays_in_new_snapshots():

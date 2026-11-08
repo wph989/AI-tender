@@ -510,7 +510,7 @@ class AgentRunStore:
                 except Exception as exc:
                     publish_error = exc
                     status, error = "failed", f"模块成果发布失败：{str(exc)[:500]}"
-            conn.execute(
+            finished = conn.execute(
                 update(AgentModuleRun)
                 .where(
                     AgentModuleRun.id == self.run["id"],
@@ -523,12 +523,18 @@ class AgentRunStore:
                     lease_until=None,
                     **({"state": state} if state is not None else {}),
                 )
-            )
+                .returning(AgentModuleRun.status, AgentModuleRun.error_message,
+                           AgentModuleRun.finished_at, AgentModuleRun.state,
+                           AgentModuleRun.model_calls, AgentModuleRun.tool_calls,
+                           AgentModuleRun.prompt_tokens, AgentModuleRun.completion_tokens)
+            ).mappings().one()
             conn.execute(
                 update(AnalysisModule)
                 .where(AnalysisModule.id == self.run["module_id"])
                 .values(status=status, error_message=error)
             )
+        # 只有事务成功且所有权仍有效才更新本地终态，供诊断归档采用实际结果和完成时间。
+        self.run.update(finished)
         if publish_error is not None:
             with suppress(Exception):
                 self.event(
@@ -553,14 +559,16 @@ class AgentRunStore:
                     AgentModuleRun.status == "pending",
                 )
                 .values(status=status, error_message=error, finished_at=func.now())
-                .returning(AgentModuleRun.module_id)
-            ).scalar_one_or_none()
+                .returning(AgentModuleRun.module_id, AgentModuleRun.finished_at)
+            ).mappings().one_or_none()
             if changed:
                 conn.execute(
                     update(AnalysisModule)
-                    .where(AnalysisModule.id == changed)
+                    .where(AnalysisModule.id == changed["module_id"])
                     .values(status=status, error_message=error)
                 )
+        if changed:
+            self.run.update(status=status, error_message=error, finished_at=changed["finished_at"])
 
     def _publish(self, conn: Connection, publish: dict[str, Any]) -> None:
         """发布通过校验的成果与关系；单独成方法以便在 savepoint 内失败即回滚。"""
