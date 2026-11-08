@@ -68,7 +68,9 @@ def test_compact_evidence_hides_metadata_and_rereads_by_registered_id():
         assert research.seen["s1r1c0"]["page_no"] == 8
         reread = await research.read_evidence("s1r1c0", 0, 1)
         assert reread["blocks"] == result["blocks"]
-        assert research.events[-1]["action"] == "read_evidence"
+        assert research.events[-2]["action"] == "read_evidence"
+        assert research.events[-1]["action"] == "read_result"
+        assert research.events[-1]["block_ids"] == [r["block_id"] for r in rows]
         assert all(set(d) == {"id", "text"} for d in await research.documents())
 
     asyncio.run(run())

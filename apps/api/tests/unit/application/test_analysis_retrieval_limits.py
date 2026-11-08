@@ -362,7 +362,7 @@ def test_limited_candidate_window_guides_cached_pages_before_new_queries():
             assert "末尾" not in result["search_hint"]
         last = await research.search("投标保证金", "project", offset=4)
         assert not last["page"]["has_more"]
-        assert "子主题" in last["search_hint"]
+        assert "具体未决条件" in last["search_hint"]
 
     asyncio.run(run())
 

@@ -47,7 +47,7 @@ def test_shared_search_and_one_conclusion_can_cover_multiple_checklists():
             search_args={"query": "质保及例外", "work": ["w1", "w2"]},
             research_steps=[finish()],
         )
-        assert {p["topic"] for p in reviewed} == {"a", "b"}
+        assert {t for p in reviewed for t in p.get("topics", [p["topic"]])} == {"a", "b"}
         assert len(module_data(state)["records"]) == 1
         assert all(e["status"] == "ready" for e in state["topic_flow"]["entries"].values())
 

@@ -545,7 +545,11 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
         path = module["module_key"] + "/references/coverage.json"
         checks = json.loads(row["skill_snapshot"][path])
         current = next(r for r in runs if r["module_id"] == module["id"])
-        assert current["model_calls"] == 4 + len(checks)
+        # 小主题共享一次独立审查，但每个主题仍须留下可恢复的完成凭据。
+        assert current["model_calls"] == 5
+        audit = current["state"]["topic_flow"]["audit"]
+        assert audit["done"]
+        assert set(audit["completed_topics"]) == {"0:" + topic["key"] for topic in checks}
     assert all(r["state"]["research"]["seen"] for r in runs)
     assert all(r["state"]["loaded_skill"]["sha256"] for r in runs)
     assert len(env.db.rows("SELECT id FROM agent_run_event WHERE kind='skill_loaded'")) == 13

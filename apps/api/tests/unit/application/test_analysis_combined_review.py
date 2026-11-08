@@ -374,7 +374,7 @@ def test_distinct_synthesis_batches_make_progress_without_blocking_another_topic
         )
         await invoke_module(graph, files, thread_id="synthesis-progress", task="分批综合全部事项")
         assert not router.calls
-        assert {p["topic"] for p in reviewed} == {"a", "b"}
+        assert {t for p in reviewed for t in p.get("topics", [p["topic"]])} == {"a", "b"}
         assert len(module_data(state)["records"]) == len(facts)
         assert all(e["status"] == "ready" for e in state["topic_flow"]["entries"].values())
         assert all(not module_data(s)["records"] for s in saved if "draft" not in s)
@@ -415,7 +415,7 @@ def test_unscoped_review_issue_preserves_unrelated_results_and_revokes_dependent
 
         async def review(payload):
             verdict = approve(payload)
-            if payload["topic"] == affected_topic:
+            if affected_topic in payload.get("topics", [payload["topic"]]):
                 verdict["issues"] = [{
                     "topic": affected_topic, "kind": "scope", "detail": "本子主题范围待确认",
                     "target": "本子主题条款", "evidence_ids": [], "record_ids": [],

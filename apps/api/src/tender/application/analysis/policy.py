@@ -237,12 +237,21 @@ def progress_signature(
     return fingerprint([sorted(seen), facts, bool(state.get("research_completed"))])
 
 
-def tool_key(name: str, arguments: dict) -> str:
+def tool_key(name: str, arguments: dict, *, retrieval: bool = False) -> str:
     # 查询内部空格和HTML实体会改变召回语义；不能复用逐字引用的归一化。
     args = dict(arguments)
+    if retrieval:
+        # 业务归属不改变原文；缓存只复用读取，命中后仍须关联本次选择的工作和主题。
+        args.pop("work", None)
+        args.pop("topic_keys", None)
+        if (isinstance(args.get("block_id"), list)
+                and all(isinstance(key, str) for key in args["block_id"])):
+            args["block_id"] = sorted(set(args["block_id"]))
     if name in {"search_document", "search_knowledge"} and isinstance(args.get("query"), str):
         args["query"] = args["query"].strip()
         args.setdefault("source_id", None)
+        if retrieval:
+            args.setdefault("offset", 0)
     if name == "read_document":
         args.setdefault("before", 2)
         args.setdefault("after", 2)

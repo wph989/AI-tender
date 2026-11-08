@@ -121,8 +121,10 @@ class TopicSearch:
         if raw_keys is not None and (not isinstance(raw_keys, list)
                                     or any(not isinstance(key, str) for key in raw_keys)):
             raise ToolArgumentError("topic_keys须为主题key的字符串数组")
-        if block_id is not None and not isinstance(block_id, str):
-            raise ToolArgumentError("block_id须为已读原文的字符串ID")
+        if block_id is not None and not (isinstance(block_id, str) or (
+                isinstance(block_id, list) and 1 <= len(block_id) <= 4
+                and all(isinstance(key, str) for key in block_id))):
+            raise ToolArgumentError("block_id须为已读原文ID，或最多4个ID的数组")
         keys = self.flow.topic_keys(args.get("topic_keys"), block_id=args.get("block_id"),
                                     work=args.get("work"))
         if name == "read_document" and args.get("before", 2) == args.get("after", 2) == 0:
@@ -214,11 +216,12 @@ class TopicSearch:
         self.flow.data["active_topics"] = keys
         return selected
 
-    def end(self, work: list[dict], result: dict, before: set[str]) -> None:
+    def end(self, work: list[dict], result: dict, before: set[str]) -> bool:
         self.flow.data.pop("active_work", None)
         if not work:
-            return
+            return False
         added = set(self.flow.research.seen) - before
+        progressed = bool(added)
         stats = self.flow.data.setdefault("efficiency", {})
         stats["research_calls"] = stats.get("research_calls", 0) + 1
         if not added:
@@ -255,6 +258,7 @@ class TopicSearch:
             paging = (previous.get("has_more") and previous.get("next_offset") == offset
                       and offset > previous.get("offset", 0) and page.get("offset") == offset
                       and bool(result.get("blocks") or result.get("already_read")))
+            progressed = progressed or bool(paging)
             if page:
                 pages[page_key] = {k: page.get(k) for k in ("offset", "has_more", "next_offset")}
             continuation = bool(added) and (self.flow.simplified
@@ -289,6 +293,7 @@ class TopicSearch:
                 "否则只针对缺失条件、例外、续段或转引继续检索，笔记按需保存。"
             )
         self.flow.sync()
+        return progressed
 
     @staticmethod
     def summary(state: dict) -> dict:

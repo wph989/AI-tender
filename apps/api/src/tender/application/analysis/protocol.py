@@ -24,6 +24,9 @@ work_ids使用当前工作索引返回的短ID。
 检索指定work短ID后，程序推导主题，无须重复填写topic_keys；主题探索可单独用topic_keys。
 检索关键词、条款含义、范围、条件、例外及是否充分由你判断；程序负责执行和记账。
 一次检索可以关联多个核对项。先分析已有原文，根据具体缺口调整查询，不穷举同义词。
+优先定位承载多个核对项的章节，再用read_document读取连续条款；block_id可传最多4个已读ID，
+程序合并重叠窗口。按返回的windows边界补读清单续段；read_limited表示仍有未交付原文。
+关键词仅用于定位；已知名称、金额和事实直接复用。候选还有下一页不等于必须继续搜索。
 每次检索后理解原文，判断缺少的具体内容；已有依据充分时立即complete_research，不为用满额度继续检索。
 update_research按需保存简短事实线索、歧义和具体问题，不提前写完整业务正文；无需每次查询后登记。
 found表示该核对项已完整研究；examined只登记已分析原文；未解决问题用followups登记。
@@ -32,6 +35,7 @@ not_found只表示已检索范围内未找到；not_applicable须有项目原文
 研究笔记和全文可用get_research_context按work_ids分页读取，续页沿用revision和next_offset。
 has_more=true仍有未读片段；in_context仅省略当前对话仍有的同版本原文，直接使用其原文。
 认为内容充分时complete_research简述研究结论即可进入综合，不必逐项登记found或examined。
+collection_closed仅表示停止重复采集；使用已有原文综合，新问题须有具体条款或转引线索。
 未找到、不适用、资料缺失及仍无法核清的具体问题须如实用update_research保存，不假定均已找到。
 进入综合后submit_analysis暂存完整业务事项，按输出容量分批；检查清单和未处理线索仍交独立审查。
 记录用work_ids声明业务归属，范围、条件和关系仍按原文判断；不填写技术位置或覆盖行政字段。
@@ -170,6 +174,8 @@ class ResearchLedger:
                 key, {"topic": work["topic"], "scope": work["scope"], "items": []}
             )
             item = {k: work[k] for k in ("id", "kind", "check", "status")}
+            if self.flow.data.get("search_work", {}).get(work["id"], {}).get("exhausted"):
+                item["collection_closed"] = True
             if work.get("target"):
                 item["target"] = work["target"]
             group["items"].append(item)
@@ -362,6 +368,8 @@ class ResearchLedger:
         return json.dumps(
             {
                 "phase": self.flow.data.get("phase", "research"),
+                **({"research_stop_reason": self.flow.data["research_stop_reason"]}
+                   if self.flow.data.get("research_stop_reason") else {}),
                 "works": self.work_index(works),
                 **({"synthesis_work_origins": self.work_index(origins)} if origins else {}),
                 "next_action": ("理解已有原文；依据充分则complete_research，否则只补查具体缺口"

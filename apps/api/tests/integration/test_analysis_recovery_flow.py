@@ -101,12 +101,7 @@ def test_model_unavailable_resumes_same_thread_with_bounded_attempts(env, monkey
     )
     assert [event["detail"]["attempt"] for event in events] == [1, 2]
     # 两次失败恢复同样占用模型预算，不能通过恢复获得额外请求次数。
-    topic_count = len(
-        json.loads(
-            runtime.report["skill_snapshot"][run["module_key"] + "/references/coverage.json"]
-        )
-    )
-    assert row[0]["model_calls"] == 6 + topic_count
+    assert row[0]["model_calls"] == 7  # 两次失败、四次主模型、一次合包审查。
 
 
 def test_model_unavailable_exhaustion_finishes_partial_with_supported_items(env, monkeypatch):
@@ -158,11 +153,7 @@ def test_model_unavailable_does_not_create_new_attempt_or_reset_budget(env, monk
     )
     # 恢复沿用同一次运行账，不创建新 attempt，也不清空已消耗预算（7 次工具 + Skill 与四个工具）。
     assert len(rows) == 1
-    assert rows[0]["model_calls"] == 11 + len(
-        json.loads(
-            runtime.report["skill_snapshot"][run["module_key"] + "/references/coverage.json"]
-        )
-    )
+    assert rows[0]["model_calls"] == 12  # 旧预算五次加本轮七次，合包不重置恢复账。
     assert rows[0]["tool_calls"] == 12
     assert rows[0]["prompt_tokens"] >= 100
     assert rows[0]["completion_tokens"] >= 50

@@ -18,6 +18,43 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_merged_batch_read_uses_bounded_postgres_windows(env):
+    import asyncio
+
+    from tender.adapters.pg.analysis.checkpoints import run_async
+    from tender.application.analysis.research import ResearchSession
+
+    row = report(env, topic_flow=True)
+    # 多个独立元素确保原文派生至少16块，真实仓储仍执行每次最多12块的契约。
+    env.db.execute("""INSERT INTO element
+        (version_id,run_id,page_no,order_no,anchor,type,text,bbox_x0,bbox_y0,bbox_x1,bbox_y1)
+        SELECT e.version_id,e.run_id,1,g.n,'p1b' || g.n,'text','独立条款' || g.n,0,0,1,1
+        FROM (SELECT version_id,run_id FROM element LIMIT 1) e
+        CROSS JOIN generate_series(2,20) AS g(n)""")
+    row, sources = test_deepagents_runtime.worker.prepare_report(env.db, row)
+    source = next(s for s in sources if s["project_id"] == row["project_id"])
+    anchors = [env.db.read_chunk_window(source, offset, 1).rows[0] for offset in (2, 7)]
+    reads = []
+
+    async def read(selected, offset, limit):
+        reads.append((offset, limit))
+        return await asyncio.to_thread(env.db.read_chunk_window, selected, offset, limit)
+
+    async def authorize():
+        pass
+
+    async def forbidden(*args):
+        raise AssertionError("已知锚点补读无需重新检索")
+
+    research = ResearchSession(sources, row["project_id"], forbidden, read, authorize)
+    research.seen = {r["block_id"]: r for r in anchors}
+    result = run_async(research.read_evidence([r["block_id"] for r in anchors], 2, 8))
+    assert reads == [(0, 12), (12, 4)]
+    assert [r["offset"] for r in result["blocks"]] == list(range(16))
+    assert research.tool_calls == 1 and len(research.seen) == 16
+    assert research.events[-1]["action"] == "read_result"
+
+
 def progress_state(runtime):
     state = publishable_state("project_basic_info_parsing")
     state["staged_items_verified"] = False
@@ -426,12 +463,12 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
     run_async(env.executor.execute_module(runtime.report, run, runtime.sources))
     module = env.db.rows("SELECT status,business_data FROM analysis_module WHERE id=:id",
                          {"id": run["module_id"]})[0]
-    if max_calls in {4, 5, 6}:
-        assert module["status"] == ("partial" if max_calls == 6 else "failed")
-        assert len(module["business_data"]["records"]) == (1 if max_calls == 6 else 0)
+    if max_calls in {4, 5}:
+        assert module["status"] == "failed"
+        assert len(module["business_data"]["records"]) == 0
         stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
                              {"id": run["id"]})[0]
-        assert stored["model_calls"] == max_calls and len(completed) == (1 if max_calls == 6 else 0)
+        assert stored["model_calls"] == max_calls and len(completed) == 0
         assert all(e["findings"] for e in stored["state"]["topic_flow"]["entries"].values())
         assert any(g["key"] == "execution:incomplete"
                    for g in stored["state"]["business_gaps"])
@@ -439,11 +476,18 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
     assert module["status"] == "completed"
     assert len(observed) == 1 and len(observed[0]["records"]) == 0
     assert len(module["business_data"]["records"]) == 2
-    assert len(completed) == 2
+    # 两主题合包后六次预算已足够；原文只传一份，核对清单仍包含全部主题。
+    assert len(completed) == 1
+    assert set(completed[0]["topics"]) == {"quantity", "warranty"}
+    assert {row["topic"] for row in completed[0]["checks"]} == {"quantity", "warranty"}
+    assert len(completed[0]["records"]) == 2 and len(completed[0]["evidence"]) == 1
     stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
                          {"id": run["id"]})[0]
     assert stored["state"]["topic_flow"]["audit"]["done"]
-    assert stored["model_calls"] == 7
+    assert set(stored["state"]["topic_flow"]["audit"]["completed_topics"]) == {
+        "0:quantity", "0:warranty",
+    }
+    assert stored["model_calls"] == 6
     # JSON审查账从真实数据库恢复后复用已完成请求，资料版本变化则拒绝旧完成状态。
     from tender.application.analysis.research import AgentLimits
     from tender.application.analysis.review import audit_combined

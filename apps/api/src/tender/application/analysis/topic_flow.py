@@ -156,7 +156,7 @@ class TopicFlow:
                 "detail": "尚未核对", "requested_status": "researching"}
 
     def topic_keys(
-        self, keys: list[str] | None, *, block_id: str | None = None,
+        self, keys: list[str] | None, *, block_id: str | list[str] | None = None,
         work: str | list[str] | None = None,
     ) -> list[str]:
         if not keys and self.simplified and work:
@@ -169,7 +169,9 @@ class TopicFlow:
                 raise ToolArgumentError("省略topic_keys时，work须使用当前工作索引的有效短ID")
             keys = sorted({known[w]["topic"] for w in requested})
         if not keys and block_id:
-            keys = self.data["evidence_topics"].get(block_id)
+            anchors = [block_id] if isinstance(block_id, str) else block_id
+            keys = sorted({topic for anchor in anchors
+                           for topic in self.data["evidence_topics"].get(anchor, [])})
         valid = {t["key"] for t in self.state["business_topics"]}
         if not keys or set(keys) - valid:
             raise ToolArgumentError(
@@ -181,7 +183,7 @@ class TopicFlow:
         self, before: set[str], keys: list[str], result: dict | None = None,
         *, update_progress: bool = True,
     ) -> None:
-        if (result or {}).get("budget_exhausted"):
+        if (result or {}).get("budget_exhausted") and not self.simplified:
             self.state["topic_budget_exhausted"] = "证据额度已耗尽，保留已核实事项和未完成主题"
         added = set(self.research.seen) - before
         returned = set((result or {}).get("already_read", []))

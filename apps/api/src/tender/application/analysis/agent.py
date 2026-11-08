@@ -457,37 +457,96 @@ class ResearchMiddleware(AgentMiddleware):
 
     def budget_needs_synthesis(self, status: dict) -> bool:
         """按已冻结总预算预留收尾空间，避免快速检索先耗尽次数、来不及逐条提交。"""
-        if self.topic_flow:
+        if self.topic_flow and not self.topic_flow.simplified:
             return False
         if status.get("seconds_remaining", 99999) <= self.synthesis_reserve_seconds(status):
             return True
-        if not self.state.get("output_schema"):
+        if not self.state.get("output_schema") and not self.topic_flow:
             return False
         if len(self.research.seen) >= self.research.limits.max_evidence_blocks:
             # 原文额度已满时，扩展检索和大窗口补读不会增加证据，必须把机会留给综合。
             return True
+        if self.review_repairing():
+            # 初次研究的预留额度包含修复机会；定向补查只为最后综合和复核继续留额度。
+            return (status.get("model_calls_remaining", self.research.limits.max_model_calls)
+                    <= self.synthesis_reserve_calls()
+                    or status.get("tool_calls_remaining", self.research.limits.max_tool_calls) <= 2)
         # 与时间预留一致，最后四分之一次数用于补读、研究登记、逐条提交及支持性校验。
         # 使用运行账剩余次数，不能用研究工具次数代替全部工具调用；硬上限仍由仓储执行。
         return any(
-            status.get(key, total) <= (total + 3) // 4
+            status.get(key, total) <= max(
+                (total + 3) // 4,
+                self.synthesis_reserve_calls() if key == "model_calls_remaining" else 0,
+            )
             for key, total in (
                 ("model_calls_remaining", self.research.limits.max_model_calls),
                 ("tool_calls_remaining", self.research.limits.max_tool_calls),
             )
         )
 
+    def review_repairing(self) -> bool:
+        if not self.topic_flow or not self.topic_flow.simplified:
+            return False
+        audit = self.topic_flow.data["audit"]
+        return bool(audit["round"] and audit.get("issues") and not audit.get("done"))
+
+    def synthesis_reserve_calls(self) -> int:
+        if not self.topic_flow or not self.topic_flow.simplified:
+            return 4
+        from tender.application.analysis.review import batches, review_scope
+
+        # 按已有正文的实际分包预留审查，加综合与一次定向修复；不把预算当作完成证明。
+        repairing = self.review_repairing()
+        topics = sorted({e["topic"] for e in self.topic_flow.entries})
+        repair: list[dict] = []
+        if repairing:
+            # 与最终审查共用受影响范围，已完成且未变的主题不重复占用预留额度。
+            topics, _, repair = review_scope(self.topic_flow)
+        packets = 0
+        for topic in topics:
+            try:
+                packets += len(batches(self.topic_flow, topic, [i for i in repair
+                                                              if i["topic"] == topic])[0])
+            except TopicIncomplete:
+                packets += 1
+        return max(2, packets + 1) if repairing else max(4, packets + 3)
+
     def synthesis_reserve_seconds(self, status: dict) -> float:
         # 慢模型单轮可能超过原有五分钟预留；至少留出研究登记、结果提交、校验及一次纠正。
         # 这里只提前切换工具阶段，不增加总预算，不把证据数量或覆盖声明当作完成判据。
+        calls = self.synthesis_reserve_calls()
+        baseline = status.get("finish_reserve_seconds", 0)
+        if self.review_repairing():
+            # 旧基线覆盖四轮收尾；修复阶段只预留剩余综合和复核，仍尊重慢模型实测耗时。
+            baseline = baseline * calls / 4
         return max(
-            status.get("finish_reserve_seconds", 0),
-            4 * self.state.get("model_round_seconds", 0) if self.state.get("output_schema") else 0,
+            baseline,
+            calls * self.state.get("model_round_seconds", 0)
+            if self.state.get("output_schema") or self.topic_flow else 0,
+        )
+
+    def research_budget_closed(self, name: str, args: dict) -> bool:
+        return bool(
+            self.topic_flow and self.topic_flow.simplified
+            and name in {"search_document", "search_knowledge", "read_document"}
+            and not (name == "read_document" and args.get("before", 2) == args.get("after", 2) == 0)
+            and any(e["action"] == "search_result" and e.get("scope") == "project"
+                    for e in self.research.events)
+            and self.budget_needs_synthesis(self.budget_status() if self.budget_status else {})
         )
 
     async def awrap_model_call(self, request, handler):
         await self.research.authorize()
         if self.topic_flow:
-            return await self.topic_model_call(request, handler)
+            started = time.monotonic()
+            with bind_context(agent_phase=("research" if self.topic_flow.researching
+                                           else "synthesis")):
+                response = await self.topic_model_call(request, handler)
+            # 新专题同样记录已完成请求的延迟，慢模型才能提前留下真实可用的收尾时间。
+            self.state["model_round_seconds"] = max(
+                self.state.get("model_round_seconds", 0), time.monotonic() - started,
+            )
+            return response
         status = self.budget_status() if self.budget_status else {}
         if self.state.get("output_schema"):
             status = status | {"finish_reserve_seconds": self.synthesis_reserve_seconds(status)}
@@ -1253,7 +1312,22 @@ class ResearchMiddleware(AgentMiddleware):
     async def abefore_model(self, state, runtime):
         await self.research.authorize()
         if self.topic_flow and self.state.get("topic_budget_exhausted"):
-            raise TopicIncomplete(self.state["topic_budget_exhausted"])
+            if self.topic_flow.simplified:
+                # 旧检查点可能仍带终止标记；原文额度保持原值，恢复后按新规则转综合。
+                self.state.pop("topic_budget_exhausted")
+            else:
+                raise TopicIncomplete(self.state["topic_budget_exhausted"])
+        if (self.topic_flow and self.topic_flow.simplified and self.topic_flow.researching
+                and self.budget_needs_synthesis(self.budget_status() if self.budget_status else {})
+                and any(e["action"] == "search_result" and e.get("scope") == "project"
+                        for e in self.research.events)):
+            # 程序在边界直接切换阶段，避免再花一轮请求让模型猜该用哪个收尾工具。
+            ResearchLedger(self.topic_flow).finish(
+                "研究已到收尾预算边界，按已有原文统一综合；未核对项、未读续段和冲突保留，"
+                "由独立审查检查完整性。"
+            )
+            self.topic_flow.data["research_stop_reason"] = "budget_reserve"
+            await self.save(self.state)
         if self.skill:
             loaded = self.state.get("loaded_skill")
             if loaded and loaded["sha256"] != self.skill["sha256"]:
@@ -1284,6 +1358,19 @@ class ResearchMiddleware(AgentMiddleware):
                 self.state.update(progress_signature=signature, progress_message_id=message.id,
                                   no_progress_rounds=idle)
                 if idle >= self.research.limits.max_no_progress_rounds and not research_turn:
+                    if (self.topic_flow.simplified and self.topic_flow.researching
+                            and any(e["action"] == "search_result" and e.get("scope") == "project"
+                                    for e in self.research.events)):
+                        # 缓存命中和重复召回不再豁免全局空转；先产出已有内容，查漏再给具体问题。
+                        ResearchLedger(self.topic_flow).finish(
+                            "连续研究没有新增依据或业务推进，转入已有原文综合；未决问题交独立审查。"
+                        )
+                        self.topic_flow.data["research_stop_reason"] = "no_progress"
+                        self.state["no_progress_rounds"] = 0
+                        await self.save(self.state)
+                        return self.feedback(
+                            "重复研究已停止，现进入综合；提交已有依据支持的完整事项"
+                        )
                     self.topic_flow.block_stalled()
                     if self.topic_flow.simplified and self.topic_flow.researching:
                         # 所有可处理工作都已受阻时直接尝试转综合，避免关闭回执反复空转。
@@ -1523,12 +1610,17 @@ class ResearchMiddleware(AgentMiddleware):
                     status="cached", duration_ms=0,
                 )
                 return self.evidence_response(request, messages_from_dict([cached])[0])
-            await self.reserve_tool()
+            budget_closed = self.research_budget_closed(name, request.tool_call.get("args", {}))
+            # 同一模型响应可带多次检索；边界后的未执行请求只记拒绝回执，不能侵占综合额度。
+            if not budget_closed:
+                await self.reserve_tool()
             started = time.monotonic()
+            evidence_before = set(self.research.seen)
             # 调用 ID 留在工具协议和检查点中用于重放，运行日志只记录动作摘要。
             tool_log = logger.bind(tool=name)
             tool_error: BaseException | None = None
             result = None
+            reused_result = False
             failure_class: str | None = None
             try:
                 if name == "submit_analysis":
@@ -1539,13 +1631,16 @@ class ResearchMiddleware(AgentMiddleware):
                         self.topic_flow.data.pop("synthesis_finished", None)
                         self.state.pop("topic_final_requested", None)
                 signature = tool_key(name, request.tool_call["args"])
+                retrieval_signature = tool_key(name, request.tool_call["args"], retrieval=True)
                 counts = self.state.setdefault("identical_tool_calls", {})
                 counts[signature] = counts.get(signature, 0) + 1
                 # 多个独立事项可共用原文；成功回读已有缓存，重复并不表示检索陷入循环。
-                cached_read = (name == "read_document" and signature in
+                cached_read = (name == "read_document" and retrieval_signature in
                                self.state.get("read_tool_cache", {}))
-                if (not cached_read
-                        and counts[signature] > self.research.limits.max_identical_tool_calls):
+                repeated = (not cached_read and counts[signature]
+                            > self.research.limits.max_identical_tool_calls)
+                if repeated and not (self.topic_flow and self.topic_flow.simplified
+                                     and name in {"search_document", "search_knowledge"}):
                     if self.topic_flow:
                         raise TopicIncomplete("相同工具与参数重复调用已达上限：" + name)
                     raise RuntimeError("相同工具与参数重复调用已达上限：" + name)
@@ -1554,6 +1649,13 @@ class ResearchMiddleware(AgentMiddleware):
                     status = self.budget_status() if self.budget_status else {}
                     control, work = None, []
                     before = set(self.research.seen)
+                    if budget_closed or repeated:
+                        stats = self.topic_flow.data.setdefault("efficiency", {})
+                        stats["blocked_research"] = stats.get("blocked_research", 0) + 1
+                        raise WorkClosed(
+                            "已到综合与审查预留预算，停止扩展检索；综合已有原文并保留缺口"
+                            if budget_closed else "相同查询已重复，直接使用已有原文并综合"
+                        )
                     if self.topic_flow and name in {
                         "search_document", "search_knowledge", "read_document",
                     }:
@@ -1567,7 +1669,8 @@ class ResearchMiddleware(AgentMiddleware):
                         work = control.begin(name, request.tool_call["args"])
                     if name in {"search_document", "search_knowledge"} and (
                         (self.state.get("finish_only") and not self.topic_flow)
-                        or self.budget_needs_synthesis(status)
+                        or (not (self.topic_flow and self.topic_flow.simplified)
+                            and self.budget_needs_synthesis(status))
                     ) and not (name == "search_document" and not any(
                         e["action"] == "search_result" and e.get("scope") == "project"
                         for e in self.research.events
@@ -1582,14 +1685,30 @@ class ResearchMiddleware(AgentMiddleware):
                         "read_document",
                         "list_documents",
                     }
-                    prior = self.state.setdefault("read_tool_cache", {}).get(signature)
+                    prior = self.state.setdefault("read_tool_cache", {}).get(retrieval_signature)
                     if reusable and prior is not None:
+                        reused_result = True
                         if control:
                             stats = self.topic_flow.data.setdefault("efficiency", {})
                             stats["reused_tools"] = stats.get("reused_tools", 0) + 1
                         result = messages_from_dict([prior])[0].model_copy(
                             update={"tool_call_id": call_id, "id": None}
                         )
+                        if control:
+                            payload = json.loads(result.content)
+                            payload.pop("research_notice", None)
+                            payload.pop("next_action", None)
+                            # 新主题可以复用已读原文，不能因跳过工具函数漏掉归属和补遗失效处理。
+                            args = request.tool_call["args"]
+                            keys = self.topic_flow.topic_keys(
+                                args.get("topic_keys"), block_id=args.get("block_id"),
+                                work=args.get("work"),
+                            )
+                            self.topic_flow.data["active_topics"] = keys
+                            self.topic_flow.evidence(before, keys, payload)
+                            result = result.model_copy(update={"content": json.dumps(
+                                payload, ensure_ascii=False,
+                            )})
                     elif (self.topic_flow and name == "read_file"
                           and request.tool_call["args"].get("file_path") in
                           getattr(self, "loaded_skill_paths", set())):
@@ -1606,9 +1725,9 @@ class ResearchMiddleware(AgentMiddleware):
                     if (control and result.status != "error"
                             and not str(result.content).startswith(TOOL_ARGUMENT_PREFIX)):
                         payload = json.loads(result.content)
-                        control.end(work, payload, before)
-                        if work:
-                            # 只有实际完成采集才交给工作账收敛；关闭／暂停回执不能豁免无进展。
+                        progressed = control.end(work, payload, before)
+                        if work and (progressed or not self.topic_flow.simplified):
+                            # 新原文或真实续页才能豁免空转；同轮其它工具的真实进展仍然保留。
                             self.state["topic_research_round"] = self._round_id(request)
                         result = result.model_copy(update={"content": json.dumps(
                             payload, ensure_ascii=False,
@@ -1624,7 +1743,7 @@ class ResearchMiddleware(AgentMiddleware):
                     result = ToolMessage(content=json.dumps({
                         "work_closed": True, "message": str(exc),
                         "next_action": (
-                            "用update_research登记研究发现，或选择其他具体工作"
+                            "依据充分时complete_research；否则只处理尚未核清的具体问题"
                             if self.topic_flow and self.topic_flow.researching else
                             "提交已读事项，或选择当前search_work中的其他具体工作"),
                     }, ensure_ascii=False), tool_call_id=call_id, name=name)
@@ -1663,7 +1782,7 @@ class ResearchMiddleware(AgentMiddleware):
                         "read_document",
                         "list_documents",
                     } and failure_class != "work_closed":
-                        self.state["read_tool_cache"][signature] = message_to_dict(result)
+                        self.state["read_tool_cache"][retrieval_signature] = message_to_dict(result)
                     if name in {"search_document", "search_knowledge", "read_document"} and (
                         was_synthesis and not self.state.get("research_completed")
                     ):
@@ -1727,6 +1846,11 @@ class ResearchMiddleware(AgentMiddleware):
                             else "error" if failed else "ok"
                         ),
                         duration_ms=int((time.monotonic() - started) * 1000),
+                        new_evidence_count=len(set(self.research.seen) - evidence_before),
+                        budget_reserved=not budget_closed,
+                        result_kind=failure_class or (
+                            "error" if failed else "reused" if reused_result else "executed"
+                        ),
                         error_type=type(tool_error).__name__ if tool_error else None,
                         error=(
                             error_detail(str(tool_error)) if tool_error
@@ -1856,13 +1980,13 @@ def build_module_agent(
         return result
 
     async def read_document(
-        block_id: str,
+        block_id: str | Annotated[list[str], Field(min_length=1, max_length=4)],
         before: Annotated[int, Field(ge=0, le=11)] = 2,
         after: Annotated[int, Field(ge=0, le=11)] = 2,
         topic_keys: list[str] | None = None,
         work: str | list[str] | None = None,
     ) -> dict:
-        """补读已知证据的邻近原文；合计超过11块时由运行时按顺序截断并回报实际窗口。"""
+        """按已知ID补读连续条款；block_id可为最多4个ID，重叠窗口自动合并。单锚点最多12块。"""
         keys = flow.topic_keys(topic_keys, block_id=block_id, work=work) if flow else []
         if flow:
             flow.data["active_topics"] = keys

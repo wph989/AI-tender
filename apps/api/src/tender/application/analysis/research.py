@@ -311,13 +311,13 @@ class ResearchSession:
             if has_more:
                 # 窗口外还有匹配不代表缓存已读完；先翻页才能复用已有召回，避免反复付费改写查询。
                 result["search_hint"] = (
-                    "同一查询仍有下一页：请用 offset=next_offset 继续读取本查询；"
-                    "不要改写查询词重复检索，也不要把当前页当作全部命中。"
+                    "同一查询仍有下一页：具体缺口需要时用 offset=next_offset 继续读取；"
+                    "依据充分即可综合，不必穷尽相关性候选；未读分页不能声称已核对。"
                 )
             elif search_limited:
                 result["search_hint"] = (
                     "本次检索的候选窗口已到末尾或扩展结果被截断，仍可能有未返回内容；"
-                    "请按未覆盖子主题拆分查询、限定 source_id，或登记未读缺口。"
+                    "仅对具体未决条件拆分查询或限定 source_id；有未读相关条款时登记缺口。"
                 )
             elif not rows and offset:
                 result["search_hint"] = (
@@ -358,10 +358,14 @@ class ResearchSession:
         )
         return result if self.compact_results else result | {"retrieval": info}
 
-    async def read_evidence(self, block_id: str, before: int = 2, after: int = 2) -> dict:
+    async def read_evidence(
+        self, block_id: str | list[str], before: int = 2, after: int = 2,
+    ) -> dict:
         """只允许围绕已读 ID 补读，服务端解析位置，防止模型猜测偏移或跨版本读取。"""
         if any(type(n) is not int or n < 0 for n in (before, after)) or before + after > 11:
             raise ToolArgumentError("before/after 必须为非负整数，连同当前块每次最多12块")
+        if isinstance(block_id, list):
+            return await self._read_batch(block_id, before, after)
         row = self.seen.get(block_id)
         if row is None:
             raise ToolArgumentError("证据ID尚未读取，请先检索；不得猜测其他资料的ID")
@@ -383,7 +387,87 @@ class ResearchSession:
         if not any(str(r["block_id"]) == block_id for r in selected):
             raise PermissionError("证据已失效，请基于最新资料重新分析")
         async with self._lock:
-            return self._remember(selected, deduplicate=False)
+            result = self._remember(selected, deduplicate=False)
+        self.events.append({
+            "action": "read_result", "anchor_ids": [block_id], "before": before, "after": after,
+            "block_ids": [r.get("id", r.get("block_id")) for r in result["blocks"]],
+        })
+        return result
+
+    async def _read_batch(self, block_ids: list[str], before: int, after: int) -> dict:
+        """同批邻域先合并再读取，减少交互与重叠窗口；容量不足时显式返回续读边界。"""
+        if (not 1 <= len(block_ids) <= 4
+                or any(not isinstance(key, str) or key not in self.seen for key in block_ids)):
+            raise ToolArgumentError("批量补读须提供1到4个已读ID；包含尚未读取的证据")
+        sources = {s["source_id"]: s for s in self.sources}
+        anchors = [self.seen[key] for key in dict.fromkeys(block_ids)]
+        if any(row["source_id"] not in sources for row in anchors):
+            raise SourceNotAllowed("证据所属资料不在授权范围")
+        ranges: list[dict] = []
+        for row in sorted(anchors, key=lambda r: (r["source_id"], r["offset"])):
+            start, end = max(0, row["offset"] - before), row["offset"] + after + 1
+            if (ranges and ranges[-1]["source_id"] == row["source_id"]
+                    and start <= ranges[-1]["end"]):
+                ranges[-1]["end"] = max(end, ranges[-1]["end"])
+                ranges[-1]["anchors"].append(row["block_id"])
+            else:
+                ranges.append({"source_id": row["source_id"], "start": start, "end": end,
+                               "anchors": [row["block_id"]]})
+        await self._begin("read_evidence", {
+            "block_id": block_ids, "before": before, "after": after,
+        })
+        allowed = {(s["source_id"], s["parse_run_id"], s["version_id"]) for s in self.sources}
+        windows: list[list[dict]] = []
+        selected: list[dict] = []
+        remaining = max(1024, (self.limits.context_tokens - self.limits.max_output_tokens) // 2)
+        limited, continuation = False, []
+        for interval in ranges:
+            sid, start, end = interval["source_id"], interval["start"], interval["end"]
+            rows: list[dict] = []
+            # 合并区间可超过12块，但每次仓储读取仍须遵守原有窗口契约。
+            for offset in range(start, end, 12):
+                stop = min(end, offset + 12)
+                window = await self.read(sources[sid], offset, stop - offset)
+                await self.authorize()
+                # 截断前校验整批来源，越权或版本变化不能藏在容量外的尾部。
+                if any(r["source_id"] != sid
+                       or (r["source_id"], r["parse_run_id"], r["version_id"]) not in allowed
+                       for r in window.rows):
+                    raise PermissionError("补读返回了其它来源或错误版本的资料")
+                rows.extend(r for r in window.rows if offset <= r["offset"] < stop)
+            rows.sort(key=lambda r: r["offset"])
+            if set(interval["anchors"]) - {r["block_id"] for r in rows}:
+                raise PermissionError("证据已失效，请基于最新资料重新分析")
+            included: list[dict] = []
+            for row in rows:
+                # 至少交付一个完整块；不裁掉句子尾部以免把条件截断成结论。
+                size = len(row["content"]) + len(row["block_id"]) + 32
+                if selected and size > remaining:
+                    limited = True
+                    continuation.append(included[-1]["block_id"] if included
+                                        else interval["anchors"][0])
+                    break
+                selected.append(row)
+                included.append(row)
+                remaining -= size
+            windows.append(included)
+        async with self._lock:
+            result = self._remember(selected, deduplicate=False)
+        delivered = {r.get("id", r.get("block_id")) for r in result["blocks"]}
+        result["windows"] = [
+            {"first_id": kept[0], "last_id": kept[-1]}
+            for window_rows in windows
+            if (kept := [r["block_id"] for r in window_rows if r["block_id"] in delivered])
+        ]
+        if limited:
+            result.update(read_limited=True, continue_from=list(dict.fromkeys(continuation)),
+                          warning="批量原文达到上下文容量；仅返回已读区间，按续读ID补齐具体条款。")
+        # 审查也必须看到物理截断和后续读取，不能只给主Agent一条容易丢失的提示。
+        self.events.append({"action": "read_result", "anchor_ids": block_ids,
+                            "windows": result["windows"], "read_limited": limited,
+                            "continue_from": result.get("continue_from", []),
+                            "block_ids": sorted(delivered)})
+        return result
 
     async def read_source(self, source_id: int, offset: int, limit: int = 6) -> dict:
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 12:
