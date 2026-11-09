@@ -63,12 +63,10 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "技术评分：安装集成方案满分10分。方案完整可行得10分；基本可行得6分；不可行或未提供得0分。"
+              "block_id": "example-1"
             },
             {
-              "block_id": "example-2",
-              "quote": "安装集成方案每缺少一项风险措施扣1分，扣完本项得分为止。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

@@ -88,7 +88,7 @@ def test_every_frozen_module_has_usable_synthesis_format(key):
     rules = snapshot[key + "/SKILL.md"]
     from tender.application.analysis.protocol import CONTRACT as RESEARCH_RULES
 
-    assert "coverage.json" in rules and "逐字" in RESEARCH_RULES
+    assert "coverage.json" in rules and "无需quote" in RESEARCH_RULES
     assert "work_ids" in snapshot[key + "/references/output_format.md"]
     assert all(topic.get("checks") for topic in json.loads(
         snapshot[key + "/references/coverage.json"]
@@ -171,8 +171,8 @@ def test_early_submission_is_rejected_then_full_research_can_finish():
 
 @pytest.mark.parametrize("problem,path,reason", [
     ("scope", "records.0.scope", "common/unknown 不填 lot_refs"),
-    ("list", "records", "Input should be a valid list"),
-    ("required", "records.0.content", "Field required"),
+    ("list", "records", "应为数组"),
+    ("required", "records.0.content", "必填"),
 ])
 def test_schema_feedback_explains_the_rule_without_echoing_invalid_input(problem, path, reason):
     async def run():
@@ -915,6 +915,7 @@ def test_compaction_keeps_evidence_and_phase_with_project_prompt(monkeypatch):
         assert summary_requests
         assert all("摘要契约探针" in str(messages) and "{messages}" not in str(messages)
                    for messages in summary_requests)
-        assert state["draft"]["fields"][0]["values"][0]["citations"][0]["quote"] == "质保三年"
+        ref = state["draft"]["fields"][0]["values"][0]["citations"][0]
+        assert ref["quote"] == state["research"]["seen"][ref["block_id"]]["content"]
 
     asyncio.run(run())

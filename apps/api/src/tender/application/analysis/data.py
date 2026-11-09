@@ -14,9 +14,11 @@ from tender.application.analysis.state import published_items
 from tender.application.knowledge.content import (
     dedupe_citations,
     fingerprint,
+    match_text,
     normalized,
     validate_items,
 )
+from tender.application.shared.validation import allowed_values, validation_message
 
 DATA_VERSION = "1"
 
@@ -26,8 +28,17 @@ class DataInput(BaseModel):
 
 
 class DataCitation(DataInput):
-    block_id: str = Field(min_length=1)
-    quote: str = Field(min_length=1)
+    """模型只选择已读块，文件、页码、坐标和原文由服务端补齐。"""
+
+    block_id: str = Field(min_length=1, description="检索或补读实际返回的原文块ID")
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_quote(cls, value):
+        # 冻结样例和旧检查点可能仍带quote；它不是定位输入，不能再因改写或缺失而拒绝总结。
+        if isinstance(value, dict):
+            return {key: item for key, item in value.items() if key != "quote"}
+        return value
 
 
 class DataScope(DataInput):
@@ -81,11 +92,18 @@ class RecordContent(DataInput):
     key: str = Field(min_length=1, max_length=100)
     kind: Literal["fact", "requirement", "lot", "format_node", "relation"]
     title: str = Field(min_length=1, max_length=300)
-    content: dict[str, str | list[str]] = Field(default_factory=dict)
+    content: dict[str, str | list[str]] = Field(
+        default_factory=dict,
+        description="键使用当前group在输出格式声明中的列名，事项名称及结论写在对应的值中",
+    )
     scope: DataScope
-    citations: list[DataCitation] = Field(min_length=1)
-    group: str = ""
-    category: str = "other"
+    citations: list[DataCitation] = Field(
+        min_length=1, description="总结所依据的已读块定位，只填写block_id，无需摘抄原文",
+    )
+    group: str = Field(
+        default="", description="展示分类，填写当前Skill输出格式的title；不能用category代替",
+    )
+    category: str = Field(default="other", description="可选业务标签；展示分类填写group")
     structuring: Literal["complete", "partial"] = "partial"
     conditions: Conditions = Field(default_factory=Conditions)
     materials: list[Material] = Field(default_factory=list)
@@ -125,7 +143,9 @@ class SynthesisRecord(BusinessRecord):
     """汇总工具只需填专题内容，通用业务文本由服务端从内容确定性生成。"""
 
     text: str = ""
-    content: dict[str, str | list[str]] = Field(min_length=1)
+    content: dict[str, str | list[str]] = Field(
+        min_length=1, description=RecordContent.model_fields["content"].description,
+    )
 
 
 class CoverageInput(DataInput):
@@ -158,6 +178,14 @@ def semantic_payload(record: Mapping) -> dict:
     """校验全部业务属性；内部编号和展示排序没有业务含义，不浪费审查上下文。"""
     excluded = {"id", "key", "module_key", "citations", "verification", "sort_order"}
     return {k: v for k, v in record.items() if k not in excluded}
+
+
+def missing_scope_refs(scope: dict, citations: list[dict]) -> list[str]:
+    """提交与最终选证共用原文指向规则，避免错误范围到付费审查后才暴露。"""
+    if scope.get("kind") != "lots":
+        return []
+    return [ref for ref in scope.get("lot_refs", [])
+            if not any(match_text(ref) in match_text(c["quote"]) for c in citations)]
 
 
 def prepare_records(
@@ -196,19 +224,39 @@ def prepare_records(
             while current.get("parent_key"):
                 parent = current["parent_key"]
                 if parent not in combined or parent in visited:
-                    raise ValueError("格式层级存在缺失父节点或循环，请先提交父节点")
+                    raise ValueError(
+                        "parent_key：格式层级存在缺失父节点或循环，请先提交父节点；"
+                        "可选父节点key：" + allowed_values(
+                            k for k, value in combined.items()
+                            if value["kind"] == "format_node" and k not in visited
+                        )
+                    )
                 current = combined[parent]
                 if current["kind"] != "format_node":
-                    raise ValueError("格式父节点必须是格式节点")
+                    raise ValueError(
+                        "parent_key：格式父节点必须是格式节点；先提交kind=format_node的父节点"
+                    )
                 visited.add(parent)
                 path.insert(0, current["title"])
                 refs.extend(current["citations"])
             entry["parent_path"] = path
         if entry["kind"] == "relation":
+            errors = []
             for endpoint in ("subject", "object"):
                 target = combined.get(entry[endpoint + "_key"])
                 if not target or target["kind"] in {"lot", "relation"}:
-                    raise ValueError("关系端点必须是同批或已提交的本模块事实、要求或格式节点")
+                    errors.append((
+                        endpoint + "_key",
+                        "关系端点必须是同批或已提交的本模块事实、要求或格式节点；"
+                        "可选key：" + allowed_values(
+                            k for k, value in combined.items()
+                            if value["kind"] not in {"lot", "relation"}
+                        ),
+                    ))
+            if errors:
+                raise ValueError(validation_message(errors))
+            for endpoint in ("subject", "object"):
+                target = combined[entry[endpoint + "_key"]]
                 entry[endpoint + "_text"] = target["text"]
                 refs.extend(target["citations"])
         # 所有属性与本条文本共用一套证据送审；禁止先审展示文字再补入未经验证的属性。
@@ -216,9 +264,17 @@ def prepare_records(
             "field": entry["title"], "group": entry["group"],
             "sort_order": entry["sort_order"],
             "values": [{"value": entry["text"], "citations": refs}],
-        }], seen, align=False)[0]
+        }], seen, align=False, citation_path="citations", source_locations=True)[0]
         entry.update(id=record_identity(state, entry["key"]), module_key=module_key)
         entry["citations"] = item["values"][0]["citations"]
+        missing = missing_scope_refs(entry["scope"], entry["citations"])
+        if missing:
+            raise ValueError(validation_message([
+                (f"scope.lot_refs[{entry['scope']['lot_refs'].index(ref)}]",
+                 "必须填写引文中的标段原文编号或名称；当前指向未出现在引文中："
+                 + ref + "。不要填写内部事项key；请按已引用原文修正，并同步关联工作的范围")
+                for ref in missing
+            ]))
         item.update(id=entry["id"], business=entry)
         if output is not None:
             item["output"] = output
@@ -244,7 +300,8 @@ def prepare_coverage(
             item = validate_items([{
                 "field": "主题不适用：" + entry["topic"],
                 "values": [{"value": entry["detail"], "citations": entry["citations"]}],
-            }], seen, align=False)[0]
+            }], seen, align=False, source_locations=True)[0]
+            entry["citations"] = item["values"][0]["citations"]
             proof_key = "coverage:" + fingerprint([entry["topic"], entry["scope"]])
             previous = next((v for v in state.get("business_coverage", [])
                              if v["topic"] == entry["topic"] and v["scope"] == entry["scope"]

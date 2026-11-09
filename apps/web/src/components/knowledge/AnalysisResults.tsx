@@ -241,6 +241,13 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           {isActive(module.status) && module.progress.topics.some((topic) => ["researching", "needs_review"].includes(topic.status)) && <p>
             正在处理：{module.progress.topics.filter((topic) => ["researching", "needs_review"].includes(topic.status)).map((topic) => topic.title).join("、")}
           </p>}
+          {module.progress.phase === "review" && module.progress.review && <p>
+            {module.progress.review.stage === "initial" ? "完整审查" : "定向复核"} · 已完成 {module.progress.review.completed_packets}/{module.progress.review.total_packets} 包
+            {" · "}已用修复 {module.progress.review.repairs_used}/{module.progress.review.repairs_limit} 次
+              {module.progress.review.unresolved_issues !== undefined && <>
+                {" · "}剩余问题 {module.progress.review.unresolved_issues} 项
+              </>}
+          </p>}
           {module.progress.topics.filter((topic) => topic.status === "blocked").slice(0, 2).map((topic, index) => <p key={index}>
             研究受阻 · {topic.title}：{topic.tasks.find((task) => task.status === "blocked")?.detail || topic.detail}
           </p>)}
@@ -251,7 +258,9 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           {!!module.runs?.length && <ol className="analysis-runs" aria-label="历次分析记录">
             {module.runs.map((run) => <li key={run.id} className="run-detail" aria-label={`第 ${run.attempt} 次分析`}>
               <div className="run-summary"><strong>第 {run.attempt} 次 · {STATE_LABELS[run.status] ?? run.status}</strong>
-                <span>模型请求 {run.model_calls}/{run.limits.max_model_calls} · 工具调用 {run.tool_calls}/{run.limits.max_tool_calls}</span>
+                {/* 新旧接口切换时可能缺少成功字段；保留真实零值，缺失不能用尝试数或零冒充。 */}
+                <span>模型请求成功 {run.successful_model_calls == null ? "未记录" : `${run.successful_model_calls} 次`}
+                  {" · "}工具执行成功 {run.successful_tool_calls == null ? "未记录" : `${run.successful_tool_calls} 次`}</span>
               </div>
               <dl className="run-times">
                 <div><dt>开始时间</dt><dd><time dateTime={run.started_at ?? undefined}>{formatDateTime(run.started_at)}</time></dd></div>
@@ -260,9 +269,9 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
                   : isActive(run.status) ? "尚未结束" : "未记录"}</dd></div>
               </dl>
               {/* 每次尝试独立保留原因，后续成功不能覆盖此前失败或取消的信息。 */}
-              {(run.error_message || ["failed", "canceled"].includes(run.status)) && <p className="run-error" data-status={run.status}>
+                {(run.stop_reason?.message || run.error_message || ["failed", "canceled"].includes(run.status)) && <p className="run-error" data-status={run.status}>
                 <strong>{run.status === "canceled" ? "停止原因" : run.status === "failed" ? "失败原因" : "运行说明"}：</strong>
-                {run.error_message || "未记录"}
+                {run.stop_reason?.message || run.error_message || "未记录"}
               </p>}
             </li>)}
           </ol>}

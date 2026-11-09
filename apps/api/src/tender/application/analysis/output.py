@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tender.application.knowledge.content import normalized
+from tender.application.shared.validation import validation_message
 
 OUTPUT_VERSION = "1"
 
@@ -98,28 +100,71 @@ def _legacy_output_schema(snapshot: dict, module_key: str) -> dict:
     return {"version": OUTPUT_VERSION, "sections": sections}
 
 
+def output_contract(schema: dict) -> str:
+    """用冻结列名生成一个局部格式样例，避免精简提示后模型猜测分类和内容键的对应关系。"""
+    section = schema["sections"][0]
+    example = {
+        "group": section["title"] if section["title"] != "*" else "原文具体岗位或格式层级",
+        "content": {
+            column: "具体事项名称" if index == 0 and len(section["columns"]) > 1
+            else ["原文支持的具体要求"] if column in {"关键要求", "编制要求"}
+            else "原文支持的具体结论"
+            for index, column in enumerate(section["columns"])
+        },
+    }
+    return (
+        "group填写输出格式sections中的title（*使用原文具体岗位或格式层级）；"
+        "category是可选业务标签，不能代替group。content的键使用该分类的columns列名，"
+        "具体事项名称和结论写在列对应的值中。局部格式示例（值为占位说明）："
+        + json.dumps(example, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
 def record_output(record: dict, schema: dict) -> dict:
     """仅接纳当前专题允许的分类和内容键，模型不能新增通用字段/原文表格。"""
     section = next((
         s for s in schema["sections"] if s["title"] in {record["group"], "*"}
     ), None)
+    issues: list[tuple[str, str]] = []
     if section is None or (section["layout"] != "tree" and not record["group"].strip()):
-        raise ValueError("结果分类不符合当前 Skill 输出格式")
+        issues.append(("group",
+            "结果分类不符合当前 Skill 输出格式：group须填写分类："
+            + "、".join(s["title"] for s in schema["sections"])
+            + "；category不能代替group"
+        ))
+        # 只用可确定的候选分类诊断内容键，不能把category悄悄转换成有效group。
+        section = next((s for s in schema["sections"]
+                        if s["title"] == record.get("category")), None)
+        if section is None and len({tuple(s["columns"]) for s in schema["sections"]}) == 1:
+            section = schema["sections"][0]
     content = record.get("content") or {}
-    if not content or set(content) - set(section["columns"]):
-        raise ValueError("content 只能填写当前分类的内容键：" + "、".join(section["columns"]))
+    if section is not None and (not content or set(content) - set(section["columns"])):
+        issues.append(("content",
+            "content 只能填写当前分类的内容键：" + "、".join(section["columns"])
+            + "；具体事项名称和结论写在列对应的值中，不作为content键"
+        ))
+    if section is None:
+        raise ValueError(validation_message(issues))
     # 两列各自的数组没有可靠配对语义；仅新快照声明单值列，旧报告保留原协议。
     for column in section.get("scalar_columns", []):
         if column in content and not isinstance(content[column], str):
-            raise ValueError(f"{column}必须是单个事项名称；请将多个独立字段分别逐条提交")
-    for value in content.values():
+            issues.append(("content." + column,
+                           f"{column}必须是单个事项名称；请将多个独立字段分别逐条提交"))
+    for column, value in content.items():
         values = value if isinstance(value, list) else [value]
         if not values or any(not isinstance(v, str) or not v.strip() for v in values):
-            raise ValueError("结果内容不能为空；缺少原文依据的内容键应省略")
+            issues.append(("content." + column, "结果内容不能为空；缺少原文依据的内容键应省略"))
+    if record["group"] == "技术方案要求" and not {"要求摘要", "关键要求"} & content.keys():
+        issues.append(("content", "技术方案条目缺少有依据的要求内容；填写要求摘要或关键要求"))
+    elif (len(section["columns"]) > 1 and content
+          and not set(content) - {section["columns"][0]} and record["group"] != "总分构成"):
+        issues.append(("content", "结果只有事项名称，缺少有依据的分析内容；请补充："
+                       + "、".join(section["columns"][1:])))
+    if issues:
+        # 先汇总所有可独立判断的问题，再进行内容规范化；不能让模型逐个碰错。
+        raise ValueError(validation_message(issues))
     content = dict(content)
     if record["group"] == "技术方案要求":
-        if not {"要求摘要", "关键要求"} & content.keys():
-            raise ValueError("技术方案条目缺少有依据的要求内容")
         # 单条要求的字符串可直接包成数组；摘要与条目相互补齐不增加新断言，随后仍整体送审。
         if "关键要求" not in content:
             summary = content["要求摘要"]
@@ -127,9 +172,6 @@ def record_output(record: dict, schema: dict) -> dict:
         elif isinstance(content["关键要求"], str):
             content["关键要求"] = [content["关键要求"]]
         content.setdefault("要求摘要", "；".join(content["关键要求"]))
-    elif (len(section["columns"]) > 1 and not set(content) - {section["columns"][0]}
-          and record["group"] != "总分构成"):
-        raise ValueError("结果只有事项名称，缺少有依据的分析内容")
     # 原文可能只提供部分列，不能要求模型为了凑齐首末列而编造信息。
     return {
         "version": OUTPUT_VERSION, "layout": section["layout"],

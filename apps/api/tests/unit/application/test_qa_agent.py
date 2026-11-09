@@ -88,6 +88,31 @@ async def answer(client, research, **options):
     )
 
 
+def test_citation_feedback_allows_rereading_with_the_qa_tool_parameters():
+    client = Client([
+        call("search_document", {"query": "质保"}, 1),
+        submit(2, [submitted_field("质保", "质保三年", quote="质保五年")], final=False),
+        call("read_document", {"source_id": 1, "offset": 0, "limit": 1}, 3),
+        submit(4, [submitted_field("质保", "质保三年")], final=True),
+    ])
+    draft, _ = asyncio.run(answer(client, session([block()])))
+    feedback = next(
+        message["data"]["content"] for message in client.requests[2]
+        if message["type"] == "tool" and message["data"]["tool_call_id"] == "call_2"
+    )
+    # 问答按来源和偏移回读；共享引文错误不能诱导模型使用解析工具的邻段参数。
+    assert "read_document" in feedback and "复制连续原文" in feedback
+    assert "before" not in feedback and "after" not in feedback
+    reread = next(
+        message["data"] for message in client.requests[3]
+        if message["type"] == "tool" and message["data"]["tool_call_id"] == "call_3"
+    )
+    assert reread["status"] == "success"
+    assert json.loads(reread["content"])["blocks"][0]["block_id"] == "s1r1c0"
+    assert draft["fields"][0]["values"][0]["value"] == "质保三年"
+    assert len(client.requests) == 4
+
+
 def test_batches_accumulate_and_only_explicit_final_finishes():
     first = submitted_field("质保", "质保三年")
     second = submitted_field("服务期限", "质保三年")

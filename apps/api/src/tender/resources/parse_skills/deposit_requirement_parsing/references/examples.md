@@ -39,8 +39,7 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "本项目不收取投标保证金。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -68,8 +67,7 @@
           },
           "citations": [
             {
-              "block_id": "example-2",
-              "quote": "履约保证金为合同金额的5%。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

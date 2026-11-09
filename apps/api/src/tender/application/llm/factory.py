@@ -92,6 +92,8 @@ class RoutingModelFactory:
         extra_retries_limit: int | None = None,
         rate_limit_backoff_seconds: float = 30,
         rate_limit_max_wait_seconds: float = 600,
+        invocation_store=None,
+        before_call=None,
     ) -> RoutingModel:
 
         cooldown = self.cooldown
@@ -143,4 +145,6 @@ class RoutingModelFactory:
             remaining_seconds=remaining_seconds,
             rate_limit_backoff_seconds=rate_limit_backoff_seconds,
             rate_limit_max_wait_seconds=rate_limit_max_wait_seconds,
+            invocation_store=invocation_store,
+            before_call=before_call,
         )

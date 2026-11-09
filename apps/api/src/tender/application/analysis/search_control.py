@@ -161,7 +161,9 @@ class TopicSearch:
                                     + "；选择其他工作，有新线索时用update_research明确reopen",
                                     closed=True)
                     if set(requested) - registered:
-                        self.reject("work须选择当前工作索引中的有效ID")
+                        self.reject("work须选择当前工作索引中的有效ID：" + "、".join(
+                            c["id"] for c in choices[:8]
+                        ))
                 else:
                     self.reject("work未对应当前待办；请省略work按主题检索，或使用search_work返回的id")
             choices = [c for c in choices if set(requested) & {c["id"], c["work"]}]

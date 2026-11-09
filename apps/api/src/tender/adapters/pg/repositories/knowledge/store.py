@@ -1177,6 +1177,8 @@ class KnowledgeSession:
         self._session.execute(
             pg_insert(AgentModuleRun)
             .values(
+                successful_model_calls=0,
+                successful_tool_calls=0,
                 module_id=module_id,
                 company_id=company_id,
                 attempt=1,
@@ -1486,6 +1488,8 @@ class KnowledgeSession:
                 thread_id=thread_id,
                 limits=limits,
                 state=state,
+                successful_model_calls=0,
+                successful_tool_calls=0,
             )
         )
 

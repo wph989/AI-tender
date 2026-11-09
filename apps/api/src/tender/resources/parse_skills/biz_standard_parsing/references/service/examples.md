@@ -42,12 +42,10 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "阶段服务成果验收合格后支付合同金额的30%。"
+              "block_id": "example-1"
             },
             {
-              "block_id": "example-2",
-              "quote": "上述付款须先取得合规发票，收到发票后15日内支付。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

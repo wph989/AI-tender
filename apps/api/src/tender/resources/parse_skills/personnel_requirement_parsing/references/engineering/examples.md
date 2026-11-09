@@ -42,12 +42,10 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "配备总监理工程师1名，具有有效的注册监理工程师证书。"
+              "block_id": "example-1"
             },
             {
-              "block_id": "example-2",
-              "quote": "该总监理工程师最多只能同时担任3项工程（含本项目）的相关岗位。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

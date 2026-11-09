@@ -199,8 +199,11 @@ def test_thirteen_topic_review_packets_keep_domain_rules_properties_and_quotes(k
         assert packet["domain_rules"] == rules
         for row in packet["records"]:
             seen.setdefault(row["record_id"], []).extend(row["values"])
-        validate({"reviews": {}, "issues": [],
-                  "context_requests": [packet["available_context"][0]]}, packet)
+        validate({"reviews": {row["record_id"]: {
+            "supported": True, "issues": [],
+            "bindings": {v["value_id"]: v["candidate_ids"] for v in row["values"]},
+        } for row in packet["records"]}, "issues": [],
+                  "checked_units": [r["unit_id"] for r in packet["evidence"]]}, packet)
         assert all(c["quote"] in research.seen[c["block_id"]]["content"]
                    for c in packet["citations"].values())
     assert seen.keys() == {i["id"] for i in prepared}
@@ -266,7 +269,7 @@ def test_no_deposit_hit_keeps_gap_instead_of_emitting_exemption():
     assert any(gap["key"] == "deposit-search" for gap in business["gaps"])
 
 
-def test_example_cannot_cite_unread_or_invented_quote():
+def test_example_rejects_unread_location_and_ignores_legacy_quote():
     key = "biz_standard_parsing"
     value = examples(RESOURCE_ROOT / key / "references/output_format.md")[0]
     seen = {row["block_id"]: row for row in example_rows(value)}
@@ -276,8 +279,8 @@ def test_example_cannot_cite_unread_or_invented_quote():
     with pytest.raises(ValueError, match="未读取"):
         prepare_records([business_record(raw)], state, seen, key)
     raw["citations"][0] = {"block_id": "example-1", "quote": "预付全部价款"}
-    with pytest.raises(ValueError, match="引用"):
-        prepare_records([business_record(raw)], state, seen, key)
+    item = prepare_records([business_record(raw)], state, seen, key)[0]
+    assert item["values"][0]["citations"][0]["quote"] == seen["example-1"]["content"]
 
 
 def test_fact_labels_cannot_be_parallel_arrays_in_new_snapshots():

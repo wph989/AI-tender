@@ -168,7 +168,7 @@ def test_call_record_preserves_long_upstream_details_and_hides_candidate_key():
 
 def test_invalid_json_is_corrected_before_trying_an_unavailable_fallback():
     completion, records, gateway = _run(
-        [_candidate("a", 1), _candidate("b", 2)],
+        [replace(_candidate("a", 1), extra_retries=1), _candidate("b", 2)],
         {"a": [InvalidModelOutput("非法 JSON"), None], "b": [ModelUnavailable("超时")]},
     )
     assert completion.model == "a"
@@ -182,7 +182,7 @@ def test_invalid_json_is_corrected_before_trying_an_unavailable_fallback():
 
 def test_invalid_json_exhausts_two_corrections_then_fails_over():
     completion, records, _ = _run(
-        [_candidate("a", 1), _candidate("b", 2)],
+        [replace(_candidate("a", 1), extra_retries=2), _candidate("b", 2)],
         {"a": [InvalidModelOutput("非法 JSON")] * 3, "b": [None]},
     )
     assert completion.model == "b"
@@ -203,7 +203,8 @@ def test_format_correction_does_not_reset_total_request_budget():
     router = RoutingModel(
         "analysis",
         "analysis",
-        [_candidate("a", 1), _candidate("b", 2)],
+        [replace(_candidate("a", 1), extra_retries=2),
+         replace(_candidate("b", 2), extra_retries=2)],
         _ScriptedGateway({name: [InvalidModelOutput("非法 JSON")] * 3 for name in "ab"}),
         records.append,
     )
@@ -429,8 +430,8 @@ def test_retry_after_larger_than_deadline_stops_without_retry():
     assert len(records) == 1
 
 
-def test_rate_limit_wait_does_not_consume_retry_allowance():
-    """限流是暂时没有配额，不是请求失败：等待后必须仍然可以重试。"""
+def test_rate_limit_send_uses_one_retry_but_wait_does_not_add_requests():
+    """真实发送使用配置重试额度，冷却等待不会额外占用一次请求。"""
 
     async def run():
         records: list[CallRecord] = []
@@ -438,12 +439,11 @@ def test_rate_limit_wait_does_not_consume_retry_allowance():
         limit.retry_after = 0.01
         gateway = _ScriptedGateway({"a": [limit, True]})
         model = RoutingModel(
-            "analysis", "analysis", [replace(_candidate("a", 1), extra_retries=0)],
+            "analysis", "analysis", [replace(_candidate("a", 1), extra_retries=1)],
             gateway, records.append,
             rate_limit_backoff_seconds=0.01, rate_limit_max_wait_seconds=0.05,
         )
         try:
-            # extra_retries=0 时旧实现只允许一次请求，这里必须能在等待后成功。
             completion = await model.complete("分析")
         finally:
             await model.aclose()
@@ -485,7 +485,7 @@ def test_rate_limit_backoff_grows_when_the_supplier_gives_no_reset_time():
         second = ModelUnavailable("限流", http_status=429)
         gateway = _ScriptedGateway({"a": [first, second, True]})
         model = RoutingModel(
-            "analysis", "analysis", [replace(_candidate("a", 1), extra_retries=0)],
+            "analysis", "analysis", [replace(_candidate("a", 1), extra_retries=2)],
             gateway, records.append,
             rate_limit_backoff_seconds=0.01, rate_limit_max_wait_seconds=5,
         )
@@ -512,7 +512,7 @@ def test_rate_limit_cooldown_avoids_repeated_requests_and_invalid_usage_is_recor
         model = RoutingModel(
             "analysis",
             "analysis",
-            [_candidate("limited", 1), _candidate("fallback", 2)],
+            [_candidate("limited", 1), replace(_candidate("fallback", 2), extra_retries=1)],
             gateway,
             records.append,
         )
@@ -596,6 +596,7 @@ def test_retry_after_waits_without_burning_requests(monkeypatch):
 
     now, sleeps, records = [100.0], [], []
     monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(llm_routing.time, "time", lambda: now[0])
 
     async def sleep(seconds):
         sleeps.append(seconds)
@@ -625,6 +626,7 @@ def test_disabled_failover_waits_for_primary_instead_of_using_a_lower_priority_m
 
     now, records = [100.0], []
     monkeypatch.setattr(llm_routing.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(llm_routing.time, "time", lambda: now[0])
 
     async def sleep(seconds):
         now[0] += seconds

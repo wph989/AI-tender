@@ -47,8 +47,7 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "A标段报价包括驻场人员工资、日常交通费和国家规定的税金。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -81,8 +80,7 @@
           },
           "citations": [
             {
-              "block_id": "example-2",
-              "quote": "A标段因采购人书面要求增加异地踏勘的，新增交通和住宿费用由采购人另行支付。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

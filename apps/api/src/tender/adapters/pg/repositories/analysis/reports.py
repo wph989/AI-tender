@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import Engine, case, exists, func, literal, select
+from sqlalchemy import Engine, case, exists, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import aliased
 
@@ -141,6 +141,33 @@ class ReportQueries:
             ),
             else_=literal([], type_=JSONB),
         ).label("saved_items")
+        # 成功数来自已落定的结果事件，不能用预占次数推算；聚合只扫描本报告的运行账。
+        successes = (
+            select(
+                AgentRunEvent.run_id,
+                func.count().filter(
+                    AgentRunEvent.kind == "model_result",
+                    AgentRunEvent.detail["status"].astext == "ok",
+                ).label("successful_model_calls"),
+                func.count().filter(
+                    # Skill 自动加载也扣工具尝试次数，其成功事件须与普通工具结果一起统计。
+                    or_(AgentRunEvent.kind == "skill_loaded", (
+                        (AgentRunEvent.kind == "tool_result")
+                        & (AgentRunEvent.detail["status"].astext == "success")
+                    )),
+                ).label("successful_tool_calls"),
+            )
+            .select_from(AgentRunEvent)
+            .join(AgentModuleRun, AgentModuleRun.id == AgentRunEvent.run_id)
+            .join(AnalysisModule, AnalysisModule.id == AgentModuleRun.module_id)
+            .where(
+                AnalysisModule.report_id == report_id,
+                AgentModuleRun.company_id == self.company_id,
+                AgentRunEvent.kind.in_(("model_result", "tool_result", "skill_loaded")),
+            )
+            .group_by(AgentRunEvent.run_id)
+            .subquery()
+        )
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(
@@ -155,14 +182,25 @@ class ReportQueries:
                     AgentModuleRun.lease_until,
                     AgentModuleRun.model_calls,
                     AgentModuleRun.tool_calls,
+                    # 旧运行没有结果事件时保留NULL，由页面显示未记录，不能伪造成功0次。
+                    func.coalesce(AgentModuleRun.successful_model_calls,
+                                  successes.c.successful_model_calls).label(
+                        "successful_model_calls",
+                    ),
+                    func.coalesce(AgentModuleRun.successful_tool_calls,
+                                  successes.c.successful_tool_calls).label(
+                        "successful_tool_calls",
+                    ),
                     AgentModuleRun.prompt_tokens,
                     AgentModuleRun.completion_tokens,
                     AgentModuleRun.limits,
                     AgentModuleRun.error_message,
+                    AgentModuleRun.state["stop_reason"].label("stop_reason"),
                     saved,
                 )
                 .select_from(AgentModuleRun)
                 .join(AnalysisModule, AnalysisModule.id == AgentModuleRun.module_id)
+                .outerjoin(successes, successes.c.run_id == AgentModuleRun.id)
                 .where(
                     AnalysisModule.report_id == report_id,
                     AgentModuleRun.company_id == self.company_id,

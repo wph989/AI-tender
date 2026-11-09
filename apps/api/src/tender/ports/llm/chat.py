@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -35,6 +36,24 @@ class StructuredTextModel(Protocol):
     async def aclose(self) -> None:
         """释放连接池。"""
         ...
+
+
+class ValidatedTextModel(Protocol):
+    """校验与重试属于同一请求窗口，只有校验通过的响应才可结算成功。"""
+
+    async def complete_validated(
+        self, prompt: str, *, validate: Callable[[Completion], object] | None = None,
+        call_key: str | None = None,
+        validate_input: Callable[[str], object] | None = None,
+    ) -> Completion: ...
+
+
+class ModelInvocationStore(Protocol):
+    """恢复模型逻辑请求所需的窗口与有效响应；实现负责所有权校验。"""
+
+    def load_invocation(self, key: str) -> dict: ...
+
+    def save_invocation(self, key: str, value: dict) -> None: ...
 
 
 class ChatGateway(StructuredTextModel, Protocol):

@@ -123,6 +123,8 @@ class ModelUnavailable(TenderError):
 
     code: ClassVar[str] = "model_unavailable"
     retryable: ClassVar[bool] = True
+    # 上游仍可在新运行重试，但已耗尽的逻辑调用不能再触发外层检查点恢复。
+    invocation_exhausted: bool = False
 
 
 class ModelRefused(ModelCallFailed):

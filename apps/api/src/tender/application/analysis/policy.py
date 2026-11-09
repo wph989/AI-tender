@@ -77,7 +77,8 @@ def skill_digest(content: str, *, schema: dict | None, topics: list[dict]) -> st
     retrieval = _skill_section(content, "## 本项目的检索与输出")
     if not flow or not retrieval:
         return ""
-    parts = [flow, retrieval, "citations只使用已读ID及逐字原文；结构与支持性校验通过后保存成果。"]
+    parts = [flow, retrieval,
+             "正文归纳总结，citations只填已读block_id，无需quote；程序补齐定位，通过支持性校验后保存。"]
     if schema:
         keys = "；".join(
             str(section.get("title", "")) + "（"

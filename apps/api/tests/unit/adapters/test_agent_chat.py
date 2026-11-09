@@ -542,7 +542,7 @@ def test_native_protocol_retry_receives_specific_schema_error(wrong_name):
             "analysis", "fixture", [ModelCandidate(
                 registry_model_id=1, provider_id=1, display_name="fixture", model="fixture",
                 base_url="http://test/v1", api_key=None, timeout=5, temperature=None,
-                max_tokens=128, extra_retries=0,
+                max_tokens=128, extra_retries=1,
             )], lambda *args, **kwargs: model, records.append,
         )
         try:
@@ -586,5 +586,29 @@ def test_each_module_owns_http_clients_so_closing_one_does_not_break_another():
             assert not second._owned_sync_http.is_closed
         finally:
             await second.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("duplicate_ids", [False, True])
+def test_native_protocol_rejects_wrong_parameter_types_and_duplicate_call_ids(duplicate_ids):
+    async def run():
+        calls = [{"id": "call_1", "type": "function", "function": {
+            "name": "search_document", "arguments": '{"query":"预算"}'
+            if duplicate_ids else '{"query":12}',
+        }}]
+        if duplicate_ids:
+            calls.append(calls[0])
+        model = agent(httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: stream_response(response({"role": "assistant", "content": None,
+                                                  "tool_calls": calls})),
+        )))
+        try:
+            with pytest.raises(InvalidModelOutput) as caught:
+                await model.chat([message_to_dict(HumanMessage(content="分析"))], [TOOL])
+            assert "id" in str(caught.value) if duplicate_ids else "type" in str(caught.value)
+            assert (caught.value.prompt_tokens, caught.value.completion_tokens) == (12, 7)
+        finally:
+            await model.aclose()
 
     asyncio.run(run())

@@ -11,8 +11,11 @@ from __future__ import annotations
 from tender.ports.repository.shared.schema import SchemaReader
 
 # 分析链路强依赖的对象，缺少任何一个都会在流程中途报错，必须提前发现。
-REQUIRED_COLUMNS = (("analysis_module", "business_data"), ("analysis_report", "derived_lot_ids"))
-REQUIRED_TABLES = ("analysis_data_snapshot",)
+REQUIRED_COLUMNS = (
+    ("analysis_module", "business_data"), ("analysis_report", "derived_lot_ids"),
+    ("agent_module_run", "successful_model_calls"), ("agent_module_run", "successful_tool_calls"),
+)
+REQUIRED_TABLES = ("analysis_data_snapshot", "agent_call_attempt", "agent_model_invocation")
 
 
 def missing_schema(db: SchemaReader) -> list[str]:

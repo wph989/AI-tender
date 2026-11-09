@@ -39,9 +39,13 @@ class AgentRunStore(Protocol):
         """到期后仅允许核实成果收尾，仍须验证所有权、租约与配额锁。"""
         ...
 
-    def reserve(self, kind: str) -> None:
+    def reserve(self, kind: str, call_key: str | None = None) -> str:
         """预占一次模型或工具调用；预算耗尽时抛 ``ValueError``。``kind`` 取 model/tool。"""
         ...
+
+    def load_invocation(self, key: str) -> dict: ...
+
+    def save_invocation(self, key: str, value: dict) -> None: ...
 
     def record_call(self, record: dict[str, Any]) -> None:
         """累计一次模型调用的 token 用量并记一条审计事件（``record`` 已序列化为字典）。"""

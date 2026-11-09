@@ -133,12 +133,12 @@ def test_schema_guard_does_not_touch_inaccessible_or_terminal_reports(monkeypatc
 
 
 def test_ready_schema_allows_analysis(monkeypatch):
+    from tender.application.shared.schema_guard import REQUIRED_COLUMNS, REQUIRED_TABLES
+
     db = Mock(spec=KnowledgeStore)
     db.accessible_report_status.return_value = "running"
-    db.schema_columns.return_value = {
-        ("analysis_module", "business_data"), ("analysis_report", "derived_lot_ids")
-    }
-    db.schema_tables.return_value = {"analysis_data_snapshot"}
+    db.schema_columns.return_value = set(REQUIRED_COLUMNS)
+    db.schema_tables.return_value = set(REQUIRED_TABLES)
     report = {"id": 16, "status": "running", "runtime_version": RUNTIME_VERSION}
     db.report_for_analysis.return_value = report
     analyze = AsyncMock()

@@ -878,6 +878,7 @@ test.describe("每次分析的时间与原因", () => {
       id: 1, attempt: 1, status: "failed", thread_id: "run-1", started_at: "2026-10-19T01:01:01Z",
       finished_at: "2026-10-19T01:02:03Z", deadline_at: "2026-10-19T01:30:00Z",
       model_calls: 10, tool_calls: 8, prompt_tokens: 100, completion_tokens: 50,
+      successful_model_calls: 6, successful_tool_calls: 5,
       limits: { max_model_calls: 80, max_tool_calls: 100, timeout_seconds: 1800, max_output_tokens: 8192 },
       error_message: "HTTP 429：模型服务限流。\n请稍后重试。",
     };
@@ -894,6 +895,10 @@ test.describe("每次分析的时间与原因", () => {
     const history = page.getByRole("list", { name: "历次分析记录", exact: true });
     await expect(history.getByRole("listitem")).toHaveCount(4);
     const failed = history.getByRole("listitem", { name: "第 1 次分析", exact: true });
+    // 成功次数独立展示，不能拿包含失败的尝试次数或执行上限作为分母。
+    await expect(failed.locator(".run-summary")).toContainText("模型请求成功 6 次 · 工具执行成功 5 次");
+    await expect(failed.locator(".run-summary")).not.toContainText("10/80");
+    await expect(failed.locator(".run-summary")).not.toContainText("8/100");
     await expect(failed).toContainText("2026/10/19 09:01:01");
     await expect(failed).toContainText("2026/10/19 09:02:03");
     await expect(failed.locator(".run-error")).toHaveText("失败原因：HTTP 429：模型服务限流。 请稍后重试。");
@@ -910,6 +915,7 @@ test.describe("每次分析的时间与原因", () => {
       status: "running", modules: [{ ...modules[0]!, items: [], status: "running", runs: [{
         id: 1, attempt: 1, status: "running", thread_id: "run-1", started_at: "2026-10-19T01:01:01Z",
         finished_at: null, deadline_at: "2026-10-19T01:30:00Z", model_calls: 1, tool_calls: 1,
+        successful_model_calls: 0, successful_tool_calls: 0,
         prompt_tokens: 100, completion_tokens: 50, error_message: null,
         limits: { max_model_calls: 80, max_tool_calls: 100, timeout_seconds: 1800, max_output_tokens: 8192 },
       }] }],
@@ -918,8 +924,33 @@ test.describe("每次分析的时间与原因", () => {
     await page.locator(".module-operations > summary").click();
     const history = page.getByRole("list", { name: "历次分析记录", exact: true });
     await expect(history).toContainText("尚未结束");
+    await expect(history).toContainText("模型请求成功 0 次 · 工具执行成功 0 次");
     await expect(history).not.toContainText("09:30:00");
     await expect(page.getByRole("button", { name: "重新解析本模块", exact: true })).toBeDisabled();
+  });
+
+  test("接口缺少成功统计时显示未记录，不能空白或用尝试数代替", async ({ page }) => {
+    const run = {
+      id: 1, attempt: 4, status: "partial", thread_id: "run-4", started_at: "2026-11-08T08:25:22Z",
+      finished_at: "2026-11-08T08:58:51Z", deadline_at: "2026-11-08T09:25:22Z",
+      model_calls: 48, tool_calls: 39, prompt_tokens: 100, completion_tokens: 50,
+      limits: { max_model_calls: 80, max_tool_calls: 100, timeout_seconds: 3600, max_output_tokens: 8192 },
+      error_message: "审查重复请求已提供上下文：dates",
+    };
+    await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+      modules: [{ ...modules[0]!, items: [], runs: [
+        run, { ...run, id: 2, attempt: 5, successful_model_calls: 0, successful_tool_calls: null },
+      ] }],
+    }) }));
+    await page.reload();
+    await page.locator(".module-operations > summary").click();
+    const history = page.getByRole("list", { name: "历次分析记录", exact: true });
+    const missing = history.getByRole("listitem", { name: "第 4 次分析", exact: true });
+    await expect(missing.locator(".run-summary")).toContainText("模型请求成功 未记录 · 工具执行成功 未记录");
+    await expect(missing.locator(".run-summary")).not.toContainText("48");
+    await expect(missing.locator(".run-summary")).not.toContainText("39");
+    await expect(history.getByRole("listitem", { name: "第 5 次分析", exact: true }).locator(".run-summary"))
+      .toContainText("模型请求成功 0 次 · 工具执行成功 未记录");
   });
 });
 
@@ -1031,5 +1062,36 @@ test("研究与综合阶段只展示进度，结束后统一展示结果并保�
   await expect(progress).toContainText("已展示 2 条结果");
   await page.locator('[data-report-item="background"]').getByRole("button", { name: /^定位：/ }).first().click();
   await expect(page.getByRole("region", { name: "引用原文", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test("审查展示分包和修复进度，部分完成显示具体停止原因", async ({ page }) => {
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+    status: "partial", modules: [{ ...modules[0]!, status: "partial", items: [], runs: [{
+      id: 1, attempt: 1, status: "partial", thread_id: "review-v2",
+      started_at: "2026-11-08T08:25:22Z", finished_at: "2026-11-08T08:58:51Z",
+      deadline_at: null, model_calls: 9, tool_calls: 8,
+      successful_model_calls: 4, successful_tool_calls: 5, prompt_tokens: 100, completion_tokens: 20,
+      limits: { max_model_calls: 40, max_tool_calls: 48, timeout_seconds: 3600, max_output_tokens: 8192 },
+      error_message: null, stop_reason: { code: "review_call_failed", stage: "review",
+        message: "项目身份审查在候选重试后仍超时；已保留核实成果，可补跑继续。" },
+    }] }],
+  }) }));
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => {
+    const data = records(modules[0]!);
+    data.progress = { phase: "review", audit_round: 1, review: {
+      stage: "repair", completed_packets: 2, total_packets: 3,
+      repairs_used: 1, repairs_limit: 2, unresolved_issues: 1,
+    }, topics: [] };
+    return route.fulfill({ json: data });
+  });
+  await page.reload();
+  const progress = page.getByRole("status", { name: "解析进展" });
+  await expect(progress).toContainText("定向复核 · 已完成 2/3 包");
+  await expect(progress).toContainText("已用修复 1/2 次 · 剩余问题 1 项");
+  await page.locator(".module-operations > summary").click();
+  const history = page.getByRole("list", { name: "历次分析记录", exact: true });
+  await expect(history).toContainText("模型请求成功 4 次 · 工具执行成功 5 次");
+  await expect(history).toContainText("项目身份审查在候选重试后仍超时");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });

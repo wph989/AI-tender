@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tender.application.knowledge.content import normalized
+from tender.application.shared.validation import allowed_values
 from tender.ports.repository.knowledge.sources import ChunkWindow
 
 Retrieve = Callable[[list[dict], str], Awaitable[tuple[list[dict], dict]]]
@@ -58,6 +59,8 @@ class AgentLimits:
     max_model_recoveries: int = 2
     # 同一查询最多翻 5 页；候选窗口按页大小成倍缓存，避免改写同义词续命。
     max_search_pages: int = 5
+    max_review_repairs: int = 1
+    review_max_input_tokens: int = 12000
 
     @property
     def search_window(self) -> int:
@@ -93,10 +96,72 @@ class ResearchSession:
         # 每次工具操作都重新检查取消及关联权限；不能只在任务创建时检查一次。
         await self.authorize()
         async with self._lock:
-            if self.tool_calls >= self.limits.max_tool_calls:
+            if not self.compact_results and self.tool_calls >= self.limits.max_tool_calls:
                 raise ValueError("本模块已达到工具调用预算")
             self.tool_calls += 1
             self.events.append({"action": action, "arguments": arguments})
+
+    async def review_context(self, anchors: set[str]) -> dict:
+        """程序补齐已知引文的邻域；沿用授权和证据上限，不伪造Agent工具调用。"""
+        await self.authorize()
+        ranges: dict[int, list[tuple[int, int]]] = {}
+        for key in sorted(anchors):
+            row = self.seen[key]
+            offset = row["offset"]
+            ranges.setdefault(row["source_id"], []).append((max(0, offset - 1), offset + 2))
+        blocks = []
+        for source_id, windows in ranges.items():
+            source = next(s for s in self.sources if s["source_id"] == source_id)
+            merged: list[list[int]] = []
+            for start, end in sorted(windows):
+                if merged and start <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], end)
+                else:
+                    merged.append([start, end])
+            for start, end in merged:
+                for offset in range(start, end, 12):
+                    await self.authorize()
+                    window = await self.read(source, offset, min(12, end - offset))
+                    blocks.extend(window.rows)
+        # 长表格/段落可能横跨很多块；沿已知元素读至边界，不能把固定邻域当作完整依赖。
+        by_position = {(r["source_id"], r["offset"]): r for r in blocks}
+        checked = set(by_position)
+        pending = [(self.seen[key]["source_id"], self.seen[key]["offset"],
+                    self.seen[key]["element_id"]) for key in anchors]
+        visited = set()
+        while pending:
+            sid, offset, element_id = pending.pop()
+            if (sid, offset) in visited:
+                continue
+            visited.add((sid, offset))
+            for neighbor in (offset - 1, offset + 1):
+                if neighbor < 0:
+                    continue
+                position = sid, neighbor
+                if position not in checked:
+                    if len(checked) >= self.limits.max_evidence_blocks:
+                        raise EvidenceBudgetError("审查条款续段超过证据上限，无法完整准备依赖")
+                    await self.authorize()
+                    source = next(s for s in self.sources if s["source_id"] == sid)
+                    window = await self.read(source, neighbor, 1)
+                    checked.add(position)
+                    for row in window.rows:
+                        by_position[row["source_id"], row["offset"]] = row
+                adjacent = by_position.get(position)
+                if adjacent and adjacent["element_id"] == element_id:
+                    pending.append((sid, neighbor, element_id))
+        blocks = list(by_position.values())
+        await self.authorize()
+        if anchors - {r["block_id"] for r in blocks}:
+            raise PermissionError("审查引文已失效，请基于最新资料重新分析")
+        async with self._lock:
+            result = self._remember(blocks, deduplicate=False)
+        if result.get("omitted_blocks"):
+            raise EvidenceBudgetError("审查必要邻域超过证据上限，请调整证据额度后补跑")
+        self.events.append({"action": "read_result", "anchor_ids": sorted(anchors),
+                            "block_ids": sorted(r["block_id"] for r in blocks),
+                            "prepared_for_review": True})
+        return result
 
     def _sources(self, scope: str, source_id: int | None = None) -> list[dict]:
         if scope not in {"project", "reference"}:
@@ -368,7 +433,9 @@ class ResearchSession:
             return await self._read_batch(block_id, before, after)
         row = self.seen.get(block_id)
         if row is None:
-            raise ToolArgumentError("证据ID尚未读取，请先检索；不得猜测其他资料的ID")
+            raise ToolArgumentError(
+                "block_id：证据ID尚未读取，请先检索；已读ID：" + allowed_values(self.seen)
+            )
         sources = [s for s in self.sources if s["source_id"] == row["source_id"]]
         if len(sources) != 1:
             raise SourceNotAllowed("证据所属资料不在授权范围")
@@ -398,7 +465,10 @@ class ResearchSession:
         """同批邻域先合并再读取，减少交互与重叠窗口；容量不足时显式返回续读边界。"""
         if (not 1 <= len(block_ids) <= 4
                 or any(not isinstance(key, str) or key not in self.seen for key in block_ids)):
-            raise ToolArgumentError("批量补读须提供1到4个已读ID；包含尚未读取的证据")
+            raise ToolArgumentError(
+                "block_id：批量补读须提供1到4个已读ID；包含尚未读取的证据；可选ID："
+                + allowed_values(self.seen)
+            )
         sources = {s["source_id"]: s for s in self.sources}
         anchors = [self.seen[key] for key in dict.fromkeys(block_ids)]
         if any(row["source_id"] not in sources for row in anchors):

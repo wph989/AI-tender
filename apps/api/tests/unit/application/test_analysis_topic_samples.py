@@ -169,14 +169,16 @@ async def run_combined_sample():
                                            "final": True}, "finish"))
     prompts, tool_calls = [], []
     class Reviewer:
-        async def complete(self, prompt):
+        async def complete_validated(self, prompt, *, validate=None, **kwargs):
             prompts.append(prompt)
             payload = json.loads(prompt.rsplit("\n", 1)[-1])
             reviews = {row["record_id"]: {"supported": True, "issues": [],
                        "bindings": {v["value_id"]: v["candidate_ids"] for v in row["values"]}}
                        for row in payload["records"]}
-            return Completion(content=json.dumps({"reviews": reviews, "issues": [],
-                                                   "context_requests": []}), model="offline")
+            result = Completion(content=json.dumps({"reviews": reviews, "issues": [],
+                "checked_units": [r["unit_id"] for r in payload["evidence"]]}), model="offline")
+            validate(result)
+            return result
     async def review(payload):
         return await review_combined(Reviewer(), payload)
     async def reserve():

@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 import httpx
+from jsonschema import Draft202012Validator
 from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
@@ -211,13 +212,25 @@ class AgentChat:
             for tool in tools
         }
         issues = []
+        call_ids = set()
         for call in result.tool_calls:
+            if not call.get("id") or call["id"] in call_ids:
+                issues.append("工具调用id须为非空且在本响应中唯一的字符串")
+            call_ids.add(call.get("id"))
             if call["name"] not in required:
                 # 模型可把正文误塞进工具名，不能回显未知名称；只给出服务端允许的名单。
                 issues.append("未知工具；当前可用工具：" + "、".join(required))
             elif absent := required[call["name"]] - call["args"].keys():
                 # 缺项来自本次工具schema，无需回显参数值或整份模型响应即可准确纠正。
                 issues.append(call["name"] + " 缺少必填参数：" + "、".join(sorted(absent)))
+            else:
+                schema = next(t["function"].get("parameters", {}) for t in tools
+                              if t["function"]["name"] == call["name"])
+                # 完整协议类型在成功结算前校验；范围和引文等业务规则仍由工具执行判断。
+                for error in list(Draft202012Validator(schema).iter_errors(call["args"]))[:6]:
+                    path = ".".join(str(p) for p in error.absolute_path) or "args"
+                    issues.append(call["name"] + "." + path
+                                  + " 不符合工具JSON Schema的 " + error.validator + " 约束")
         missing = bool(issues)
         finish = result.response_metadata.get("finish_reason") or result.response_metadata.get(
             "stop_reason"

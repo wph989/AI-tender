@@ -568,7 +568,7 @@ def test_prevalidation_failure_preserves_valid_batch_items_and_tracks_failed_ite
         state, saved, router, _ = await execute([
             search("a"),
             call("submit_analysis", submission([
-                summary_record(key="bad", quote="原文中不存在的引文"),
+                summary_record(key="bad", citations=[{"block_id": "unread"}]),
                 summary_record(key="good"),
             ], final=final) | {"topic_updates": [update("a", ["bad", "good"], tasks=[{
                 "detail": "核对失败事项", "status": "resolved", "record_keys": ["bad"],

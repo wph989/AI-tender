@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 from data_schema import install_data_schema
-from langchain_core.messages import AIMessage, message_to_dict
+from langchain_core.messages import AIMessage, ToolMessage, message_to_dict
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.conninfo import make_conninfo
 from sqlalchemy import create_engine, text
@@ -26,6 +26,7 @@ from tender.application.analysis import execution as worker
 from tender.application.analysis import runtime as agent_runtime
 from tender.application.analysis.agent import VerificationUnavailable
 from tender.application.analysis.skills import MODULES, skill_snapshot
+from tender.application.llm.routing import CallRecord
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
 from tender.core.di import create_analysis_executor
@@ -65,6 +66,8 @@ def env(monkeypatch):
         "config_release",
         "agent_module_run",
         "agent_run_event",
+        "agent_call_attempt",
+        "agent_model_invocation",
         "llm_call_log",
     )
     with base.begin() as conn:
@@ -315,7 +318,10 @@ def test_resume_preserves_budget_evidence_and_deadline(env):
         assert resumed.run["deadline_at"] == deadline
         assert resumed.run["model_calls"] == 1
         assert resumed.run["state"]["research"]["seen"]["original"]["content"] == "独立证据"
-        resumed.run["limits"]["max_model_calls"] = 1
+        env.db.execute("""UPDATE agent_module_run SET limits=jsonb_set(limits,
+            '{max_model_calls}','1') WHERE id=:id""", {"id": resumed.run["id"]})
+        # 失联的旧请求结算为未知，成功额度释放；新请求的在途预占仍阻止并发超额。
+        resumed.reserve("model")
         with pytest.raises(ValueError, match="预算"):
             resumed.reserve("model")
         env.db.execute(
@@ -327,12 +333,163 @@ def test_resume_preserves_budget_evidence_and_deadline(env):
         resumed.release()
 
 
+def test_report_runs_counts_confirmed_successes_per_run_without_counting_failures(env):
+    runtime = prepared_runtime(env)
+    try:
+        assert runtime.claim()
+        for status in ("ok", "error", "unknown"):
+            runtime.reserve("model")
+            runtime.store.record_call({"status": status})
+        runtime.reserve("model")
+        for call_key in ("success", "failed", "skill:fixture", "pending"):
+            runtime.reserve("tool", call_key)
+        state = {"loaded_skill": {"path": "/skills/example/SKILL.md", "sha256": "fixture"},
+                 "tool_results": {
+            call_id: message_to_dict(ToolMessage(
+                content="工具回执", name="read_document", tool_call_id=call_id, status=status,
+            )) for call_id, status in (("success", "success"), ("failed", "error"))
+        }}
+        runtime.save(state)
+        runtime.save(state)
+        # 未完成的请求没有成功结果；检查点重放同一工具回执也不能重复累计。
+        runs = env.db.report_runs(runtime.report["id"])
+        current = next(run for run in runs if run["id"] == runtime.run["id"])
+        assert current["successful_model_calls"] == 1
+        assert current["successful_tool_calls"] == 2
+        assert current["model_calls"] == 4 and current["tool_calls"] == 4
+        assert all(run["successful_model_calls"] == run["successful_tool_calls"] == 0
+                   for run in runs if run["id"] != current["id"])
+    finally:
+        runtime.release()
+
+
+def test_historical_run_without_success_records_stays_unknown(env):
+    runtime = prepared_runtime(env)
+    env.db.execute("""UPDATE agent_module_run SET successful_model_calls=NULL,
+        successful_tool_calls=NULL,model_calls=99,tool_calls=99 WHERE id=:id""",
+        {"id": runtime.run["id"]})
+    current = next(row for row in env.db.report_runs(runtime.report["id"])
+                   if row["id"] == runtime.run["id"])
+    # 历史缺少结果事件时显示未记录；99次尝试不能推算为0次或99次成功。
+    assert current["successful_model_calls"] is None
+    assert current["successful_tool_calls"] is None
+    assert current["model_calls"] == current["tool_calls"] == 99
+
+
+def test_success_budget_serializes_pending_and_deduplicates_settlement(env):
+    from concurrent.futures import ThreadPoolExecutor
+
+    runtime = prepared_runtime(env)
+    try:
+        assert runtime.claim()
+        env.db.execute("""UPDATE agent_module_run SET limits=jsonb_set(limits,
+            '{max_model_calls}','1') WHERE id=:id""", {"id": runtime.run["id"]})
+
+        def reserve(key):
+            try:
+                runtime.reserve("model", key)
+                return key
+            except ValueError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            accepted = [key for key in pool.map(reserve, ("first", "second")) if key]
+        assert len(accepted) == 1
+        runtime.store.record_call({"status": "error", "prompt_tokens": 5})
+        assert runtime.run["successful_model_calls"] == 0
+        runtime.reserve("model", "retry")
+        record = {"status": "ok", "prompt_tokens": 7, "completion_tokens": 3}
+        runtime.store.record_call(record)
+        runtime.store.record_call(record)
+        assert runtime.run["successful_model_calls"] == 1
+        row = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id",
+                          {"id": runtime.run["id"]})[0]
+        assert (row["model_calls"], row["prompt_tokens"], row["completion_tokens"]) == (2, 12, 3)
+        with pytest.raises(ValueError, match="预算"):
+            runtime.reserve("model", "over-limit")
+    finally:
+        runtime.release()
+
+
+def test_resume_settles_saved_valid_result_and_releases_unknown_only_after_ownership(env):
+    first = prepared_runtime(env)
+    assert first.claim()
+    first.reserve("model", "logical:1")
+    first.reserve("model", "logical:2")
+    first.store.save_invocation("packet", {
+        "deadline_at": 12345, "requests": [{"ordinal": 1}, {"ordinal": 2}],
+        "result": {"content": "{}", "model": "fixture"},
+        "success_record": {"invocation_id": "logical", "request_ordinal": 2,
+                           "status": "ok", "prompt_tokens": 8, "completion_tokens": 2},
+    })
+    first.release()
+    worker.prepare_report(env.db, analysis_api.report_row(env.request, first.report["id"]))
+    run = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", {"id": first.run["id"]})[0]
+    resumed = agent_runtime.AgentRuntime(env.db, first.report, run, first.sources)
+    try:
+        assert resumed.claim()
+        assert resumed.run["successful_model_calls"] == 1
+        assert resumed.store.load_invocation("packet")["deadline_at"] == 12345
+        rows = env.db.rows("SELECT call_key,status FROM agent_call_attempt WHERE run_id=:id",
+                           {"id": first.run["id"]})
+        assert {r["call_key"]: r["status"] for r in rows} == {
+            "logical:1": "unknown", "logical:2": "ok",
+        }
+        with pytest.raises(InterruptedError):
+            first.store.record_call({"invocation_id": "logical", "request_ordinal": 1,
+                                     "status": "ok"})
+    finally:
+        resumed.release()
+
+
+def test_unknown_tool_reexecution_uses_a_new_attempt_and_settles_saved_result_once(env):
+    first = prepared_runtime(env)
+    assert first.claim()
+    first.reserve("tool", "read-call")
+    first.release()
+    worker.prepare_report(env.db, analysis_api.report_row(env.request, first.report["id"]))
+    row = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", {"id": first.run["id"]})[0]
+    resumed = agent_runtime.AgentRuntime(env.db, first.report, row, first.sources)
+    try:
+        assert resumed.claim()
+        attempt_key = resumed.reserve("tool", "read-call")
+        assert attempt_key != "read-call"
+        state = {"tool_call_keys": {"read-call": attempt_key}, "tool_outcomes": {"read-call": "ok"},
+                 "tool_results": {"read-call": message_to_dict(ToolMessage(
+                     content="正常空检索", name="search_document", tool_call_id="read-call",
+                 ))}}
+        resumed.save(state)
+        resumed.save(state)
+        assert resumed.run["successful_tool_calls"] == 1 and resumed.run["tool_calls"] == 2
+        rows = env.db.rows("SELECT call_key,status FROM agent_call_attempt WHERE run_id=:id",
+                           {"id": first.run["id"]})
+        assert {r["call_key"]: r["status"] for r in rows} == {
+            "read-call": "unknown", attempt_key: "ok",
+        }
+    finally:
+        resumed.release()
+
+
 class NativeRouter:
     def __init__(self, *, purpose="", **kwargs):
-        self.reserve = kwargs["before_request"]
+        self.before_call, self.on_call = kwargs["before_call"], kwargs["on_call"]
+        self.invocation_id, self.requests = str(uuid4()), 0
         self.key = next((key for key in MODULES if key in purpose), "project_basic_info_parsing")
         self.topics = json.loads(skill_snapshot()[self.key + "/references/coverage.json"])
         self.calls = 0
+
+    async def reserve(self):
+        self.requests += 1
+        self.record = CallRecord(None, None, "analysis", "fixture", "running", None,
+                                 0, None, None, None, invocation_id=self.invocation_id,
+                                 request_ordinal=self.requests)
+        await self.before_call(self.record)
+
+    def respond(self, result):
+        from dataclasses import replace
+
+        self.on_call(replace(self.record, status="ok", http_status=200))
+        return result
 
     async def chat(self, messages, tools):
         await self.reserve()
@@ -371,7 +528,7 @@ class NativeRouter:
             )
         else:
             name, args = "submit_analysis", {"records": [], "final": True}
-        return Completion(
+        return self.respond(Completion(
             content="",
             model="fixture",
             agent_message=message_to_dict(
@@ -379,14 +536,23 @@ class NativeRouter:
                     content="", tool_calls=[{"name": name, "args": args, "id": f"call{self.calls}"}]
                 )
             ),
-        )
+        ))
 
     async def complete(self, prompt):
         await self.reserve()
+        payload = json.loads(prompt.rsplit("\n", 1)[-1])
         return Completion(
-            content='{"reviews":{},"issues":[],"context_requests":[]}', model="fixture"
+            content=json.dumps({"reviews": {}, "issues": [],
+                "checked_units": [r["unit_id"] for r in payload["evidence"]]}), model="fixture"
         )
 
+    async def complete_validated(self, prompt, *, validate=None, validate_input=None, **kwargs):
+        if validate_input:
+            validate_input(prompt)
+        result = await self.complete(prompt)
+        if validate:
+            validate(result)
+        return self.respond(result)
 
     async def aclose(self):
         pass
@@ -449,10 +615,11 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
                     "citations": [{"block_id": b["id"], "quote": "质保三年"}
                                   for b in result["blocks"]],
                 }], "final": True}
-            return Completion(content="", model="fixture", agent_message=message_to_dict(
+            return self.respond(Completion(content="", model="fixture",
+                                           agent_message=message_to_dict(
                 AIMessage(content="", tool_calls=[{"name": name, "args": args,
                                                    "id": f"evidence-{self.calls}"}])
-            ))
+            )))
 
         async def complete(self, prompt):
             await self.reserve()
@@ -466,7 +633,8 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
             return Completion(content=json.dumps({"reviews": {row["record_id"]: {
                 "supported": True, "issues": [],
                 "bindings": {v["value_id"]: [cid] for v in row["values"]},
-            }}, "issues": [], "context_requests": []}), model="fixture")
+            }}, "issues": [], "checked_units": [r["unit_id"] for r in payload["evidence"]]}),
+                              model="fixture")
 
     async def retrieve(db, selected_sources, query, *args, **kwargs):
         return db.readable_chunks(selected_sources[0]), {"mode": "keyword"}

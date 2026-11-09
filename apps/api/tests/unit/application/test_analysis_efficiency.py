@@ -131,9 +131,14 @@ def test_batch_read_capacity_exposes_unread_boundary_and_can_continue():
 
         flow = TopicFlow({"business_topics": [{"key": "a", "checks": ["完整清单"]}]}, research)
         flow.evidence(set(), ["a"], result)
-        packets, _ = batches(flow, "a", [])
-        assert packets[0]["reads"][0]["read_limited"]
-        assert packets[0]["reads"][0]["continue_from"] == result["continue_from"]
+        from tender.application.analysis.review import _reads
+        from tender.application.analysis.topic_flow import TopicIncomplete
+
+        with pytest.raises(TopicIncomplete, match="超过审查上下文"):
+            batches(flow, "a", [])
+        reads = _reads(flow, flow.entries)
+        assert reads[0]["read_limited"]
+        assert reads[0]["continue_from"] == result["continue_from"]
         continuation = await research.read_evidence(last, 0, 3)
         assert any(row["id"] not in {r["id"] for r in result["blocks"]}
                    for row in continuation["blocks"])

@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, Engine, delete, func, insert, literal, select, text, update
 from sqlalchemy.dialects.postgresql import INTERVAL
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.pool import NullPool
 
 from tender.adapters.pg.locks import (
@@ -29,6 +30,7 @@ from tender.adapters.pg.models import (
     KnowledgeRelation,
     LlmCallLog,
 )
+from tender.adapters.pg.models.analysis import AgentCallAttempt, AgentModelInvocation
 from tender.adapters.pg.session import create_pg_engine
 
 # 双整数 advisory lock 与旧 hashtextextended 锁处于不同空间，避免业务 ID 意外撞锁。
@@ -268,6 +270,20 @@ class AgentRunStore:
                 )
                 self.run = dict(row)
                 if resuming:
+                    # 已独占旧运行后才释放悬挂预占；已保存有效返回的请求可直接补结算。
+                    windows = conn.execute(select(AgentModelInvocation.progress).where(
+                        AgentModelInvocation.run_id == self.run["id"],
+                    )).scalars().all()
+                    for window in windows:
+                        record = window.get("success_record")
+                        if record:
+                            self._settle(conn, "model",
+                                         f"{record['invocation_id']}:{record['request_ordinal']}",
+                                         "ok", record)
+                    conn.execute(update(AgentCallAttempt).where(
+                        AgentCallAttempt.run_id == self.run["id"],
+                        AgentCallAttempt.status == "running",
+                    ).values(status="unknown", detail={"reason": "旧执行者失联，结果未知"}))
                     # 已取得旧模块的独占锁，原执行者不再存活；未回传的请求必须显式标为未知。
                     purpose = (
                         f"analysis:{self.report['id']}:{self.run['module_key']}"
@@ -282,7 +298,7 @@ class AgentRunStore:
                             )
                             .values(
                                 status="unknown",
-                                error_message="worker中断，供应商结果未知；恢复保留已预占预算",
+                                error_message="worker中断，供应商结果未知；释放成功额度预占",
                             )
                             .returning(LlmCallLog.id)
                         )
@@ -299,6 +315,7 @@ class AgentRunStore:
                     .values(status="running")
                 )
             self.lock_connection = conn
+            self._refresh_counts()
             self.event(
                 "resumed" if resuming else "started",
                 {"thread_id": self.run["thread_id"], "owner": self.owner},
@@ -354,53 +371,140 @@ class AgentRunStore:
                 .values(lease_until=func.now() + _LEASE_WINDOW)
             )
 
-    def reserve(self, kind: str) -> None:
+    def load_invocation(self, key: str) -> dict:
+        with self.engine.connect() as conn:
+            return conn.execute(select(AgentModelInvocation.progress).where(
+                AgentModelInvocation.run_id == self.run["id"],
+                AgentModelInvocation.call_key == key,
+            )).scalar_one_or_none() or {}
+
+    def save_invocation(self, key: str, value: dict) -> None:
+        self.guard()
+        with self.engine.begin() as conn:
+            self._lock_owned(conn)
+            statement = pg_insert(AgentModelInvocation).values(
+                run_id=self.run["id"], call_key=key, progress=value,
+            )
+            conn.execute(statement.on_conflict_do_update(
+                index_elements=["run_id", "call_key"], set_={"progress": value},
+            ))
+
+    def _lock_owned(self, conn: Connection) -> dict:
+        row = conn.execute(select(AgentModuleRun).where(
+            AgentModuleRun.id == self.run["id"],
+            AgentModuleRun.owner == UUID(self.owner),
+            AgentModuleRun.status == "running",
+            AgentModuleRun.lease_until > func.now(),
+        ).with_for_update()).mappings().one_or_none()
+        if row is None:
+            raise InterruptedError("模块所有权已改变，不能结算旧调用")
+        locked = conn.execute(text("""SELECT 1 FROM pg_locks l
+            WHERE l.locktype='advisory' AND l.classid=:ns AND l.objid=:id
+              AND l.objsubid=2 AND l.granted"""),
+            {"ns": QUOTA_NAMESPACE, "id": self.run["id"]}).first()
+        if locked is None:
+            raise InterruptedError("模块配额锁已失效，不能结算旧调用")
+        return dict(row)
+
+    def _refresh_counts(self) -> None:
+        # 仅在事务提交后更新内存预算；回滚不能留下虚假的成功数。
+        with self.engine.connect() as conn:
+            counts = conn.execute(select(
+                AgentModuleRun.model_calls, AgentModuleRun.tool_calls,
+                AgentModuleRun.successful_model_calls, AgentModuleRun.successful_tool_calls,
+            ).where(AgentModuleRun.id == self.run["id"])).mappings().one()
+        for key, value in counts.items():
+            if value is not None:
+                self.run[key] = max(self.run.get(key) or 0, value)
+
+    def reserve(self, kind: str, call_key: str | None = None) -> str:
         if kind not in {"model", "tool"}:
             raise ValueError("未知预算类型")
+        call_key = call_key or str(uuid4())
         column = kind + "_calls"
         field = getattr(AgentModuleRun, column)
         with self.engine.begin() as conn:
-            used = conn.execute(
-                update(AgentModuleRun)
-                .where(
-                    AgentModuleRun.id == self.run["id"],
-                    AgentModuleRun.owner == UUID(self.owner),
-                    AgentModuleRun.status == "running",
-                    field < self.run["limits"]["max_" + column],
-                    AgentModuleRun.deadline_at > func.now(),
-                )
-                .values({field: field + 1})
-                .returning(field)
-            ).scalar_one_or_none()
-            if used is None:
+            row = self._lock_owned(conn)
+            previous = conn.execute(select(AgentCallAttempt.status).where(
+                AgentCallAttempt.run_id == self.run["id"], AgentCallAttempt.kind == kind,
+                AgentCallAttempt.call_key == call_key,
+            )).scalar_one_or_none()
+            if previous == "unknown" and kind == "tool":
+                # 失联工具重新执行是新的实际尝试；旧未知回执不能被改写成成功。
+                call_key += ":retry:" + str(uuid4())
+            elif previous is not None:
+                return call_key
+            pending = conn.execute(select(func.count()).select_from(AgentCallAttempt).where(
+                AgentCallAttempt.run_id == self.run["id"], AgentCallAttempt.kind == kind,
+                AgentCallAttempt.status == "running",
+            )).scalar_one()
+            successes = row["successful_" + column]
+            used = row[column] if successes is None else successes + pending
+            if used >= row["limits"]["max_" + column] or row["deadline_at"] <= datetime.now(UTC):
                 label = "模型请求" if kind == "model" else "工具调用"
                 from tender.domain.shared.errors import BudgetExhausted
 
                 raise BudgetExhausted(f"模块{label}预算已耗尽")
-            self.run[column] = used
+            conn.execute(insert(AgentCallAttempt).values(
+                run_id=self.run["id"], kind=kind, call_key=call_key, status="running", detail={},
+            ))
+            conn.execute(update(AgentModuleRun).where(
+                AgentModuleRun.id == self.run["id"],
+            ).values({field: field + 1}))
             conn.execute(
                 insert(AgentRunEvent).values(
-                    run_id=self.run["id"], kind=kind + "_reserved", detail={"ordinal": used}
+                    run_id=self.run["id"], kind=kind + "_reserved",
+                    detail={"ordinal": row[column] + 1, "call_key": call_key},
                 )
             )
+        self._refresh_counts()
+        return call_key
+
+    def _settle(self, conn: Connection, kind: str, call_key: str, status: str,
+                detail: dict) -> bool:
+        changed = conn.execute(update(AgentCallAttempt).where(
+            AgentCallAttempt.run_id == self.run["id"], AgentCallAttempt.kind == kind,
+            AgentCallAttempt.call_key == call_key, AgentCallAttempt.status == "running",
+        ).values(status=status, detail=detail).returning(AgentCallAttempt.call_key)).first()
+        if changed is None:
+            return False
+        updates = {}
+        if status == "ok":
+            field = getattr(AgentModuleRun, "successful_" + kind + "_calls")
+            updates[field] = field + 1
+        if kind == "model":
+            updates[AgentModuleRun.prompt_tokens] = (AgentModuleRun.prompt_tokens
+                                                     + (detail.get("prompt_tokens") or 0))
+            updates[AgentModuleRun.completion_tokens] = (AgentModuleRun.completion_tokens
+                                                         + (detail.get("completion_tokens") or 0))
+        if updates:
+            conn.execute(update(AgentModuleRun).where(
+                AgentModuleRun.id == self.run["id"],
+            ).values(updates))
+        return True
 
     def record_call(self, record: dict[str, Any]) -> None:
-        # unknown 请求也保留已预占次数，不能靠中断把不确定的供应商请求当作免费。
+        # 运行行锁使预占、成功额度和用量幂等结算；失败尝试仍保留审计。
         with self.engine.begin() as conn:
-            conn.execute(
-                update(AgentModuleRun)
-                .where(AgentModuleRun.id == self.run["id"])
-                .values(
-                    prompt_tokens=AgentModuleRun.prompt_tokens + (record.get("prompt_tokens") or 0),
-                    completion_tokens=AgentModuleRun.completion_tokens
-                    + (record.get("completion_tokens") or 0),
-                )
-            )
+            self._lock_owned(conn)
+            call_key = (f"{record['invocation_id']}:{record['request_ordinal']}"
+                        if record.get("invocation_id") else conn.execute(
+                            select(AgentCallAttempt.call_key).where(
+                                AgentCallAttempt.run_id == self.run["id"],
+                                AgentCallAttempt.kind == "model",
+                                AgentCallAttempt.status == "running",
+                            ).order_by(AgentCallAttempt.call_key).limit(1),
+                        ).scalar_one_or_none())
+            if call_key is None or not self._settle(
+                conn, "model", call_key, record["status"], record,
+            ):
+                return
             conn.execute(
                 insert(AgentRunEvent).values(
                     run_id=self.run["id"], kind="model_result", detail=record
                 )
             )
+        self._refresh_counts()
 
     def save(self, state: dict[str, Any], *, publish: dict[str, Any] | None = None) -> None:
         with self.engine.begin() as conn:
@@ -421,12 +525,16 @@ class AgentRunStore:
             ).scalar_one_or_none()
             if previous is None:
                 raise InterruptedError("模块所有权已改变，不能写入旧状态")
+            self._lock_owned(conn)
             conn.execute(
                 update(AgentModuleRun)
                 .where(AgentModuleRun.id == self.run["id"])
                 .values(state=state)
             )
             if state.get("loaded_skill") and not previous.get("loaded_skill"):
+                skill_key = "skill:" + state["loaded_skill"]["sha256"]
+                attempt_key = state.get("tool_call_keys", {}).get(skill_key, skill_key)
+                self._settle(conn, "tool", attempt_key, "ok", {"name": "load_skill"})
                 conn.execute(
                     insert(AgentRunEvent).values(
                         run_id=self.run["id"],
@@ -442,9 +550,14 @@ class AgentRunStore:
                     .values(items=publish["items"], business_data=publish["business"])
                 )
             for call_id in (
-                state.get("tool_results", {}).keys() - previous.get("tool_results", {}).keys()
+                (state.get("tool_results", {}).keys() - previous.get("tool_results", {}).keys())
+                | (state.get("tool_outcomes", {}).keys() - previous.get("tool_outcomes", {}).keys())
             ):
-                message = state["tool_results"][call_id]["data"]
+                message = state.get("tool_results", {}).get(call_id, {}).get("data", {})
+                outcome = state.get("tool_outcomes", {}).get(call_id,
+                    "error" if message.get("status") == "error" else "ok")
+                attempt_key = state.get("tool_call_keys", {}).get(call_id, call_id)
+                self._settle(conn, "tool", attempt_key, outcome, {"name": message.get("name")})
                 # 公共审计只记录动作和结果状态；正文与错误草稿仍留在受控的证据账。
                 conn.execute(
                     insert(AgentRunEvent).values(
@@ -453,10 +566,11 @@ class AgentRunStore:
                         detail={
                             "tool_call_id": call_id,
                             "name": message.get("name"),
-                            "status": message.get("status", "success"),
+                            "status": "success" if outcome == "ok" else outcome,
                         },
                     )
                 )
+        self._refresh_counts()
 
     def finish(
         self,
@@ -490,6 +604,9 @@ class AgentRunStore:
             ).first()
             if row is None:
                 return
+            conn.execute(update(AgentCallAttempt).where(
+                AgentCallAttempt.run_id == self.run["id"], AgentCallAttempt.status == "running",
+            ).values(status="unknown", detail={"reason": "运行结束，尚无确定回执"}))
             if state is not None:
                 # 到期仅豁免时间，收尾事务仍复核租约和锁；与状态、展示投影一次提交。
                 valid = conn.execute(text("""SELECT 1 FROM agent_module_run a

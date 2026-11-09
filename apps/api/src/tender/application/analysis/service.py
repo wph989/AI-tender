@@ -563,8 +563,12 @@ class AnalysisService:
                             item.get("verification") == "supported" for item in draft["fields"]
                         )
                     carry.pop("tool_results", None)
+                    carry.pop("tool_outcomes", None)
+                    carry.pop("tool_call_keys", None)
+                    carry.pop("stop_reason", None)
                     carry.pop("invalid_submissions", None)
                     carry.pop("consecutive_invalid_submissions", None)
+                    carry.pop("prevalidation_failures", None)
                     carry.pop("consecutive_unsubmitted_responses", None)
                     carry.pop("last_unsubmitted_message_id", None)
                     carry.pop("field_failures", None)
@@ -603,10 +607,22 @@ class AnalysisService:
                         carry.pop(key, None)
                     carry.pop("pending_final", None)
                     if carry.get("topic_flow"):
-                        if carry["topic_flow"].get("output_mode") == "after-research":
-                            carry["topic_flow"].update(phase="research", release_results=False)
-                        # 显式补跑是新运行：重新打开受阻待办，独立查漏次数按本次预算计算。
-                        carry["topic_flow"]["audit"] = {"round": 0, "results": {}}
+                        flow = carry["topic_flow"]
+                        audit = flow.get("audit", {})
+                        if audit.get("version") == "combined-v2":
+                            # 新attempt只更新执行额度；语义一致的包与主题判定跨补跑保留。
+                            completed = {}
+                            for key, value in audit.get("completed_topics", {}).items():
+                                completed["0:" + key.split(":", 1)[-1]] = value
+                            audit.update(round=0, done=False, completed_topics=completed)
+                            audit.pop("progress", None)
+                            if flow.get("synthesis_finished") or completed:
+                                flow.update(phase="review", synthesis_finished=True)
+                        else:
+                            flow["audit"] = {"round": 0, "results": {}}
+                            flow["phase"] = "research"
+                        if flow.get("output_mode") == "after-research":
+                            flow["release_results"] = False
                         # 仅显式补跑开启新研究额度；同attempt恢复仍保留耗尽状态及统计。
                         for key in ("search_work", "efficiency", "active_work", "active_topics"):
                             carry["topic_flow"].pop(key, None)

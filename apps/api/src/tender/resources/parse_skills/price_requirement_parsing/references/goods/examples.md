@@ -42,8 +42,7 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "东区标段最高投标限价100万元（含税），超过限价否决投标。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -73,8 +72,7 @@
           },
           "citations": [
             {
-              "block_id": "example-2",
-              "quote": "西区标段最高投标限价80万元（含税）。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

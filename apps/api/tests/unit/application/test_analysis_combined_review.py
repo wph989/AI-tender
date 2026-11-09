@@ -28,13 +28,15 @@ def approve(payload):
             for row in reversed(payload["records"])
         },
         "issues": [],
-        "context_requests": [],
+        "checked_units": [r["unit_id"] for r in payload["evidence"]],
     }
 
 
 async def execute(records, *, review=None, tail=(), limits=None, search_args=None,
-                  research_steps=None, keys=("a",), synthesis_steps=None, evidence_rows=None):
-    state, saved, reviewed = {}, [], []
+                  research_steps=None, keys=("a",), synthesis_steps=None, evidence_rows=None,
+                  state=None):
+    state = {} if state is None else state
+    saved, reviewed = [], []
     records = [record | {"work_ids": record.get("work_ids", ["w1"])} for record in records]
 
     async def save(value):
@@ -171,6 +173,7 @@ def test_completed_review_replays_without_model_requests_and_detects_changed_evi
         state, _, _, _ = await execute([summary_record()])
         research = session([block()])
         research.seen = state["research"]["seen"]
+        research.events = state["research"]["events"]
         flow = TopicFlow(state, research)
 
         async def forbidden(*_):
@@ -204,64 +207,52 @@ def test_long_record_is_reviewed_by_body_units_and_published_only_after_all_part
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("repeat", [False, True])
-def test_split_record_can_load_its_full_context_once(repeat):
+def test_split_record_has_full_semantic_context_without_extra_model_requests():
     from tender.application.analysis.research import AgentLimits
-    from tender.application.analysis.review import fits
-    from tender.application.analysis.topic_flow import TopicIncomplete
 
     async def run():
-        limits = AgentLimits(max_output_tokens=1000)
-        requested = []
-        loaded = []
-
         async def review(payload):
-            row = payload["records"][0]
-            context_id = "record:" + row["record_id"]
-            assert len(row["values"]) < 26
-            if not payload["context_records"]:
-                requested.append(context_id)
-                return {"reviews": {}, "issues": [], "context_requests": [context_id]}
-            full = payload["context_records"][0]
-            assert full["record_id"] == row["record_id"] and len(full["values"]) == 26
-            assert fits(payload, limits)
-            loaded.append(context_id)
-            return ({"reviews": {}, "issues": [], "context_requests": [context_id]}
-                    if repeat else approve(payload))
+            assert "available_context" not in payload
+            assert "context_requests" not in payload
+            full = payload["record_index"][0]
+            assert len(full["values"]) == 26
+            assert len(payload["records"][0]["values"]) < 26
+            return approve(payload)
 
         record = summary_record(content={"字段": "质保范围", "内容": ["质保三年"] * 24})
-        if repeat:
-            with pytest.raises(TopicIncomplete, match="重复请求"):
-                await execute([record], limits=limits, review=review)
-            assert len(requested) == len(loaded) == 1
-        else:
-            state, saved, _, reviewed = await execute([record], limits=limits, review=review)
-            assert len(requested) == len(loaded) > 1
-            assert len(reviewed) == len(requested) * 2
-            assert len(module_data(state)["records"][0]["content_evidence"]["内容"]) == 24
-            assert all(not module_data(s)["records"] for s in saved if "draft" not in s)
+        state, _, _, packets = await execute(
+            [record], limits=AgentLimits(max_output_tokens=1000), review=review,
+        )
+        assert len(packets) > 1
+        assert len(module_data(state)["records"][0]["content_evidence"]["内容"]) == 24
 
     asyncio.run(run())
 
 
-def test_repeated_context_request_stops_without_another_full_audit():
+def test_context_request_is_rejected_as_protocol_error_without_a_context_loop():
     from tender.application.analysis.topic_flow import TopicIncomplete
 
     async def run():
-        count = 0
+        calls = []
 
         async def request(payload):
-            nonlocal count
-            count += 1
-            return {
-                "reviews": {},
-                "issues": [],
-                "context_requests": [payload["available_context"][0]],
-            }
+            calls.append(payload)
+            return {"reviews": {}, "issues": [], "context_requests": ["record:old"]}
 
-        with pytest.raises(TopicIncomplete, match="重复请求"):
+        with pytest.raises(TopicIncomplete, match="不再索取上下文"):
             await execute([summary_record()], review=request)
-        assert count == 1
+        assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("checked", [[], ["unknown"], ["duplicate", "duplicate"]])
+def test_omitted_or_foreign_coverage_units_are_protocol_errors(checked):
+    async def run():
+        _, _, _, packets = await execute([summary_record()])
+        verdict = approve(packets[0]) | {"checked_units": checked}
+        with pytest.raises(InvalidModelOutput, match="checked_units"):
+            validate(verdict, packets[0])
 
     asyncio.run(run())
 

@@ -42,12 +42,10 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "配备项目经理1名，具有计算机专业中级及以上职称。"
+              "block_id": "example-1"
             },
             {
-              "block_id": "example-2",
-              "quote": "该项目经理最多只能同时担任3项工程（含本项目）的相关岗位。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

@@ -104,12 +104,12 @@ class AgentRuntime:
             check_report_status(self.db, self.report)
         self.store.heartbeat()
 
-    def reserve(self, kind: str) -> None:
+    def reserve(self, kind: str, call_key: str | None = None) -> str:
         self.guard()
-        self.store.reserve(kind)
+        return self.store.reserve(kind, call_key)
 
     def record_call(self, record) -> None:
-        # unknown 请求也保留已预占次数，不把不确定的供应商请求当作免费。
+        # 实际用量与成功额度分别结算；未知和失败保留尝试记录，不扣成功次数。
         self.store.record_call(asdict(record))
 
     def save(self, state: dict) -> None:

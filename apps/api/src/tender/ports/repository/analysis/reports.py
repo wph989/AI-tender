@@ -51,7 +51,10 @@ class ReportTransaction(Protocol):
         ...
 
     def report_runs(self, report_id: int) -> list[dict[str, Any]]:
-        """报告下全部模块运行（含历史 attempt），按 id 升序。"""
+        """报告下全部模块运行，含独立的 successful_model_calls / successful_tool_calls。
+
+        成功数只统计已确认的结果；model_calls / tool_calls 保留实际尝试数。
+        """
         ...
 
     def report_modules(self, report_id: int) -> list[dict[str, Any]]:
@@ -178,7 +181,7 @@ class ReportRepository(SourceReader, RetrievalRepository, SchemaReader, TaskLife
         ...
 
     def report_runs(self, report_id: int) -> list[dict[str, Any]]:
-        """报告的全部模块运行账（含尚未核实的暂存成果），按 attempt 升序。"""
+        """报告的运行账及成功调用数（含尚未核实的暂存成果），按 attempt 升序。"""
         ...
 
     def report_active_modules(self, report_id: int) -> list[dict[str, Any]]:

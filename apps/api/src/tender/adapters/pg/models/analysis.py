@@ -76,6 +76,8 @@ class AgentModuleRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     model_calls: Mapped[int] = mapped_column(Integer)
     tool_calls: Mapped[int] = mapped_column(Integer)
+    successful_model_calls: Mapped[int | None] = mapped_column(Integer)
+    successful_tool_calls: Mapped[int | None] = mapped_column(Integer)
     prompt_tokens: Mapped[int] = mapped_column(BigInteger)
     completion_tokens: Mapped[int] = mapped_column(BigInteger)
     limits: Mapped[dict[str, Any]] = mapped_column(JSONB)
@@ -91,6 +93,24 @@ class AgentRunEvent(Base):
     kind: Mapped[str] = mapped_column(Text)
     detail: Mapped[dict[str, Any]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AgentCallAttempt(Base):
+    __tablename__ = "agent_call_attempt"
+
+    run_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(Text, primary_key=True)
+    call_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    status: Mapped[str] = mapped_column(Text)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB)
+
+
+class AgentModelInvocation(Base):
+    __tablename__ = "agent_model_invocation"
+
+    run_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    call_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    progress: Mapped[dict[str, Any]] = mapped_column(JSONB)
 
 
 class AnalysisDataSnapshot(Base):

@@ -62,7 +62,7 @@ def test_routing_database_hooks_leave_event_loop_and_preserve_order():
         candidate = ModelCandidate(
             registry_model_id=1, provider_id=1, display_name="fixture", model="fixture",
             base_url="http://fixture.invalid", api_key=None, timeout=2,
-            temperature=None, max_tokens=None, extra_retries=0,
+            temperature=None, max_tokens=None, extra_retries=1,
         )
         client = AsyncMock()
         client.complete.side_effect = [

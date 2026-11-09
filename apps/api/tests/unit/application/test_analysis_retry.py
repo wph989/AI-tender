@@ -150,3 +150,24 @@ def test_retry_preserves_examined_notes_todos_and_evidence_without_complete_find
     assert restored.works()[0]["id"] == work_id
     assert "还需核对附件例外" in str(restored.context([work_id]))
     assert previous == original
+
+
+def test_v2_retry_keeps_valid_packets_and_completed_topics_instead_of_restarting_research():
+    from test_analysis_verification_degradation import _RetryStore, _RetryTx
+
+    previous = {"topic_flow": {
+        "audit": {"version": "combined-v2", "round": 1, "done": True,
+                  "results": {"packet": {"checked_units": ["u1"], "issues": []}},
+                  "record_results": {"record-fingerprint": {"supported": True}},
+                  "completed_topics": {"1:a": {"signature": "same", "issues": []}}},
+        "entries": {}, "phase": "review", "synthesis_finished": True,
+    }}
+    tx = _RetryTx([{"id": 9, "status": "partial"}], previous)
+    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
+    service.retry_report(3, module_keys=[], max_output_tokens=None, timeout_seconds=None)
+    flow = tx.inserted[0]["state"]["topic_flow"]
+    assert flow["phase"] == "review"
+    assert flow["audit"]["round"] == 0 and not flow["audit"]["done"]
+    assert flow["audit"]["results"] == previous["topic_flow"]["audit"]["results"]
+    assert flow["audit"]["completed_topics"] == {"0:a": {"signature": "same", "issues": []}}
+    assert flow["audit"]["record_results"]["record-fingerprint"]["supported"]

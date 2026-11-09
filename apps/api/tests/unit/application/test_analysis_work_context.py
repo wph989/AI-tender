@@ -259,7 +259,9 @@ def test_actual_rule_selection_follows_work_ids_and_synthesis_keeps_all_rules():
         result = await middleware.topic_model_call(FakeRequest(messages=messages), capture)
         assert "预算与限价区分" not in result.system_message.content
         current.data["phase"] = "synthesis"
-        state["output_schema"] = {}
+        state["output_schema"] = json.loads(
+            skill_snapshot()[key + "/references/output_schema.json"],
+        )
         result = await middleware.topic_model_call(FakeRequest(messages=messages), capture)
         assert "预算与限价区分" in result.system_message.content
 

@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, ToolMessage, message_to_dict
 from tender.application.analysis.data import semantic_payload
 from tender.application.analysis.topic_flow import identity
 from tender.application.knowledge.content import fingerprint
+from tender.application.shared.validation import allowed_values
 
 
 def evidence_version(row: dict) -> str:
@@ -81,7 +82,7 @@ def rule_topics(flow, messages, works: list[dict]) -> set[str]:
 def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
     known = {w["id"]: w for w in works}
     if not work_ids or set(work_ids) - known.keys():
-        raise ValueError("请选择有效的非空work_ids")
+        raise ValueError("work_ids：请选择有效的非空work_ids；可选ID：" + allowed_values(known))
     selected = {key: known[key] for key in work_ids}
     # 后续待办继承产生它的研究线索，不要求模型再抄一份父问题与证据。
     while True:

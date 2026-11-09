@@ -19,7 +19,7 @@
 
 ## 提交方式
 
-研究结束后统一综合。content 只使用本专题声明的中文键，citations 使用已读原文；业务范围、条件、材料和评分属性同样需要依据。
+研究结束后统一综合。content 只使用本专题声明的中文键，citations 只填写已读block_id，由程序补齐原文定位，无需quote；业务范围、条件、材料和评分属性同样需要依据。
 工作ID、分批及审查规则以运行时工具为准，样例中的 work_ids 须换为实际返回的ID。
 
 ## JSON 示例
@@ -67,12 +67,10 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "资格审查条件第1项：投标人须具有有效的保安服务许可证。"
+              "block_id": "example-1"
             },
             {
-              "block_id": "example-2",
-              "quote": "上述资格条件任一项不满足的，否决其投标。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

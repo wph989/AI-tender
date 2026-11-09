@@ -39,8 +39,7 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "纸质投标文件正本1份、副本2份。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -71,8 +70,7 @@
           },
           "citations": [
             {
-              "block_id": "example-2",
-              "quote": "技术文件实行盲标，正文不得出现投标人名称；封面按指定格式填写。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

@@ -39,8 +39,7 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "开标时间为2026年11月2日9时30分，采用不见面开标。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -71,12 +70,10 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "开标时间为2026年11月2日9时30分，采用不见面开标。"
+              "block_id": "example-1"
             },
             {
-              "block_id": "example-2",
-              "quote": "投标人应登录示例交易平台，在开标后30分钟内完成解密。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

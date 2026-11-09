@@ -16,7 +16,7 @@
 
 ## 提交方式
 
-研究结束后统一综合。content 只使用本专题声明的中文键，citations 使用已读原文；业务范围、条件、材料和评分属性同样需要依据。
+研究结束后统一综合。content 只使用本专题声明的中文键，citations 只填写已读block_id，由程序补齐原文定位，无需quote；业务范围、条件、材料和评分属性同样需要依据。
 工作ID、分批及审查规则以运行时工具为准，样例中的 work_ids 须换为实际返回的ID。
 
 ## JSON 示例
@@ -62,8 +62,7 @@
           "node_type": "group",
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "投标文件的技术部分包括实施方案。实施方案包括迁移方案，迁移方案下设回退措施。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -94,8 +93,7 @@
           "parent_key": "technical",
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "投标文件的技术部分包括实施方案。实施方案包括迁移方案，迁移方案下设回退措施。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -126,8 +124,7 @@
           "parent_key": "implementation",
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "投标文件的技术部分包括实施方案。实施方案包括迁移方案，迁移方案下设回退措施。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -158,8 +155,7 @@
           "parent_key": "migration",
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "投标文件的技术部分包括实施方案。实施方案包括迁移方案，迁移方案下设回退措施。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -189,8 +185,7 @@
           "node_type": "section",
           "citations": [
             {
-              "block_id": "example-2",
-              "quote": "另须独立提交授权委托书，不归入技术部分。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

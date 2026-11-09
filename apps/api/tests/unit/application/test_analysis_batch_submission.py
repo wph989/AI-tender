@@ -78,7 +78,7 @@ def test_batch_with_one_invalid_record_stages_valid_records_without_final():
     result = json.loads(after_batch["tool_results"]["call_batch"]["data"]["content"])
     assert result["accepted"] is True
     assert [item["key"] for item in result["rejected"]] == ["broken"]
-    assert "部分记录未通过预校验" in result["note"]
+    assert "已保存有效事项" in result["note"]
     assert {r["key"] for r in state["draft"]["business_data"]["records"]} == {
         "valid", "other",
     }
@@ -101,7 +101,7 @@ def test_final_batch_with_invalid_record_does_not_publish():
     assert "broken" not in published
     assert set(published) == {"valid", "replacement"}
     error = state["tool_results"]["call_final"]["data"]["content"]
-    assert "final=true 需要全部记录通过预校验" in error
+    assert "请修正后重新提交 final=true" in error
 
 
 def test_batch_invalid_submission_keeps_consecutive_limit():

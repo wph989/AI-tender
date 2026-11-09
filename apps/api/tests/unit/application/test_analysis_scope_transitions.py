@@ -225,7 +225,8 @@ def test_retired_scope_proof_does_not_prove_new_scope_or_block_its_new_proof():
 
 def test_scope_replacement_with_bad_record_keeps_valid_items_and_waits_for_correction():
     async def run():
-        bad = summary_record(scope=LOT_A, quote="不存在的引文")
+        bad = summary_record(scope=LOT_A, citations=[{"block_id": "unread"}])
+        research = session([block() | {"content": "A标段质保三年"}])
         state, saved, _, _ = await execute([
             search("a"),
             call("submit_analysis", submission([summary_record()], final=False) | {
@@ -236,14 +237,16 @@ def test_scope_replacement_with_bad_record_keeps_valid_items_and_waits_for_corre
                 update("a", ["warranty"], scope=LOT_A, replaces_scopes=[COMMON]),
                 update("a", ["other"], checked=[]),
             ]}, "mixed"),
-            call("submit_analysis", submission([summary_record(scope=LOT_A)]) | {
+            call("submit_analysis", submission([
+                summary_record(scope=LOT_A, quote="A标段质保三年"),
+            ]) | {
                 "topic_updates": [update(
                     "a", ["warranty"], scope=LOT_A, replaces_scopes=[COMMON], tasks=[{
                         "detail": "修正未通过预校验的事项：warranty", "status": "resolved",
                         "record_keys": ["warranty"],
                     }],
                 ), update("a", ["other"])]}, "corrected"),
-        ], keys=("a",))
+        ], keys=("a",), research=research)
         assert any({i["business"]["key"] for i in published_items(s)} == {"warranty", "other"}
                    and any(e["scope"] == COMMON for e in s["topic_flow"]["entries"].values())
                    for s in saved)

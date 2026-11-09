@@ -43,12 +43,10 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "资格审查条件第1项：投标人须具有有效的保安服务许可证。"
+              "block_id": "example-1"
             },
             {
-              "block_id": "example-2",
-              "quote": "上述资格条件任一项不满足的，否决其投标。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

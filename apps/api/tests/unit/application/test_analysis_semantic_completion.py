@@ -70,7 +70,8 @@ def test_semantic_completion_does_not_bypass_independent_omission_review():
                           tail=[finish("repair-ready"), call("submit_analysis", {
                               "records": [], "final": True,
                           }, "repair-final")])
-        assert len(calls) == 2 and calls[1]["repair_issues"]
+        # 空提交没有改变内容或依据，沿用原问题直接结束，不再发送复核。
+        assert len(calls) == 1
 
     asyncio.run(run())
 

@@ -281,11 +281,15 @@ class AnalysisExecutor:
             async def authorize():
                 await asyncio.to_thread(runtime.guard)
 
-            async def reserve_model():
-                await asyncio.to_thread(runtime.reserve, "model")
+            async def begin_model(record):
+                await asyncio.to_thread(runtime.reserve, "model",
+                                        f"{record.invocation_id}:{record.request_ordinal}")
 
             async def reserve_tool():
                 await asyncio.to_thread(runtime.reserve, "tool")
+
+            async def begin_tool(call_key):
+                return await asyncio.to_thread(runtime.reserve, "tool", call_key)
 
             async def save(state):
                 await asyncio.to_thread(runtime.save, state)
@@ -329,9 +333,9 @@ class AnalysisExecutor:
                 self.model_factory,
                 "analysis",
                 f"analysis:{report['id']}:{module['module_key']}:{module['attempt']}",
-                before_request=reserve_model,
+                before_call=begin_model,
+                invocation_store=runtime.store,
                 output_limit=limits.max_output_tokens,
-                extra_retries_limit=2,
                 rate_limit_backoff_seconds=limits.rate_limit_backoff_seconds,
                 rate_limit_max_wait_seconds=limits.rate_limit_max_wait_seconds,
                 on_call=runtime.record_call,
@@ -345,7 +349,7 @@ class AnalysisExecutor:
                     from tender.application.analysis.review import review_combined
                     from tender.application.knowledge.content import citation
 
-                    result = await review_combined(model, payload)
+                    result = await review_combined(model, payload, limits=limits)
                     await authorize()
                     selected = {cid for verdict in result["reviews"].values()
                                 if verdict["supported"] for ids in verdict["bindings"].values()
@@ -367,6 +371,7 @@ class AnalysisExecutor:
                         snapshot=report["skill_snapshot"],
                         checkpointer=saver,
                         reserve_tool=reserve_tool,
+                        begin_tool=begin_tool,
                         save=save,
                         budget_status=lambda: {
                             "seconds_remaining": max(
@@ -377,9 +382,9 @@ class AnalysisExecutor:
                             ),
                             "finish_reserve_seconds": min(300, int(limits.timeout_seconds * 0.25)),
                             "model_calls_remaining": limits.max_model_calls
-                            - runtime.run["model_calls"],
+                            - (runtime.run.get("successful_model_calls") or 0),
                             "tool_calls_remaining": limits.max_tool_calls
-                            - runtime.run["tool_calls"],
+                            - (runtime.run.get("successful_tool_calls") or 0),
                         },
                         review_combined=review_all,
                         lots=report["lot_settings"],
@@ -424,7 +429,10 @@ class AnalysisExecutor:
                             )
                             break
                         except ModelUnavailable as exc:
-                            # 路由自身的有限重试已经结束；按检查点在同一 thread/attempt 内恢复，
+                            if exc.invocation_exhausted:
+                                # 路由已耗尽原窗口，恢复只会读取同一失败；直接保留成果收尾。
+                                raise
+                            # 未耗尽窗口的临时故障按检查点在同一 thread/attempt 内恢复，
                             # 不修改 invoke_module 的重试元组，避免与路由重试次数相乘。
                             if attempts >= limits.max_model_recoveries:
                                 raise

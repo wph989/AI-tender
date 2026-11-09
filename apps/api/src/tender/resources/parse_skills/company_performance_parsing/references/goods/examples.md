@@ -48,12 +48,10 @@
           ],
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "投标人须提供2023年1月1日以来已验收的同类设备供货项目业绩至少2项，每项合同金额不低于100万元。"
+              "block_id": "example-1"
             },
             {
-              "block_id": "example-2",
-              "quote": "上述业绩以验收日期为准，须同时提供合同关键页和验收证明。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

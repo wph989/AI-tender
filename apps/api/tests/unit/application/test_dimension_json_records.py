@@ -70,7 +70,7 @@ def test_large_submission_is_rejected_without_losing_saved_result():
     ]))
     rejected = next(s for s in saved if "call_large" in s.get("tool_results", {}))
     assert len(rejected["staged_items"]) == 1
-    assert "最多三条" in rejected["tool_results"]["call_large"]["data"]["content"]
+    assert "最多3项" in rejected["tool_results"]["call_large"]["data"]["content"]
     assert len(state["draft"]["business_data"]["records"]) == 2
 
 

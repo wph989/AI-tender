@@ -37,6 +37,9 @@ LOTS = [{"lot_id": 1, "code": "A", "title": "A标段", "aliases": []},
 
 
 def record(key="r", text="质保三年", scope=None, **kwargs):
+    if scope and scope["kind"] == "lots":
+        # 范围测试的合法样本也须在原文中明确标段，才能进入下游选择逻辑。
+        text = "、".join(scope["lot_refs"]) + "：" + text
     return BusinessRecord(
         key=key, title=kwargs.pop("title", key), text=text,
         kind=kwargs.pop("kind", "requirement"), scope=scope or COMMON,
@@ -176,6 +179,10 @@ def test_scope_identifiers_must_remain_in_selected_quotes(
             record(text=requirement["content"], scope=scope).model_dump() | {"citations": refs}
         )
         seen = {r["block_id"]: r for r in (requirement, catalog)}
+        if scope["kind"] == "lots" and not quote_catalog:
+            with pytest.raises(ValueError, match="scope.lot_refs"):
+                prepare_records([row], {}, seen, KEY)
+            return
         items = prepare_records([row], {}, seen, KEY)
         selected = [requirement["block_id"]] + (["catalog"] if select_catalog else [])
 
@@ -274,7 +281,7 @@ def test_display_projection_keeps_same_title_records_in_different_lots():
     items = prepare_records([
         record("a", title="质保", scope={"kind": "lots", "lot_refs": ["A"]}),
         record("b", title="质保", scope={"kind": "lots", "lot_refs": ["B"]}),
-    ], {}, {"s1r1c0": block()}, KEY)
+    ], {}, {"s1r1c0": block() | {"content": "A：质保三年\nB：质保三年"}}, KEY)
     for item in items:
         item["verification"] = "supported"
     projected = display_items(items)
@@ -288,7 +295,7 @@ def test_business_corrections_use_identity_and_keep_lot_budgets_separate():
     items = prepare_records([
         record("a", title="质保", scope={"kind": "lots", "lot_refs": ["A"]}),
         record("b", title="质保", scope={"kind": "lots", "lot_refs": ["B"]}),
-    ], state, {"s1r1c0": block()}, KEY)
+    ], state, {"s1r1c0": block() | {"content": "A：质保三年\nB：质保三年"}}, KEY)
     assert correction_count(state, items[0]) == 1
     assert correction_count(state, items[1]) == 1
     corrected = copy.deepcopy(items[0])

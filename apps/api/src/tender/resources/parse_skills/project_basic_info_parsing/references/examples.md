@@ -39,8 +39,7 @@
           },
           "citations": [
             {
-              "block_id": "example-1",
-              "quote": "项目名称：示例园区升级项目。"
+              "block_id": "example-1"
             }
           ],
           "work_ids": [
@@ -69,8 +68,7 @@
           "code": "A",
           "citations": [
             {
-              "block_id": "example-2",
-              "quote": "本项目分为东区标段与西区标段，东区标段编号A。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [
@@ -98,8 +96,7 @@
           },
           "citations": [
             {
-              "block_id": "example-2",
-              "quote": "本项目分为东区标段与西区标段，东区标段编号A。"
+              "block_id": "example-2"
             }
           ],
           "work_ids": [

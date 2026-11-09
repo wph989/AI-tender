@@ -97,6 +97,14 @@ export interface AnalysisModule {
 export interface TopicProgress {
   phase?: "research" | "synthesis" | "review" | "completed" | "partial";
   audit_round: number;
+  review?: {
+    stage: "initial" | "repair";
+    repairs_used: number;
+    repairs_limit: number;
+    completed_packets: number;
+    total_packets: number;
+    unresolved_issues?: number;
+  };
   topics: {
     topic: string; title: string; scope: Omit<AnalysisScope, "lot_ids">;
     status: "pending" | "researching" | "ready" | "blocked" | "needs_review";
@@ -115,6 +123,9 @@ export interface AgentRun {
   finished_at: string | null;
   model_calls: number;
   tool_calls: number;
+  successful_model_calls?: number | null;
+  successful_tool_calls?: number | null;
+  stop_reason?: { code: string; stage: string; message: string } | null;
   prompt_tokens: number;
   completion_tokens: number;
   limits: { max_model_calls: number; max_tool_calls: number; timeout_seconds: number; max_output_tokens: number };

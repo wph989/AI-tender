@@ -53,9 +53,14 @@ def _item(
 ITEMS: tuple[ConfigItem, ...] = (
     _item("analysis.max_inflight", L1, "int", 2, "同公司所有报告共享的 DeepAgents 子代理并发上限"),
     _item(
-        "analysis.max_model_calls", L1, "int", 40, "每模块每次运行的实际模型请求上限，含重试和摘要"
+        "analysis.max_model_calls", L1, "int", 40,
+        "每模块每次运行的成功模型请求上限，含摘要，协议失败不扣次数"
     ),
-    _item("analysis.max_tool_calls", L1, "int", 48, "每模块每次运行的工具调用上限"),
+    _item("analysis.max_tool_calls", L1, "int", 48, "每模块每次运行的成功工具执行上限"),
+    _item("analysis.max_review_repairs", L1, "int", 1,
+          "完整审查后的自动修复及定向复核上限，0表示不自动修复"),
+    _item("analysis.review_max_input_tokens", L1, "int", 12000,
+          "审查单包完整输入的估算token上限，包含规则、正文、引文及依赖"),
     _item("analysis.max_evidence_blocks", L1, "int", 160, "每模块保留的原文证据块上限"),
     _item(
         "analysis.similarity_threshold", L1, "number", 0.6,
@@ -169,6 +174,7 @@ def value_rules(key: str) -> dict[str, Any]:
         return {"minimum": 0, "maximum": 1}
     if entry.value_type == "int":
         nonnegative = {
+            "analysis.max_review_repairs",
             "analysis.max_subagent_retries", "convert.max_inflight", "parse.max_inflight",
             "job.retry.convert_500",
         }

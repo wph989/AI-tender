@@ -16,6 +16,7 @@ from tender.application.knowledge.content import (
     normalized,
     validate_items,
 )
+from tender.application.shared.validation import allowed_values, validation_message
 from tender.domain.shared.errors import InvalidModelOutput, ModelOutputTruncated
 from tender.ports.llm.chat import StructuredTextModel
 
@@ -71,7 +72,7 @@ def skill_version(snapshot: dict | None = None) -> str:
     return fingerprint(snapshot or skill_snapshot())[:24]
 
 
-async def json_completion(model: StructuredTextModel, prompt: str, *, validate=None) -> dict:
+def parse_json_object(content: str) -> dict:
     def unique_object(pairs):
         value = {}
         for key, item in pairs:
@@ -80,19 +81,27 @@ async def json_completion(model: StructuredTextModel, prompt: str, *, validate=N
             value[key] = item
         return value
 
+    content = content.strip()
+    fenced = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```", content, re.S | re.I)
+    if fenced:
+        content = fenced.group(1)
+    try:
+        parsed = json.loads(content, object_pairs_hook=unique_object)
+    except json.JSONDecodeError as exc:
+        raise InvalidModelOutput(
+            f"JSON第{exc.lineno}行第{exc.colno}列：{exc.msg}；修正语法并返回完整JSON对象"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise InvalidModelOutput("模型必须返回 JSON 对象")
+    return parsed
+
+
+async def json_completion(model: StructuredTextModel, prompt: str, *, validate=None) -> dict:
+    original_prompt = prompt
     for attempt in range(3):
         try:
             result = await model.complete(prompt)
-            content = result.content.strip()
-            fenced = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```", content, re.S | re.I)
-            if fenced:
-                content = fenced.group(1)
-            try:
-                parsed = json.loads(content, object_pairs_hook=unique_object)
-            except ValueError as exc:
-                raise InvalidModelOutput("模型必须返回 JSON 对象") from exc
-            if not isinstance(parsed, dict):
-                raise InvalidModelOutput("模型必须返回 JSON 对象")
+            parsed = parse_json_object(result.content)
             if validate is not None:
                 validate(parsed)
             return parsed
@@ -104,9 +113,10 @@ async def json_completion(model: StructuredTextModel, prompt: str, *, validate=N
                 raise
             # 只纠正已收到的格式错误；连接、配置、拒绝和权限错误仍由原调用策略处理。
             # 不猜测自然语言中的动作，也不把未经校验的模型文本拼进工具结果。
-            prompt += (
+            # 只带当前错误，已修正的错误不能在后续请求里反复叠加；保留有界的多字段修法。
+            prompt = original_prompt + (
                 "\n上次响应结构错误："
-                + str(exc)[:400]
+                + str(exc)[:1800]
                 + "。请按上述结构重新返回完整 JSON 对象，不输出解释或额外字段。"
             )
     raise AssertionError("不可达的 JSON 重试状态")
@@ -380,12 +390,15 @@ def _compact_review_values(item: dict, windows: EvidenceWindows, budget: list) -
     }
 
 
-def _validate_evidence_selection(review: dict, item: dict) -> None:
+def _validate_evidence_selection(review: dict, item: dict, path: str = "evidence_ids") -> None:
     selections = review.get("evidence_ids")
     values = item.get("values", [])
     if not isinstance(selections, list) or len(selections) != len(values):
-        raise InvalidModelOutput("evidence_ids 必须与本字段 values 一一对应，为二维ID数组")
-    for chosen, value in zip(selections, values, strict=True):
+        raise InvalidModelOutput(
+            f"{path}：evidence_ids 必须与本字段 values 一一对应，为二维ID数组，共{len(values)}项"
+        )
+    errors = []
+    for index, (chosen, value) in enumerate(zip(selections, values, strict=True)):
         refs = value["citations"]
         allowed = {str(r["block_id"]) for r in refs}
         if (
@@ -394,18 +407,25 @@ def _validate_evidence_selection(review: dict, item: dict) -> None:
             or len(set(chosen)) != len(chosen)
             or not set(chosen) <= allowed
         ):
-            raise InvalidModelOutput(
-                "evidence_ids 只能选本值已提交的引用ID，不得重复或借用上下文ID"
-            )
+            errors.append((f"{path}.{index}",
+                           "evidence_ids 只能选本值已提交的引用ID，不得重复或借用上下文ID；可选："
+                           + allowed_values(allowed)))
+            continue
         if review["supported"]:
             if not chosen:
-                raise InvalidModelOutput("通过的解析值必须选择至少一条直接证据")
+                errors.append((f"{path}.{index}", "通过的解析值必须选择至少一条直接证据："
+                               + allowed_values(allowed)
+                               + "；无充分依据则supported=false并说明缺口"))
             # 跨来源证据常代表修订双方或项目与参考的适用关系，不能靠排序删掉其中一方。
             # 正文单元只从整项候选中挑自己的来源；整项值仍保留跨来源证据，不能把修订双方丢掉。
             if not value.get("content_path") and {r.get("source_id") for r in refs} != {
                 r.get("source_id") for r in refs if str(r["block_id"]) in chosen
             }:
-                raise InvalidModelOutput("跨来源结论必须保留各方必要引用，再在同一来源内去重")
+                errors.append((f"{path}.{index}",
+                               "跨来源结论必须保留各方必要引用，再在同一来源内去重；本值候选："
+                               + allowed_values(allowed)))
+    if errors:
+        raise InvalidModelOutput(validation_message(errors))
 
 
 def _review_business(record: Mapping[str, Any]) -> dict:
@@ -588,7 +608,9 @@ async def verify_items(
                                 "unresolved_references 必须是非空字符串组成的数组，"
                                 "无待展开指向时为[]"
                             )
-                        _validate_evidence_selection(review, batch[index])
+                        _validate_evidence_selection(
+                            review, batch[index], f"reviews.{index}.evidence_ids",
+                        )
             else:
                 flags = verdict.get("supported")
                 if (
