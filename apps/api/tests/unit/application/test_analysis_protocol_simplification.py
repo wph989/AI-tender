@@ -140,7 +140,7 @@ def test_batched_research_closes_without_renewing_budget_by_changing_selection()
         control.end(work, {"blocks": []}, set(research.seen))
     restored = TopicFlow(copy.deepcopy(state), research)
     control = TopicSearch(restored)
-    with pytest.raises(ToolArgumentError, match="耗尽"):
+    with pytest.raises(ToolArgumentError, match="耗尽|已完成或受阻"):
         control.begin("search_document", {"topic_keys": ["a"], "work": ["期限", "数量"]})
     assert control.summary(restored.state)["exhausted_work"] == 2
 

@@ -13,7 +13,7 @@ description: "从全部招标材料的 PDF 原文块识别投标文件格式、�
 ## 执行流程
 
 1. 结合已加载的格式定位、层级与目录过滤规则识别编制材料。
-2. 先 search_document 定位格式正文，再 read_document 扩展；根据问题查找分散附件和格式材料。
+2. 先 search_document_batch 定位格式正文，再 read_document 扩展；根据问题查找分散附件和格式材料。
 3. 对疑似导航目录读取 references/toc_filter_rules.md，区分目录与真正规定材料组成的正文。
 4. 先确定逻辑标类型及管辖范围，再识别章节父子关系，保留原文实际层级。
 5. 根据 references/output_format.md，提交标类型、章节及其 parent_key 父级；先父后子，每节点单独引用。

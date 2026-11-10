@@ -94,6 +94,16 @@ def test_indexed_search_does_not_read_full_text_or_return_vectors(environment, m
     assert columns and all("embedding" not in names for names in columns)
 
 
+def test_exact_keyword_survives_an_opposite_embedding_at_existing_threshold(environment):
+    db, sources, _ = indexed_sources(environment, count=1)
+    result = db.search_candidates(sources, "资质等级", [1.0, 0.0], "test-space",
+                                  limit=10, min_similarity=1.0)
+    # ordinal=4的原文完整命中，但向量[-1,0]与查询相反；关键词资格必须独立保留。
+    expected = next(row for row in db.readable_chunks(sources[0]) if row["ordinal"] == 4)
+    assert expected["content"] == "资质等级"
+    assert expected["block_id"] in {row["block_id"] for row in result.rows}
+
+
 @pytest.mark.parametrize("revoked", ["project", "project_file", "knowledge_collection", "company"])
 def test_cached_sources_cannot_bypass_revoked_access(environment, revoked):
     db, sources, _ = indexed_sources(environment, count=1)

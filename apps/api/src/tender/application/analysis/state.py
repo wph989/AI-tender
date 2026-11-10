@@ -46,7 +46,7 @@ def published_items(snapshot: dict, *, final: bool = False) -> list[dict]:
                 items[key] = old
     valid = [item for item in items.values() if item.get("verification") == "supported"
              and not ((final or deferred) and item.get("review_status") == "needs_review")]
-    if flow.get("protocol") == "research-v2":
+    if flow.get("protocol") in {"research-v2", "research-v3"}:
         reviewed = flow.get("audit", {}).get("record_topics", {})
         valid = [item for item in valid if item.get("review_status") == "current" and {
             e["topic"] for e in flow["entries"].values()
@@ -58,7 +58,7 @@ def published_items(snapshot: dict, *, final: bool = False) -> list[dict]:
             filtered = [item for item in valid if {
                 item["business"].get(k) for k in ("parent_key", "subject_key", "object_key")
                 if item["business"].get(k)
-            } <= keys]
+            } | set(item["business"].get("requirement_keys", [])) <= keys]
             if len(filtered) == len(valid):
                 break
             valid = filtered

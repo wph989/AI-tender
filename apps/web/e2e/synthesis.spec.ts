@@ -685,6 +685,30 @@ test("模块标签和三种重解析操作直接可用，提交范围互不混�
   await expect(actions.getByRole("button", { name: "重新解析本模块", exact: true })).toBeDisabled();
 });
 
+test("旧协议报告保留三个重解析按钮并说明禁用原因，正文与定位仍可用", async ({ page }, info) => {
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+    status: "partial", execution_compatible: false,
+  }) }));
+  await page.reload();
+  await selectModule(page, 1);
+  const actions = page.getByRole("group", { name: "报告操作", exact: true });
+  await page.screenshot({ path: info.outputPath("report-actions.png") });
+  await expect(actions.getByRole("button")).toHaveText(["刷新结果", "重新解析本模块", "补跑未完成模块", "全部重新解析"]);
+  const reason = "解析协议已升级，当前报告无法继续解析，请生成新报告。";
+  await expect(actions.getByText(reason, { exact: true })).toBeVisible();
+  for (const name of ["重新解析本模块", "补跑未完成模块", "全部重新解析"]) {
+    const button = actions.getByRole("button", { name, exact: true });
+    await expect(button).toBeVisible();
+    await expect(button).toBeDisabled();
+    await expect(button).toHaveAttribute("title", reason);
+  }
+  await expect(actions.getByRole("button", { name: "刷新结果", exact: true })).toBeEnabled();
+  await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+  await page.locator('[data-report-item="background"]')
+    .getByRole("button", { name: /^定位：/ }).first().click();
+  await expect(page.getByRole("region", { name: "引用原文", exact: true })).toBeVisible();
+});
+
 test("正文同一事项的位置跨条去重，不同出处直接定位且原文框保持透明", async ({ page }, info) => {
   const data = records(modules[0]!);
   const first = { ...citation, quote: "本项目预算为2130万元。", bbox: [0.1, 0.12, 0.8, 0.18] as [number, number, number, number] };

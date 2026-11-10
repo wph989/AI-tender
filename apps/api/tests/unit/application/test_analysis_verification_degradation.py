@@ -413,7 +413,9 @@ class _RetryStore:
     def report(self, report_id):
         return {
             "id": report_id, "project_id": 1, "status": "partial",
-            "runtime_version": RUNTIME_VERSION, "coverage": {"mode": "agent_research"},
+            "runtime_version": RUNTIME_VERSION,
+            "skill_snapshot": {"__analysis_flow_version__": "research-v3"},
+            "coverage": {"mode": "agent_research"},
         }
 
     def transaction(self):

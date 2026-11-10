@@ -162,6 +162,7 @@ def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
         evidence.update(r["block_id"] for r in business.get("citations", []))
         pending.extend(business[k] for k in ("parent_key", "subject_key", "object_key")
                        if business.get(k) and business[k] not in visited)
+        pending.extend(key for key in business.get("requirement_keys", []) if key not in visited)
     # 长笔记也分成完整、有位置的片段；不能切开JSON后要求模型猜测剩余结构。
     fragmented = []
     for unit in units:

@@ -5,7 +5,7 @@
 
 报价包含项与触发后另付的费用分别提交。计税附件缺失仅形成缺口，不能抹去已经明确的包含要求，也不能补出默认计税方法。
 
-以下仅展示综合阶段的局部输出结构。实际运行先完成本专题全部可处理核对项，明确受阻原因和适用范围，再统一输出；final=true 声明本轮综合已提交完毕，运行时仍核验覆盖与查漏结果。unknown 不能作为公共或指定标段要求使用。
+以下展示局部业务事项。研究期间逐批暂存，明确受阻原因和适用范围；final=true 声明本轮综合已提交完毕，运行时仍核验覆盖与查漏结果。unknown 不能作为公共或指定标段要求使用。
 
 ```json
 {
@@ -27,9 +27,7 @@
     {
       "records": [
         {
-          "key": "included-service-costs",
           "kind": "requirement",
-          "title": "驻场服务报价包含的费用",
           "group": "价格构成",
           "content": {
             "费用项": [
@@ -45,14 +43,12 @@
               "A标段"
             ]
           },
-          "citations": [
-            {
-              "block_id": "example-1"
-            }
-          ],
           "work_ids": [
             "w1",
             "w2"
+          ],
+          "block_ids": [
+            "example-1"
           ]
         }
       ],
@@ -61,9 +57,7 @@
     {
       "records": [
         {
-          "key": "extra-site-visit",
           "kind": "requirement",
-          "title": "书面要求增加异地踏勘的另付费用",
           "group": "价格构成",
           "content": {
             "费用项": "新增交通和住宿费用",
@@ -75,17 +69,12 @@
               "A标段"
             ]
           },
-          "conditions": {
-            "expression": "因采购人书面要求增加异地踏勘"
-          },
-          "citations": [
-            {
-              "block_id": "example-2"
-            }
-          ],
           "work_ids": [
             "w1",
             "w2"
+          ],
+          "block_ids": [
+            "example-2"
           ]
         }
       ],

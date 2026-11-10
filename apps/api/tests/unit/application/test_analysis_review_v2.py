@@ -84,11 +84,14 @@ def test_packets_contain_full_semantic_index_and_direct_source_within_input_limi
         flow.research.limits = replace(flow.research.limits, review_max_input_tokens=6000)
         packets, _ = batches(flow, "a", [])
         for packet in packets:
-            assert packet["protocol"] == "combined-v2"
+            assert packet["protocol"] == "combined-v3"
             assert _tokens(prompt(packet)) + 2048 <= 6000
-            assert packet["record_index"][0]["values"][1]["text"]
+            assert packet["record_index"][0]["business"]["title"]
+            assert any(row["business"]["content"] for row in
+                       packet["records"] + packet["context_records"])
             if packet["records"]:
-                assert packet["context_evidence"][0]["text"] == block()["content"]
+                spans = packet["context_evidence"] + packet["evidence"]
+                assert spans[0]["text"] == block()["content"]
 
     asyncio.run(run())
 
@@ -132,13 +135,14 @@ def test_plan_progress_includes_all_packets_before_the_first_request_and_survive
     async def run():
         from tender.application.analysis.research import AgentLimits
 
-        limits = AgentLimits(max_output_tokens=1000)
-        record = summary_record(content={"字段": "质保范围", "内容": ["质保三年"] * 24})
-        state, _, _, _ = await execute([record], limits=limits)
+        limits = AgentLimits(max_output_tokens=500)
+        records = [summary_record(key=f"r{i}", content={"字段": f"事项{i}", "内容": "质保三年"})
+                   for i in range(5)]
+        state, _, _, _ = await execute(records, limits=limits)
         research = session([block()], limits=limits)
         research.seen = state["research"]["seen"]
         research.events = state["research"]["events"]
-        state["topic_flow"]["audit"] = {"version": "combined-v2", "round": 0, "results": {}}
+        state["topic_flow"]["audit"] = {"version": "combined-v3", "round": 0, "results": {}}
         flow, requests, totals = TopicFlow(state, research), [], []
 
         async def review(payload):
@@ -169,7 +173,7 @@ def test_plan_progress_includes_all_packets_before_the_first_request_and_survive
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("dependency", ["parent", "endpoint", "lot"])
+@pytest.mark.parametrize("dependency", ["parent", "endpoint", "lot", "requirement"])
 def test_dependency_changes_review_only_affected_assertions(dependency):
     async def run():
         flow = await flow_fixture()
@@ -187,6 +191,9 @@ def test_dependency_changes_review_only_affected_assertions(dependency):
         elif dependency == "endpoint":
             dependent.update(kind="relation", predicate="requires", subject_key="dependency",
                              object_key="dependency")
+        elif dependency == "requirement":
+            source.update(kind="requirement")
+            dependent.update(requirement_keys=["dependency"])
         else:
             source.update(kind="lot", title="杭州标段", code="一")
             dependent.update(scope={"kind": "lots", "lot_refs": ["杭州标段"]})

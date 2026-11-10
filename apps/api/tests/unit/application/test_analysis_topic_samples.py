@@ -140,7 +140,6 @@ def test_annotated_sample_preserves_all_items_and_avoids_old_result_resubmission
 
 
 async def run_combined_sample():
-    from tender.application.analysis.protocol import PROTOCOL_VERSION
     from tender.application.analysis.review import review_combined
 
     rows = [block() | value for value in SAMPLE["blocks"]]
@@ -173,10 +172,11 @@ async def run_combined_sample():
             prompts.append(prompt)
             payload = json.loads(prompt.rsplit("\n", 1)[-1])
             reviews = {row["record_id"]: {"supported": True, "issues": [],
-                       "bindings": {v["value_id"]: v["candidate_ids"] for v in row["values"]}}
+                       "block_ids": [next(r["block_id"] for r in SAMPLE["expected"]
+                                          if r["key"] == row["key"])]}
                        for row in payload["records"]}
-            result = Completion(content=json.dumps({"reviews": reviews, "issues": [],
-                "checked_units": [r["unit_id"] for r in payload["evidence"]]}), model="offline")
+            result = Completion(content=json.dumps({"reviews": reviews, "issues": []}),
+                                model="offline")
             validate(result)
             return result
     async def review(payload):
@@ -184,7 +184,7 @@ async def run_combined_sample():
     async def reserve():
         tool_calls.append(1)
     router, state = ScriptedRouter(script), {}
-    snapshot = SKILL | {FLOW_KEY: PROTOCOL_VERSION,
+    snapshot = SKILL | {FLOW_KEY: "research-v2",
                        KEY + "/references/coverage.json": json.dumps(topics, ensure_ascii=False)}
     graph, files = build_module_agent(key=KEY, model=RoutedAgentModel(router=router),
                                      research=research, state=state, snapshot=snapshot,

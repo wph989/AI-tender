@@ -15,7 +15,7 @@ from test_deep_analysis import call
 from tender.application.analysis.data import GapInput, SynthesisRecord, prepare_records
 from tender.application.analysis.output import output_schema
 from tender.application.analysis.policy import load_module_skill
-from tender.application.analysis.protocol import ResearchLedger
+from tender.application.analysis.protocol import ResearchLedger, SubmissionRecord
 from tender.application.analysis.skills import MODULES, RESOURCE_ROOT, skill_snapshot
 from tender.application.analysis.topic_flow import TopicFlow
 
@@ -36,12 +36,22 @@ def examples(path):
 
 
 def business_record(record):
-    return SynthesisRecord.model_validate({k: v for k, v in record.items() if k != "work_ids"})
+    from tender.application.knowledge.content import fingerprint
+
+    SubmissionRecord.model_validate(record)
+    payload = {k: v for k, v in record.items() if k not in {"work_ids", "block_ids", "id"}}
+    name = payload["content"].get("要求摘要", next(iter(payload["content"].values())))
+    payload.setdefault("title", ("；".join(name) if isinstance(name, list) else name)[:300])
+    payload.setdefault("key", "example-" + fingerprint(record)[:24])
+    return SynthesisRecord.model_validate(payload | {
+        "citations": [{"block_id": bid} for bid in record["block_ids"]],
+        "structuring": "complete",
+    })
 
 
 def legacy_submission(submission):
-    return {**submission, "records": [{k: v for k, v in r.items() if k != "work_ids"}
-                                      for r in submission["records"]]}
+    return {"records": [business_record(r).model_dump() for r in submission["records"]],
+            "final": submission["final"]}
 
 
 def example_rows(value, *, cross_file=False):
@@ -59,6 +69,7 @@ def test_native_and_historical_schemas_keep_existing_public_shape(key):
     public_shape = copy.deepcopy(actual)
     for section in public_shape["sections"]:
         section.pop("scalar_columns", None)
+        section.pop("title_column", None)
     assert public_shape == expected
     assert output_schema(LEGACY["snapshot"], key) == expected
     # 原生声明不依赖 Markdown 或硬编码专题分支，也无需访问当前磁盘。
@@ -115,7 +126,11 @@ def test_frozen_category_loading_and_hash_do_not_mix_versions():
     schema["sections"][0]["columns"].append("未来字段")
     changed = frozen | {path: json.dumps(schema)}
     assert load_module_skill(changed, key)["sha256"] != load_module_skill(frozen, key)["sha256"]
-    assert output_schema(frozen, key) == LEGACY["schemas"][key]
+    public = output_schema(frozen, key)
+    for section in public["sections"]:
+        section.pop("title_column", None)
+        section.pop("scalar_columns", None)
+    assert public == LEGACY["schemas"][key]
 
 
 @pytest.mark.parametrize("path", EXAMPLE_PATHS, ids=lambda p: str(p.relative_to(RESOURCE_ROOT)))
@@ -128,7 +143,7 @@ def test_packaged_examples_pass_real_record_and_citation_validation(path):
         state = {"output_schema": output_schema(SNAPSHOT, key), "staged_items": []}
         assert value["submissions"][-1]["final"] is True
         for index, submission in enumerate(value["submissions"]):
-            assert len(submission["records"]) <= 1
+            assert isinstance(submission["records"], list)
             assert submission["final"] == (index == len(value["submissions"]) - 1)
             raw = [business_record(r) for r in submission["records"]]
             entries = prepare_records(raw, state, seen, key)
@@ -160,7 +175,14 @@ def test_packaged_examples_accept_minimal_topic_progress_without_extra_empty_sub
                                         for r in submission["records"]], state, seen, key)
             updates = [u for item, record in zip(prepared, submission["records"], strict=True)
                        for u in ResearchLedger(flow).record_updates([item], record["work_ids"])]
-            updates = flow.prepare_updates(prepared, updates)
+            merged = {}
+            for update in updates:
+                token = (update.topic, json.dumps(update.scope_value(), sort_keys=True))
+                if token in merged:
+                    merged[token].record_keys.extend(update.record_keys)
+                else:
+                    merged[token] = update
+            updates = flow.prepare_updates(prepared, list(merged.values()))
             flow.validate_records(prepared, updates)
             available = {i["business"]["key"] for i in [*state.get("staged_items", []), *prepared]}
             flow.apply(updates, available)
@@ -198,20 +220,21 @@ def test_thirteen_topic_review_packets_keep_domain_rules_properties_and_quotes(k
         assert fits(packet, research.limits)
         assert packet["domain_rules"] == rules
         for row in packet["records"]:
-            seen.setdefault(row["record_id"], []).extend(row["values"])
+            seen[row["record_id"]] = row["business"]
         validate({"reviews": {row["record_id"]: {
             "supported": True, "issues": [],
-            "bindings": {v["value_id"]: v["candidate_ids"] for v in row["values"]},
-        } for row in packet["records"]}, "issues": [],
-                  "checked_units": [r["unit_id"] for r in packet["evidence"]]}, packet)
-        assert all(c["quote"] in research.seen[c["block_id"]]["content"]
-                   for c in packet["citations"].values())
+            "block_ids": row["block_ids"],
+        } for row in packet["records"]}, "issues": []}, packet)
+        assert all(span["text"] == research.seen[span["id"]]["content"]
+                   for span in packet["evidence"] + packet["context_evidence"])
     assert seen.keys() == {i["id"] for i in prepared}
     for item in prepared:
         expected = {k: v for k, v in semantic_payload(item["business"]).items()
-                    if k not in {"text", "content", "content_evidence"}
-                    and v not in (None, "", [], {})}
-        assert seen[item["id"]][0]["business"] == expected
+                    if k not in {"text", "category", "structuring"} and v not in (None, "", [], {})}
+        if not any(expected.get("conditions", {}).get(k)
+                   for k in ("expression", "terms", "exceptions")):
+            expected.pop("conditions", None)
+        assert seen[item["id"]] == expected
 
 
 @pytest.mark.parametrize("key", [
@@ -224,23 +247,25 @@ def test_native_example_survives_real_agent_graph_and_evidence_storage(key):
     rows = example_rows(value, cross_file=key == "general_module_parsing")
     research = session(rows)
     research.sources = [source(sid) for sid in sorted({row["source_id"] for row in rows})]
+    submissions = [legacy_submission(submission) for submission in value["submissions"]]
+    chunks = [submission["records"][i:i + 3] for submission in submissions
+              for i in range(0, len(submission["records"]), 3)]
     script = [*research_calls(query=MODULES[key]), *[
-        call("submit_analysis", legacy_submission(submission),
-             f"record-{i}")
-        for i, submission in enumerate(value["submissions"])
+        call("submit_analysis", {"records": records, "final": i == len(chunks) - 1}, f"record-{i}")
+        for i, records in enumerate(chunks)
     ]]
     state, _, _ = asyncio.run(execute(script, research=research, snapshot=SNAPSHOT, key=key))
     actual = state["draft"]["business_data"]["records"]
     expected = [r for submission in value["submissions"] for r in submission["records"]]
-    assert [r["key"] for r in actual] == [r["key"] for r in expected]
+    assert [r["key"] for r in actual] == [business_record(r).key for r in expected]
     assert [r["content"] for r in actual] == [r["content"] for r in expected]
     assert all(r["evidence_ids"] and "citations" not in r for r in actual)
     if key == "price_requirement_parsing":
         assert actual[0]["scope"] != actual[1]["scope"]
         assert "超限处理" not in actual[1]["content"]
     elif key == "scoring_standard_parsing":
-        assert len(actual) == 1 and len(actual[0]["scoring"]["tiers"]) == 3
-        assert actual[0]["scoring"]["deductions"]
+        assert len(actual) == 1
+        assert "得6分" in str(actual[0]["content"]) and "扣1分" in str(actual[0]["content"])
     elif key == "tech_requirement_parsing":
         assert len(actual) == 2
         assert all("600mm" not in json.dumps(r["content"]) for r in actual)
@@ -275,10 +300,10 @@ def test_example_rejects_unread_location_and_ignores_legacy_quote():
     seen = {row["block_id"]: row for row in example_rows(value)}
     raw = copy.deepcopy(value["submissions"][0]["records"][0])
     state = {"output_schema": output_schema(SNAPSHOT, key)}
-    raw["citations"][0]["block_id"] = "unread"
+    raw["block_ids"][0] = "unread"
     with pytest.raises(ValueError, match="未读取"):
         prepare_records([business_record(raw)], state, seen, key)
-    raw["citations"][0] = {"block_id": "example-1", "quote": "预付全部价款"}
+    raw["block_ids"][0] = "example-1"
     item = prepare_records([business_record(raw)], state, seen, key)[0]
     assert item["values"][0]["citations"][0]["quote"] == seen["example-1"]["content"]
 

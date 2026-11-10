@@ -23,6 +23,7 @@ from tender.application.analysis.data_store import (
     snapshot_matches_report,
 )
 from tender.application.analysis.output import output_schema
+from tender.application.analysis.protocol import PROTOCOL_VERSION
 from tender.application.analysis.runtime import limits_snapshot
 from tender.application.analysis.skills import MODULES, skill_snapshot, skill_version
 from tender.application.knowledge.content import (
@@ -253,6 +254,9 @@ class AnalysisService:
             "modules": modules,
             "stale": stale,
             "runtime_retired": retired,
+            "execution_compatible": not retired and report.get("skill_snapshot", {}).get(
+                "__analysis_flow_version__",
+            ) == PROTOCOL_VERSION,
             "data_schema_version": None if retired else DATA_VERSION,
         }
 
@@ -498,6 +502,9 @@ class AnalysisService:
                 "该报告由已下线的解析流程生成，请重新发起分析",
                 code="runtime_retired",
             )
+        if report.get("skill_snapshot", {}).get("__analysis_flow_version__") != PROTOCOL_VERSION:
+            raise Conflict("解析协议已升级，请新建报告；旧报告仍可查看",
+                           code="execution_incompatible")
         if report["status"] in {"waiting", "pending", "running"}:
             raise Conflict(
                 "报告正在排队或执行，请等待完成或先取消再补跑",
@@ -609,7 +616,7 @@ class AnalysisService:
                     if carry.get("topic_flow"):
                         flow = carry["topic_flow"]
                         audit = flow.get("audit", {})
-                        if audit.get("version") == "combined-v2":
+                        if audit.get("version") == "combined-v3":
                             # 新attempt只更新执行额度；语义一致的包与主题判定跨补跑保留。
                             completed = {}
                             for key, value in audit.get("completed_topics", {}).items():

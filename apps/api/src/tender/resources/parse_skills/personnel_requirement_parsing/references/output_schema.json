@@ -10,7 +10,8 @@
       ],
       "scalar_columns": [
         "字段"
-      ]
+      ],
+      "title_column": "字段"
     }
   ]
 }

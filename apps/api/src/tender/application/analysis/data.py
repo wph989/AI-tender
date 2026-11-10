@@ -219,6 +219,9 @@ def prepare_records(
         if entry["kind"] == "format_node" and module_key != "bid_format_outline_parsing":
             raise ValueError("格式节点由投标文件格式模块提交")
         refs = list(entry["citations"])
+        if any(ref == entry["key"] or ref not in combined
+               or combined[ref]["kind"] != "requirement" for ref in entry["requirement_keys"]):
+            raise ValueError("requirement_keys：须引用同批或已提交的要求事项，不能引用自身")
         if entry["kind"] == "format_node":
             path, visited, current = [], {entry["key"]}, entry
             while current.get("parent_key"):
@@ -280,6 +283,45 @@ def prepare_records(
             item["output"] = output
         result.append(item)
     return result
+
+
+def prepare_record_batch(raw: list[SynthesisRecord], state: dict, seen: dict,
+                         module_key: str) -> tuple[list[dict], list[dict]]:
+    """共享同批有效引用图；仅移除坏记录及依赖它的事项，保留无关的有效依赖组。"""
+    candidates, rejected = {}, {}
+    for index, record in enumerate(raw):
+        try:
+            value = record.model_dump()
+            if state.get("output_schema"):
+                output = record_output(value, state["output_schema"])
+                value["content"] = output["content"]
+                value["text"] = "\n".join(
+                    name + "：" + ("\n".join(v) if isinstance(v, list) else v)
+                    for name, v in value["content"].items()
+                )
+            candidates[index] = value
+        except ValueError as exc:
+            rejected[index] = str(exc)
+    while candidates:
+        context = dict(state) | {"staged_items": [
+            *state.get("staged_items", []),
+            *({"business": value} for value in candidates.values()),
+        ]}
+        accepted, failures = {}, {}
+        for index in candidates:
+            try:
+                accepted[index] = prepare_records([raw[index]], context, seen, module_key)[0]
+            except ValueError as exc:
+                failures[index] = str(exc)
+        if not failures:
+            return list(accepted.values()), [
+                {"index": i, "key": raw[i].key, "title": raw[i].title, "error": error}
+                for i, error in sorted(rejected.items())
+            ]
+        rejected.update(failures)
+        candidates = {i: value for i, value in candidates.items() if i not in failures}
+    return [], [{"index": i, "key": raw[i].key, "title": raw[i].title, "error": error}
+                for i, error in sorted(rejected.items())]
 
 
 def prepare_coverage(

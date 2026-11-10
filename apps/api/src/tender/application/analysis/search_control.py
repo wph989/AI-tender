@@ -29,18 +29,25 @@ class TopicSearch:
             for entry in entries:
                 if target["kind"] == "task":
                     task = entry["tasks"].get(target["task_id"], {})
-                    notes.append(task if task.get("status") == "resolved" else {})
-                else:
+                    # 已解决待办的笔记可继续修订，但只有解决状态变化能给研究续期。
+                    notes.append(bool(task.get("status") == "resolved")
+                                 if self.flow.data.get("protocol") == "research-v3"
+                                 else task if task.get("status") == "resolved" else {})
+                elif self.flow.data.get("protocol") != "research-v3":
                     notes.extend((check, sorted(value["evidence_ids"]), value["status"])
                                  for check, value in entry.get("findings", {}).items()
                                  if target["kind"] == "exploration" or check == target["work"])
+
         return fingerprint([
-            ([e["checked"] for e in entries] if target["kind"] == "exploration" else
+            ([] if self.flow.data.get("protocol") == "research-v3" else
+             [e["checked"] for e in entries] if target["kind"] == "exploration" else
              [target["work"] in e["checked"] for e in entries]
              if target["kind"] == "check" else []),
             [business_claim(i) for i in self.state.get("staged_items", [])
-             if i.get("business", {}).get("key") in records
-             and i.get("verification") == "supported"],
+             if (i.get("business", {}).get("key") in records
+                 or target["id"] in i.get("work_ids", []))
+             and (self.flow.data.get("protocol") == "research-v3"
+                  or i.get("verification") == "supported")],
         ] + ([notes] if self.flow.research_first else []))
 
     def exhaust(self, target: dict) -> None:
@@ -127,6 +134,16 @@ class TopicSearch:
             raise ToolArgumentError("block_id须为已读原文ID，或最多4个ID的数组")
         keys = self.flow.topic_keys(args.get("topic_keys"), block_id=args.get("block_id"),
                                     work=args.get("work"))
+        if name == "read_document":
+            # 门禁先于工具schema，先收敛窗口类型，避免坏参数在range中击穿整批执行。
+            args = dict(args)
+            for field in ("before", "after"):
+                value = args.get(field, 2)
+                if isinstance(value, str) and value.isdecimal():
+                    value = int(value)
+                if type(value) is not int or not 0 <= value <= 11:
+                    raise ToolArgumentError(field + "须为0～11的整数")
+                args[field] = value
         if name == "read_document" and args.get("before", 2) == args.get("after", 2) == 0:
             return []
         try:
@@ -196,7 +213,20 @@ class TopicSearch:
                           and offset > previous.get("offset", 0)
                           and offset < self.flow.research.limits.search_window)
                 # 轻量流程不要求靠写笔记续期；下一次不同查询先执行，再检查是否真有新原文。
-                continuation = self.flow.simplified or name == "read_document" or paging
+                anchors = args.get("block_id", [])
+                anchors = [anchors] if isinstance(anchors, str) else anchors
+                unread = name == "read_document" and any(
+                    not any(row["source_id"] == self.flow.research.seen[key]["source_id"]
+                            and row["offset"] == self.flow.research.seen[key]["offset"] + step
+                            for row in self.flow.research.seen.values())
+                    for key in anchors if key in self.flow.research.seen
+                    for step in range(-args.get("before", 2), args.get("after", 2) + 1)
+                    if self.flow.research.seen[key]["offset"] + step >= 0)
+                continuation = (unread or paging if self.flow.data.get("protocol") == "research-v3"
+                                else self.flow.simplified or name == "read_document" or paging)
+                if (self.flow.data.get("protocol") == "research-v3" and ledger.get("exhausted")
+                        and (continuation or ledger.get("signature") != self.signature(candidate))):
+                    ledger.update(exhausted=False, pending_stop=False, idle=0)
                 if ledger.get("pending_stop"):
                     if ledger["signature"] == self.signature(candidate):
                         # 已有命中的后续页和清单邻段仍可补齐；不能在看到正文后截断条件。
@@ -218,7 +248,86 @@ class TopicSearch:
         self.flow.data["active_topics"] = keys
         return selected
 
-    def end(self, work: list[dict], result: dict, before: set[str]) -> bool:
+    def end(self, work: list[dict], result: dict, before: set[str],
+            *, batch_id: str | None = None) -> bool:
+        if self.flow.data.get("protocol") != "research-v3":
+            return self._end_legacy(work, result, before)
+        self.flow.data.pop("active_work", None)
+        if not work:
+            return False
+        settled = (self.flow.data.setdefault("settled_search_batches", {}).setdefault(batch_id, [])
+                   if batch_id else [])
+        work = [target for target in work if target["id"] not in settled]
+        if not work:
+            return False
+        stats = self.flow.data.setdefault("efficiency", {})
+        stats["research_calls"] = stats.get("research_calls", 0) + 1
+        grouped: dict[str, list[dict]] = {}
+        for target in work:
+            grouped.setdefault(target["id"], []).append(target)
+        progressed = False
+        for wid, targets in grouped.items():
+            target = targets[0]
+            ledger = self.ledger.setdefault(wid, {"attempts": 0, "idle": 0})
+            signature = self.signature(target)
+            changed = "signature" in ledger and signature != ledger["signature"]
+            associated, paging = set(), False
+            pages = ledger.setdefault("pages", {})
+            for item in targets:
+                page = item.get("page", result.get("page", {}))
+                ids = set(item.get("associated_ids", []))
+                if "associated_ids" not in item:
+                    ids = set(result.get("already_read", [])) | {
+                        b.get("id", b.get("block_id")) for b in result.get("blocks", [])}
+                associated.update(ids)
+                page_key = fingerprint([item["action"], item.get("query"), item.get("source_id")])
+                previous = pages.get(page_key, {})
+                paging |= bool(previous.get("has_more") and ids
+                               and previous.get("next_offset") == item.get("offset", 0)
+                               and item.get("offset", 0) > previous.get("offset", 0))
+                if page:
+                    pages[page_key] = {
+                        k: page.get(k) for k in ("offset", "has_more", "next_offset")
+                    }
+                if item.get("action") == "search_document":
+                    searches = self.flow.data.setdefault("research_searches", {}).setdefault(
+                        item["topic"], {})
+                    sources = [s["source_id"] for s in self.flow.research.sources
+                               if s["project_id"] == self.flow.research.project_id
+                               and (item.get("source_id") is None
+                                    or s["source_id"] == item["source_id"])]
+                    searches[fingerprint([item.get("query"), sources])] = {
+                        "query": item.get("query", "").strip(), "source_ids": sources,
+                        "has_more": bool(page.get("has_more")),
+                        "limited": bool(result.get("search_limited")
+                                        or result.get("budget_exhausted")),
+                    }
+            # 证据必须新增到本工作；别的查询拿到的块、笔记和重复提交不能续期。
+            previous_ids = set(ledger.get("evidence_ids", []))
+            advance = changed or bool(associated - previous_ids) or paging
+            ledger.update(attempts=ledger["attempts"] + 1, signature=signature,
+                          evidence_ids=sorted(previous_ids | associated),
+                          idle=0 if advance else ledger["idle"] + 1)
+            if batch_id:
+                settled.append(wid)
+            progressed |= advance
+            if advance:
+                ledger.update(exhausted=False, pending_stop=False)
+            elif ledger["idle"] >= min(2, self.flow.research.limits.max_no_progress_rounds):
+                ledger["pending_stop"] = True
+                self.exhaust(target)
+                result["research_notice"] = (
+                    "本工作连续两批没有实质推进，已停止补查；请分析已有原文并保留具体缺口"
+                )
+        if not progressed:
+            stats["repeated_evidence_calls"] = stats.get("repeated_evidence_calls", 0) + 1
+        result["next_action"] = (
+            "先理解本批原文并暂存有据草稿；仅针对具体未决条件、续段或转引补查"
+        )
+        self.flow.sync()
+        return progressed
+
+    def _end_legacy(self, work: list[dict], result: dict, before: set[str]) -> bool:
         self.flow.data.pop("active_work", None)
         if not work:
             return False

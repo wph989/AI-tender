@@ -23,12 +23,11 @@ def approve(payload):
             row["record_id"]: {
                 "supported": True,
                 "issues": [],
-                "bindings": {v["value_id"]: v["candidate_ids"] for v in reversed(row["values"])},
+                "block_ids": row["block_ids"],
             }
             for row in reversed(payload["records"])
         },
         "issues": [],
-        "checked_units": [r["unit_id"] for r in payload["evidence"]],
     }
 
 
@@ -89,7 +88,7 @@ async def execute(records, *, review=None, tail=(), limits=None, search_args=Non
         model=RoutedAgentModel(router=router),
         research=session(evidence_rows or [block()], limits=limits),
         state=state,
-        snapshot=snapshot(keys) | {"__analysis_flow_version__": PROTOCOL_VERSION},
+        snapshot=snapshot(keys) | {"__analysis_flow_version__": "research-v2"},
         checkpointer=InMemorySaver(),
         reserve_tool=reserve,
         save=save,
@@ -106,7 +105,7 @@ def test_more_than_three_records_are_staged_then_reviewed_together_once():
         state, saved, router, reviewed = await execute(records)
         assert len(reviewed) == 1
         assert len(reviewed[0]["records"]) == 7
-        assert len(reviewed[0]["citations"]) == 1
+        assert len(reviewed[0]["evidence"] + reviewed[0]["context_evidence"]) == 1
         assert len(module_data(state)["records"]) == 7
         assert all(not module_data(s)["records"] for s in saved if "draft" not in s)
         first_tools = [t["function"]["name"] for t in router.requests[0][1]]
@@ -114,7 +113,7 @@ def test_more_than_three_records_are_staged_then_reviewed_together_once():
         assert "submit_analysis" not in first_tools
         assert "submit_analysis" in final_tools and "search_document" not in final_tools
         for record in module_data(state)["records"]:
-            assert record["content_evidence"]
+            assert "content_evidence" not in record
 
     asyncio.run(run())
 
@@ -198,10 +197,11 @@ def test_long_record_is_reviewed_by_body_units_and_published_only_after_all_part
         limits = AgentLimits(max_output_tokens=1000)
         record = summary_record(content={"字段": "质保范围", "内容": ["质保三年"] * 24})
         state, saved, _, reviewed = await execute([record], limits=limits)
-        assert len(reviewed) > 1
+        assert len(reviewed) == 1
         assert all(fits(payload, limits) for payload in reviewed)
         actual = module_data(state)["records"][0]
-        assert len(actual["content_evidence"]["内容"]) == 24
+        assert len(actual["content"]["内容"]) == 24
+        assert "content_evidence" not in actual
         assert all(not module_data(s)["records"] for s in saved if "draft" not in s)
 
     asyncio.run(run())
@@ -214,17 +214,17 @@ def test_split_record_has_full_semantic_context_without_extra_model_requests():
         async def review(payload):
             assert "available_context" not in payload
             assert "context_requests" not in payload
-            full = payload["record_index"][0]
-            assert len(full["values"]) == 26
-            assert len(payload["records"][0]["values"]) < 26
+            full = payload["records"][0]
+            assert len(full["business"]["content"]["内容"]) == 24
+            assert "values" not in payload["records"][0]
             return approve(payload)
 
         record = summary_record(content={"字段": "质保范围", "内容": ["质保三年"] * 24})
         state, _, _, packets = await execute(
             [record], limits=AgentLimits(max_output_tokens=1000), review=review,
         )
-        assert len(packets) > 1
-        assert len(module_data(state)["records"][0]["content_evidence"]["内容"]) == 24
+        assert len(packets) == 1
+        assert len(module_data(state)["records"][0]["content"]["内容"]) == 24
 
     asyncio.run(run())
 
@@ -239,7 +239,7 @@ def test_context_request_is_rejected_as_protocol_error_without_a_context_loop():
             calls.append(payload)
             return {"reviews": {}, "issues": [], "context_requests": ["record:old"]}
 
-        with pytest.raises(TopicIncomplete, match="不再索取上下文"):
+        with pytest.raises(TopicIncomplete, match="只返回reviews"):
             await execute([summary_record()], review=request)
         assert len(calls) == 1
 
@@ -251,7 +251,7 @@ def test_omitted_or_foreign_coverage_units_are_protocol_errors(checked):
     async def run():
         _, _, _, packets = await execute([summary_record()])
         verdict = approve(packets[0]) | {"checked_units": checked}
-        with pytest.raises(InvalidModelOutput, match="checked_units"):
+        with pytest.raises(InvalidModelOutput, match="只返回reviews"):
             validate(verdict, packets[0])
 
     asyncio.run(run())
@@ -269,7 +269,7 @@ def test_missing_or_foreign_ids_are_rejected_instead_of_positional_binding():
             validate(bad, payload)
         bad = copy.deepcopy(verdict)
         review = next(iter(bad["reviews"].values()))
-        review["bindings"][next(iter(review["bindings"]))] = ["foreign"]
+        review["block_ids"] = ["foreign"]
         with pytest.raises(InvalidModelOutput):
             validate(bad, payload)
 
@@ -360,7 +360,7 @@ def test_distinct_synthesis_batches_make_progress_without_blocking_another_topic
         graph, files = build_module_agent(
             key=KEY, model=RoutedAgentModel(router=router),
             research=session([block() | {"content": text}]), state=state,
-            snapshot=snapshot(("a", "b")) | {"__analysis_flow_version__": PROTOCOL_VERSION},
+            snapshot=snapshot(("a", "b")) | {"__analysis_flow_version__": "research-v2"},
             checkpointer=InMemorySaver(), reserve_tool=noop, save=save, review_combined=review,
         )
         await invoke_module(graph, files, thread_id="synthesis-progress", task="分批综合全部事项")

@@ -351,13 +351,12 @@ class AnalysisExecutor:
 
                     result = await review_combined(model, payload, limits=limits)
                     await authorize()
-                    selected = {cid for verdict in result["reviews"].values()
-                                if verdict["supported"] for ids in verdict["bindings"].values()
-                                for cid in ids}
+                    selected = {bid for verdict in result["reviews"].values()
+                                if verdict["supported"] for bid in verdict["block_ids"]}
                     locations = {}
                     for cid in selected:
-                        raw = payload["citations"][cid]
-                        ref = citation(research.seen[raw["block_id"]], raw["quote"])
+                        raw = research.seen[cid]
+                        ref = citation(raw, raw["content"])
                         locations[cid] = await asyncio.to_thread(db.resolve, ref)
                     result["locations"] = locations
                     return result

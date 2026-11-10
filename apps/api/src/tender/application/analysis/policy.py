@@ -244,6 +244,7 @@ def tool_key(name: str, arguments: dict, *, retrieval: bool = False) -> str:
     if retrieval:
         # 业务归属不改变原文；缓存只复用读取，命中后仍须关联本次选择的工作和主题。
         args.pop("work", None)
+        args.pop("work_ids", None)
         args.pop("topic_keys", None)
         if (isinstance(args.get("block_id"), list)
                 and all(isinstance(key, str) for key in args["block_id"])):

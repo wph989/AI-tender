@@ -37,7 +37,7 @@ from langchain_core.tools import StructuredTool, ToolException
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langsmith import tracing_context
 from psycopg import OperationalError
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, ValidationError
 
 from tender.application.analysis.context import (
     evidence_message,
@@ -52,6 +52,7 @@ from tender.application.analysis.data import (
     format_tree_issues,
     module_data,
     prepare_coverage,
+    prepare_record_batch,
     prepare_records,
 )
 from tender.application.analysis.output import (
@@ -81,6 +82,10 @@ from tender.application.analysis.protocol import (
     ResearchDelta,
     ResearchLedger,
     ResearchRecord,
+    SearchQuery,
+    SubmissionRecord,
+    submission_records,
+    tool_arguments,
 )
 from tender.application.analysis.research import (
     EvidenceBudgetError,
@@ -529,7 +534,8 @@ class ResearchMiddleware(AgentMiddleware):
     def research_budget_closed(self, name: str, args: dict) -> bool:
         return bool(
             self.topic_flow and self.topic_flow.simplified
-            and name in {"search_document", "search_knowledge", "read_document"}
+            and name in {"search_document", "search_document_batch",
+                         "search_knowledge", "read_document"}
             and not (name == "read_document" and args.get("before", 2) == args.get("after", 2) == 0)
             and any(e["action"] == "search_result" and e.get("scope") == "project"
                     for e in self.research.events)
@@ -839,7 +845,8 @@ class ResearchMiddleware(AgentMiddleware):
             hint += "\n当前Skill路径：" + self.skill["path"]
             if self.topic_flow.simplified:
                 hint += "\n领域规则：\n" + selected_rules
-                if not self.topic_flow.researching:
+                if (not self.topic_flow.researching
+                        or self.topic_flow.data.get("protocol") == "research-v3"):
                     hint += "\n成果组织：\n" + self.skill["output_rules"]
                     hint += "\n输出格式声明：" + json.dumps(
                         self.state["output_schema"], ensure_ascii=False, separators=(",", ":"),
@@ -861,6 +868,8 @@ class ResearchMiddleware(AgentMiddleware):
         if self.topic_flow.simplified:
             allowed = {"list_documents", "read_file", "get_research_context",
                        "update_research", "read_document"}
+            if self.topic_flow.data.get("protocol") == "research-v3":
+                allowed.update({"submit_analysis", "search_document_batch"})
             allowed.update({"search_document", "search_knowledge", "complete_research"}
                            if self.topic_flow.researching else {"submit_analysis"})
             tools = [t for t in tools if (
@@ -950,6 +959,14 @@ class ResearchMiddleware(AgentMiddleware):
         final = self.state.pop("topic_final_requested", None)
         if final:
             flow.data["synthesis_finished"] = True
+        if (flow.data.get("protocol") == "research-v3"
+                and not any(row.get("project_id") == self.research.project_id
+                            for row in self.research.seen.values())
+                and not self.state.get("staged_items")):
+            self.state["stop_reason"] = {"code": "evidence_failed", "stage": "research",
+                                         "message": "未取得本项目原文，取证失败"}
+            await self.save(self.state)
+            raise TopicIncomplete("未取得本项目原文，取证失败")
         if not flow.data.get("synthesis_finished"):
             return None
         pending = []
@@ -1684,6 +1701,7 @@ class ResearchMiddleware(AgentMiddleware):
             self._apply_failure_policy()
             call_id = request.tool_call["id"]
             name = request.tool_call["name"]
+            self.state["active_tool_call_id"] = call_id
             cached = self.state.setdefault("tool_results", {}).get(call_id)
             if cached is not None:
                 logger.bind(tool=name).info(
@@ -1691,9 +1709,37 @@ class ResearchMiddleware(AgentMiddleware):
                     status="cached", duration_ms=0,
                 )
                 return self.evidence_response(request, messages_from_dict([cached])[0])
+            if self.topic_flow and self.topic_flow.data.get("protocol") == "research-v3":
+                arguments = tool_arguments(name, request.tool_call.get("args", {}))
+                if name == "submit_analysis" and isinstance(arguments.get("records"), list):
+                    from tender.application.analysis.data import record_identity
+
+                    valid, indices, rejected = [], [], []
+                    for index, value in enumerate(arguments["records"]):
+                        try:
+                            SubmissionRecord.model_validate(value)
+                            valid.append(value)
+                            indices.append(index)
+                        except ValidationError as exc:
+                            slot = f"{call_id}:{index}"
+                            allocated = self.state.setdefault("submission_identities", {})
+                            ids = {record_identity(self.state, key) for key in allocated.values()}
+                            ids.update(i["id"] for i in self.state.get("staged_items", []))
+                            identifier = value.get("id") if isinstance(value, dict) else None
+                            if not isinstance(identifier, str) or identifier not in ids:
+                                key = allocated.setdefault(
+                                    slot, "r-" + record_identity(self.state, "submission:" + slot),
+                                )
+                                identifier = record_identity(self.state, key)
+                            rejected.append({"index": index, "id": identifier,
+                                             "status": "rejected", "error": schema_feedback(exc)})
+                    self.state["active_submission_indices"] = indices
+                    self.state["active_submission_rejected"] = rejected
+                    arguments = arguments | {"records": valid}
+                request = request.override(tool_call=request.tool_call | {"args": arguments})
             budget_closed = self.research_budget_closed(name, request.tool_call.get("args", {}))
             # 同一模型响应可带多次检索；边界后的未执行请求只记拒绝回执，不能侵占综合额度。
-            if not budget_closed:
+            if not budget_closed and name != "search_document_batch":
                 if self.begin_tool:
                     self.state.setdefault("tool_call_keys", {})[call_id] = (
                         await self.begin_tool(call_id)
@@ -1709,6 +1755,8 @@ class ResearchMiddleware(AgentMiddleware):
             reused_result = False
             failure_class: str | None = None
             try:
+                # 批量工具在闭包内结算工作账，需沿用当前模型轮次登记真实进展。
+                self.state["active_tool_round_id"] = self._round_id(request)
                 if name == "submit_analysis":
                     # 同轮工具串行执行：后续暂存或无效提交撤销前一提交的完成意图，
                     # 否则它尚未纠正就会借用旧 final 发布残缺成果；同ID重放已在上方返回。
@@ -1752,7 +1800,10 @@ class ResearchMiddleware(AgentMiddleware):
                                 >= self.research.limits.max_argument_failures):
                             raise TopicIncomplete("参数纠错额度已耗尽，停止新增检索并保留核实成果")
                         control = TopicSearch(self.topic_flow)
-                        work = control.begin(name, request.tool_call["args"])
+                        args = request.tool_call["args"]
+                        work = control.begin(name, args | {
+                            "work": args.get("work_ids", args.get("work")),
+                        })
                     if name in {"search_document", "search_knowledge"} and (
                         (self.state.get("finish_only") and not self.topic_flow)
                         or (not (self.topic_flow and self.topic_flow.simplified)
@@ -1788,7 +1839,7 @@ class ResearchMiddleware(AgentMiddleware):
                             args = request.tool_call["args"]
                             keys = self.topic_flow.topic_keys(
                                 args.get("topic_keys"), block_id=args.get("block_id"),
-                                work=args.get("work"),
+                                work=args.get("work_ids", args.get("work")),
                             )
                             self.topic_flow.data["active_topics"] = keys
                             self.topic_flow.evidence(before, keys, payload)
@@ -1908,7 +1959,8 @@ class ResearchMiddleware(AgentMiddleware):
                 try:
                     # 控制类回执没有执行动作；失败和取消也不能扣成功额度。
                     self.state.setdefault("tool_outcomes", {})[call_id] = (
-                        "skipped" if failure_class == "work_closed" or budget_closed
+                        "skipped" if name == "search_document_batch"
+                        or failure_class == "work_closed" or budget_closed
                         else "unknown" if isinstance(tool_error, asyncio.CancelledError)
                         else "error" if tool_error is not None or result is None
                         or getattr(result, "status", None) == "error"
@@ -1918,6 +1970,10 @@ class ResearchMiddleware(AgentMiddleware):
                     if self.topic_flow:
                         # 参数错误或取消同样结束当前归因，防止后续提交误用上次的局部范围。
                         self.topic_flow.data.pop("active_work", None)
+                    self.state.pop("active_tool_call_id", None)
+                    self.state.pop("active_tool_round_id", None)
+                    self.state.pop("active_submission_indices", None)
+                    self.state.pop("active_submission_rejected", None)
                     self.state["research"] = self.research.checkpoint()
                     await self.save(self.state)
                 except BaseException as exc:
@@ -1942,7 +1998,7 @@ class ResearchMiddleware(AgentMiddleware):
                         ),
                         duration_ms=int((time.monotonic() - started) * 1000),
                         new_evidence_count=len(set(self.research.seen) - evidence_before),
-                        budget_reserved=not budget_closed,
+                        budget_reserved=not budget_closed and name != "search_document_batch",
                         result_kind=failure_class or (
                             "error" if failed else "reused" if reused_result else "executed"
                         ),
@@ -1987,8 +2043,8 @@ def build_module_agent(
     flow = TopicFlow(state, research) if enabled(snapshot) else None
     if flow:
         state["topic_lots"] = list(lots)
-        if snapshot.get("__analysis_flow_version__") == PROTOCOL_VERSION:
-            flow.data["protocol"] = PROTOCOL_VERSION
+        if snapshot.get("__analysis_flow_version__") in {"research-v2", PROTOCOL_VERSION}:
+            flow.data["protocol"] = snapshot["__analysis_flow_version__"]
         if snapshot.get(OUTPUT_MODE_KEY) == OUTPUT_MODE or flow.simplified:
             # 输出时序冻结于报告快照；恢复沿用同一阶段及研究账，不另建Agent实现。
             flow.data["output_mode"] = OUTPUT_MODE
@@ -2058,6 +2114,159 @@ def build_module_agent(
             update_search_ledger()
         return result
 
+    async def search_document_batch(
+        queries: Annotated[list[SearchQuery], Field(min_length=1, max_length=4)],
+    ) -> dict:
+        """批量检索1到4个具体缺口；并发召回后去重交付，按成功子查询结算。"""
+        from tender.domain.shared.errors import BudgetExhausted
+
+        merged = {}
+        for index, query in enumerate(queries):
+            token = (query.query.strip(), query.source_id, query.offset)
+            entry = merged.setdefault(token, query.model_dump()
+                                      | {"indices": [], "work_ids": []})
+            entry["indices"].append(index)
+            entry["work_ids"] = list(dict.fromkeys(entry["work_ids"] + query.work_ids))
+        parent = state["active_tool_call_id"]
+        control = TopicSearch(flow)
+        jobs, responses, all_work = [], [], []
+        before = set(research.seen)
+        semaphore = asyncio.Semaphore(2)
+
+        async def recall(job):
+            try:
+                async with semaphore:
+                    await research.prefetch_search(job["query"], job["source_id"])
+            except Exception as exc:
+                # 来源参数错误只影响该查询；真实撤权和执行中断仍须终止整批。
+                if isinstance(exc, (PermissionError, InterruptedError)) and not isinstance(
+                    exc, SourceNotAllowed,
+                ):
+                    raise
+                job["error"] = str(exc)
+
+        try:
+            for sequence, entry in enumerate(merged.values()):
+                child_id = f"{parent}:query:{sequence}"
+                cached = state.get("tool_results", {}).get(child_id)
+                if cached and state.get("tool_outcomes", {}).get(child_id) == "ok":
+                    # 批次中断后沿用已成功子查询的回执，不能重新召回或预占额度。
+                    response = json.loads(cached["data"]["content"])
+                    responses.append(response)
+                    try:
+                        selected = control.begin("search_document", {
+                            "query": entry["query"], "source_id": entry["source_id"],
+                            "offset": entry["offset"], "work": entry["work_ids"],
+                        })
+                        all_work.extend(target | {"associated_ids": response["block_ids"],
+                                                  "page": response.get("page", {})}
+                                        for target in selected)
+                    except WorkClosed:
+                        pass
+                    continue
+                args = {k: v for k, v in entry.items() if k in {"query", "source_id", "offset"}}
+                args["work"] = entry["work_ids"]
+                try:
+                    selected = control.begin("search_document", args)
+                    if begin_tool:
+                        state.setdefault("tool_call_keys", {})[child_id] = (
+                            await begin_tool(child_id)
+                        )
+                    else:
+                        await reserve_tool()
+                except (ToolArgumentError, BudgetExhausted) as exc:
+                    responses.append({"indices": entry["indices"], "error": str(exc),
+                                      "status": "skipped", "block_ids": []})
+                    continue
+                jobs.append(entry | {"child_id": child_id, "work": selected, "args": args})
+            # 先冻结子调用身份；取消和Worker恢复可通过现有调用结算账回收在途额度。
+            await save(state)
+
+            tasks = [asyncio.create_task(recall(job)) for job in jobs]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            blocks = {}
+            already = {key for response in responses for key in response.get("block_ids", [])}
+            for job in jobs:
+                child_id = job["child_id"]
+                prior = set(research.seen)
+                try:
+                    if "error" in job:
+                        raise ToolArgumentError(job["error"])
+                    flow.data["active_work"] = job["work"]
+                    result = await search_document(**job["args"])
+                except Exception as exc:
+                    if isinstance(exc, (PermissionError, InterruptedError)) and not isinstance(
+                        exc, SourceNotAllowed,
+                    ):
+                        raise
+                    # 邻段扩展或串行入账失败也按子查询隔离，后续成功项仍能保存。
+                    state.setdefault("tool_outcomes", {})[child_id] = "error"
+                    responses.append({"indices": job["indices"], "status": "error",
+                                      "error": str(exc), "block_ids": []})
+                    all_work.extend(target | {"associated_ids": []} for target in job["work"])
+                    continue
+                ids = set(result.get("already_read", [])) | {
+                    row["id"] for row in result.get("blocks", [])}
+                for target in job["work"]:
+                    all_work.append(target | {"associated_ids": sorted(ids),
+                                               "new_ids": sorted(ids - prior),
+                                               "page": result.get("page", {})})
+                for row in result.get("blocks", []):
+                    blocks[row["id"]] = row
+                already.update(result.get("already_read", []))
+                responses.append({k: v for k, v in result.items()
+                                  if k not in {"blocks", "already_read"}} | {
+                    "indices": job["indices"], "query": job["query"],
+                    "work_ids": job["work_ids"], "status": "ok", "block_ids": sorted(ids),
+                })
+                state.setdefault("tool_outcomes", {})[child_id] = "ok"
+                state.setdefault("tool_results", {})[child_id] = message_to_dict(ToolMessage(
+                    content=json.dumps(responses[-1], ensure_ascii=False),
+                    tool_call_id=child_id, name="search_document",
+                ))
+                state["research"] = research.checkpoint()
+                await save(state)
+            payload = {"blocks": list(blocks.values()),
+                       "already_read": sorted(already - blocks.keys()),
+                       "queries": sorted(responses, key=lambda row: row["indices"][0])}
+            if control.end(all_work, payload, before, batch_id=parent):
+                state["topic_research_round"] = state["active_tool_round_id"]
+            return payload
+        finally:
+            for job in jobs:
+                state.setdefault("tool_outcomes", {}).setdefault(job["child_id"], "unknown")
+            flow.data.pop("active_work", None)
+            state["research"] = research.checkpoint()
+            await save(state)
+
+    async def search_document_v3(
+        query: str, work_ids: list[str], source_id: int | None = None,
+        offset: Annotated[int, Field(ge=0)] = 0,
+    ) -> dict:
+        """单查询检索项目原文；work_ids关联当前工作。分页仅用offset，无limit参数。"""
+        return await search_document(query, source_id, offset, work=work_ids)
+
+    async def search_knowledge_v3(
+        query: str, work_ids: list[str], source_id: int | None = None,
+        offset: Annotated[int, Field(ge=0)] = 0,
+    ) -> dict:
+        """单查询检索已关联参考资料，work_ids关联当前工作，参考资料不能替代项目原文。"""
+        return await search_knowledge(query, source_id, offset, work=work_ids)
+
+    async def read_document_v3(
+        block_id: str | Annotated[list[str], Field(min_length=1, max_length=4)],
+        before: Annotated[int, Field(ge=0, le=11)] = 2,
+        after: Annotated[int, Field(ge=0, le=11)] = 2,
+        work_ids: list[str] | None = None,
+    ) -> dict:
+        """围绕已读block_id补读连续条款；最多4个锚点，重叠窗口合并。"""
+        return await read_document(block_id, before, after, work=work_ids)
     async def search_knowledge(
         query: str, source_id: int | None = None, offset: Annotated[int, Field(ge=0)] = 0,
         topic_keys: list[str] | None = None,
@@ -2170,12 +2379,13 @@ def build_module_agent(
     async def finish_compact_research(
         research_summary: Annotated[str, Field(min_length=1, max_length=4000)],
     ) -> dict:
-        """已理解原文且依据充分时立即结束检索，进入最后统一综合；无需逐项登记研究笔记。"""
+        """结束研究；已有草稿直接审查，无草稿才综合，无需逐项登记研究笔记。"""
         try:
             ResearchLedger(flow).finish(research_summary)
             state["research"] = research.checkpoint()
             await save(state)
-            return {"phase": "synthesis", "note": "按Skill统一综合，最后一批final=true进入独立审查"}
+            return {"phase": "review" if state.get("staged_items") else "synthesis",
+                    "note": "已有草稿直接合并审查；无草稿时综合原文，最后一批final=true"}
         except ValueError as exc:
             raise ToolException(str(exc)) from exc
 
@@ -2301,7 +2511,7 @@ def build_module_agent(
     ) -> dict:
         """按冻结的输出时序提交完整事项；复用同一结构、引用与支持性校验链。"""
         try:
-            if flow and flow.researching:
+            if flow and flow.researching and flow.data.get("protocol") != "research-v3":
                 raise ValueError(
                     "当前仍在研究阶段，依据充分时先complete_research再统一综合；"
                     "尚有缺口则继续定向研究"
@@ -2320,18 +2530,7 @@ def build_module_agent(
                 prepared = prepare_records(records, state, research.seen, key)
             except ValueError as batch_error:
                 # 一条坏记录不应让同批其余独立事项全部被拒；按记录顺序隔离失败。
-                prepared = []
-                for index, record in enumerate(records):
-                    try:
-                        prepared.extend(prepare_records([record], state, research.seen, key))
-                    except ValueError as exc:
-                        rejected.append({
-                            "index": index,
-                            "key": record.key,
-                            "title": record.title,
-                            # 底层已对字段诊断设限，提前截断会丢掉后续引用的位置和修法。
-                            "error": str(exc),
-                        })
+                prepared, rejected = prepare_record_batch(records, state, research.seen, key)
                 if records and not prepared:
                     # 整批失败仍须反馈各类问题；同一格式错误只解释一次，避免重复整批错误正文。
                     errors: dict[str, list[int]] = {}
@@ -2380,7 +2579,9 @@ def build_module_agent(
                                                      w["check"] == old["check"])
                                                 for old in previous_works)]
                 flow.bind_records(prepared)
-            research_summary = research_summary or state["research_completed"]["research_summary"]
+            research_summary = research_summary or state.get("research_completed", {}).get(
+                "research_summary", "研究中暂存有据事项",
+            )
             checked_coverage, reviews = prepare_coverage(
                 coverage or [], state, research.seen, state["business_topics"], key,
             )
@@ -2448,6 +2649,63 @@ def build_module_agent(
             final=final, record_work={r.key: r.work_ids for r in records},
         )
 
+    async def submit_v3(
+        records: Annotated[list[Any], Field(description=(
+            "完整事项数组；每项kind/group/content/block_ids/work_ids，修改带回执id；"
+            "标段与格式节点提供title，范围未知或混合须显式scope；"
+            "父子或关系引用使用parent_key/subject_key/object_key/requirement_keys"
+        ))], final: bool = False,
+    ) -> dict:
+        """暂存完整业务事项；新增省略id，修改沿用回执id，最后一批final=true。"""
+        from tender.application.analysis.data import record_identity
+
+        # 原生工具先校验批次容器，逐条类型校验由中间件处理并保留原始位置和有效依赖组。
+        submitted = [SubmissionRecord.model_validate(value) for value in records]
+        premature_final = final and flow.researching
+        adapted, rejected = submission_records(
+            submitted, state, ResearchLedger(flow).works(), state["active_tool_call_id"],
+            indices=state.get("active_submission_indices"),
+        )
+        rejected.extend(state.get("active_submission_rejected", []))
+        valid, failures = prepare_record_batch(
+            [record for _, record in adapted], state, research.seen, key,
+        )
+        valid_keys = {item["business"]["key"] for item in valid}
+        rejected.extend({
+            "index": adapted[entry["index"]][0],
+            "id": record_identity(state, entry["key"]), "status": "rejected",
+            "error": entry["error"],
+        } for entry in failures)
+        adapted = [(index, record) for index, record in adapted if record.key in valid_keys]
+        if not adapted and rejected:
+            await save(state)
+            raise ToolException(json.dumps({"accepted": False, "records": rejected,
+                                            "final": False}, ensure_ascii=False))
+        original_indices = state.get("active_submission_indices", list(range(len(submitted))))
+        mapping = {record.key: submitted[original_indices.index(index)].work_ids
+                   for index, record in adapted}
+        result = await submit_business([record for _, record in adapted],
+                                       final=False, record_work=mapping)
+        business_rejected = {v["key"]: v for v in result.get("rejected", [])}
+        receipts = rejected + [
+            {"index": index, "id": record_identity(state, record.key),
+             "status": "rejected" if record.key in business_rejected else "accepted",
+             **({"error": business_rejected[record.key]["error"]}
+                if record.key in business_rejected else {})}
+            for index, record in adapted
+        ]
+        completed = (final and not premature_final
+                     and not any(r["status"] == "rejected" for r in receipts))
+        if completed:
+            transitions.request_final(state["research_completed"]["research_summary"], None)
+        await save(state)
+        # 工作与审查账已持久化；逐批重发整份progress会把旧正文和待办反复灌入模型上下文。
+        return {"records": sorted(receipts, key=lambda r: r["index"]), "final": completed,
+                "staged_items": result["staged_items"], **({
+                    # 提前收尾只纠正阶段意图；有据正文先保存，避免整批重新生成。
+                    "next_action": "有效事项已暂存；研究完成后调用complete_research进入审查",
+                } if premature_final else {})}
+
     def validation_feedback(error, *, tool_name: str = "submit_analysis"):
         # 只给字段路径无法区分类型错误与范围冲突；保留schema／业务校验原因，
         # 排除input和ctx，避免把完整坏草稿重复塞回上下文并浪费纠正预算。
@@ -2466,11 +2724,18 @@ def build_module_agent(
             TOOL_ARGUMENT_PREFIX + fields + "。请修正上述字段后重新提交。"
         )
 
+    v3 = bool(flow and flow.data.get("protocol") == "research-v3")
+    research_tools = [("list_documents", list_documents),
+                      ("search_document", search_document_v3 if v3 else search_document),
+                      ("search_knowledge", search_knowledge_v3 if v3 else search_knowledge),
+                      ("read_document", read_document_v3 if v3 else read_document)]
+    if v3:
+        research_tools.append(("search_document_batch", search_document_batch))
     tools = [
         StructuredTool.from_function(coroutine=f, handle_validation_error=partial(
-            validation_feedback, tool_name=f.__name__,
-        ))
-        for f in (list_documents, search_document, search_knowledge, read_document)
+            validation_feedback, tool_name=name,
+        ), name=name)
+        for name, f in research_tools
     ]
     if not flow:
         tools.append(StructuredTool.from_function(
@@ -2500,7 +2765,8 @@ def build_module_agent(
     tools.append(
         StructuredTool.from_function(
             name="submit_analysis",
-            coroutine=submit_compact if flow and flow.simplified else submit_business,
+            coroutine=(submit_v3 if flow and flow.data.get("protocol") == "research-v3" else
+                       submit_compact if flow and flow.simplified else submit_business),
             handle_tool_error=True,
             handle_validation_error=validation_feedback,
         )

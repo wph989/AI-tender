@@ -316,7 +316,8 @@ def test_budget_boundary_graph_can_research_review_issue_and_publish_repaired_re
                     "evidence_ids": ["s1r1c0"], "record_ids": [], "kind": "reference",
                 }]}
             assert payload["repair_issues"]
-            assert any(e["id"] == "s1r1c1" for e in payload["evidence"])
+            assert any(e["id"] == "s1r1c1" for e in
+                       payload["evidence"] + payload["context_evidence"])
             return approve(payload)
 
         graph, files = build_module_agent(
@@ -395,7 +396,8 @@ def test_small_topics_share_one_review_request_and_one_copy_of_evidence():
         )
         assert len(reviewed) == 1
         assert reviewed[0]["topics"] == ["a", "b"]
-        assert len(reviewed[0]["records"]) == len(reviewed[0]["evidence"]) == 1
+        assert len(reviewed[0]["records"]) == 1
+        assert len(reviewed[0]["evidence"] + reviewed[0]["context_evidence"]) == 1
         assert {c["topic"] for c in reviewed[0]["checks"]} == {"a", "b"}
         assert len(module_data(state)["records"]) == 1
         assert all(e["status"] == "ready" for e in state["topic_flow"]["entries"].values())

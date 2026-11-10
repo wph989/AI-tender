@@ -143,6 +143,7 @@ export interface AnalysisReport {
   data_schema_version?: string | null;
   stale: boolean;
   runtime_retired?: boolean;
+  execution_compatible?: boolean;
   error_message: string | null;
   modules: AnalysisModule[];
   runtime_version?: string;

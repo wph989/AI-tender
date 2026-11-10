@@ -288,25 +288,26 @@ def search_candidates(
     scored = select(
         *(lowered.c[name] for name in candidates.c.keys()),
         hits.label("hits"),
-        embedding.is_not(None).label("semantic"),
-        case((embedding.is_not(None), cosine), else_=hits / max(1, len(tokens))).label(
-            "similarity"
-        ),
+        ((hits > 0) & (hits / max(1, len(tokens)) >= (
+            min_similarity if min_similarity is not None else 0
+        ))).label("lexical"),
+        (embedding.is_not(None) & (cosine >= (
+            min_similarity if min_similarity is not None else -1
+        ))).label("semantic"),
+        cosine.label("similarity"),
     ).cte("scored")
-    filtered = select(scored)
-    if min_similarity is not None:
-        filtered = filtered.where(scored.c.similarity >= min_similarity)
-    eligible = filtered.cte("eligible")
-    # 与原 Python 规则一致：先按原始相似度过滤，再分别排名并做 RRF；不会先截断召回。
+    eligible = select(scored).where(scored.c.lexical | scored.c.semantic).cte("eligible")
+    # 通道资格分别排名，另一通道不合格的候选不能挤占本通道的名次。
     ties = [eligible.c.source_order.desc(), eligible.c.ordinal.desc()]
     ranked = select(
         eligible,
-        func.row_number().over(order_by=[eligible.c.hits.desc(), *ties]).label("lex_rank"),
+        func.row_number().over(order_by=[eligible.c.lexical.desc(), eligible.c.hits.desc(),
+                                        *ties]).label("lex_rank"),
         func.row_number()
         .over(order_by=[eligible.c.semantic.desc(), eligible.c.similarity.desc(), *ties])
         .label("sem_rank"),
     ).cte("ranked")
-    score = case((ranked.c.hits > 0, 1.0 / (60 + ranked.c.lex_rank)), else_=0) + case(
+    score = case((ranked.c.lexical, 1.0 / (60 + ranked.c.lex_rank)), else_=0) + case(
         (ranked.c.semantic, 1.0 / (60 + ranked.c.sem_rank)), else_=0
     )
     final = (
@@ -319,12 +320,12 @@ def search_candidates(
             score.label("score"),
         )
         .where(
-            (ranked.c.hits > 0) | ranked.c.semantic,
+            ranked.c.lexical | ranked.c.semantic,
         )
         .order_by(
             score.desc(),
-            case((ranked.c.hits > 0, 0), else_=1),
-            case((ranked.c.hits > 0, ranked.c.lex_rank), else_=ranked.c.sem_rank),
+            case((ranked.c.lexical, 0), else_=1),
+            case((ranked.c.lexical, ranked.c.lex_rank), else_=ranked.c.sem_rank),
         )
         .limit(limit)
     )

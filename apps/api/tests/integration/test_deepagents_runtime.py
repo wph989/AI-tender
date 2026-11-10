@@ -150,10 +150,6 @@ def report(env, *, topic_flow=False):
         project["id"], analysis_api.AnalysisSettings(category="goods"), env.request
     )
     created = analysis_api.start_analysis(project["id"], analysis_api.AnalysisInput(), env.request)
-    if not topic_flow:
-        # 既有脚本专门回归历史协议；新报告冻结与增量协议由 topic_flow 集成用例覆盖。
-        env.db.execute("""UPDATE analysis_report SET skill_snapshot=
-            skill_snapshot - '__analysis_flow_version__' WHERE id=:id""", {"id": created["id"]})
     return analysis_api.report_row(env.request, created["id"])
 
 
@@ -166,6 +162,41 @@ def prepared_runtime(env, *, topic_flow=False):
         {"id": row["id"]},
     )[0]
     return agent_runtime.AgentRuntime(env.db, row, run, sources)
+
+
+def test_old_protocol_is_readable_but_retry_is_rejected_before_enqueue(env):
+    row = report(env)
+    frozen = row["skill_snapshot"] | {"__analysis_flow_version__": "research-v2"}
+    env.db.execute("UPDATE analysis_report SET skill_snapshot=CAST(:snapshot AS JSONB), "
+                   "status='failed' WHERE id=:id",
+                   {"snapshot": json.dumps(frozen), "id": row["id"]})
+    result = analysis_api.get_report(row["id"], env.request)
+    assert result["execution_compatible"] is False and not result["runtime_retired"]
+    before = env.db.rows("SELECT * FROM agent_module_run")
+    with pytest.raises(ApiProblem) as caught:
+        analysis_api.retry_report(row["id"], analysis_api.RetryInput(), env.request)
+    assert caught.value.status_code == 409
+    assert env.db.rows("SELECT * FROM agent_module_run") == before
+
+
+def test_batch_children_settle_success_once_and_parent_does_not_spend_budget(env):
+    runtime = prepared_runtime(env)
+    assert runtime.claim()
+    try:
+        keys = [runtime.reserve("tool", f"batch:query:{i}") for i in range(3)]
+        state = {"tool_call_keys": dict(zip(
+            (f"batch:query:{i}" for i in range(3)), keys, strict=True,
+        )),
+                 "tool_outcomes": {"batch": "skipped", "batch:query:0": "ok",
+                                   "batch:query:1": "error", "batch:query:2": "unknown"}}
+        runtime.save(state)
+        runtime.save(state)
+        assert runtime.run["tool_calls"] == 3 and runtime.run["successful_tool_calls"] == 1
+        rows = env.db.rows("SELECT status FROM agent_call_attempt WHERE run_id=:run",
+                           {"run": runtime.run["id"]})
+        assert sorted(row["status"] for row in rows) == ["error", "ok", "unknown"]
+    finally:
+        runtime.release()
 
 
 def prepared_runtimes(env, count: int = 1):
@@ -503,7 +534,7 @@ class NativeRouter:
         elif self.calls == 2:
             name, args = (
                 "search_document",
-                {"query": "质保", "topic_keys": [t["key"] for t in self.topics]},
+                {"query": "质保", "work_ids": all_works},
             )
         elif self.calls == 3:
             name, args = (
@@ -540,10 +571,8 @@ class NativeRouter:
 
     async def complete(self, prompt):
         await self.reserve()
-        payload = json.loads(prompt.rsplit("\n", 1)[-1])
         return Completion(
-            content=json.dumps({"reviews": {}, "issues": [],
-                "checked_units": [r["unit_id"] for r in payload["evidence"]]}), model="fixture"
+            content=json.dumps({"reviews": {}, "issues": []}), model="fixture"
         )
 
     async def complete_validated(self, prompt, *, validate=None, validate_input=None, **kwargs):
@@ -608,12 +637,11 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
                 }]}
             else:
                 name, args = "submit_analysis", {"records": [{
-                    "key": "warranty", "kind": "requirement", "title": "质保",
+                    "kind": "requirement",
                     "work_ids": ["w1"], "group": "项目基本信息",
                     "content": {"字段": "质保期限", "内容": "质保期限为三年"},
                     "scope": {"kind": "common", "lot_refs": []},
-                    "citations": [{"block_id": b["id"], "quote": "质保三年"}
-                                  for b in result["blocks"]],
+                    "block_ids": [b["id"] for b in result["blocks"]],
                 }], "final": True}
             return self.respond(Completion(content="", model="fixture",
                                            agent_message=message_to_dict(
@@ -624,17 +652,15 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
         async def complete(self, prompt):
             await self.reserve()
             payload = json.loads(prompt.rsplit("\n", 1)[-1])
-            assert len(payload["citations"]) == 2
-            assert not any("bbox" in c for c in payload["citations"].values())
+            spans = payload["evidence"] + payload["context_evidence"]
+            assert len(spans) == 2 and not any("bbox" in span for span in spans)
             row = payload["records"][0]
-            assert row["values"][0]["business"]["scope"] == {"kind": "common", "lot_refs": []}
-            cid = max(payload["citations"], key=lambda c: payload["citations"][c]["block_id"])
-            selected.append(payload["citations"][cid]["block_id"])
+            assert row["business"]["scope"] == {"kind": "common", "lot_refs": []}
+            bid = max(span["id"] for span in spans)
+            selected.append(bid)
             return Completion(content=json.dumps({"reviews": {row["record_id"]: {
-                "supported": True, "issues": [],
-                "bindings": {v["value_id"]: [cid] for v in row["values"]},
-            }}, "issues": [], "checked_units": [r["unit_id"] for r in payload["evidence"]]}),
-                              model="fixture")
+                "supported": True, "issues": [], "block_ids": [bid],
+            }}, "issues": []}), model="fixture")
 
     async def retrieve(db, selected_sources, query, *args, **kwargs):
         return db.readable_chunks(selected_sources[0]), {"mode": "keyword"}

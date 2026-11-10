@@ -24,11 +24,8 @@ from tender.ports.llm.chat import Completion
 def packet():
     return {
         "topic": "a", "topics": ["a"], "records": [
-            {"record_id": "r1", "values": [
-                {"value_id": "v1", "candidate_ids": ["c1"]},
-                {"value_id": "v2", "candidate_ids": ["c2"]},
-            ]},
-            {"record_id": "r2", "values": [{"value_id": "v3", "candidate_ids": ["c3"]}]},
+            {"record_id": "r1", "block_ids": ["s1r1c0"]},
+            {"record_id": "r2", "block_ids": ["s1r1c0"]},
         ],
         "record_index": [{"record_id": "r1"}, {"record_id": "r2"}],
         "evidence": [{"id": "s1r1c0", "unit_id": "unit1"}], "context_evidence": [],
@@ -62,12 +59,12 @@ def test_review_collects_record_and_binding_errors_before_retry():
     payload = packet()
     result = approve(payload)
     result["reviews"].pop("r2")
-    result["reviews"]["r1"]["bindings"]["v1"] = ["foreign"]
+    result["reviews"]["r1"]["block_ids"] = ["foreign"]
     with pytest.raises(InvalidModelOutput) as caught:
         validate(result, payload)
     feedback = str(caught.value)
     assert "reviews" in feedback and "r2" in feedback
-    assert "reviews.r1.bindings.v1" in feedback and "c1" in feedback
+    assert "reviews.r1.block_ids" in feedback and "s1r1c0" in feedback
 
 
 def test_review_retry_receives_exact_binding_fix_and_finishes_next_request():
@@ -82,9 +79,9 @@ def test_review_retry_receives_exact_binding_fix_and_finishes_next_request():
                 self.prompts.append(prompt)
                 result = approve(payload)
                 if len(self.prompts) == 1:
-                    result["reviews"]["r1"]["bindings"]["v1"] = []
+                    result["reviews"]["r1"]["block_ids"] = []
                 else:
-                    assert "reviews.r1.bindings.v1" in prompt and "c1" in prompt
+                    assert "reviews.r1.block_ids" in prompt and "s1r1c0" in prompt
                 return Completion(content=json.dumps(result), model="fixture")
 
         from dataclasses import replace
@@ -224,7 +221,7 @@ def test_json_syntax_and_duplicate_keys_receive_specific_fix_before_retry(conten
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("field,wrong", [("reviews", []), ("issues", {}), ("checked_units", {})])
+@pytest.mark.parametrize("field,wrong", [("reviews", []), ("issues", {})])
 def test_review_root_type_feedback_names_field_before_dependent_validation(field, wrong):
     payload = packet()
     result = approve(payload) | {field: wrong}

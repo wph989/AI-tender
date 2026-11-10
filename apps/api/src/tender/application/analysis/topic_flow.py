@@ -102,7 +102,7 @@ not_found只说明在已核对资料范围内未找到，须说明范围与原�
 
 
 def enabled(snapshot: dict) -> bool:
-    return snapshot.get(FLOW_KEY) in {FLOW_VERSION, "research-v2"}
+    return snapshot.get(FLOW_KEY) in {FLOW_VERSION, "research-v2", "research-v3"}
 
 
 def identity(topic: str, scope: dict) -> str:
@@ -134,7 +134,7 @@ class TopicFlow:
 
     @property
     def simplified(self) -> bool:
-        return self.data.get("protocol") == "research-v2"
+        return self.data.get("protocol") in {"research-v2", "research-v3"}
 
     @property
     def research_first(self) -> bool:
@@ -225,6 +225,19 @@ class TopicFlow:
                 self.data["phase"] = "research"
                 self.data.pop("synthesis_finished", None)
         affected = {k for e in self.entries if e["topic"] in keys for k in e["record_keys"]}
+        if self.data.get("protocol") == "research-v3" and not global_revision:
+            active = self.data.get("active_work", [])
+            ids = {work["id"] for work in active}
+            explicit = {key for work in active for key in work.get("record_keys", [])}
+            if ids:
+                affected = {
+                    item["business"]["key"] for item in self.state.get("staged_items", [])
+                    if item.get("business") and (
+                        item["business"]["key"] in explicit or ids & set(item.get("work_ids", []))
+                        or review_ids & {ref["block_id"]
+                                         for ref in item["business"].get("citations", [])}
+                    )
+                }
         # 待办描述检索目的，不能证明返回原文只影响其record_keys；混合条款须按关联主题复核。
         affected.update(i["business"]["key"] for i in self.state.get("staged_items", [])
                         if i.get("business", {}).get("kind") == "coverage"
@@ -236,7 +249,7 @@ class TopicFlow:
                 business = item.get("business", {})
                 dependencies = {
                     business.get(k) for k in ("parent_key", "subject_key", "object_key")
-                }
+                } | set(business.get("requirement_keys", []))
                 if dependencies & affected:
                     affected.add(business["key"])
             if affected == previous:
@@ -855,13 +868,14 @@ class TopicFlow:
             resolved.update(fingerprint([entry["topic"], sorted(task["evidence_ids"]),
                                          sorted(task["record_keys"])])
                             for task in entry["tasks"].values() if task["status"] == "resolved")
-        # 综合最后统一审查，预校验通过的新草稿也算阶段推进，避免合法分批被误判为停滞。
+        # v3允许研究期暂存，预校验通过的新草稿也算推进，避免合法分批被误判为停滞。
         # 仍按业务断言去重；重命名、重复暂存及current/needs_review切换不能续期。
-        synthesis = self.simplified and not self.researching
+        pending_progress = (self.data.get("protocol") == "research-v3"
+                            or self.simplified and not self.researching)
         claims = {fingerprint(business_claim(item))
                   for item in self.state.get("staged_items", [])
                   if item.get("verification") == "supported"
-                  or synthesis and item.get("verification") == "pending"}
+                  or pending_progress and item.get("verification") == "pending"}
         return fingerprint([sorted(checked), sorted(resolved), sorted(claims)])
 
     def block_stalled(self) -> None:

@@ -517,18 +517,14 @@ def rank_chunks(
             )
         return similarities[index]
 
-    if min_similarity is not None:
-        # RRF 是排名融合值而非相似度，必须先按原始相关度过滤，再融合排名和限量。
-        # 缺向量的资料仍有确定的全文回退口径，不能让低分向量靠关键词命中绕过阈值。
-        keep = [i for i in range(len(rows)) if similarity(i) >= min_similarity]
-        rows = [rows[i] for i in keep]
-        hits = [hits[i] for i in keep]
-        similarities = {new: similarities[old] for new, old in enumerate(keep)}
+    # 两个通道独立达标后融合；低向量相似度不能否决明确的关键词命中。
+    threshold = min_similarity if min_similarity is not None else float("-inf")
     lexical = sorted(
         ((score, i) for i, score in enumerate(hits)),
         reverse=True,
     )
-    lists = [[i for score, i in lexical if score > 0]]
+    lists = [[i for score, i in lexical
+              if score > 0 and score / max(1, len(tokens)) >= threshold]]
     if vector is not None:
         semantic = sorted(
             (
@@ -538,7 +534,7 @@ def rank_chunks(
             ),
             reverse=True,
         )
-        lists.append([i for _, i in semantic])
+        lists.append([i for score, i in semantic if score >= threshold])
     scores: dict[int, float] = {}
     for indexes in lists:
         for rank, index in enumerate(indexes):

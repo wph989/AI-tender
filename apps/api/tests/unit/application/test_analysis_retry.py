@@ -71,6 +71,7 @@ def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
     service = AnalysisService(repository, 1, Mock(), Mock(), Mock())
     monkeypatch.setattr(service, "report_row", lambda _: {
         "id": 27, "project_id": 10, "status": "partial", "runtime_version": RUNTIME_VERSION,
+        "skill_snapshot": {"__analysis_flow_version__": "research-v3"},
         "coverage": {"mode": "agent_research"},
     })
 
@@ -152,12 +153,12 @@ def test_retry_preserves_examined_notes_todos_and_evidence_without_complete_find
     assert previous == original
 
 
-def test_v2_retry_keeps_valid_packets_and_completed_topics_instead_of_restarting_research():
+def test_v3_retry_keeps_valid_packets_and_completed_topics_instead_of_restarting_research():
     from test_analysis_verification_degradation import _RetryStore, _RetryTx
 
     previous = {"topic_flow": {
-        "audit": {"version": "combined-v2", "round": 1, "done": True,
-                  "results": {"packet": {"checked_units": ["u1"], "issues": []}},
+        "audit": {"version": "combined-v3", "round": 1, "done": True,
+                  "results": {"packet": {"reviews": {}, "issues": []}},
                   "record_results": {"record-fingerprint": {"supported": True}},
                   "completed_topics": {"1:a": {"signature": "same", "issues": []}}},
         "entries": {}, "phase": "review", "synthesis_finished": True,

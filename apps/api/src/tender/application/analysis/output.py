@@ -21,6 +21,7 @@ class _OutputSection(BaseModel):
     layout: Literal["table", "list", "tree"]
     columns: list[Annotated[str, Field(pattern=r"\S")]] = Field(min_length=1)
     scalar_columns: list[str] = Field(default_factory=list)
+    title_column: str | None = None
 
     @model_validator(mode="after")
     def unique_columns(self):
@@ -29,6 +30,8 @@ class _OutputSection(BaseModel):
         if (len(set(self.scalar_columns)) != len(self.scalar_columns)
                 or set(self.scalar_columns) - set(self.columns)):
             raise ValueError("单值列必须来自输出列且不能重复")
+        if self.title_column is not None and self.title_column not in self.columns:
+            raise ValueError("标题来源必须是本分类的输出列")
         return self
 
 
@@ -114,7 +117,7 @@ def output_contract(schema: dict) -> str:
     }
     return (
         "group填写输出格式sections中的title（*使用原文具体岗位或格式层级）；"
-        "category是可选业务标签，不能代替group。content的键使用该分类的columns列名，"
+        "content的键使用该分类的columns列名，"
         "具体事项名称和结论写在列对应的值中。局部格式示例（值为占位说明）："
         + json.dumps(example, ensure_ascii=False, separators=(",", ":"))
     )

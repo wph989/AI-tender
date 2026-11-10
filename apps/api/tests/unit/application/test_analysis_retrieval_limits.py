@@ -98,14 +98,15 @@ def test_config_defaults_and_overrides_are_frozen_in_module_limits():
     assert AgentLimits(**configured).max_search_results == 20
 
 
-def test_vector_threshold_is_inclusive_and_low_vector_cannot_bypass_via_keyword():
+def test_keyword_and_vector_qualify_independently_before_fusion():
     blocks = [
         {"content": "无关键词但语义达标", "embedding": [0.6, 0.8]},
         {"content": "投标保证金", "embedding": [0.59, math.sqrt(1 - 0.59**2)]},
         {"content": "投标保证金", "embedding": [-1.0, 0.0]},
     ]
     result = rank_chunks(blocks, "投标保证金", [1.0, 0.0], min_similarity=0.6)
-    assert [row["content"] for row in result] == ["无关键词但语义达标"]
+    assert len(result) == 3
+    assert any(row["content"] == "无关键词但语义达标" for row in result)
     # RRF分数本来就小于0.6，不能拿它过滤，否则正确的语义结果也会消失。
     assert result[0]["score"] < 0.6
 
@@ -183,7 +184,7 @@ def test_rerank_orders_only_qualified_candidates_before_final_limit():
             min_similarity=0.6,
             max_results=1,
         )
-        assert len(order_seen) == 2 and len(hits) == 1 and info["reranked"]
+        assert len(order_seen) == 4 and len(hits) == 1 and info["reranked"]
         assert hits[0]["content"] == order_seen[-1]
 
     asyncio.run(run())
@@ -412,7 +413,7 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
         )
         await executor.execute_module(
             {"id": 1, "project_id": 10,
-             "skill_snapshot": {"__analysis_flow_version__": "research-v2"}, "category": "goods",
+             "skill_snapshot": {"__analysis_flow_version__": "research-v3"}, "category": "goods",
              "topics": [], "lot_settings": []},
             {"id": 2, "module_key": "deposit_requirement_parsing", "attempt": 1}, [SOURCE],
         )

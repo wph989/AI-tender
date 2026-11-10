@@ -59,6 +59,9 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
   const selectedModules = current ? [current] : modules;
   const canResume = ["failed", "partial", "canceled"].includes(report.status)
     && (!modules.length || modules.some((module) => module.status !== "completed"));
+  // 协议升级影响可执行性，保留原有入口并说明原因，避免用户误以为重解析功能被删除。
+  const retryBlockedReason = report.execution_compatible === false
+    ? "解析协议已升级，当前报告无法继续解析，请生成新报告。" : undefined;
   const gaps = useMemo<DisplayGap[]>(() => {
     const existing: DisplayGap[] = data ? data.gaps.map((gap, index) => {
       // 记录级缺口未必重复写 module_key，仍应归到对应事项，避免混入每一个专题。
@@ -144,15 +147,16 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       </p>
       <div className="report-actions" role="group" aria-label="报告操作">
         <Button onClick={onRefresh}>刷新结果</Button>
-        {!report.runtime_retired && <Button disabled={busy || running || !current || isActive(current?.status)}
-          title={current ? `重新解析：${current.title}` : "请先选择一个专题"}
+        {!report.runtime_retired && <Button disabled={busy || running || Boolean(retryBlockedReason) || !current || isActive(current?.status)}
+          title={retryBlockedReason ?? (current ? `重新解析：${current.title}` : "请先选择一个专题")}
           onClick={() => { if (current) onAction("retry", [current.module_key]); }}>重新解析本模块</Button>}
         {isActive(report.status) && <Button disabled={busy || report.canceling} onClick={() => onAction("cancel")}>取消任务</Button>}
-        {!report.runtime_retired && <Button disabled={busy || running || !canResume}
+        {!report.runtime_retired && <Button disabled={busy || running || Boolean(retryBlockedReason) || !canResume} title={retryBlockedReason}
           onClick={() => onAction("retry")}>补跑未完成模块</Button>}
-        {!report.runtime_retired && modules.length > 0 && <Button disabled={busy || running || !terminal}
+        {!report.runtime_retired && modules.length > 0 && <Button disabled={busy || running || Boolean(retryBlockedReason) || !terminal} title={retryBlockedReason}
           onClick={() => onAction("retry", modules.map((module) => module.module_key))}>全部重新解析</Button>}
-        {report.runtime_retired && <p>旧流程报告仅供查看，需要最新结果请生成新报告。</p>}
+        {report.runtime_retired ? <p>旧流程报告仅供查看，需要最新结果请生成新报告。</p>
+          : retryBlockedReason && <p>{retryBlockedReason}</p>}
       </div>
     </div>
     <div className="results-sticky">
@@ -308,7 +312,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
         </details>}
       </section>)}
       {!modules.length && <p className="result-empty">{isActive(report.status) ? "专题尚未生成，请等待任务就绪。"
-        : ["failed", "partial", "canceled"].includes(report.status) && !report.runtime_retired
+        : ["failed", "partial", "canceled"].includes(report.status) && !report.runtime_retired && report.execution_compatible !== false
           ? "专题尚未生成，可点击上方补跑未完成模块。" : "这份报告没有保存专题结果。"}</p>}
     </>}
     </div>

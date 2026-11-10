@@ -22,6 +22,38 @@ from tender.domain.shared.errors import (
 from tender.ports.llm.chat import Completion
 
 
+def _decode_containers(value: Any, schema: dict, root: dict) -> Any:
+    """只解码schema明确要求的容器；允许字符串的正文值必须保持原样。"""
+    if ref := schema.get("$ref"):
+        if ref.startswith("#/"):
+            target = root
+            for part in ref[2:].split("/"):
+                target = target[part.replace("~1", "/").replace("~0", "~")]
+            return _decode_containers(value, target, root)
+    variants = schema.get("anyOf", schema.get("oneOf", [schema]))
+    if isinstance(value, str) and not any(s.get("type") == "string" for s in variants):
+        if any(s.get("type") in ("object", "array") for s in variants):
+            try:
+                decoded = json.loads(value)
+            except ValueError:
+                pass
+            else:
+                if isinstance(decoded, (dict, list)):
+                    value = decoded
+    for variant in variants:
+        if "$ref" in variant:
+            return _decode_containers(value, variant, root)
+        if isinstance(value, dict) and variant.get("type") == "object":
+            properties = variant.get("properties", {})
+            additional = variant.get("additionalProperties", {})
+            return {key: _decode_containers(child, properties.get(
+                key, additional if isinstance(additional, dict) else {},
+            ), root) for key, child in value.items()}
+        if isinstance(value, list) and variant.get("type") == "array":
+            return [_decode_containers(child, variant.get("items", {}), root) for child in value]
+    return value
+
+
 class AgentChat:
     def __init__(
         self,
@@ -226,6 +258,8 @@ class AgentChat:
             else:
                 schema = next(t["function"].get("parameters", {}) for t in tools
                               if t["function"]["name"] == call["name"])
+                # 兼容网关把数组或对象再次编码为字符串；先按schema归一化，再计成功和交给工具。
+                call["args"] = _decode_containers(call["args"], schema, schema)
                 # 完整协议类型在成功结算前校验；范围和引文等业务规则仍由工具执行判断。
                 for error in list(Draft202012Validator(schema).iter_errors(call["args"]))[:6]:
                     path = ".".join(str(p) for p in error.absolute_path) or "args"

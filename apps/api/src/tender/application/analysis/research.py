@@ -423,6 +423,30 @@ class ResearchSession:
         )
         return result if self.compact_results else result | {"retrieval": info}
 
+    async def prefetch_search(self, query: str, source_id: int | None = None) -> None:
+        """批次只并发纯召回；证据登记、容量分配和事件由后续串行search统一完成。"""
+        await self.authorize()
+        sources = self._sources("project", source_id)
+        if not sources:
+            return
+        key = ("project", query.strip(), source_id,
+               tuple(sorted(s["source_id"] for s in sources)))
+        async with self._search_locks.setdefault(key, asyncio.Lock()):
+            if key in self._search_cache:
+                return
+            retrieved, info = await self.retrieve(sources, query.strip())
+            await self.authorize()
+            if any(row["source_id"] not in {s["source_id"] for s in sources}
+                   for row in retrieved):
+                raise PermissionError("检索返回了授权范围外的资料")
+            candidates = [dict(row) for row in retrieved[:self.limits.search_window]]
+            info = dict(info) | {"candidate_limited": bool(info.get("search_limited"))
+                                or len(retrieved) > len(candidates)}
+            info.pop("search_limited", None)
+            self._search_cache[key] = candidates, info
+            if len(self._search_cache) > SEARCH_CACHE_ENTRIES:
+                self._search_cache.pop(next(iter(self._search_cache)))
+
     async def read_evidence(
         self, block_id: str | list[str], before: int = 2, after: int = 2,
     ) -> dict:
