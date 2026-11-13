@@ -1035,12 +1035,15 @@ def test_cancel_without_worker_closes_queued_and_orphaned_modules(env):
     assert result == {"status": "canceled", "canceling": False}
     assert analysis_api.cancel_report(report_id, env.request) == result
     current = analysis_api.get_report(report_id, env.request)
+    assert current["execution_compatible"] is True
+    assert "skill_snapshot" not in current
     assert all(m["status"] == "canceled" for m in current["modules"])
     assert all(r["status"] == "canceled" for m in current["modules"] for r in m["runs"])
     selected = current["modules"][3]
     analysis_api.retry_report(report_id, analysis_api.RetryInput(
         module_keys=[selected["module_key"]]), env.request)
     after = analysis_api.get_report(report_id, env.request)
+    assert after["execution_compatible"] is True
     assert [(m["id"], m["runs"][-1]["attempt"]) for m in after["modules"]
             if m["status"] == "pending"] == [(selected["id"], 2)]
 
@@ -1048,6 +1051,7 @@ def test_cancel_without_worker_closes_queued_and_orphaned_modules(env):
 def test_cancel_before_modules_created_can_retry(env):
     row = report(env)
     analysis_api.cancel_report(row["id"], env.request)
+    assert analysis_api.get_report(row["id"], env.request)["execution_compatible"] is True
     assert analysis_api.retry_report(row["id"], analysis_api.RetryInput(), env.request)[
         "status"] == "waiting"
 

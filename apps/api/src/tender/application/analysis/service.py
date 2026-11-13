@@ -170,7 +170,8 @@ class AnalysisService:
 
     def get_report(self, report_id: int) -> dict[str, Any]:
         report = self.report_row(report_id)
-        report.pop("skill_snapshot", None)
+        # 快照不对外返回，但兼容性仍须使用它；提前丢弃会把当前协议误判成旧协议。
+        rules = report.pop("skill_snapshot", {})
         modules = self.store.report_modules(report_id)
         allowed = self.store.collections_for_project(report["project_id"])
         for module in modules:
@@ -254,7 +255,7 @@ class AnalysisService:
             "modules": modules,
             "stale": stale,
             "runtime_retired": retired,
-            "execution_compatible": not retired and report.get("skill_snapshot", {}).get(
+            "execution_compatible": not retired and rules.get(
                 "__analysis_flow_version__",
             ) == PROTOCOL_VERSION,
             "data_schema_version": None if retired else DATA_VERSION,
