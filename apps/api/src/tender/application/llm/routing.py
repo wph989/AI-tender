@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import random
@@ -601,6 +602,11 @@ class RoutingModel:
                         prompt_tokens=completion.prompt_tokens,
                         completion_tokens=completion.completion_tokens,
                     )
+                if completion.agent_message is not None:
+                    message = copy.deepcopy(completion.agent_message)
+                    message["data"].setdefault("response_metadata", {})[
+                        "request_latency_ms"] = success_record.latency_ms
+                    completion = replace(completion, agent_message=message)
                 # 先保存有效返回，Worker在结算前中断时可恢复回执，无须再次向供应商发送。
                 window.update(result=asdict(completion), success_record=asdict(success_record))
                 await persist()

@@ -18,7 +18,11 @@ from tender.application.knowledge.content import (
     normalized,
     validate_items,
 )
-from tender.application.shared.validation import allowed_values, validation_message
+from tender.application.shared.validation import (
+    InputError,
+    allowed_values,
+    validation_message,
+)
 
 DATA_VERSION = "1"
 
@@ -193,7 +197,7 @@ def prepare_records(
 ) -> list[dict]:
     records = [entry.model_dump() for entry in raw]
     if len({entry["key"] for entry in records}) != len(records):
-        raise ValueError("同批业务记录 key 重复")
+        raise InputError.for_field("key", "同批业务记录 key 重复")
     existing = {
         item["business"]["key"]: item["business"]
         for item in state.get("staged_items", []) if item.get("business")
@@ -215,19 +219,21 @@ def prepare_records(
     for entry in records:
         output = outputs.get(entry["key"])
         if entry["kind"] == "lot" and module_key != "project_basic_info_parsing":
-            raise ValueError("标段目录由项目概况模块提交；其它模块填写 scope.lot_refs")
+            raise InputError.for_field("kind",
+                                       "标段目录由项目概况模块提交；其它模块填写 scope.lot_refs")
         if entry["kind"] == "format_node" and module_key != "bid_format_outline_parsing":
-            raise ValueError("格式节点由投标文件格式模块提交")
+            raise InputError.for_field("kind", "格式节点由投标文件格式模块提交")
         refs = list(entry["citations"])
         if any(ref == entry["key"] or ref not in combined
                or combined[ref]["kind"] != "requirement" for ref in entry["requirement_keys"]):
-            raise ValueError("requirement_keys：须引用同批或已提交的要求事项，不能引用自身")
+            raise InputError.for_field("requirement_keys",
+                                "requirement_keys：须引用同批或已提交的要求事项，不能引用自身")
         if entry["kind"] == "format_node":
             path, visited, current = [], {entry["key"]}, entry
             while current.get("parent_key"):
                 parent = current["parent_key"]
                 if parent not in combined or parent in visited:
-                    raise ValueError(
+                    raise InputError.for_field("parent_key",
                         "parent_key：格式层级存在缺失父节点或循环，请先提交父节点；"
                         "可选父节点key：" + allowed_values(
                             k for k, value in combined.items()
@@ -236,7 +242,7 @@ def prepare_records(
                     )
                 current = combined[parent]
                 if current["kind"] != "format_node":
-                    raise ValueError(
+                    raise InputError.for_field("parent_key",
                         "parent_key：格式父节点必须是格式节点；先提交kind=format_node的父节点"
                     )
                 visited.add(parent)
@@ -257,7 +263,7 @@ def prepare_records(
                         ),
                     ))
             if errors:
-                raise ValueError(validation_message(errors))
+                raise InputError(validation_message(errors), field_issues=errors)
             for endpoint in ("subject", "object"):
                 target = combined[entry[endpoint + "_key"]]
                 entry[endpoint + "_text"] = target["text"]
@@ -272,12 +278,13 @@ def prepare_records(
         entry["citations"] = item["values"][0]["citations"]
         missing = missing_scope_refs(entry["scope"], entry["citations"])
         if missing:
-            raise ValueError(validation_message([
+            errors = [
                 (f"scope.lot_refs[{entry['scope']['lot_refs'].index(ref)}]",
                  "必须填写引文中的标段原文编号或名称；当前指向未出现在引文中："
                  + ref + "。不要填写内部事项key；请按已引用原文修正，并同步关联工作的范围")
                 for ref in missing
-            ]))
+            ]
+            raise InputError(validation_message(errors), field_issues=errors)
         item.update(id=entry["id"], business=entry)
         if output is not None:
             item["output"] = output
@@ -289,6 +296,7 @@ def prepare_record_batch(raw: list[SynthesisRecord], state: dict, seen: dict,
                          module_key: str) -> tuple[list[dict], list[dict]]:
     """共享同批有效引用图；仅移除坏记录及依赖它的事项，保留无关的有效依赖组。"""
     candidates, rejected = {}, {}
+    details: dict[int, list[tuple[str, str]]] = {}
     for index, record in enumerate(raw):
         try:
             value = record.model_dump()
@@ -300,8 +308,9 @@ def prepare_record_batch(raw: list[SynthesisRecord], state: dict, seen: dict,
                     for name, v in value["content"].items()
                 )
             candidates[index] = value
-        except ValueError as exc:
+        except InputError as exc:
             rejected[index] = str(exc)
+            details[index] = exc.field_issues
     while candidates:
         context = dict(state) | {"staged_items": [
             *state.get("staged_items", []),
@@ -311,16 +320,19 @@ def prepare_record_batch(raw: list[SynthesisRecord], state: dict, seen: dict,
         for index in candidates:
             try:
                 accepted[index] = prepare_records([raw[index]], context, seen, module_key)[0]
-            except ValueError as exc:
+            except InputError as exc:
                 failures[index] = str(exc)
+                details[index] = exc.field_issues
         if not failures:
             return list(accepted.values()), [
-                {"index": i, "key": raw[i].key, "title": raw[i].title, "error": error}
+                {"index": i, "key": raw[i].key, "title": raw[i].title, "error": error,
+                 "field_issues": details.get(i, [])}
                 for i, error in sorted(rejected.items())
             ]
         rejected.update(failures)
         candidates = {i: value for i, value in candidates.items() if i not in failures}
-    return [], [{"index": i, "key": raw[i].key, "title": raw[i].title, "error": error}
+    return [], [{"index": i, "key": raw[i].key, "title": raw[i].title, "error": error,
+                 "field_issues": details.get(i, [])}
                 for i, error in sorted(rejected.items())]
 
 

@@ -55,6 +55,46 @@ def test_invalid_batch_is_atomic_and_does_not_clear_unexamined_evidence():
     assert not flow.entries[0].get("findings")
 
 
+@pytest.mark.parametrize("scope", [
+    {"kind": "common", "lot_refs": []},
+    {"kind": "lots", "lot_refs": ["A标段"]},
+])
+def test_known_scope_notes_preserve_coexisting_unknown_drafts_after_restore(scope):
+    import json
+
+    from synthesis_fixtures import summary_record
+
+    from tender.application.analysis.data import BusinessRecord, prepare_records
+    from tender.application.analysis.topic_flow import TopicFlow, TopicUpdate, identity
+
+    book, flow, state, research = ledger()
+    flow.data["protocol"] = "research-v3"
+    research.seen["s1r1c0"]["content"] = "A标段质保三年"
+    unknown = {"kind": "unknown", "lot_refs": []}
+    state["staged_items"] = prepare_records([
+        BusinessRecord.model_validate(summary_record(key=key, scope=value) | {"text": "质保三年"})
+        for key, value in (("unconfirmed", unknown), ("confirmed", scope))
+    ], state, research.seen, "project_basic_info_parsing")
+    flow.apply([
+        TopicUpdate(topic="a", scope=unknown, record_keys=["unconfirmed"]),
+        TopicUpdate(topic="a", scope=scope, record_keys=["confirmed"]),
+    ], {"unconfirmed", "confirmed"})
+    book.works()
+    state = json.loads(json.dumps(state))
+    flow = TopicFlow(state, research)
+    book = ResearchLedger(flow)
+    work_id = next(w["id"] for w in book.works() if w["scope"] == scope)
+    before = copy.deepcopy(flow.data["entries"][identity("a", unknown)])
+    items = copy.deepcopy(state["staged_items"])
+    book.update([ResearchDelta(work_ids=[work_id], detail="已核对当前范围的质保期限",
+                               evidence_ids=["s1r1c0"])])
+    assert flow.data["entries"][identity("a", unknown)] == before
+    assert flow.data["entries"][identity("a", scope)]["record_keys"] == ["confirmed"]
+    assert state["staged_items"] == items
+    assert next(w for w in book.works() if w["id"] == work_id)["status"] == "found"
+    assert flow.researching
+
+
 def test_one_real_query_can_record_not_found_without_claiming_absence():
     book, flow, _, research = ledger()
     work = book.works()[0]

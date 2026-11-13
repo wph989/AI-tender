@@ -13,6 +13,10 @@ class AnalysisState(TypedDict, total=False):
     staged_items_verified: bool
     staged_prompt_ids: list[str]
     pending_final: dict[str, Any]
+    topic_final_requested: dict[str, Any]
+    recovery_finish_requested: str
+    progress_signature: str
+    no_progress_rounds: int
     draft: dict[str, Any]
     business_previous: dict[str, Any]
     rejected_records: dict[str, Any]
@@ -108,6 +112,46 @@ class AnalysisTransitions:
     def research_completed(self, checkpoint: dict[str, Any]) -> None:
         self.state["research_completed"] = checkpoint
 
+    def enter_research(self) -> None:
+        """研究增量撤销旧完成意图，但保留正文和与新证据无关的审查结果。"""
+        flow = self.state.get("topic_flow", {})
+        if flow.get("phase") != "research":
+            self.state.pop("progress_signature", None)
+            self.state["no_progress_rounds"] = 0
+        flow["phase"] = "research"
+        flow.pop("synthesis_finished", None)
+        self.state.pop("pending_final", None)
+        self.state.pop("topic_final_requested", None)
+
+    def finish_research(self, checkpoint: dict[str, Any], *, reason: str = "") -> None:
+        """所有研究出口共用同一阶段转换，已有草稿直接进入审查。"""
+        flow = self.state.get("topic_flow", {})
+        if flow.get("phase") == "research":
+            # 研究的空转次数不能转嫁给第一次综合，否则模型还没提交机会就会被结束。
+            self.state.pop("progress_signature", None)
+            self.state["no_progress_rounds"] = 0
+        flow["phase"] = "synthesis"
+        self.research_completed(checkpoint)
+        if reason:
+            flow["research_stop_reason"] = reason
+        if flow.get("protocol") == "research-v3" and self.state.get("staged_items"):
+            flow["synthesis_finished"] = True
+        self.state.pop("recovery_finish_requested", None)
+
+    def cancel_completion(self) -> None:
+        """新提交必须重新表达完成意图，不能借用前一批的final发布错误改写。"""
+        self.take_final()
+        self.state.pop("topic_final_requested", None)
+        self.state.get("topic_flow", {}).pop("synthesis_finished", None)
+
+    def start_review(self) -> None:
+        flow = self.state.get("topic_flow", {})
+        flow["phase"] = "review"
+        flow.pop("synthesis_work_origins", None)
+
+    def end_review(self) -> None:
+        self.state.get("topic_flow", {})["phase"] = "synthesis"
+
     def replace_items(self, items: list[dict[str, Any]]) -> None:
         self.state["staged_items"] = items
 
@@ -128,6 +172,9 @@ class AnalysisTransitions:
         self.state["pending_final"] = request
 
     def publish_draft(self, draft: dict[str, Any]) -> None:
+        flow = self.state.get("topic_flow", {})
+        if flow.get("output_mode") == "after-research":
+            flow.update(phase="completed", release_results=True)
         self.state["draft"] = draft
         self.take_final()
 

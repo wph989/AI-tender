@@ -18,6 +18,38 @@ LOT_A = {"kind": "lots", "lot_refs": ["A标段"]}
 LOT_B = {"kind": "lots", "lot_refs": ["B标段"]}
 
 
+@pytest.mark.parametrize("scope", [COMMON, LOT_A])
+def test_new_scope_draft_keeps_unassigned_unknown_records_and_pending_work(scope):
+    flow, state, research = prepared_flow()
+    state["topic_flow"]["entries"] = {}
+    flow = TopicFlow(state, research)
+    flow.apply([TopicUpdate.model_validate(update(
+        "a", ["warranty"], scope=UNKNOWN, status="researching", checked=[],
+        tasks=[{"detail": "核对旧事项的适用范围"}],
+    ))], {"warranty"})
+    before = copy.deepcopy(flow.entries[0])
+    flow.apply([TopicUpdate.model_validate(update("a", ["new"], scope=scope))],
+               {"warranty", "new"})
+    unknown = next(e for e in flow.entries if e["scope"] == UNKNOWN)
+    assert unknown == before
+    assert next(e for e in flow.entries if e["scope"] == scope)["record_keys"] == ["new"]
+    assert flow.pending()
+
+
+def test_explicit_unknown_scope_replacement_still_requires_all_old_records():
+    flow, state, research = prepared_flow()
+    state["topic_flow"]["entries"] = {}
+    flow = TopicFlow(state, research)
+    flow.apply([TopicUpdate.model_validate(update("a", ["warranty"], scope=UNKNOWN))],
+               {"warranty"})
+    before = copy.deepcopy(state)
+    with pytest.raises(ValueError, match="被替代范围仍有事项"):
+        flow.apply([TopicUpdate.model_validate(update(
+            "a", ["new"], replaces_scopes=[UNKNOWN],
+        ))], {"warranty", "new"})
+    assert state == before
+
+
 def test_unknown_scope_confirmation_preserves_and_resolves_tasks_and_references_in_graph():
     async def run():
         trace = {"topic": "a", "from_block_id": "s1r1c0", "target": "质保细则",

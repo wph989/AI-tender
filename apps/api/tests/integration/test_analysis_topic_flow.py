@@ -1,5 +1,6 @@
 """原生 PostgreSQL 验证增量状态与展示投影、到期收尾及旧执行者隔离。"""
 
+import json
 import os
 from types import SimpleNamespace
 from uuid import uuid4
@@ -69,6 +70,12 @@ def progress_state(runtime):
 def test_new_report_freezes_topic_flow_and_old_report_remains_legacy(env):
     current = report(env, topic_flow=True)
     old = report(env)
+    # 新建报告始终使用当前协议；历史读取用真实旧快照验证，不能靠失效的创建参数模拟。
+    old["skill_snapshot"].pop(FLOW_KEY)
+    env.db.execute("UPDATE analysis_report SET skill_snapshot=CAST(:snapshot AS JSONB) "
+                   "WHERE id=:id",
+                   {"snapshot": json.dumps(old["skill_snapshot"]), "id": old["id"]})
+    old = test_deepagents_runtime.analysis_api.report_row(env.request, old["id"])
     assert current["skill_snapshot"][FLOW_KEY] == PROTOCOL_VERSION
     assert FLOW_KEY not in old["skill_snapshot"]
     assert current["runtime_version"] == old["runtime_version"]
@@ -403,10 +410,9 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
                    {"rules": json.dumps(snapshot), "id": runtime.report["id"]})
     observed, completed = [], []
 
-    class Router:
+    class Router(test_deepagents_runtime.NativeRouter):
         def __init__(self, **kwargs):
-            self.reserve = kwargs["before_request"]
-            self.calls = 0
+            super().__init__(**kwargs)
 
         async def chat(self, messages, tools):
             await self.reserve()
@@ -414,8 +420,7 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
             if self.calls == 1:
                 name, args = "list_documents", {}
             elif self.calls == 2:
-                name, args = "search_document", {"query": "质保", "topic_keys": [
-                    "warranty", "quantity"]}
+                name, args = "search_document", {"query": "质保", "work_ids": ["w1", "w2"]}
             elif self.calls == 3:
                 name, args = "update_research", {"updates": [{
                     "work_ids": ["w1", "w2"], "scope": {"kind": "common", "lot_refs": []},
@@ -435,29 +440,31 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
                 quote = "质保三年" if index == 0 else "采购交换机10台"
                 scope = {"kind": "common", "lot_refs": []}
                 name, args = "submit_analysis", {"records": [{
-                    "key": topic["key"], "kind": "requirement", "title": topic["title"],
+                    "kind": "requirement", "title": topic["title"],
                     "group": "项目基本信息", "content": {"字段": topic["title"], "内容": quote},
-                    "scope": scope, "citations": [{"block_id": block_id, "quote": quote}],
+                    "scope": scope, "block_ids": [block_id],
                     "work_ids": [f"w{index + 1}"],
                 }], "final": index == 1}
-            return Completion(content="", model="offline", agent_message=message_to_dict(
-                AIMessage(content="", tool_calls=[{"name": name, "args": args,
-                                                   "id": f"incremental-{self.calls}"}])))
+            return self.respond(Completion(
+                content="", model="offline", agent_message=message_to_dict(
+                    AIMessage(content="", tool_calls=[{"name": name, "args": args,
+                                                       "id": f"incremental-{self.calls}"}]))))
 
         async def complete(self, prompt):
             await self.reserve()
             payload = json.loads(prompt.rsplit("\n", 1)[-1])
             completed.append(payload)
             reviews = {row["record_id"]: {"supported": True, "issues": [],
-                       "bindings": {v["value_id"]: v["candidate_ids"] for v in row["values"]}}
+                       "block_ids": row["block_ids"]}
                        for row in payload["records"]}
-            return Completion(content=json.dumps({"reviews": reviews, "issues": [],
-                                                   "context_requests": []}), model="offline")
+            return Completion(content=json.dumps({"reviews": reviews, "issues": []}),
+                              model="offline")
 
         async def aclose(self):
             pass
 
-    monkeypatch.setattr(env.executor, "model_factory", lambda *args, **kwargs: Router(**kwargs))
+    monkeypatch.setattr(env.executor, "model_factory",
+                        lambda feature, purpose, **kwargs: Router(purpose=purpose, **kwargs))
     run = env.db.rows("SELECT a.*,m.module_key FROM agent_module_run a JOIN analysis_module m "
                       "ON m.id=a.module_id WHERE a.id=:id", {"id": runtime.run["id"]})[0]
     run_async(env.executor.execute_module(runtime.report, run, runtime.sources))
@@ -480,7 +487,10 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
     assert len(completed) == 1
     assert set(completed[0]["topics"]) == {"quantity", "warranty"}
     assert {row["topic"] for row in completed[0]["checks"]} == {"quantity", "warranty"}
-    assert len(completed[0]["records"]) == 2 and len(completed[0]["evidence"]) == 1
+    assert len(completed[0]["records"]) == 2
+    # 同一原文可置于共享上下文，核对完整发送内容，避免把位置优化误判成丢失证据。
+    spans = completed[0]["evidence"] + completed[0]["context_evidence"]
+    assert len(spans) == 1 and spans[0]["id"] == "s1r1c0"
     stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
                          {"id": run["id"]})[0]
     assert stored["state"]["topic_flow"]["audit"]["done"]
@@ -494,6 +504,7 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
     from tender.application.analysis.topic_flow import TopicIncomplete
 
     research = SimpleNamespace(seen=stored["state"]["research"]["seen"],
+                               events=stored["state"]["research"]["events"],
                                sources=runtime.sources, limits=AgentLimits())
     restored = TopicFlow(stored["state"], research)
 

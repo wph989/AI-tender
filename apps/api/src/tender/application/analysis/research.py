@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tender.application.knowledge.content import normalized
-from tender.application.shared.validation import allowed_values
+from tender.application.shared.validation import InputError, allowed_values
 from tender.ports.repository.knowledge.sources import ChunkWindow
 
 Retrieve = Callable[[list[dict], str], Awaitable[tuple[list[dict], dict]]]
@@ -20,7 +20,7 @@ class SourceNotAllowed(PermissionError):
     """工具参数引用了清单外的来源；拒绝读取后允许模型按清单纠正。"""
 
 
-class ToolArgumentError(ValueError):
+class ToolArgumentError(InputError):
     """工具参数越界或类型不符；属于可自纠正错误，回传给模型修正而不是终止模块。"""
 
 

@@ -5,6 +5,19 @@ from collections.abc import Iterable
 from pydantic import ValidationError
 
 
+class InputError(ValueError):
+    """已明确检查到的输入错误；调用方只隔离此类异常，程序内部ValueError继续外抛。"""
+
+    def __init__(self, message: str, *, field_issues: Iterable[tuple[str, str]] = ()):
+        self.field_issues = list(field_issues)
+        super().__init__(message)
+
+    @classmethod
+    def for_field(cls, path: str, message: str) -> "InputError":
+        """字段位置随显式检查一起产生，反馈与问题账不再从中文错误文案猜测。"""
+        return cls(message, field_issues=[(path, message)])
+
+
 def allowed_values(values: Iterable[str]) -> str:
     """只展示服务端已知的候选，不能把模型提交的非法正文当作候选回显。"""
     choices = sorted(set(values))

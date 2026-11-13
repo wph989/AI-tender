@@ -40,6 +40,9 @@ def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
         },
         "research_completed": True,
         "research_summary": "已核对质保要求",
+        "tool_issue_ledger": {"version": 1, "issues": {"old": {"attempts": 6}}},
+        "research_update_receipts": {"old-call": {"accepted": True}},
+        "recovery_finish_requested": "old-reason",
     }
     if topic_flow:
         saved_state.update(topic_research_round="old-round", topic_flow={
@@ -93,6 +96,9 @@ def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
     assert carried["research"]["seen"] == saved_state["research"]["seen"]
     assert carried["research"]["events"] == saved_state["research"]["events"]
     assert carried["research"]["tool_calls"] == 0
+    assert not set(carried) & {
+        "tool_issue_ledger", "research_update_receipts", "recovery_finish_requested",
+    }
     assert saved_state["research"]["tool_calls"] == previous_tool_calls
     if topic_flow:
         assert carried["topic_flow"]["entries"]["a"]["status"] == "researching"

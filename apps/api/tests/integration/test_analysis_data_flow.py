@@ -133,12 +133,13 @@ def test_independent_module_json_uses_separate_evidence_and_live_permissions(bas
     assert len(result["records"]) == 5
     assert result["output_schema"]["sections"][2] == {
         "title": "项目基本信息", "layout": "table", "columns": ["字段", "内容"],
-        "scalar_columns": ["字段"],
+        "scalar_columns": ["字段"], "title_column": "字段",
     }
     assert all("citations" not in r for r in result["records"])
     record = next(r for r in result["records"] if r["key"] == "a")
     refs = [result["evidence"][key] for key in record["evidence_ids"]]
-    assert refs[0]["quote"] == "A标段质保三年"
+    # 原文由服务端按实际已读块生成；模型传入的旧quote不再决定引用范围。
+    assert refs[0]["quote"] == basis.block["content"]
     assert refs[0]["element_id"] == basis.block["element_id"]
     # 独立数据入口同样检查实时依据，删除来源后不能绕过报告权限读取正文。
     basis.db.execute("DELETE FROM knowledge_source WHERE id=:id", {"id": basis.source["source_id"]})

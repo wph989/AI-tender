@@ -11,7 +11,11 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from tender.application.shared.validation import allowed_values, validation_message
+from tender.application.shared.validation import (
+    InputError,
+    allowed_values,
+    validation_message,
+)
 
 # 分块与去标签的纯规则落 domain，adapters 的检索仓储也要用；这里按用例层的入口再导出。
 from tender.domain.knowledge.search import keywords
@@ -358,7 +362,7 @@ def merge_field_entries(entries: Sequence[dict], *, is_outline: bool = False) ->
 def citation(row: Mapping[str, Any], quote: str) -> dict:
     if not quote.strip() or normalized(quote) not in normalized(str(row["content"])):
         # 解析与问答的回读参数不同，共享反馈须让模型沿用当前工具定义，避免混用接口。
-        raise ValueError(
+        raise InputError(
             "引文必须逐字来自已读取的原文块；用read_document按当前工具定义回读该块，"
             "复制连续原文填写quote，归纳结论填写业务正文"
         )
@@ -404,41 +408,41 @@ def validate_items(
     - source_locations=True 供解析使用：模型只选择块，原文及位置取自已读账，避免抄录失败阻断总结。
     """
     if not isinstance(raw, list):
-        raise ValueError("fields：结果必须是字段数组；每项填写field、values及各值的citations")
+        raise InputError("fields：结果必须是字段数组；每项填写field、values及各值的citations")
     result = []
     for order, entry in enumerate(raw):
         if not isinstance(entry, dict):
-            raise ValueError(f"fields.{order}：字段条目必须是对象，填写field和values")
+            raise InputError(f"fields.{order}：字段条目必须是对象，填写field和values")
         field = entry.get("field")
         values = entry.get("values")
         if not isinstance(field, str) or not field.strip():
-            raise ValueError(f"fields.{order}.field：字段条目缺少字段名，须填写非空字符串")
+            raise InputError(f"fields.{order}.field：字段条目缺少字段名，须填写非空字符串")
         group = entry.get("group", "")
         if not isinstance(group, str):
-            raise ValueError(f"fields.{order}.group：字段分类必须是文字，无分类时省略或填空字符串")
+            raise InputError(f"fields.{order}.group：字段分类必须是文字，无分类时省略或填空字符串")
         sort_order = entry.get("sort_order")
         if sort_order is None:
             # 未提供时按提交顺序展示，模型只需在有意调整展示顺序时填写。
             sort_order = order
         if not isinstance(sort_order, int) or isinstance(sort_order, bool) or sort_order < 0:
-            raise ValueError(f"fields.{order}.sort_order：字段展示顺序必须是非负整数；"
+            raise InputError(f"fields.{order}.sort_order：字段展示顺序必须是非负整数；"
                              "可省略由程序排序")
         if not isinstance(values, list) or not values:
-            raise ValueError(f"fields.{order}.values：字段条目缺少解析值列表，"
+            raise InputError(f"fields.{order}.values：字段条目缺少解析值列表，"
                              "须为至少含一项的数组")
         clean_values = []
         citation_errors: list[tuple[str, str]] = []
         for value_index, value_entry in enumerate(values):
             if not isinstance(value_entry, dict):
-                raise ValueError(f"fields.{order}.values.{value_index}："
+                raise InputError(f"fields.{order}.values.{value_index}："
                                  "解析值必须是含value和citations的对象")
             value = value_entry.get("value")
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"fields.{order}.values.{value_index}.value："
+                raise InputError(f"fields.{order}.values.{value_index}.value："
                                  "存在空解析值；填写有依据的结论或省略此项")
             references = value_entry.get("citations", [])
             if not isinstance(references, list) or not references:
-                raise ValueError(f"fields.{order}.values.{value_index}.citations："
+                raise InputError(f"fields.{order}.values.{value_index}.citations："
                                  + ("请选择至少一个已读原文块ID" if source_locations else
                                     "每个解析值必须附带原文依据，填写已读block_id和逐字quote"))
             refs = []
@@ -463,17 +467,17 @@ def validate_items(
                     refs.append(
                         align_citation(read_blocks, registered, value) if align else registered
                     )
-                except ValueError as exc:
+                except InputError as exc:
                     # 同一事项可能有多处改写，一次列全错误块，避免逐个报错耗尽纠正预算。
                     citation_errors.append((path + ".quote",
                                             f"引用 {str(ref['block_id'])[:60]} 校验失败：{exc}"))
             clean_values.append({"value": value, "citations": refs})
         if citation_errors:
-            raise ValueError(validation_message(citation_errors))
+            raise InputError(validation_message(citation_errors))
         clean_values = dedupe_values(clean_values)
         note = entry.get("note", "")
         if not isinstance(note, str):
-            raise ValueError(f"fields.{order}.note：备注必须是文字，无备注时省略或填空字符串")
+            raise InputError(f"fields.{order}.note：备注必须是文字，无备注时省略或填空字符串")
         clean = {
             "id": fingerprint([field, clean_values])[:20],
             "field": field,

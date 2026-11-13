@@ -18,7 +18,9 @@ from tender.application.analysis.data import module_data, record_identity
 from tender.application.analysis.protocol import SubmissionRecord, submission_records
 
 
-def build(script, research=None, *, reserve=None, review=None, state=None, budget=None):
+def build(
+    script, research=None, *, reserve=None, review=None, state=None, budget=None, keys=("a",),
+):
     state, saved, reviewed, reserved = state if state is not None else {}, [], [], []
 
     async def save(value):
@@ -33,7 +35,7 @@ def build(script, research=None, *, reserve=None, review=None, state=None, budge
         return await reserve(key) if reserve else key
 
     router = ScriptedRouter(script)
-    frozen = snapshot(("a",)) | {"__analysis_flow_version__": "research-v3",
+    frozen = snapshot(keys) | {"__analysis_flow_version__": "research-v3",
         KEY + "/references/output_schema.json": json.dumps(schema(), ensure_ascii=False)}
     graph, files = build_module_agent(
         key=KEY, model=RoutedAgentModel(router=router), research=research or session([block()]),

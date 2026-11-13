@@ -88,6 +88,25 @@ def _candidate(model: str, registry_id: int) -> ModelCandidate:
     )
 
 
+def test_agent_result_preserves_successful_attempt_latency_after_candidate_switch(monkeypatch):
+    original = _ScriptedClient.complete
+    metadata = {"type": "ai", "data": {"content": "完成", "response_metadata": {}}}
+
+    async def complete(client, prompt):
+        result = await original(client, prompt)
+        return replace(result, agent_message=metadata)
+
+    monkeypatch.setattr(_ScriptedClient, "complete", complete)
+    records = []
+    router = RoutingModel("analysis", "analysis", [_candidate("a", 1), _candidate("b", 2)],
+        _ScriptedGateway({"a": [ModelUnavailable("临时服务故障")], "b": [None]}), records.append)
+    result = asyncio.run(router.complete("候选切换后完成"))
+    assert [r.status for r in records] == ["unknown", "ok"]
+    assert result.agent_message["data"]["response_metadata"]["request_latency_ms"] == records[
+        -1].latency_ms
+    assert not metadata["data"]["response_metadata"]
+
+
 def _run(
     candidates: Sequence[ModelCandidate],
     scripts: dict[str, list[Any]],

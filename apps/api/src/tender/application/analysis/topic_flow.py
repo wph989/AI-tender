@@ -13,9 +13,10 @@ from tender.application.analysis.data import DataInput, DataScope, record_identi
 from tender.application.analysis.output import ReferenceTrace, canonical_topic
 from tender.application.analysis.policy import business_claim
 from tender.application.analysis.research import ToolArgumentError
-from tender.application.analysis.state import clear_record_gaps
+from tender.application.analysis.state import AnalysisTransitions, clear_record_gaps
+from tender.application.analysis.validation import ToolValidationError
 from tender.application.knowledge.content import fingerprint, normalized
-from tender.application.shared.validation import allowed_values
+from tender.application.shared.validation import InputError, allowed_values
 
 FLOW_KEY = "__analysis_flow_version__"
 FLOW_VERSION = "topic-v1"
@@ -167,9 +168,8 @@ class TopicFlow:
             known = {w["id"]: w for w in ResearchLedger(self).works()}
             if (not isinstance(requested, list) or any(not isinstance(w, str) for w in requested)
                     or set(requested) - known.keys()):
-                raise ToolArgumentError(
-                    "省略topic_keys时，work须使用当前工作索引的有效短ID：" + allowed_values(known)
-                )
+                raise ToolValidationError.at("invalid_work", "work_ids",
+                    "请选择当前工作索引的有效短ID：" + allowed_values(known))
             keys = sorted({known[w]["topic"] for w in requested})
         if not keys and block_id:
             anchors = [block_id] if isinstance(block_id, str) else block_id
@@ -222,8 +222,7 @@ class TopicFlow:
                 entry["unreviewed_evidence"] = sorted(
                     set(entry.get("unreviewed_evidence", [])) | changed[entry["topic"]]
                 )
-                self.data["phase"] = "research"
-                self.data.pop("synthesis_finished", None)
+                AnalysisTransitions(self.state).enter_research()
         affected = {k for e in self.entries if e["topic"] in keys for k in e["record_keys"]}
         if self.data.get("protocol") == "research-v3" and not global_revision:
             active = self.data.get("active_work", [])
@@ -399,7 +398,7 @@ class TopicFlow:
             if not scopes or not any(record["scope"] == scope
                                      or covers_topic_scope(record["scope"], scope)
                                      for scope in scopes):
-                raise ValueError(
+                raise InputError(
                     record["key"] + "的适用范围与主题不一致，请核对topic_updates.scope及record_keys"
                 )
 
@@ -425,7 +424,7 @@ class TopicFlow:
             if not owners:
                 owners = {u.topic for u in result}
             if not owners:
-                raise ValueError(
+                raise InputError(
                     key + "尚无主题关联，请提供topic_updates.topic或先关联检索topic_keys"
                 )
             for topic in sorted(owners):
@@ -439,7 +438,7 @@ class TopicFlow:
                     result.append(TopicUpdate(topic=topic, scope=DataScope.model_validate(scope),
                                               record_keys=[key]))
                 else:
-                    raise ValueError(topic + "存在多组待更新范围，请用record_keys明确本条归属")
+                    raise InputError(topic + "存在多组待更新范围，请用record_keys明确本条归属")
         for update in result:
             linked = [records.get(k, existing.get(k)) for k in update.record_keys]
             if update.scope is None:
@@ -449,7 +448,7 @@ class TopicFlow:
                     scopes = {json.dumps(e["scope"], sort_keys=True) for e in self.entries
                               if e["topic"] == update.topic}
                 if len(scopes) != 1:
-                    raise ValueError(update.topic + "包含多个适用范围，请明确scope后分别核对")
+                    raise InputError(update.topic + "包含多个适用范围，请明确scope后分别核对")
                 update.scope = DataScope.model_validate(json.loads(next(iter(scopes))))
             ids = {ref["block_id"] for i in linked if i for value in i["values"]
                    for ref in value["citations"]}
@@ -525,24 +524,33 @@ class TopicFlow:
             for scope in update.replaces_scopes:
                 source = identity(update.topic, scope.model_dump())
                 if source == key:
-                    raise ValueError("范围不能替代自身；保留部分旧范围时同批另行更新旧范围")
+                    raise ToolValidationError.at("scope_self_replacement", "replaces_scopes",
+                        "范围不能替代自身；保留部分旧范围时同批另行更新旧范围")
                 if source not in entries:
                     if key in self.data.get("scope_replacements", {}).get(source, []):
                         continue
-                    raise ValueError("被替代范围尚未登记于当前主题")
+                    raise ToolValidationError.at("unknown_replaced_scope", "replaces_scopes",
+                                                 "被替代范围尚未登记于当前主题")
                 replacements.setdefault(source, set()).add(key)
         # 未知只是待确认范围；已有研究内容也应迁移，不能永远留在完成门禁中。
         for key, update in targets.items():
             unknown = identity(update.topic, {"kind": "unknown", "lot_refs": []})
             if (update.scope_value()["kind"] != "unknown"
                     and unknown in entries and unknown not in targets):
+                assigned = {record for u in updates if u.topic == update.topic
+                            for record in u.record_keys}
+                # 新草稿或已确认范围的笔记不分配旧事项；保留未知组，避免把并存更新误作替代。
+                # 显式replaces_scopes仍在上方登记，并由下方完整分配校验约束。
+                if set(entries[unknown]["record_keys"]) - assigned:
+                    continue
                 replacements.setdefault(unknown, set()).add(key)
         for source, destinations in replacements.items():
             if source in targets:
                 destinations.add(source)
             if any(destination != source and destination in replacements
                    for destination in destinations):
-                raise ValueError("同批范围替代不能形成链或循环，请直接声明最终目标范围")
+                raise ToolValidationError.at("cyclic_replacement", "replaces_scopes",
+                    "同批范围替代不能形成链或循环，请直接声明最终目标范围")
             assigned = {key for destination in destinations for u in updates
                         if identity(u.topic, u.scope_value()) == destination
                         for key in u.record_keys}
@@ -550,9 +558,9 @@ class TopicFlow:
                             for key in entries.get(destination, {}).get("record_keys", []))
             missing = set(entries[source]["record_keys"]) - assigned
             if missing:
-                raise ValueError(
+                raise ToolValidationError.at("unassigned_scope_records", "replaces_scopes",
                     "被替代范围仍有事项未分配到目标范围：" + "、".join(sorted(missing))
-                )
+                    + "；先用submit_analysis携带已有id及明确scope修订旧事项，再替代范围")
         originals = {source: entries.pop(source) for source in replacements}
         topics = {t["key"]: t for t in self.state["business_topics"]}
         for source, destinations in replacements.items():
@@ -601,34 +609,34 @@ class TopicFlow:
         entries = copy.deepcopy(self.data["entries"])
         topics = {t["key"]: t for t in self.state["business_topics"]}
         if any(u.topic not in topics for u in updates):
-            raise ValueError("topic：未知主题；选择当前专题主题key：" + allowed_values(topics))
+            raise InputError("topic：未知主题；选择当前专题主题key：" + allowed_values(topics))
         replacements = self.migrate_scopes(updates, entries)
         for update in updates:
             scope = update.scope_value()
             key = identity(update.topic, scope)
             entry = entries.setdefault(key, self._entry(topics[update.topic], scope))
             if set(update.checked) - set(entry["checks"]):
-                raise ValueError("checked只能填写该主题已声明的checks："
+                raise InputError("checked只能填写该主题已声明的checks："
                                  + allowed_values(entry["checks"]))
             ids = set(update.evidence_ids)
             ids.update(i for task in update.tasks for i in task.evidence_ids)
             ids.update(r.from_block_id for r in update.references)
             ids.update(i for r in update.references for i in r.evidence_ids)
             if ids - self.research.seen.keys():
-                raise ValueError("evidence_ids：主题、待办与转引只能关联实际已读的证据ID："
+                raise InputError("evidence_ids：主题、待办与转引只能关联实际已读的证据ID："
                                  + allowed_values(self.research.seen))
             if set(update.record_keys) - available:
-                raise ValueError("record_keys含尚未提交或预校验失败的记录；可选："
+                raise InputError("record_keys含尚未提交或预校验失败的记录；可选："
                                  + allowed_values(available))
             for task in update.tasks:
                 if set(task.record_keys) - available:
-                    raise ValueError("tasks.record_keys：待办关联记录尚未提交；可选："
+                    raise InputError("tasks.record_keys：待办关联记录尚未提交；可选："
                                      + allowed_values(available))
                 if task.status == "resolved" and not (task.evidence_ids or task.record_keys):
-                    raise ValueError("resolved待办必须关联证据或已提交记录")
+                    raise InputError("resolved待办必须关联证据或已提交记录")
                 task_id = task.task_id or fingerprint(normalized(task.detail))
                 if task.task_id and task_id not in entry["tasks"]:
-                    raise ValueError(
+                    raise InputError(
                         "task_id须引用当前主题及范围已有的待办；新增待办请省略task_id；可选："
                         + allowed_values(entry["tasks"])
                     )
@@ -638,7 +646,7 @@ class TopicFlow:
                 entry["tasks"][task_id] = value
             for trace in update.references:
                 if trace.status == "resolved" and not trace.evidence_ids:
-                    raise ValueError("转引resolved必须关联目标实质证据")
+                    raise InputError("转引resolved必须关联目标实质证据")
             traces = {fingerprint([r["from_block_id"], normalized(r["target"])]): r
                       for r in entry["references"]}
             traces.update({fingerprint([r.from_block_id, normalized(r.target)]): r.model_dump()
@@ -1035,8 +1043,7 @@ class TopicFlow:
         if found and audit["round"] == 0:
             audit.update(round=1, issues=found, topic_signatures=signatures)
             if self.research_first:
-                self.data["phase"] = "research"
-                self.data.pop("synthesis_finished", None)
+                AnalysisTransitions(self.state).enter_research()
             for issue in found:
                 for entry in self.entries:
                     if entry["topic"] != issue["topic"]:

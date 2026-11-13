@@ -220,6 +220,33 @@ def test_semantic_checkpoint_failure_keeps_three_strike_limit():
     asyncio.run(run())
 
 
+def test_mixed_tool_failures_report_actual_remaining_attempts_before_termination():
+    async def run():
+        research = session([block()], limits=AgentLimits(max_tool_failures=3))
+        state = {}
+        wraps = middleware(research, state)
+
+        async def handler(req):
+            return ToolMessage("研究更新未通过校验", tool_call_id=req.tool_call["id"],
+                               name=req.tool_call["name"], status="error")
+
+        for index, name in enumerate(("update_research", "get_research_context")):
+            result = await wraps.awrap_tool_call(
+                request(name, {}, call_id=f"c{index}", round_id=f"r{index}"), handler,
+            )
+            assert safe_json(result.content)["remaining_attempts"] == 2 - index
+        with pytest.raises(ValueError, match="工具连续失败"):
+            await wraps.awrap_tool_call(
+                request("update_research", {}, call_id="last", round_id="last"), handler,
+            )
+        feedback = safe_json(state["tool_results"]["last"]["data"]["content"])
+        assert feedback["remaining_attempts"] == 0
+        assert "耗尽" in feedback["next_action"]
+        assert state["tool_failures"]["update_research"] == 2
+
+    asyncio.run(run())
+
+
 def test_legacy_failure_counters_reset_once_under_new_policy():
     async def run():
         research = session([block()])

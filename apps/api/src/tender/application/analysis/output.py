@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tender.application.knowledge.content import normalized
-from tender.application.shared.validation import validation_message
+from tender.application.shared.validation import InputError, validation_message
 
 OUTPUT_VERSION = "1"
 
@@ -147,7 +147,7 @@ def record_output(record: dict, schema: dict) -> dict:
             + "；具体事项名称和结论写在列对应的值中，不作为content键"
         ))
     if section is None:
-        raise ValueError(validation_message(issues))
+        raise InputError(validation_message(issues), field_issues=issues)
     # 两列各自的数组没有可靠配对语义；仅新快照声明单值列，旧报告保留原协议。
     for column in section.get("scalar_columns", []):
         if column in content and not isinstance(content[column], str):
@@ -165,7 +165,7 @@ def record_output(record: dict, schema: dict) -> dict:
                        + "、".join(section["columns"][1:])))
     if issues:
         # 先汇总所有可独立判断的问题，再进行内容规范化；不能让模型逐个碰错。
-        raise ValueError(validation_message(issues))
+        raise InputError(validation_message(issues), field_issues=issues)
     content = dict(content)
     if record["group"] == "技术方案要求":
         # 单条要求的字符串可直接包成数组；摘要与条目相互补齐不增加新断言，随后仍整体送审。

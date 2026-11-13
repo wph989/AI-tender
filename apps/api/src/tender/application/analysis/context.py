@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, ToolMessage, message_to_dict
 
 from tender.application.analysis.data import semantic_payload
 from tender.application.analysis.topic_flow import identity
+from tender.application.analysis.validation import ToolIssue, ToolValidationError
 from tender.application.knowledge.content import fingerprint
 from tender.application.shared.validation import allowed_values
 
@@ -82,7 +83,9 @@ def rule_topics(flow, messages, works: list[dict]) -> set[str]:
 def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
     known = {w["id"]: w for w in works}
     if not work_ids or set(work_ids) - known.keys():
-        raise ValueError("work_ids：请选择有效的非空work_ids；可选ID：" + allowed_values(known))
+        raise ToolValidationError([ToolIssue("invalid_work", "work_ids",
+            "work_ids：请选择有效的非空work_ids；可选ID：" + allowed_values(known),
+            tuple(i for i in work_ids if i in known))])
     selected = {key: known[key] for key in work_ids}
     # 后续待办继承产生它的研究线索，不要求模型再抄一份父问题与证据。
     while True:
@@ -177,7 +180,8 @@ def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
     for key in sorted(evidence):
         row = flow.research.seen.get(key)
         if row is None:
-            raise ValueError("关联原文已变化或缺失，请重新核对工作依据")
+            raise ToolValidationError([ToolIssue("stale_evidence", "work_ids",
+                "关联原文已变化或缺失，请重新核对工作依据", tuple(work_ids))])
         text = row["content"]
         fragmented.extend({"kind": "evidence", "id": key, "start": start, "total": len(text),
                            "version": evidence_version(row), "text": text[start:start + 1000]}
@@ -189,7 +193,8 @@ def context_page(units: list[dict], offset: int, limit: int, revision: str | Non
     version = fingerprint(units)
     if (offset < 0 or offset > len(units) or offset > 0 and revision is None
             or revision is not None and revision != version):
-        raise ValueError("上下文或游标发生变化，请从offset=0重新读取")
+        raise ToolValidationError([ToolIssue("stale_cursor", "offset",
+                                            "上下文或游标发生变化，请从offset=0重新读取")])
     result: list[dict] = []
     size, end = 0, offset
     for unit in units[offset:]:
