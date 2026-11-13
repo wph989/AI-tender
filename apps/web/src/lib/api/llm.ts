@@ -160,8 +160,7 @@ export function replaceBindings(
     revision: number;
     failover_limit: number;
     max_total_requests: number;
-    deadline_seconds: number;
-  },
+    },
 ): Promise<LlmFeature> {
   return send<LlmFeature>(
     BASE + "/features/" + encodeURIComponent(key) + "/models",

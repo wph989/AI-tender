@@ -108,7 +108,7 @@ def test_model_timeout_rejects_nonfinite_and_zero(value):
 
 def test_feature_budgets_keep_positive_semantics_without_old_maximum():
     payload = FeaturePatch(
-        revision=1, failover_limit=10, max_total_requests=1000, deadline_seconds=172800
+        revision=1, failover_limit=10, max_total_requests=1000
     )
     assert payload.max_total_requests == 1000
     model = ModelCreate(provider_id=1, model_id="fixture", max_tokens=262144).model_dump()
@@ -116,3 +116,25 @@ def test_feature_budgets_keep_positive_semantics_without_old_maximum():
     assert "max" not in selected["parameter_schema"]["max_tokens"]
     validate_model("openai", model | {"api_mode": "responses"})
     validate_model("gemini", model | {"api_mode": "generate_content", "parameters": {"top_k": 501}})
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_optional_total_timeout_rejects_invalid_numbers(value):
+    with pytest.raises(ValidationError):
+        ModelPatch(total_timeout_seconds=value)
+
+
+def test_text_timeout_defaults_and_patch_clear_semantics():
+    model = ModelCreate(provider_id=1, model_id="fixture")
+    assert model.timeout_seconds == 10
+    assert model.total_timeout_seconds is None
+    assert ModelPatch(timeout_seconds=0.01).timeout_seconds == 0.01
+    assert ModelPatch(timeout_seconds=1000000).timeout_seconds == 1000000
+    assert ModelPatch().model_dump(exclude_unset=True) == {}
+    assert ModelPatch(total_timeout_seconds=None).model_dump(exclude_unset=True) == {
+        "total_timeout_seconds": None,
+    }
+    with pytest.raises(ValidationError):
+        ModelCreate(provider_id=1, model_id="fixture", timeout_seconds=None)
+    with pytest.raises(ValidationError):
+        FeaturePatch(revision=1, failover_limit=1, deadline_seconds=600)

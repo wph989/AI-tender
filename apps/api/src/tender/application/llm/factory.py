@@ -72,6 +72,9 @@ class RoutingModelFactory:
                     base_url=str(row["base_url"]),
                     api_key=api_key,
                     timeout=float(row["timeout_seconds"]),
+                    total_timeout=float(row["total_timeout_seconds"])
+                    if row.get("total_timeout_seconds") is not None
+                    else None,
                     temperature=float(row["temperature"])
                     if row["temperature"] is not None
                     else None,
@@ -135,7 +138,6 @@ class RoutingModelFactory:
             record_call,
             failover_limit=policy["failover_limit"] if policy else 3,
             max_total_requests=policy["max_total_requests"] if policy else 6,
-            deadline_seconds=policy["deadline_seconds"] if policy else 600,
             recheck=recheck,
             reserve=self._log_call,
             before_request=before_request,

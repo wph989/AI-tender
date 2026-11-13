@@ -40,7 +40,7 @@ from tender.domain.shared.errors import (
         (
             "gemini",
             "generate_content",
-            "models/fixture:generateContent",
+            "models/fixture:streamGenerateContent",
             {
                 "candidates": [{"content": {"parts": [{"text": '{"ok":true}'}]}}],
                 "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 2},

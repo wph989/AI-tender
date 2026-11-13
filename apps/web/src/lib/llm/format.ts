@@ -65,7 +65,7 @@ export function withinNumericRule(
   value: number, rule?: import("@/types/llm").ParameterSchema,
 ): boolean {
   return Number.isFinite(value) && (rule?.type !== "integer" || Number.isInteger(value)) &&
-    (rule?.min === undefined || value >= rule.min) &&
+    (rule?.min === undefined || (rule.exclusive_min ? value > rule.min : value >= rule.min)) &&
     (rule?.max === undefined || value <= rule.max);
 }
 

@@ -67,10 +67,10 @@ def test_numeric_rules_drive_api_metadata_and_database_limits(runtime):
     m = model(request, p["id"], extra_retries=99, max_tokens=262144, timeout_seconds=1200.5)
     assert m["extra_retries"] == 99
     feature = llm.update_feature("analysis", llm.FeaturePatch(
-        revision=1, failover_limit=10, max_total_requests=1000, deadline_seconds=172800,
+        revision=1, failover_limit=10, max_total_requests=1000,
     ), request)
     assert feature["max_total_requests"] == 1000
-    assert feature["deadline_seconds"] == 172800
+    assert "deadline_seconds" not in feature
     settings = llm.llm_settings()
     assert settings["model_fields"] == MODEL_FIELDS
     assert settings["feature_fields"] == FEATURE_FIELDS

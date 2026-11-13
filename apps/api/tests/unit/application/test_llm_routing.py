@@ -442,7 +442,7 @@ def test_retry_after_larger_than_deadline_stops_without_retry():
         [replace(_candidate("a", 1), extra_retries=1)],
         _ScriptedGateway({"a": [error, None]}),
         records.append,
-        deadline_seconds=1,
+        remaining_seconds=lambda: 1,
     )
     with pytest.raises(ModelCallFailed, match="时间预算"):
         asyncio.run(router.complete("测试"))
@@ -700,8 +700,8 @@ def test_cancel_during_shared_cooldown_sends_no_request():
     asyncio.run(run())
 
 
-def test_slow_candidates_leave_time_for_final_fallback_within_deadline(monkeypatch):
-    """非 Agent 功能仍按计划请求切分剩余时间：慢候选不能吃光后备模型的窗口。"""
+def test_unbounded_logical_call_does_not_divide_time_among_candidates(monkeypatch):
+    """无模块预算时不再分摊时间，候选超时由适配器处理，失败仍消耗原请求额度。"""
     from tender.application.llm import routing as llm_routing
 
     now, timeouts, records = [100.0], [], []
@@ -712,7 +712,7 @@ def test_slow_candidates_leave_time_for_final_fallback_within_deadline(monkeypat
         try:
             return await request
         except TimeoutError:
-            now[0] += timeout
+            now[0] += 300
             raise
 
     monkeypatch.setattr(llm_routing.asyncio, "wait_for", wait_for)
@@ -732,11 +732,11 @@ def test_slow_candidates_leave_time_for_final_fallback_within_deadline(monkeypat
         ),
         records.append,
         retry_base_seconds=0,
-        deadline_seconds=600,
     )
     assert asyncio.run(router.complete("测试")).model == "c"
     assert [r.model_id for r in records] == [1, 1, 2, 2, 3]
-    assert now[0] < 700 and all(timeout <= 100.01 for timeout in timeouts)
+    assert timeouts == [None] * 5
+    assert now[0] > 700
 
 
 def test_agent_module_window_is_a_continuous_budget_for_the_current_request(monkeypatch):
@@ -771,11 +771,46 @@ def test_agent_module_window_is_a_continuous_budget_for_the_current_request(monk
         ),
         records.append,
         retry_base_seconds=0,
-        deadline_seconds=600,
         remaining_seconds=lambda: 60,
     )
     # 首次请求拿到完整的剩余 60 秒窗口；慢候选耗尽后按模块总时限结束，不再切片重发或换后备。
-    with pytest.raises(ModelCallFailed, match="总请求次数或时间上限"):
+    with pytest.raises(ModelCallFailed, match="总请求次数或模块时间上限"):
         asyncio.run(router.complete("测试"))
     assert timeouts == [60.0]
     assert [r.model_id for r in records] == [1]
+
+
+def test_recovery_ignores_old_window_deadline_without_resetting_attempts():
+    from copy import deepcopy
+
+    class Store:
+        value = {
+            "deadline_at": 1, "invocation_id": "legacy",
+            "requests": [{"model": 1, "ordinal": 1}], "candidate_order": [1],
+            "policy": {"failover_limit": 1, "max_total": 2, "rate_max_wait": 600,
+                       "rate_backoff": 30, "candidates": {"1": {"extra_retries": 1, "timeout": 1}}},
+        }
+
+        def load_invocation(self, key):
+            return deepcopy(self.value)
+
+        def save_invocation(self, key, value):
+            self.value = deepcopy(value)
+
+    records, store = [], Store()
+    gateway = _ScriptedGateway({"a": [None]})
+    router = RoutingModel("analysis", "test", [replace(_candidate("a", 1), total_timeout=0.01)],
+                          gateway, records.append, invocation_store=store)
+    result = asyncio.run(router.complete_validated("测试", call_key="same"))
+    assert result.model == "a"
+    assert "deadline_at" not in store.value
+    assert len(store.value["requests"]) == 2
+    assert records[-1].request_ordinal == 2
+    assert records[-1].invocation_id == "legacy"
+    # 有效回执恢复不再发送；旧快照也不能引入最新模型配置的总时限。
+    assert asyncio.run(router.complete_validated("测试", call_key="same")) == result
+    assert gateway.prompts == ["测试"]
+    store.value = {"exhausted": True, "error": "原请求次数已耗尽", "deadline_at": 1}
+    with pytest.raises(ModelCallFailed, match="原请求次数已耗尽"):
+        asyncio.run(router.complete_validated("测试", call_key="same"))
+    assert gateway.prompts == ["测试"]

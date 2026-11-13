@@ -57,7 +57,8 @@ class LlmModel(Base):
     provider_id: Mapped[int] = mapped_column(BigInteger)
     model_id: Mapped[str] = mapped_column(Text)
     display_name: Mapped[str] = mapped_column(Text)
-    timeout_seconds: Mapped[Decimal] = mapped_column(Numeric(6, 1))
+    timeout_seconds: Mapped[float] = mapped_column(Double)
+    total_timeout_seconds: Mapped[float | None] = mapped_column(Double)
     temperature: Mapped[Decimal | None] = mapped_column(Numeric(3, 2))
     max_tokens: Mapped[int | None] = mapped_column(Integer)
     enabled: Mapped[bool] = mapped_column(Boolean)
@@ -90,7 +91,6 @@ class LlmFeature(Base):
     description: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     max_total_requests: Mapped[int] = mapped_column(Integer)
-    deadline_seconds: Mapped[int] = mapped_column(Integer)
     revision: Mapped[int] = mapped_column(Integer)
 
 
@@ -148,6 +148,7 @@ class LlmTest(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     call_log_id: Mapped[int | None] = mapped_column(BigInteger)
     timeout_seconds: Mapped[float] = mapped_column(Double)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result: Mapped[dict[str, Any]] = mapped_column(JSONB)
     preview_data: Mapped[bytes | None] = mapped_column(LargeBinary)
     preview_mime: Mapped[str | None] = mapped_column(Text)

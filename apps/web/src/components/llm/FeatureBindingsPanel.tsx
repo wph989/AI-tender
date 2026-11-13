@@ -30,7 +30,6 @@ interface Draft {
   ids: number[];
   limit: number;
   total: number;
-  deadline: number;
   revision: number;
 }
 
@@ -77,12 +76,9 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
       : active.failover_limit;
   const total =
     draft?.key === active.key ? draft.total : active.max_total_requests;
-  const deadline =
-    draft?.key === active.key ? draft.deadline : active.deadline_seconds;
   const revision = draft?.key === active.key ? draft.revision : active.revision;
   const dirty =
     total !== active.max_total_requests ||
-    deadline !== active.deadline_seconds ||
     ids.join(",") !== serverIds.join(",") ||
     limit !== active.failover_limit;
 
@@ -90,14 +86,12 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
     nextIds: number[],
     nextLimit: number = limit,
     nextTotal: number = total,
-    nextDeadline: number = deadline,
   ) =>
     setDraft({
       key: active.key,
       ids: nextIds,
       limit: nextLimit,
       total: nextTotal,
-      deadline: nextDeadline,
       revision,
     });
 
@@ -122,7 +116,6 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
         revision,
         failover_limit: limit,
         max_total_requests: total,
-        deadline_seconds: deadline,
       });
       setDraft(null);
       void toast.success("功能绑定已保存");
@@ -206,21 +199,6 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
                 className={" w-20"}
                 value={total}
                 onChange={(e) => update(ids, limit, Number(e.target.value))}
-              />
-            </label>
-            <label>
-              总时间（秒）{" "}
-              <Input
-                aria-label="调用总时间"
-                disabled={!languageRouting}
-                type="number"
-                min={fields.deadline_seconds?.min}
-                max={fields.deadline_seconds?.max}
-                className={" w-24"}
-                value={deadline}
-                onChange={(e) =>
-                  update(ids, limit, total, Number(e.target.value))
-                }
               />
             </label>
           </div>
@@ -441,8 +419,7 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
                   busy ||
                   !dirty ||
                   !withinNumericRule(limit, fields.failover_limit) ||
-                  !withinNumericRule(total, fields.max_total_requests) ||
-                  !withinNumericRule(deadline, fields.deadline_seconds)
+                  !withinNumericRule(total, fields.max_total_requests)
                 }
                 onClick={save}
               >

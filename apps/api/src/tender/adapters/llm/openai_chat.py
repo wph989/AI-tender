@@ -9,11 +9,12 @@ from urllib.parse import quote
 
 import httpx
 
-from tender.core.error_details import raise_for_status, raise_stream_error
+from tender.adapters.llm.completion_stream import CompletionStream, sse_data
+from tender.adapters.llm.response_timeout import response_timeout
+from tender.core.error_details import raise_for_status
 from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
-    ModelOutputTruncated,
     ModelRefused,
     ModelUnavailable,
 )
@@ -38,7 +39,8 @@ class OpenAIChatModel:
         model: str,
         *,
         api_key: str | None = None,
-        timeout: float = 90,
+        timeout: float = 10,
+        total_timeout: float | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         protocol: str = "openai_compatible",
@@ -53,6 +55,7 @@ class OpenAIChatModel:
             base_url=base_url.rstrip("/") + "/", timeout=timeout
         )
         self._owns_client = client is None
+        self._timeout, self._total_timeout = timeout, total_timeout
         self._model = model
         self._api_key = api_key
         # 留空表示使用供应商默认值，避免给不接受 temperature 的模型强塞参数。
@@ -65,6 +68,7 @@ class OpenAIChatModel:
             "model": model,
             "api_key": api_key,
             "timeout": timeout,
+            "total_timeout": total_timeout,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "protocol": protocol,
@@ -85,78 +89,71 @@ class OpenAIChatModel:
         return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
 
     async def _post_completion(self, path: str, body: dict) -> httpx.Response:
-        if self._api_mode != "chat_completions":
-            return await self._client.post(path, headers=self._headers(), json=body)
-        # 长推理的非流式响应会被部分网关在约60秒无数据时断开；接收增量保持连接，
-        # 但业务层仍只拿完整正文，reasoning_content 和未结束的片段绝不能作为校验结论。
-        body = body | {"stream": True, "stream_options": {"include_usage": True}}
-        async with self._client.stream(
-            "POST", path, headers=self._headers(), json=body
-        ) as response:
-            if not response.is_success or "text/event-stream" not in response.headers.get(
-                "content-type", ""
-            ):
-                # 某些兼容服务忽略 stream 并返回完整JSON；沿用原结构与状态码校验。
-                await response.aread()
-                return response
-            content: list[str] = []
-            refusal: list[str] = []
-            usage, model, finish = {}, self._model, None
-            done = False
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    done = True
-                    break
+        if self._api_mode == "generate_content":
+            path = path.replace(":generateContent", ":streamGenerateContent") + "?alt=sse"
+        else:
+            body = body | {"stream": True}
+            if self._api_mode == "chat_completions":
+                body["stream_options"] = {"include_usage": True}
+        async with response_timeout(self._timeout, self._total_timeout) as progress:
+            # 网络读超时会被心跳续期，统一由模型进展计时接管；连接池生命周期保持原样。
+            async with self._client.stream(
+                "POST", path, headers=self._headers(), json=body, timeout=None,
+            ) as response:
+                if not response.is_success or "text/event-stream" not in response.headers.get(
+                    "content-type", ""
+                ):
+                    await response.aread()
+                    progress.observe(False)
+                    if response.is_success:
+                        try:
+                            payload = response.json()
+                        except ValueError:
+                            pass
+                        else:
+                            # 兼容忽略 stream 的供应商，完整模型数据到达才算首个增量。
+                            if isinstance(payload, dict):
+                                if self._api_mode == "responses":
+                                    parts = [
+                                        p
+                                        for item in payload.get("output", [])
+                                        for p in item.get("content", [])
+                                    ]
+                                elif self._api_mode == "messages":
+                                    parts = payload.get("content", [])
+                                elif self._api_mode == "generate_content":
+                                    parts = [
+                                        p
+                                        for c in payload.get("candidates", [])
+                                        for p in c.get("content", {}).get("parts", [])
+                                    ]
+                                else:
+                                    parts = [
+                                        c.get("message", {}) for c in payload.get("choices", [])
+                                    ]
+                                progress.observe(
+                                    any(
+                                        p.get("text")
+                                        or p.get("content")
+                                        or p.get("thinking")
+                                        or p.get("reasoning_content")
+                                        or p.get("tool_calls")
+                                        for p in parts
+                                    )
+                                )
+                    return response
+                collector = CompletionStream(self._api_mode, self._model)
                 try:
-                    chunk = json.loads(data)
-                    if not isinstance(chunk, dict):
-                        raise ValueError("流式服务错误")
-                    if error := chunk.get("error"):
-                        # HTTP 200只表示流已建立；明确的503/429继续有界重试，403立即拒绝。
-                        # 只传递错误对象，不能回显已接收的半截模型正文。
-                        raise_stream_error(response, error, name="LLM", api_key=self._api_key)
-                        raise ValueError("流式服务错误")
-                    model = chunk.get("model") or model
-                    usage = chunk.get("usage") or usage
-                    for choice in chunk.get("choices", []):
-                        if choice.get("index", 0) != 0:
-                            continue
-                        delta = choice.get("delta") or {}
-                        for field, parts in (("content", content), ("refusal", refusal)):
-                            value = delta.get(field)
-                            if value is not None:
-                                if not isinstance(value, str):
-                                    raise ValueError("流式正文类型无效")
-                                parts.append(value)
-                        finish = choice.get("finish_reason") or finish
-                except (ValueError, TypeError, AttributeError) as exc:
-                    raise ModelUnavailable("LLM 流式响应无效或中断", http_status=200) from exc
-            if not done or finish is None:
-                raise ModelUnavailable("LLM 流式响应未完整结束", http_status=200)
-            if finish == "length":
-                error = ModelOutputTruncated(
-                    "模型输出达到token上限，流式正文不完整", http_status=200
-                )
-                if isinstance(usage, dict):
-                    error.prompt_tokens = _int_or_none(usage.get("prompt_tokens"))
-                    error.completion_tokens = _int_or_none(usage.get("completion_tokens"))
-                raise error
-            return httpx.Response(
-                response.status_code,
-                json={
-                    "model": model,
-                    "usage": usage,
-                    "choices": [
-                        {
-                            "finish_reason": finish,
-                            "message": {"content": "".join(content), "refusal": "".join(refusal)},
-                        }
-                    ],
-                },
-            )
+                    async for data in sse_data(response):
+                        collector.feed(data, response, progress, self._api_key)
+                        if data == "[DONE]" or (
+                            self._api_mode != "chat_completions" and collector.done
+                        ):
+                            break
+                    payload = collector.result()
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    raise ModelUnavailable("LLM 流式响应结构无效", http_status=200) from exc
+                return httpx.Response(response.status_code, json=payload)
 
     async def complete(
         self, prompt: str, *, images: tuple[ModelImage, ...] = (), json_mode: bool = True
@@ -303,7 +300,9 @@ class OpenAIChatModel:
                 ):
                     raise ModelRefused("模型拒绝了该请求")
                 content = "".join(
-                    item.get("text", "") for item in payload["candidates"][0]["content"]["parts"]
+                    item.get("text", "")
+                    for item in payload["candidates"][0]["content"]["parts"]
+                    if not item.get("thought")
                 )
             else:
                 if (
@@ -365,7 +364,7 @@ class OpenAIChatModel:
         而不是让人以为供应商连不上。
         """
         try:
-            response = await self._client.get("models", headers=self._headers())
+            response = await self._client.get("models", headers=self._headers(), timeout=30)
         except httpx.HTTPError as exc:
             raise ModelUnavailable("模型目录连接失败或请求超时") from exc
         raise_for_status(

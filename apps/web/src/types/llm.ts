@@ -35,6 +35,8 @@ export interface ParameterSchema {
   label: string;
   type: "number" | "integer" | "enum" | "string_array";
   min?: number;
+  exclusive_min?: boolean;
+  nullable?: boolean;
   max?: number;
   values?: string[];
   max_items?: number;
@@ -135,6 +137,7 @@ export interface LlmModel {
   model_id: string;
   display_name: string;
   timeout_seconds: number;
+  total_timeout_seconds: number | null;
   temperature: number | null;
   max_tokens: number | null;
   enabled: boolean;
@@ -160,7 +163,6 @@ export interface LlmFeature {
   binding_available?: boolean;
   revision: number;
   max_total_requests: number;
-  deadline_seconds: number;
   required_kind: ModelKind;
   key: string;
   name: string;
@@ -200,6 +202,7 @@ export interface ModelInput {
   model_id: string;
   display_name?: string;
   timeout_seconds?: number;
+  total_timeout_seconds?: number | null;
   temperature?: number | null;
   max_tokens?: number | null;
   enabled?: boolean;
@@ -215,6 +218,7 @@ export interface ModelPatchInput {
   supported_parameters?: string[] | null;
   display_name?: string;
   timeout_seconds?: number;
+  total_timeout_seconds?: number | null;
   temperature?: number | null;
   max_tokens?: number | null;
   enabled?: boolean;

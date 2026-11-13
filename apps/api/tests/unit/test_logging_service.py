@@ -530,8 +530,7 @@ def test_answer_failure_does_not_replay_raw_sdk_credential(options, monkeypatch)
     candidate = ModelCandidate(1, 1, "fixture", "fixture", "http://mock.invalid/v1",
                                secret, 5, None, 128, extra_retries=0)
     calls = []
-    model = RoutingModel("knowledge_ask", "knowledge_ask", [candidate], gateway, calls.append,
-                         deadline_seconds=30)
+    model = RoutingModel("knowledge_ask", "knowledge_ask", [candidate], gateway, calls.append)
     db = Mock()
     db.answer.return_value = {
         "status": "pending", "collection_ids": [], "project_id": None,
@@ -547,11 +546,11 @@ def test_answer_failure_does_not_replay_raw_sdk_credential(options, monkeypatch)
     details = read_errors(options.directory)
     assert len(calls) == 1 and secret not in calls[0].error_message
     assert "answer.fail" in details and "Traceback" in details and "answer_question" in details
-    assert "ModelCallFailed" in details and "时间预算不足" in details
+    assert "ModelUnavailable" in details and "HTTP 429" in details
     assert secret not in details + json.dumps(read_logs(options.directory), ensure_ascii=False)
-    db.finish_task.assert_called_once_with(
-        "answer", 7, "failed", "模型调用时间预算不足以等待供应商限流恢复",
-    )
+    assert db.finish_task.call_count == 1
+    assert db.finish_task.call_args.args[:3] == ("answer", 7, "failed")
+    assert "HTTP 429" in db.finish_task.call_args.args[3]
 
 
 @pytest.mark.parametrize("max_bytes", [104857600, 4096])

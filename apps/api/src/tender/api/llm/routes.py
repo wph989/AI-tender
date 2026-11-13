@@ -80,8 +80,13 @@ class ModelCreate(BaseModel):
     provider_id: int
     model_id: str = Field(min_length=1, max_length=200)
     display_name: str | None = Field(default=None, max_length=200)
-    timeout_seconds: float | None = Field(
-        default=None, allow_inf_nan=False, **field_bounds(MODEL_FIELDS["timeout_seconds"])
+    timeout_seconds: float = Field(
+        default_factory=lambda values: 10 if values.get("kind", "language") == "language" else 90,
+        allow_inf_nan=False,
+        **field_bounds(MODEL_FIELDS["timeout_seconds"]),
+    )
+    total_timeout_seconds: float | None = Field(
+        default=None, allow_inf_nan=False, **field_bounds(MODEL_FIELDS["total_timeout_seconds"])
     )
     temperature: float | None = Field(default=None, **field_bounds(LANGUAGE["temperature"]))
     max_tokens: int | None = Field(
@@ -116,6 +121,9 @@ class ModelPatch(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=200)
     timeout_seconds: float | None = Field(
         default=None, allow_inf_nan=False, **field_bounds(MODEL_FIELDS["timeout_seconds"])
+    )
+    total_timeout_seconds: float | None = Field(
+        default=None, allow_inf_nan=False, **field_bounds(MODEL_FIELDS["total_timeout_seconds"])
     )
     temperature: float | None = Field(default=None, **field_bounds(LANGUAGE["temperature"]))
     max_tokens: int | None = Field(
@@ -156,9 +164,6 @@ class BindingsRequest(BaseModel):
     max_total_requests: int | None = Field(
         default=None, strict=True, **field_bounds(FEATURE_FIELDS["max_total_requests"])
     )
-    deadline_seconds: int | None = Field(
-        default=None, strict=True, **field_bounds(FEATURE_FIELDS["deadline_seconds"])
-    )
 
 
 class FeaturePatch(BaseModel):
@@ -167,9 +172,6 @@ class FeaturePatch(BaseModel):
     failover_limit: int = Field(strict=True, **field_bounds(FEATURE_FIELDS["failover_limit"]))
     max_total_requests: int = Field(
         default=6, strict=True, **field_bounds(FEATURE_FIELDS["max_total_requests"])
-    )
-    deadline_seconds: int = Field(
-        default=600, strict=True, **field_bounds(FEATURE_FIELDS["deadline_seconds"])
     )
     revision: int = Field(ge=1)
 

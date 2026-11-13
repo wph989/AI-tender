@@ -34,7 +34,7 @@ from tender.ports.llm.media import EmbeddingInput
         (
             "gemini",
             "generate_content",
-            "/v1/models/fixture:generateContent",
+            "/v1/models/fixture:streamGenerateContent",
             {"candidates": [{"content": {"parts": [{"text": "红蓝"}]}}]},
         ),
     ],

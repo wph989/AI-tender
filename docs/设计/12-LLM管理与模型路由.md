@@ -50,7 +50,7 @@
 - 每个功能有 `failover_limit`（1–10，默认 3），实际生效值夹到该功能已绑定模型数量以内。
 - `failover_limit` 只计实际发送过请求的不同可用候选。语言模型暂时故障先按 `extra_retries` 退避；认证、参数或非法 JSON 不在原模型重复请求，模型明确拒绝与本地约束错误直接停止。
 - 模型返回了结果但置信度低**不算失败**：继续走既有的双轮复抽与规则投票。
-- 模型 `extra_retries` 为整数 ≥0，默认 1；功能 `max_total_requests` 为整数 ≥1，默认 6，`deadline_seconds` 为整数 ≥1，默认 600；这些预算无人工最大值。默认暂时故障顺序为 A/A/B/B/C/C，任何预算先到即停止。
+- 模型 `extra_retries` 为整数 ≥0，默认 1；功能 `max_total_requests` 为整数 ≥1，默认 6；功能绑定不再设置时间上限，解析模块总预算覆盖重试与等待。默认暂时故障顺序为 A/A/B/B/C/C，任何预算先到即停止。
 - 候选耗尽后，该字段落 `need_review` 并记录失败链；全部失败属于内部重试，不占机器解析序号。
 - 若所有候选的失败都是"暂时不可用"（网络、限流、5xx），向上抛 `ExtractionUnavailable`，让 worker 退避后整任务重试；只要有一个是明确拒绝（4xx、响应结构错误），就按字段失败处理。
 
@@ -198,8 +198,8 @@ ALTER TABLE extraction ADD COLUMN llm_model_name TEXT;
 - 调用列表按功能、模型、状态过滤并分页；invocation_id 查询按 request_ordinal 排序。每个语言调用发送前登记请求，回写同一条记录；显示模型/供应商名称快照、重试与用量。测试记录也保存名称快照及向量/重排数量，未知用量保留 null。历史记录软删除后仍保留。
 - 2026-10-17：失败详情保留上游 HTTP 状态和响应正文（JSON、文本或 HTML），列表展开及调用链均保留换行、按文本展示。Agent SDK 的 HTTP 错误读取实际响应或已解析的错误 body；语言、目录、嵌入、重排、生图的 HTTP 失败共用此处理。已知 API Key 和常见凭证字段在记录前隐藏；error_message 上限为16000字符，超长内容明确标记截断，接口读取不再截掉HTTP状态后的正文。旧记录若未保存正文，无法恢复；此改动不需要数据库迁移。
 - 连接异常另记录脱敏后的最底层错误消息；未收到 HTTP 响应时明确说明没有响应正文。流式接收中断记录已收到的响应头状态码、数据块数量及允许的请求标识（x-request-id / request-id / x-amzn-requestid / cf-ray），不序列化请求对象、请求正文、整份响应头或半截模型输出。流开始的 HTTP 200 只作诊断，不把未完成请求改判成功。
-- `RemoteProtocolError` 属于可重试的连接异常，按模型 `extra_retries` 重试，耗尽后按功能配置切换候选；`failover_limit=1` 明确禁止切换。SDK 自身重试关闭，所有实际请求统一落账并共享 invocation_id；重试仍受功能总请求次数、调用时限及 Agent 持久预算约束。
-- 按 `Retry-After` 和指数随机退避等待，受总时间上限控制。SDK 无内建重试。拒绝结果不换源；HTTP 401/403、结构失败不原地重发。
+- `RemoteProtocolError` 属于可重试的连接异常，按模型 `extra_retries` 重试，耗尽后按功能配置切换候选；`failover_limit=1` 明确禁止切换。SDK 自身重试关闭，所有实际请求统一落账并共享 invocation_id；重试受功能总请求次数、模型响应间隔、可选单次总时限及 Agent 持久预算约束。
+- 按 `Retry-After` 和指数随机退避等待，受已有次数、限流等待和模块总预算控制。SDK 无内建重试。拒绝结果不换源；HTTP 401/403、结构失败不原地重发。
 - 迁移 0006 首次补齐旧调用可确认的名称快照；将空 analysis/knowledge_ask 绑定从 extract 显式迁移一次，此后清空即停止调用。旧模型同时绑定 embedding 与语言时整次迁移失败并提示先拆分登记，不自动删除绑定。
 
 ### 10.1 验证与尚未实现
@@ -358,3 +358,33 @@ ALTER TABLE llm_feature DROP CONSTRAINT llm_feature_max_total_requests_check,
 INSERT INTO config_item (key,layer,value_type,default_value,description,requires_gate) VALUES
 ('analysis.max_evidence_blocks', 'L1', 'int', '160'::jsonb, '每模块保留的原文证据块上限', false);
 ```
+
+
+## 13. 模型响应间隔与迁移 0020（2026-11-13）
+
+文本模型的 `timeout_seconds` 为有效增量响应间隔，必填有限正数；新建及导入默认10秒，已有模型沿用原数值。时限使用DOUBLE PRECISION存储并由数据库检查正数与有限值，避免原NUMERIC(6,1)将小正数舍入为0。发送前开始等待首个有效增量，之后新增推理、正文及工具参数续期；心跳、角色、空数据、用量和签名不续期。供应商不输出推理片段时，内部推理也计入等待。
+
+`total_timeout_seconds` 是单次文本请求总时限，可留空关闭，已有模型默认关闭。更新未传字段保持原值，明确传null清空。非文本模型的 `timeout_seconds` 继续作为请求总超时。模型超时分别记录首增量、响应间隔和单次总时限，模块截止另由运行预算控制。普通临时故障及429继续使用原退避配置与次数，不新增连接池设置。
+
+功能绑定删除 `deadline_seconds`，保留请求次数、重试及切换级数。恢复旧未结束窗口忽略其旧截止，保留原请求身份、次数、反馈、结果与终态；解析模块的 `deadline_at` 不变，已终止窗口不重开。旧候选timeout快照作为响应间隔，可选请求总时限为空。
+
+全部文本协议流式收集完整响应后再校验；推理不替代正式正文，半截正文与工具参数不执行、不结算成功。模型测试采用同一语义，并按进程活性每15秒续租、60秒未续租清理为未知。测试结果、调用账及终态在锁定测试后一次事务写入，迟到结果不能覆盖清理终态。历史无心跳测试继续使用原清理规则。
+
+```sql
+ALTER TABLE llm_model ALTER COLUMN timeout_seconds TYPE DOUBLE PRECISION
+    USING timeout_seconds::double precision;
+ALTER TABLE llm_model ADD CONSTRAINT llm_model_timeout_seconds_check
+    CHECK (timeout_seconds > 0 AND timeout_seconds < 'Infinity'::float8);
+ALTER TABLE llm_model ADD COLUMN total_timeout_seconds DOUBLE PRECISION
+    CHECK (total_timeout_seconds IS NULL OR
+           (total_timeout_seconds > 0 AND total_timeout_seconds < 'Infinity'::float8
+            AND kind = 'language'));
+ALTER TABLE llm_feature DROP COLUMN deadline_seconds;
+ALTER TABLE llm_test ADD COLUMN heartbeat_at TIMESTAMPTZ;
+COMMENT ON COLUMN llm_model.timeout_seconds IS
+    '文本模型为有效增量响应间隔；非文本模型仍为请求总超时。已有数值保持，新文本模型由应用默认10秒';
+COMMENT ON COLUMN llm_model.total_timeout_seconds IS
+    '文本模型单次请求总时限，NULL表示关闭';
+```
+
+上线顺序：先核对活动任务并安排可安全切换时段，再应用0020并同步加载API、Worker与前端。旧绑定时限已删除，回滚需要部署前备份。

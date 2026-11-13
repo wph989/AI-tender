@@ -23,6 +23,7 @@ class ModelRuntimeRepository:
                         LlmModel.model_id,
                         LlmModel.display_name,
                         LlmModel.timeout_seconds,
+                        LlmModel.total_timeout_seconds,
                         LlmModel.temperature,
                         LlmModel.max_tokens,
                         LlmModel.extra_retries,

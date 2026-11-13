@@ -10,6 +10,7 @@ import asyncio
 import json
 import time
 from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -51,7 +52,7 @@ from tender.core.secrets import (
     secret_hint,
     secret_key_ready,
 )
-from tender.domain.shared.errors import ModelInUse, TenderError
+from tender.domain.shared.errors import ModelInUse, ModelUnavailable, TenderError
 from tender.ports.llm.media import EmbeddingInput
 from tender.ports.repository.llm.management import LlmRepository, LlmTransaction, RecordConflict
 
@@ -282,7 +283,10 @@ class LlmService:
                         "capabilities": values["capabilities"],
                         # 导入前已确认接口与能力，与手动创建保持相同的启用默认值。
                         "enabled": True,
-                        "timeout_seconds": values.get("timeout_seconds") or 90,
+                        "timeout_seconds": values.get("timeout_seconds")
+                        if values.get("timeout_seconds") is not None
+                        else (10 if values["kind"] == "language" else 90),
+                        "total_timeout_seconds": values.get("total_timeout_seconds"),
                         "temperature": values.get("temperature"),
                         "max_tokens": values.get("max_tokens"),
                         "extra_retries": values["extra_retries"],
@@ -316,7 +320,10 @@ class LlmService:
                         "provider_id": values["provider_id"],
                         "model_id": values["model_id"],
                         "display_name": values.get("display_name") or values["model_id"],
-                        "timeout_seconds": values.get("timeout_seconds") or 90,
+                        "timeout_seconds": values.get("timeout_seconds")
+                        if values.get("timeout_seconds") is not None
+                        else (10 if values["kind"] == "language" else 90),
+                        "total_timeout_seconds": values.get("total_timeout_seconds"),
                         "temperature": values.get("temperature"),
                         "max_tokens": values.get("max_tokens"),
                         "enabled": values["enabled"],
@@ -337,10 +344,12 @@ class LlmService:
         row = self._model_row(model_id)
         fields = {key: value for key, value in values.items() if key != "revision"}
         if any(
-            value is None and key not in {"temperature", "max_tokens", "supported_parameters"}
+            value is None
+            and key
+            not in {"temperature", "max_tokens", "supported_parameters", "total_timeout_seconds"}
             for key, value in fields.items()
         ):
-            raise Unprocessable("只有温度、输出上限和模型参数支持范围允许清空")
+            raise Unprocessable("只有单次请求总时限、温度、输出上限和模型参数支持范围允许清空")
         with self.repository.transaction() as transaction:
             current = transaction.lock_model(model_id)
             self._check_revision(current, values.get("revision"))
@@ -429,8 +438,11 @@ class LlmService:
             image_count
         ) = None
         preview = None
+        cancelled = False
         try:
-            async with asyncio.timeout(float(row["timeout_seconds"])):
+            async with self._test_lease(row, test_id), asyncio.timeout(
+                None if row["kind"] == "language" else float(row["timeout_seconds"])
+            ):
                 if row["kind"] == "embedding":
                     self._api_key_for(row)
                     gateway = self.embedding_gateway(row)
@@ -466,6 +478,9 @@ class LlmService:
                         row["model_id"],
                         api_key=self._api_key_for(row),
                         timeout=float(row["timeout_seconds"]),
+                        total_timeout=float(row["total_timeout_seconds"])
+                        if row.get("total_timeout_seconds") is not None
+                        else None,
                         temperature=row["temperature"],
                         max_tokens=row["max_tokens"],
                         protocol=row["protocol"],
@@ -493,8 +508,14 @@ class LlmService:
                     finally:
                         await gateway.aclose()
                 http_status = 200
+        except asyncio.CancelledError:
+            cancelled = True
+            status, error = "unknown", "测试执行已取消，供应商结果未知；不会自动重发"
         except TimeoutError:
             status, error = "unknown", "测试请求超时，供应商结果未知；不会自动重发"
+        except ModelUnavailable as exc:
+            status = "unknown" if exc.http_status is None else "error"
+            http_status, error = exc.http_status, str(exc)
         except (TenderError, SecretKeyUnavailable, ValueError) as exc:
             status, http_status, error = "error", getattr(exc, "http_status", None), str(exc)
         latency_ms = int((time.monotonic() - started) * 1000)
@@ -515,45 +536,84 @@ class LlmService:
         await asyncio.to_thread(
             self._save_model_test, row, test_id, result, preview, prompt_tokens, completion_tokens,
         )
+        if cancelled:
+            raise asyncio.CancelledError
         return result
+
+    def _heartbeat_test(self, test_id: int) -> bool:
+        with self.repository.transaction() as transaction:
+            return transaction.heartbeat_test(test_id)
+
+    @asynccontextmanager
+    async def _test_lease(self, row: Mapping[str, Any], test_id: int):
+        if row["kind"] != "language":
+            yield
+            return
+        owner = asyncio.current_task()
+        lost = False
+
+        async def heartbeat():
+            nonlocal lost
+            try:
+                while True:
+                    await asyncio.sleep(15)
+                    if not await asyncio.to_thread(self._heartbeat_test, test_id):
+                        break
+            except Exception:
+                pass
+            lost = True
+            if owner is not None:
+                owner.cancel()
+
+        renewal = asyncio.create_task(heartbeat())
+        try:
+            yield
+        except asyncio.CancelledError:
+            if lost:
+                raise ModelUnavailable("模型测试续租失败或租约已失效，供应商结果未知") from None
+            raise
+        finally:
+            renewal.cancel()
+            with suppress(asyncio.CancelledError):
+                await renewal
 
     def _save_model_test(
         self, row: Mapping[str, Any], test_id: int, result: dict[str, Any],
         preview: Any, prompt_tokens: int | None, completion_tokens: int | None,
     ) -> None:
-        # 同一段同步持久化在线程中完成，避免在异步响应收尾时阻塞其它请求。
+        # 锁定测试后一次事务写入结果、调用账及终态；维护清理和迟到结果不能互相覆盖。
         with self.repository.transaction() as transaction:
+            current = transaction.lock_test(test_id)
+            if current is None or current["status"] != "running":
+                result.update(status=current["status"] if current else "unknown",
+                              error=current.get("error_message") if current else "测试已不存在",
+                              preview_url=None)
+                return
             transaction.store_test_result(
-                test_id,
-                result=result,
-                preview_data=preview.data if preview else None,
+                test_id, result=result, preview_data=preview.data if preview else None,
                 preview_mime=preview.mime_type if preview else None,
             )
-        self._record_call(
-            provider_id=row["provider_id"],
-            model_id=row["id"],
-            feature_key=None,
-            purpose="test",
-            status=result["status"],
-            http_status=result["http_status"],
-            latency_ms=result["latency_ms"],
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            error=result["error"],
-            snapshot=row,
-            vector_count=result["vector_count"],
-            document_count=result["document_count"],
-            image_count=result["image_count"],
-            test_id=test_id,
-        )
-        self._finish_test(
-            row,
-            test_id,
-            status=result["status"],
-            error=result["error"],
-            latency_ms=result["latency_ms"],
-            is_model=True,
-        )
+            transaction.record_call(
+                provider_id=row["provider_id"],
+                model_id=row["id"],
+                feature_key=None,
+                purpose="test",
+                status=result["status"],
+                http_status=result["http_status"],
+                latency_ms=result["latency_ms"],
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                error_message=error_detail(result["error"]),
+                snapshot=row,
+                vector_count=result["vector_count"],
+                document_count=result["document_count"],
+                image_count=result["image_count"],
+                test_id=test_id,
+            )
+            transaction.finish_test(
+                row, test_id, status=result["status"], error=result["error"],
+                latency_ms=result["latency_ms"], is_model=True,
+            )
 
     def list_features(self) -> dict[str, Any]:
         rows, limits = self.repository.feature_rows()
@@ -580,7 +640,6 @@ class LlmService:
                     "key": key,
                     "revision": configured["revision"] if configured else 1,
                     "max_total_requests": configured["max_total_requests"] if configured else 6,
-                    "deadline_seconds": configured["deadline_seconds"] if configured else 600,
                     "required_kind": required_kind(key),
                     "name": name,
                     "failover_limit": int(configured["failover_limit"])
@@ -614,7 +673,6 @@ class LlmService:
                 {
                     "failover_limit": values["failover_limit"],
                     "max_total_requests": values["max_total_requests"],
-                    "deadline_seconds": values["deadline_seconds"],
                 },
             )
             transaction.bump_feature_revision(feature_key)
@@ -647,7 +705,7 @@ class LlmService:
             transaction.replace_feature_models(feature_key, rows)
             limits = {
                 key: values[key]
-                for key in ("failover_limit", "max_total_requests", "deadline_seconds")
+                for key in ("failover_limit", "max_total_requests")
                 if values.get(key) is not None
             }
             if limits:
@@ -895,6 +953,9 @@ class LlmService:
             "model_id": row["model_id"],
             "display_name": row["display_name"],
             "timeout_seconds": float(row["timeout_seconds"]),
+            "total_timeout_seconds": float(row["total_timeout_seconds"])
+            if row.get("total_timeout_seconds") is not None
+            else None,
             "temperature": float(row["temperature"]) if row["temperature"] is not None else None,
             "max_tokens": row["max_tokens"],
             "enabled": row["enabled"],

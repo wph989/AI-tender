@@ -368,6 +368,7 @@ class LlmTransaction:
                     else row["config_revision"],
                     model_revision=row["config_revision"] if is_model else None,
                     timeout_seconds=float(row.get("timeout_seconds", 90)),
+                    heartbeat_at=func.now() if is_model and row.get("kind") == "language" else None,
                     call_log_id=call_id,
                 )
                 .returning(LlmTest.id)
@@ -393,6 +394,20 @@ class LlmTransaction:
         )
         return test_id
 
+    def lock_test(self, test_id: int) -> dict[str, Any] | None:
+        row = (
+            self.connection.execute(select(LlmTest).where(LlmTest.id == test_id).with_for_update())
+            .mappings()
+            .first()
+        )
+        return dict(row) if row is not None else None
+
+    def heartbeat_test(self, test_id: int) -> bool:
+        # 只续期运行中的测试，清理后的未知状态不能被迟到心跳复活。
+        return self.connection.execute(update(LlmTest).where(
+            LlmTest.id == test_id, LlmTest.status == "running",
+        ).values(heartbeat_at=func.now()).returning(LlmTest.id)).scalar_one_or_none() is not None
+
     def store_test_result(
         self,
         test_id: int,
@@ -417,16 +432,18 @@ class LlmTransaction:
         latency_ms: int,
         is_model: bool,
     ) -> None:
-        self.connection.execute(
+        finished = self.connection.execute(
             update(LlmTest)
-            .where(LlmTest.id == test_id)
+            .where(LlmTest.id == test_id, LlmTest.status == "running")
             .values(
                 status=status,
                 error_message=error,
                 latency_ms=latency_ms,
                 finished_at=func.now(),
-            )
-        )
+            ).returning(LlmTest.id)
+        ).scalar_one_or_none()
+        if finished is None:
+            return
         entity = LlmModel if is_model else LlmProvider
         values: dict[str, Any] = {
             "last_test_status": status,

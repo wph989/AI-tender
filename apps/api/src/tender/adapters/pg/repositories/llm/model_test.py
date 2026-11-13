@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Engine, func, literal, update
+from sqlalchemy import Engine, and_, func, literal, or_, update
 from sqlalchemy.dialects.postgresql import INTERVAL
 
 from tender.adapters.pg.models import LlmCallLog, LlmTest
@@ -12,9 +12,15 @@ def maintain_model_tests(db: Engine) -> None:
     with db.begin() as c:
         # 超时口径按「配置的等待预算 + 30 秒容差」计算，避免把仍在等的测试误判为未知。
         # make_interval 只按位置传参：秒数是第 7 个，SQLAlchemy 的 func 不支持 `secs=>`。
-        stale = LlmTest.created_at + func.make_interval(
-            0, 0, 0, 0, 0, 0, LlmTest.timeout_seconds + 30
-        ) < func.now()
+        # 新文本测试按进程活性续租；正常增量流可以超过旧请求超时。
+        stale = or_(
+            and_(LlmTest.heartbeat_at.is_not(None),
+                 LlmTest.heartbeat_at + literal("60 seconds", type_=INTERVAL) < func.now()),
+            and_(LlmTest.heartbeat_at.is_(None),
+                 LlmTest.created_at + func.make_interval(
+                     0, 0, 0, 0, 0, 0, LlmTest.timeout_seconds + 30,
+                 ) < func.now()),
+        )
         c.execute(
             update(LlmTest)
             .where(LlmTest.status == "running", stale)

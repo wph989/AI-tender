@@ -30,6 +30,7 @@ _IGNORED_TABLES = frozenset({"alembic_version"})
 _CREATE_TABLE_RE = re.compile(r"^CREATE TABLE (\w+) \((.*?)^\s*\);", re.S | re.M)
 _ALTER_TABLE_RE = re.compile(r"^ALTER TABLE (\w+)\s+(.*?);", re.S | re.M)
 _ADD_COLUMN_RE = re.compile(r"ADD COLUMN\s+(\w+)\s+(.+)$", re.M)
+_ALTER_COLUMN_TYPE_RE = re.compile(r"ALTER COLUMN\s+(\w+)\s+TYPE\s+(.+)$", re.M)
 _TABLE_PK_RE = re.compile(r"^(?:CONSTRAINT\s+\w+\s+)?PRIMARY KEY\s*\(([^)]+)\)")
 _TYPE_RE = re.compile(
     r"^(DOUBLE PRECISION\[\]|DOUBLE PRECISION|TIMESTAMPTZ|TIMESTAMP WITH TIME ZONE"
@@ -116,6 +117,12 @@ def _parse_ddl_columns() -> dict[str, dict[str, tuple[str, bool]]]:
         for add in _ADD_COLUMN_RE.finditer(body):
             column, rest = add.group(1), add.group(2).strip().rstrip(",")
             tables.setdefault(table, {})[column] = _column_type(rest, f"{table}.{column}")
+        for change in _ALTER_COLUMN_TYPE_RE.finditer(body):
+            column, rest = change.group(1), change.group(2).strip().rstrip(",")
+            # 类型迁移不改变可空性；按正式迁移更新类型，避免仍拿初始DDL比较head模型。
+            assert column in tables[table], f"修改了未知列类型：{table}.{column}"
+            kind, _ = _column_type(rest, f"{table}.{column}")
+            tables[table][column] = kind, tables[table][column][1]
 
     # 下线迁移仍保留在历史链中，但 head 的模型不再承载被移除的表和列。
     for table, column in re.findall(r"ALTER TABLE (\w+) DROP COLUMN (\w+);", sql):

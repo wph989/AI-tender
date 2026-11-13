@@ -17,6 +17,8 @@ dependencies = [
     # 适配器统一用它（async；见 docs/工程/10 第 2 节）。只在 adapters 层 import，
     # 上层依赖的是 ports 里的 Protocol，不认识 httpx。
     "httpx>=0.28",
+    # Anthropic/GenAI新SDK使用httpx2，原始流适配也须识别其响应和传输错误。
+    "httpx2>=2.13,<3",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     # 统一项目与第三方日志；tzdata 让 Windows 也能按 IANA 时区切分文件。

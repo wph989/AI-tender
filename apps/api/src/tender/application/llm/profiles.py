@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from tender.application.llm.registry import MAX_FAILOVER_LIMIT
 
-ADAPTER_VERSION = "2026-10-11.1"
+ADAPTER_VERSION = "2026-11-13.1"
 
 
 def number(
@@ -28,19 +28,24 @@ def choice(label: str, *values: str) -> dict:
 
 # 管理字段与协议参数一样由后端定义一次，API和页面读取同一份范围。
 MODEL_FIELDS = {
-    "timeout_seconds": number("超时（秒）", 1),
+    "timeout_seconds": number("响应间隔超时（秒）", 0) | {"exclusive_min": True},
+    "total_timeout_seconds": number("单次请求总时限（秒，可留空）", 0)
+    | {"exclusive_min": True, "nullable": True},
     "extra_retries": number("失败后额外重试次数", 0, integer=True),
 }
 FEATURE_FIELDS = {
     "failover_limit": number("故障转移级数", 1, MAX_FAILOVER_LIMIT, integer=True),
     "max_total_requests": number("总请求上限", 1, integer=True),
-    "deadline_seconds": number("调用总时间", 1, integer=True),
 }
 
 
 def field_bounds(rule: dict) -> dict:
     """把同一份数值范围用于请求模型；最大值缺省时不生成上限。"""
-    return {name: rule[key] for name, key in (("ge", "min"), ("le", "max")) if key in rule}
+    return {
+        name: rule[key]
+        for name, key in (("gt" if rule.get("exclusive_min") else "ge", "min"), ("le", "max"))
+        if key in rule
+    }
 
 
 # schema 同时用于服务端校验与表单渲染；不能允许任意 JSON 覆写 model/认证/请求路径。
@@ -256,6 +261,18 @@ def supported_parameters(protocol: str, model: dict) -> list[str]:
 
 
 def validate_model(protocol: str, model: dict) -> dict:
+    for field in ("timeout_seconds", "total_timeout_seconds"):
+        value = model.get(field)
+        if value is None:
+            continue
+        if (
+            type(value) not in {int, float, Decimal}
+            or not math.isfinite(float(value))
+            or value <= 0
+        ):
+            raise ValueError("时限必须为有限正数")
+    if model["kind"] != "language" and model.get("total_timeout_seconds") is not None:
+        raise ValueError("单次请求总时限仅用于文本模型")
     selected = get_profile(protocol, model)
     capabilities = model["capabilities"]
     if (

@@ -406,14 +406,103 @@ def test_running_test_is_registered_before_send_and_recovers_as_unknown(env, mon
     test = llm.get_test(accepted["test_id"], request)
     assert test["status"] == "running"
     assert llm.list_calls(request, limit=25, offset=0)["items"][0]["status"] == "running"
-    # 模拟 API 在受理后崩溃：超出原请求超时与宽限后只收敛状态，不执行待处理回调。
+    # 模拟 API 在受理后崩溃：失去续租后只收敛状态，不执行待处理回调。
     c.execute(
-        text("UPDATE llm_test SET created_at=now()-interval '3 minutes' WHERE id=:id"),
+        text("UPDATE llm_test SET heartbeat_at=now()-interval '3 minutes' WHERE id=:id"),
         {"id": test["id"]},
     )
     recovered = llm.get_test(test["id"], request)
     assert recovered["status"] == recovered["validity"] == "unknown"
     assert llm.list_calls(request, limit=25, offset=0)["items"][0]["status"] == "unknown"
+
+
+def test_optional_request_total_can_be_cleared_and_interval_stays_required(env):
+    request, _ = env
+    p = provider(request)
+    m = model(request, p["id"])
+    assert m["timeout_seconds"] == 10 and m["total_timeout_seconds"] is None
+    m = llm.update_model(
+        m["id"], llm.ModelPatch(total_timeout_seconds=120, revision=m["revision"]), request
+    )
+    m = llm.update_model(
+        m["id"], llm.ModelPatch(display_name="保留总时限", revision=m["revision"]), request
+    )
+    assert m["total_timeout_seconds"] == 120
+    m = llm.update_model(
+        m["id"], llm.ModelPatch(total_timeout_seconds=None, revision=m["revision"]), request
+    )
+    assert m["total_timeout_seconds"] is None
+    with pytest.raises(ApiProblem) as invalid:
+        llm.update_model(
+            m["id"], llm.ModelPatch(timeout_seconds=None, revision=m["revision"]), request
+        )
+    assert invalid.value.status_code == 422
+
+    m = llm.update_model(
+        m["id"], llm.ModelPatch(timeout_seconds=0.01, revision=m["revision"]), request,
+    )
+    assert m["timeout_seconds"] == 0.01
+
+
+def test_healthy_long_test_is_not_stale_and_late_result_cannot_revive_expired_lease(env):
+    request, c = env
+    p = provider(request)
+    m = model(request, p["id"], timeout_seconds=1)
+    service = llm._service(request)
+    row, test_id, capability = service.begin_model_test(m["id"], "text")
+    c.execute(
+        text("UPDATE llm_test SET created_at=now()-interval '10 minutes' WHERE id=:id"),
+        {"id": test_id},
+    )
+    assert llm.get_test(test_id, request)["status"] == "running"
+    c.execute(
+        text("UPDATE llm_test SET heartbeat_at=now()-interval '61 seconds' WHERE id=:id"),
+        {"id": test_id},
+    )
+    assert llm.get_test(test_id, request)["status"] == "unknown"
+    # 后台迟到返回也不能把维护流程判定的未知状态改成有效测试。
+    result = asyncio.run(service.run_model_test(row, test_id, capability))
+    assert result["status"] == "unknown"
+    assert llm.get_test(test_id, request)["status"] == "unknown"
+    assert llm.list_calls(request, limit=25, offset=0)["items"][0]["status"] == "unknown"
+
+
+def test_migration_preserves_old_interval_and_removes_all_binding_deadlines(env):
+    request, c = env
+    p = provider(request)
+    m = model(request, p["id"], timeout_seconds=90)
+    # 在私有schema恢复迁移前列形态，再运行正式增量，核对已有数据的迁移结果。
+    c.execute(text("ALTER TABLE llm_feature ADD COLUMN deadline_seconds INT DEFAULT 123"))
+    c.execute(text("ALTER TABLE llm_model DROP COLUMN total_timeout_seconds"))
+    c.execute(text("ALTER TABLE llm_model DROP CONSTRAINT llm_model_timeout_seconds_check"))
+    c.execute(text("ALTER TABLE llm_model ALTER COLUMN timeout_seconds TYPE NUMERIC(6,1)"))
+    c.execute(text("ALTER TABLE llm_test DROP COLUMN heartbeat_at"))
+    path = Path(__file__).resolve().parents[2] / "alembic/versions/0020_llm_response_timeout.py"
+    spec = importlib.util.spec_from_file_location("timeout_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    for statement in migration._STATEMENTS:
+        c.execute(text(statement))
+    changed = next(row for row in llm.list_models(request)["items"] if row["id"] == m["id"])
+    assert changed["timeout_seconds"] == 90 and changed["total_timeout_seconds"] is None
+    assert "deadline_seconds" not in llm.list_features(request)["items"][0]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("timeout_seconds", "0"), ("timeout_seconds", "NaN"),
+    ("total_timeout_seconds", "0"), ("total_timeout_seconds", "NaN"),
+    ("total_timeout_seconds", "Infinity"), ("total_timeout_seconds", "-1"),
+])
+def test_database_rejects_nonpositive_and_nonfinite_timeouts(env, field, value):
+    from sqlalchemy.exc import IntegrityError
+
+    request, c = env
+    p = provider(request)
+    m = model(request, p["id"])
+    # 数据库约束独立于HTTP校验，脚本或其它写入路径也不能保存无效时限。
+    with pytest.raises(IntegrityError), c.begin_nested():
+        c.execute(text(f"UPDATE llm_model SET {field}=:value WHERE id=:id"),
+                  {"value": value, "id": m["id"]})
 
 
 def test_json_consumers_reject_language_model_without_json_and_capability_removal(env):

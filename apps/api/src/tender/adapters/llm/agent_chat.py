@@ -7,11 +7,25 @@ import json
 from typing import Any
 
 import httpx
+import httpx2
 from jsonschema import Draft202012Validator
 from langchain_core.messages import message_chunk_to_message, message_to_dict, messages_from_dict
 from langsmith import tracing_context
 
-from tender.core.error_details import quota_window, retry_after, stream_error_status, upstream_error
+from tender.adapters.llm.completion_stream import sse_data
+from tender.adapters.llm.response_timeout import (
+    chat_has_increment,
+    message_has_increment,
+    response_timeout,
+    responses_has_increment,
+)
+from tender.core.error_details import (
+    quota_window,
+    raise_stream_error,
+    retry_after,
+    stream_error_status,
+    upstream_error,
+)
 from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -68,14 +82,17 @@ class AgentChat:
         api_mode: str,
         parameters: dict,
         http_async_client: Any = None,
+        total_timeout: float | None = None,
     ) -> None:
+        self._timeout, self._total_timeout = timeout, total_timeout
+        self._api_mode = api_mode
         self._api_key = api_key
         self._max_tokens = max_tokens
         self._stream_chat = (
             protocol in {"openai", "openai_compatible"} and api_mode == "chat_completions"
         )
         # SDK 默认重试会与项目路由相乘；所有供应商必须关掉自己的隐式重试。
-        common: dict[str, Any] = {"model": model, "max_retries": 0, "timeout": timeout}
+        common: dict[str, Any] = {"model": model, "max_retries": 0, "timeout": None}
         if temperature is not None:
             common["temperature"] = temperature
         if max_tokens is not None:
@@ -86,8 +103,8 @@ class AgentChat:
 
             # LangChain 默认缓存 httpx 客户端。模块独立关闭/跨 Celery 事件循环恢复时，
             # 共享缓存会让其它模块复用已关闭客户端，因此显式为每个适配器创建连接池。
-            self._owned_http = http_async_client or httpx.AsyncClient(timeout=timeout)
-            self._owned_sync_http = httpx.Client(timeout=timeout)
+            self._owned_http = http_async_client or httpx.AsyncClient(timeout=None)
+            self._owned_sync_http = httpx.Client(timeout=None)
             self.model = ChatOpenAI(
                 **common,
                 **params,
@@ -95,6 +112,7 @@ class AgentChat:
                 api_key=api_key or "local-anonymous",
                 use_responses_api=api_mode == "responses",
                 stream_usage=True,
+                stream_chunk_timeout=None,
                 http_async_client=self._owned_http,
                 http_client=self._owned_sync_http,
             )
@@ -125,16 +143,39 @@ class AgentChat:
             raise ValueError("该协议暂不支持 Agent 原生工具调用")
 
     async def chat(self, messages: list[dict], tools: list[dict]) -> Completion:
+        incomplete_arguments = False
         try:
             # 业务调用记录保存在本项目，不能因终端残留 tracing 配置外发标书正文。
             with tracing_context(enabled=False):
-                if self._stream_chat:
-                    # 先聚合完整工具参数再交给 Agent；增量接收避免长生成被网关闲置超时断开。
-                    merged = await self._aggregate_chat_stream(messages, tools)
-                    result = message_chunk_to_message(merged) if merged is not None else None
+                # 先构造中立消息和供应商载荷，响应计时从实际发送前开始。
+                bound = self.model.bind_tools(tools) if tools else None
+                options = dict(bound.kwargs) if bound is not None else {}
+                if self._api_mode == "generate_content":
+                    payload = self.model._prepare_request(messages_from_dict(messages), **options)
                 else:
-                    runnable = self.model.bind_tools(tools) if tools else self.model
-                    result = await runnable.ainvoke(messages_from_dict(messages))
+                    payload = self.model._get_request_payload(
+                        messages_from_dict(messages), stream=True,
+                        **options,
+                    )
+                async with response_timeout(self._timeout, self._total_timeout) as progress:
+                    if self._stream_chat:
+                        merged = await self._aggregate_chat_stream(payload, progress)
+                    elif self._api_mode == "responses":
+                        merged = await self._aggregate_responses_stream(payload, progress)
+                    elif self._api_mode == "messages":
+                        merged = await self._aggregate_messages_stream(payload, progress)
+                    else:
+                        merged = await self._aggregate_gemini_stream(payload, progress)
+                    # LangChain会自动补齐半截JSON；成功结算前必须核对聚合后的原始参数。
+                    for call in getattr(merged, "tool_call_chunks", []):
+                        try:
+                            json.loads(call.get("args", ""))
+                        except (ValueError, TypeError):
+                            incomplete_arguments = True
+                    result = message_chunk_to_message(merged) if merged is not None else None
+        except (ModelUnavailable, ModelCallFailed):
+            # 应用超时已有首包/间隔/总时限分类，不再被 SDK 通用错误转换掩盖。
+            raise
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             stream_response = getattr(exc, "_tender_stream_response", None)
@@ -147,19 +188,21 @@ class AgentChat:
                 stream_status = stream_error_status(payload)
                 status = stream_status
             body = None
-            if isinstance(response, httpx.Response) and stream_response is None:
+            if isinstance(response, (httpx.Response, httpx2.Response)) and stream_response is None:
                 # SDK 的流式失败响应可能还未读取；只提取上游正文，不回显含请求的异常文本。
                 try:
                     await response.aread()
                     body = response.text
-                except (httpx.HTTPError, httpx.StreamError):
+                except (httpx.HTTPError, httpx.StreamError, httpx2.HTTPError, httpx2.StreamError):
                     # 响应已关闭时仍保留原错误分类，继续尝试 SDK 已解析的错误正文。
                     pass
             if not body and payload is not None:
                 body = (
                     payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
                 )
-            transport_failure = isinstance(exc, httpx.TransportError) or any(
+            transport_failure = isinstance(
+                exc, (httpx.TransportError, httpx2.TransportError),
+            ) or any(
                 token in type(exc).__name__ for token in ("Timeout", "Connection")
             )
             # 524 等非标准 5xx 同样是上游超时，必须可重试，不能直接判失败。
@@ -190,7 +233,7 @@ class AgentChat:
                         )
                     elif response is None:
                         summary += "\n响应情况：未收到上游 HTTP 响应，无响应正文可记录。"
-                if isinstance(response, httpx.Response):
+                if isinstance(response, (httpx.Response, httpx2.Response)):
                     # 只保留便于供应商排查的请求标识，避免整份响应头携带 Cookie 等凭证。
                     for header in ("x-request-id", "request-id", "x-amzn-requestid", "cf-ray"):
                         if value := response.headers.get(header):
@@ -218,8 +261,16 @@ class AgentChat:
                 ),
                 http_status=status,
             ) from exc
+        if result is not None and result.response_metadata.get("status") == "incomplete":
+            error = ModelOutputTruncated("模型输出未完整完成或达到token上限", http_status=200)
+            usage = result.usage_metadata or {}
+            error.prompt_tokens = usage.get("input_tokens")
+            error.completion_tokens = usage.get("output_tokens")
+            raise error
         if result is None or (
-            self._stream_chat and not result.response_metadata.get("finish_reason")
+            not (result.response_metadata.get("finish_reason")
+                 or result.response_metadata.get("stop_reason")
+                 or result.response_metadata.get("status") == "completed")
         ):
             # 网络结束不等于模型完成；半截工具 JSON 绝不能进入提交工具。
             raise ModelUnavailable("Agent 流式响应未完整结束")
@@ -234,7 +285,13 @@ class AgentChat:
 
         if (
             result.additional_kwargs.get("refusal")
-            or result.response_metadata.get("finish_reason") == "content_filter"
+            or str(result.response_metadata.get("finish_reason", "")).lower() in {
+                "content_filter", "safety", "recitation", "prohibited_content", "blocklist",
+            }
+            or result.response_metadata.get("stop_reason") == "refusal"
+            or (isinstance(result.content, list) and any(
+                isinstance(part, dict) and part.get("type") == "refusal" for part in result.content
+            ))
         ):
             raise invalid(ModelRefused, "模型拒绝了该请求")
         required = {
@@ -276,7 +333,7 @@ class AgentChat:
         ):
             # 部分兼容网关在额度耗尽时仍标tool_calls并返回{}，不能当作完整业务提交。
             raise invalid(ModelOutputTruncated, "模型输出达到token上限，工具参数或正文不完整")
-        if result.invalid_tool_calls:
+        if incomplete_arguments or result.invalid_tool_calls:
             raise invalid(InvalidModelOutput, "模型工具调用参数不是合法 JSON")
         if missing:
             raise invalid(
@@ -294,7 +351,38 @@ class AgentChat:
             agent_message=message_to_dict(result),
         )
 
-    async def _aggregate_chat_stream(self, messages: list[dict], tools: list[dict]) -> Any:
+    async def _full_response(self, response, progress):
+        if "text/event-stream" in response.headers.get("content-type", ""):
+            return None
+        await response.aread()
+        progress.observe(False)
+        data = response.json()
+        # 忽略流式参数的供应商须先返回完整JSON，再按供应商消息结构校验。
+        if self._api_mode == "responses":
+            from langchain_openai.chat_models.base import _construct_lc_result_from_responses_api
+            from openai.types.responses import Response
+            result = _construct_lc_result_from_responses_api(
+                self.model.root_async_client._process_response_data(
+                    data=data, cast_to=Response, response=response,
+                ), output_version=self.model.output_version,
+            )
+        elif self._api_mode == "messages":
+            from anthropic.types import Message
+            result = self.model._format_output(self.model._async_client._process_response_data(
+                data=data, cast_to=Message, response=response,
+            ))
+        else:
+            result = self.model._create_chat_result(data)
+        message = result.generations[0].message
+        message.response_metadata = {**(result.llm_output or {}), **message.response_metadata}
+        if info := result.generations[0].generation_info:
+            message.response_metadata = {**info, **message.response_metadata}
+        progress.observe(message_has_increment(message))
+        return message
+
+    async def _aggregate_chat_stream(
+        self, payload: dict, progress
+    ) -> Any:
         """消费供应商 SSE 增量并聚合成完整消息。
 
         LangChain 的 delta 转换会丢弃 refusal 字段，明确拒绝会退化成
@@ -302,14 +390,6 @@ class AgentChat:
         复用其工具参数与用量聚合，只补回被丢弃的拒绝信息。
         """
         from langchain_core.messages import AIMessageChunk
-        from langchain_core.utils.function_calling import convert_to_openai_tool
-        from langchain_openai.chat_models.base import _astream_with_chunk_timeout
-
-        payload = self.model._get_request_payload(
-            messages_from_dict(messages),
-            **({"tools": [convert_to_openai_tool(tool) for tool in tools]} if tools else {}),
-        )
-        payload["stream"] = True
         if self.model._should_stream_usage(None):
             payload["stream_options"] = {"include_usage": True}
         response = await self.model.async_client.create(**payload)
@@ -317,14 +397,28 @@ class AgentChat:
         refusal = None
         default_class = AIMessageChunk
         received_chunks = 0
+        done = False
         try:
-            async with response as stream:
-                async for raw in _astream_with_chunk_timeout(
-                    stream, self.model.stream_chunk_timeout, model_name=self.model.model_name
-                ):
+            async with response:
+                if full := await self._full_response(response.response, progress):
+                    return full
+                # SDK会把[DONE]与普通EOF都当作迭代结束；直接读事件才能拒绝缺结束标记的流。
+                async for data in sse_data(response.response):
+                    progress.observe(False)
+                    if data == "[DONE]":
+                        done = True
+                        break
                     received_chunks += 1
                     # 首块可能只有角色信息，仍需聚合完整流后校验；不记录正文以免泄露请求内容。
-                    data = raw if isinstance(raw, dict) else raw.model_dump()
+                    if error := data.get("error"):
+                        raise_stream_error(
+                            response.response, error, name="Agent", api_key=self._api_key,
+                        )
+                        raise ModelCallFailed(upstream_error(
+                            "Agent 流内错误", json.dumps(error, ensure_ascii=False),
+                            api_key=self._api_key,
+                        ), http_status=200)
+                    progress.observe(chat_has_increment(data))
                     choices = data.get("choices") or []
                     delta = (choices[0].get("delta") or {}) if choices else {}
                     refusal = delta.get("refusal") or refusal
@@ -345,13 +439,219 @@ class AgentChat:
             exc._tender_stream_response = response.response
             exc._tender_stream_chunks = received_chunks
             raise
+        if not done:
+            raise ModelUnavailable("Agent 流式响应未完整结束", http_status=200)
         if merged is not None and refusal:
             # 与静态响应的字段位置保持一致，复用同一处拒绝判断。
             merged.additional_kwargs["refusal"] = refusal
         return merged
 
+    async def _aggregate_responses_stream(self, payload: dict, progress):
+        from langchain_openai.chat_models.base import _convert_responses_chunk_to_generation_chunk
+        from openai.types.responses import ResponseStreamEvent
+
+        response = await self.model.root_async_client.responses.create(**payload)
+        merged = None
+        indexes = (-1, -1, -1)
+        received = 0
+        done = False
+        try:
+            async with response as stream:
+                if full := await self._full_response(response.response, progress):
+                    return full
+                async for data in sse_data(response.response):
+                    progress.observe(False)
+                    if data == "[DONE]":
+                        break
+                    received += 1
+                    # 在 SDK 转换前观察，避免被转换器忽略的推理增量不能续期。
+                    progress.observe(responses_has_increment(data))
+                    if data.get("type") in {"response.completed", "response.incomplete"}:
+                        done = True
+                    if data.get("type") in {"response.failed", "error"} or data.get("error"):
+                        error = data.get("response", {}).get("error") or data
+
+                        raise_stream_error(
+                            response.response, error, name="Agent", api_key=self._api_key
+                        )
+                        raise ModelCallFailed("Responses 模型未完成请求", http_status=200)
+                    raw = stream._client._process_response_data(
+                        data=data, cast_to=ResponseStreamEvent, response=response.response,
+                    )
+                    *indexes, chunk = _convert_responses_chunk_to_generation_chunk(
+                        raw, *indexes, output_version=self.model.output_version,
+                    )
+                    if chunk is not None:
+                        merged = chunk.message if merged is None else merged + chunk.message
+                    if done:
+                        break
+        except Exception as exc:
+            exc._tender_stream_response = response.response
+            exc._tender_stream_chunks = received
+            raise
+        if not done:
+            raise ModelUnavailable("Agent 流式响应未完整结束", http_status=200)
+        if merged is not None:
+            status = merged.response_metadata.get("status")
+            if status == "incomplete":
+                error = ModelOutputTruncated(
+                    "模型流式输出未完整完成或达到token上限", http_status=200
+                )
+                usage = merged.usage_metadata or {}
+                error.prompt_tokens, error.completion_tokens = (
+                    usage.get("input_tokens"),
+                    usage.get("output_tokens"),
+                )
+                raise error
+        return merged
+
+    async def _aggregate_messages_stream(self, payload: dict, progress):
+        from anthropic.types import RawMessageStreamEvent, Usage
+        from langchain_anthropic.chat_models import _create_usage_metadata
+
+        raw_response = await self.model._acreate(payload)
+        stream = raw_response.parse()
+        if inspect.isawaitable(stream):
+            stream = await stream
+        merged, block_start, done = None, None, False
+        received = 0
+        usage = {}
+        try:
+            async with stream:
+                if full := await self._full_response(raw_response.http_response, progress):
+                    return full
+                async for data in sse_data(raw_response.http_response):
+                    progress.observe(False)
+                    if data == "[DONE]":
+                        break
+                    received += 1
+                    if error := data.get("error"):
+                        raise_stream_error(raw_response.http_response, error, name="Agent",
+                                           api_key=self._api_key)
+                        raise ModelCallFailed("Anthropic模型流内错误", http_status=200)
+                    if data.get("type") == "ping":
+                        continue
+                    if data.get("type") == "message_start":
+                        event_usage = data.get("message", {}).get("usage") or {}
+                    elif data.get("type") == "message_delta":
+                        event_usage = data.get("usage") or {}
+                    else:
+                        event_usage = {}
+                    # 用量是累计值：覆盖已报告字段，保留首事件输入和缓存；null不表示清零。
+                    usage.update({key: value for key, value in event_usage.items()
+                                  if value is not None})
+                    raw = stream._client._process_response_data(
+                        data=data, cast_to=RawMessageStreamEvent,
+                        response=raw_response.http_response,
+                    )
+                    delta = data.get("delta") or data.get("content_block") or {}
+                    progress.observe(any(isinstance(delta.get(key), str) and bool(delta[key])
+                                         for key in ("text", "thinking", "partial_json"))
+                                     or bool(delta.get("input")))
+                    done = done or data.get("type") == "message_stop"
+                    chunk, block_start = self.model._make_message_chunk_from_anthropic_event(
+                        raw, stream_usage=True, coerce_content_to_string=False,
+                        block_start_event=block_start,
+                    )
+                    if chunk is not None:
+                        merged = chunk if merged is None else merged + chunk
+                    if done:
+                        break
+        except Exception as exc:
+            exc._tender_stream_response = raw_response.http_response
+            exc._tender_stream_chunks = received
+            raise
+        if not done:
+            raise ModelUnavailable("Agent 流式响应未完整结束", http_status=200)
+        if merged is not None and usage:
+            # 转换器忽略首事件输入且会累加多次delta；最终只转换一次供应商累计用量。
+            raw_usage = stream._client._process_response_data(
+                data=usage, cast_to=Usage, response=raw_response.http_response,
+            )
+            merged.usage_metadata = _create_usage_metadata(raw_usage)
+        return merged
+
+    async def _aggregate_gemini_stream(self, payload: dict, progress):
+        from google.genai import _common, types
+        from google.genai.models import _GenerateContentParameters_to_mldev
+        from langchain_google_genai.chat_models import _response_to_result, _StreamBlockIndexer
+
+        # 复用SDK请求转换及现有连接池。原SDK解析器会把SSE注释当JSON，
+        # 原始读流才能过滤心跳、检查完整JSON，并关闭重叠的网络超时和隐式重试。
+        api = self.model.client._api_client
+        parameters = types._GenerateContentParameters(**payload)
+        body = _GenerateContentParameters_to_mldev(api, parameters, None, parameters)
+        path = "{model}:streamGenerateContent?alt=sse".format_map(body["_url"])
+        body.pop("config", None)
+        body = _common.encode_unserializable_types(_common.convert_to_dict(body))
+        request = api._build_request("post", path, body, parameters.config.http_options)
+        client = api._async_httpx_client
+        response = await client.send(client.build_request(
+            request.method, request.url, headers=request.headers, json=request.data, timeout=None,
+        ), stream=True)
+        merged = None
+        indexer = _StreamBlockIndexer()
+        try:
+            from tender.core.error_details import raise_for_status
+
+            if not response.is_success:
+                await response.aread()
+                raise_for_status(response, name="Agent", api_key=self._api_key)
+            if "text/event-stream" in response.headers.get("content-type", ""):
+                stream = sse_data(response)
+            else:
+                # 完整JSON读完才交给消息转换，分段JSON不能提前续期。
+                await response.aread()
+
+                async def complete_json():
+                    yield response.json()
+
+                stream = complete_json()
+            async for data in stream:
+                progress.observe(False)
+                if not isinstance(data, dict):
+                    raise ModelUnavailable("Agent Gemini响应事件无效", http_status=200)
+                if error := data.get("error"):
+                    raise_stream_error(response, error, name="Agent", api_key=self._api_key)
+                    raise ModelCallFailed("Agent Gemini流内错误", http_status=200)
+                raw = types.GenerateContentResponse.model_validate(data)
+                parts = [
+                    part
+                    for candidate in data.get("candidates", [])[:1]
+                    for part in candidate.get("content", {}).get("parts", [])
+                ]
+                progress.observe(
+                    any(
+                        (isinstance(part.get("text"), str) and bool(part["text"]))
+                        or bool(part.get("function_call", {}).get("args"))
+                        or bool(part.get("functionCall", {}).get("args"))
+                        for part in parts
+                    )
+                )
+                generation = _response_to_result(
+                    raw,
+                    stream=True,
+                    prev_usage=merged.usage_metadata if merged is not None else None,
+                ).generations[0]
+                chunk = generation.message
+                indexer.assign(chunk)
+                if generation.generation_info:
+                    chunk.response_metadata = {
+                        **generation.generation_info,
+                        **chunk.response_metadata,
+                    }
+                merged = chunk if merged is None else merged + chunk
+                if chunk.response_metadata.get("finish_reason"):
+                    break
+        finally:
+            await response.aclose()
+        return merged
+
     async def aclose(self) -> None:
-        # pad
+        if self._api_mode == "generate_content":
+            # Gemini 的公开 aclose 同时清理本次事件循环中的异步客户端。
+            await self.model.aclose()
+            return
         for name in self._client_names:
             client = getattr(self.model, name, None)
             if client is not None and hasattr(client, "close"):

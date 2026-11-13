@@ -47,6 +47,24 @@ def agent(client):
     )
 
 
+def test_incomplete_tool_json_is_rejected_even_with_normal_finish():
+    async def run():
+        body = response({"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "search_document", "arguments": '{"query":"预算"',
+            },
+        }]})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: stream_response(body)))
+        model = agent(client)
+        try:
+            # finish_reason和DONE齐全也不能让SDK自动补齐的半截参数进入业务工具。
+            with pytest.raises(InvalidModelOutput, match="不是合法 JSON"):
+                await model.chat([message_to_dict(HumanMessage(content="测试"))], [TOOL])
+        finally:
+            await model.aclose()
+    asyncio.run(run())
+
+
 def response(message):
     return {
         "id": "fixture",

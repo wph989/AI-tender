@@ -40,6 +40,7 @@ class ModelCandidate:
     timeout: float
     temperature: float | None
     max_tokens: int | None
+    total_timeout: float | None = None
     extra_retries: int = 1
     protocol: str = "openai_compatible"
     api_mode: str = "chat_completions"
@@ -80,7 +81,6 @@ class RoutingModel:
         *,
         failover_limit: int = 3,
         max_total_requests: int = 6,
-        deadline_seconds: int = 600,
         recheck: Callable[[ModelCandidate], ModelCandidate | None] | None = None,
         reserve: Callable[[CallRecord], None] | None = None,
         retry_base_seconds: float = 1,
@@ -98,7 +98,6 @@ class RoutingModel:
         self._candidates = tuple(candidates)
         self._gateway, self._on_call = gateway, on_call
         self._failover_limit, self._max_total = failover_limit, max_total_requests
-        self._deadline_seconds = deadline_seconds
         self._recheck, self._reserve = recheck, reserve
         self._retry_base = retry_base_seconds
         self._before_request = before_request
@@ -149,6 +148,11 @@ class RoutingModel:
                 candidate.model,
                 api_key=candidate.api_key,
                 timeout=candidate.timeout,
+                **(
+                    {"total_timeout": candidate.total_timeout}
+                    if candidate.total_timeout is not None
+                    else {}
+                ),
                 temperature=candidate.temperature,
                 max_tokens=(
                     min(candidate.max_tokens or self._output_limit, self._output_limit)
@@ -206,7 +210,8 @@ class RoutingModel:
                 failure.invocation_exhausted = True
             raise failure
         invocation_id = window.setdefault("invocation_id", str(uuid4()))
-        window.setdefault("deadline_at", time.time() + self._deadline_seconds)
+        # 旧窗口的时间限制已取消；请求身份、次数和有效结果仍用于恢复。
+        window.pop("deadline_at", None)
         window.setdefault("requests", [])
         original_input = window.setdefault("input", {
             "prompt": prompt, "chat_request": chat_request,
@@ -218,8 +223,13 @@ class RoutingModel:
             "rate_max_wait": self._rate_max_wait, "rate_backoff": self._rate_backoff,
             "candidates": {str(c.registry_model_id or c.model): {
                 "extra_retries": c.extra_retries, "timeout": c.timeout,
+                "total_timeout": c.total_timeout,
             } for c in self._candidates},
         })
+
+        # 旧候选快照只有间隔字段，不能从最新配置引入恢复前没有的总时限。
+        for settings in window["policy"]["candidates"].values():
+            settings.setdefault("total_timeout", None)
 
         async def persist():
             if self._invocation_store:
@@ -332,9 +342,8 @@ class RoutingModel:
             raise ModelCallFailed(
                 f"功能 {self._feature_key} 没有可用模型，请在模型管理中配置并绑定"
             )
-        duration = window["deadline_at"] - time.time()
-        if self._remaining_seconds:
-            duration = min(duration, self._remaining_seconds())
+        # 只有模块拥有整个运行的时间预算，功能绑定不再另加截止。
+        duration = self._remaining_seconds() if self._remaining_seconds else float("inf")
         deadline = time.monotonic() + duration
         budget_error = ModelBudgetExhausted if self._remaining_seconds else ModelCallFailed
         request_count = len(window["requests"])
@@ -381,7 +390,7 @@ class RoutingModel:
             retry = sum(r["model"] == model_key for r in window["requests"])
             while retry <= snapshot.extra_retries:
                 if request_count >= max_total or time.monotonic() >= deadline:
-                    raise budget_error("模型调用已达到总请求次数或时间上限，请查看调用记录")
+                    raise budget_error("模型调用已达到总请求次数或模块时间上限，请查看调用记录")
                 delay = max(await self._remaining(snapshot), rate_state["until"] - time.time())
                 if delay and await self._has_available(candidates[position + 1 :]):
                     break
@@ -432,21 +441,6 @@ class RoutingModel:
                 # 先登记实际请求身份，数据库失败时不发送收费请求。
                 await self._reserve_call(record, records)
                 started = time.monotonic()
-                future = candidates[
-                    position + 1 : position + 1 + failover_limit - candidate_count
-                ]
-                planned_requests = min(
-                    max_total - request_count + 1,
-                    max(1, snapshot.extra_retries - retry + 1)
-                    + sum(c.extra_retries + 1 for c in future),
-                )
-                # Agent 多轮运行已有模块总时限，给当前请求连续窗口；不能把末尾60秒
-                # 切成四次15秒并反复打断正常生成。其它功能保留候选之间的时间分配。
-                request_timeout = min(
-                    snapshot.timeout,
-                    max(0, deadline - time.monotonic())
-                    / (1 if self._remaining_seconds else planned_requests),
-                )
                 try:
                     with bind_context(
                         request_ordinal=request_count, model_id=candidate.registry_model_id,
@@ -455,7 +449,9 @@ class RoutingModel:
                             self._client(candidate).chat(**native_request)
                             if native_request is not None
                             else self._client(candidate).complete(request_prompt),
-                            timeout=request_timeout,
+                            timeout=max(0, deadline - time.monotonic())
+                            if self._remaining_seconds
+                            else None,
                         )
                     if validate:
                         try:
@@ -476,7 +472,7 @@ class RoutingModel:
                     raise
                 except (TenderError, TimeoutError) as exc:
                     if isinstance(exc, TimeoutError):
-                        exc = ModelUnavailable("模型请求超时，供应商执行结果未知")
+                        exc = ModelUnavailable("模块总时间预算已耗尽，供应商执行结果未知")
                     unavailable = isinstance(exc, ModelUnavailable)
                     unavailable_only = unavailable_only and unavailable
                     await self._record_call(

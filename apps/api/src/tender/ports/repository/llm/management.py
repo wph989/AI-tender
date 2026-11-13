@@ -67,6 +67,10 @@ class LlmTransaction(Protocol):
 
     def begin_test(self, row: Mapping[str, Any], capability: str, *, is_model: bool) -> int: ...
 
+    def lock_test(self, test_id: int) -> dict[str, Any] | None: ...
+
+    def heartbeat_test(self, test_id: int) -> bool: ...
+
     def store_test_result(
         self,
         test_id: int,

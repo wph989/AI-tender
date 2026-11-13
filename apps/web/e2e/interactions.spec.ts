@@ -55,7 +55,7 @@ test("模型超时允许小数并移除预算人工上限", async ({ page }) => 
       max_tokens: { label: "输出上限", type: "integer", min: 1 },
     } }],
     model_fields: {
-      timeout_seconds: { label: "超时", type: "number", min: 1 },
+      timeout_seconds: { label: "超时", type: "number", min: 0, exclusive_min: true },
       extra_retries: { label: "额外重试", type: "integer", min: 0 },
     },
   } }));
@@ -67,14 +67,18 @@ test("模型超时允许小数并移除预算人工上限", async ({ page }) => 
   await page.getByRole("tab", { name: /管理模型/ }).click();
   await page.getByRole("button", { name: "编辑", exact: true }).first().click();
   const dialog = page.getByRole("dialog", { name: "编辑模型", exact: true });
-  const timeout = dialog.getByLabel("超时（秒）", { exact: true });
+  const timeout = dialog.getByLabel("响应间隔超时（秒）", { exact: true });
   await expect(timeout).not.toHaveAttribute("max");
-  await timeout.fill("1200.5");
+  await timeout.fill("0");
+  await dialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(dialog.getByText("请输入大于 0 的秒数", { exact: true })).toBeVisible();
+  expect(saved).toBeUndefined();
+  await timeout.fill("0.01");
   await dialog.getByLabel("失败后额外重试次数", { exact: true }).fill("99");
   await dialog.getByLabel("输出上限", { exact: true }).fill("262144");
   await dialog.getByRole("button", { name: "保存", exact: true }).click();
   await expect(dialog).not.toBeVisible();
-  expect(saved).toMatchObject({ timeout_seconds: 1200.5, extra_retries: 99, max_tokens: 262144 });
+  expect(saved).toMatchObject({ timeout_seconds: 0.01, extra_retries: 99, max_tokens: 262144 });
 });
 
 test("新增模型默认启用，编辑配置不改变启停状态", async ({ page }) => {
@@ -99,7 +103,8 @@ test("新增模型默认启用，编辑配置不改变启停状态", async ({ pa
   await createDialog.getByLabel("模型 ID", { exact: true }).fill("new-model");
   await createDialog.getByRole("button", { name: "保存", exact: true }).click();
   await expect(createDialog).not.toBeVisible();
-  expect(created).toMatchObject({ model_id: "new-model", enabled: true });
+  expect(created).toMatchObject({ model_id: "new-model", enabled: true,
+    timeout_seconds: 10, total_timeout_seconds: null });
   await page.getByRole("button", { name: "编辑", exact: true }).click();
   const editDialog = page.getByRole("dialog", { name: "编辑模型", exact: true });
   await expect(editDialog.getByRole("switch")).toHaveCount(0);
@@ -109,6 +114,33 @@ test("新增模型默认启用，编辑配置不改变启停状态", async ({ pa
   expect(edited).toMatchObject({ display_name: "仍然停用的模型", revision: 7 });
   expect(edited).not.toHaveProperty("enabled");
   await expect(page.getByRole("switch", { name: "测试模型 1启用状态" })).not.toBeChecked();
+});
+
+test("模型单次总时限允许清空，零值不能保存", async ({ page }, testInfo) => {
+  let submitted: Record<string, unknown> | undefined;
+  await page.route("**/api/v1/llm/models", (route) => route.fulfill({ json: {
+    items: [{ ...models[0], total_timeout_seconds: 120 }],
+  } }));
+  await page.route("**/api/v1/llm/models/1", async (route) => {
+    submitted = route.request().postDataJSON();
+    await route.fulfill({ json: { ...models[0], total_timeout_seconds: null } });
+  });
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: /管理模型/ }).click();
+  await page.getByRole("button", { name: "编辑", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "编辑模型", exact: true });
+  const total = dialog.getByLabel("单次请求总时限（秒）", { exact: true });
+  await expect(total).toHaveValue("120");
+  await expect(dialog.getByLabel("响应间隔超时（秒）", { exact: true })).toHaveValue("90");
+  await total.fill("0");
+  await dialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(dialog.getByText("请输入大于 0 的秒数，或留空关闭", { exact: true })).toBeVisible();
+  expect(submitted).toBeUndefined();
+  await total.fill("");
+  await dialog.screenshot({ path: testInfo.outputPath("model-timeouts.png") });
+  await dialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(submitted).toMatchObject({ total_timeout_seconds: null, timeout_seconds: 90 });
 });
 
 test("模型列表直接启停，失败保留原状态并使用当前版本", async ({ page }) => {
@@ -156,7 +188,6 @@ test("功能大预算可保存，候选上限继续读取服务端规则", async
     feature_fields: {
       failover_limit: { type: "integer", min: 1, max: 10 },
       max_total_requests: { type: "integer", min: 1 },
-      deadline_seconds: { type: "integer", min: 1 },
     },
   } }));
   await page.route("**/api/v1/llm/features/analysis/models", async (route) => {
@@ -171,10 +202,10 @@ test("功能大预算可保存，候选上限继续读取服务端规则", async
   await expect(page.getByRole("button", { name: "保存", exact: true })).toBeDisabled();
   await candidates.fill("10");
   await page.getByLabel("总请求上限", { exact: true }).fill("1000");
-  await page.getByLabel("调用总时间", { exact: true }).fill("172800");
+  await expect(page.getByLabel("调用总时间", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect.poll(() => saved).toMatchObject({
-    failover_limit: 10, max_total_requests: 1000, deadline_seconds: 172800,
+    failover_limit: 10, max_total_requests: 1000,
   });
 });
 
@@ -183,7 +214,7 @@ test("功能顺序支持置顶、置底和直接选第10位，保存顺序与界
   await page.route("**/api/v1/llm/features", (route) => route.fulfill({ json: { items: [{
     key: "analysis", name: "招标专题解析", required_kind: "language", revision: 1,
     description: "指定专题重新解析也使用此绑定。", failover_limit: 3,
-    max_total_requests: 6, deadline_seconds: 600,
+    max_total_requests: 6,
     bindings: models.slice(0, 10).map((model, index) => ({
       model_row_id: model.id, priority: index + 1,
     })),

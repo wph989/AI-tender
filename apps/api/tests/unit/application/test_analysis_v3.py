@@ -792,15 +792,27 @@ def test_native_adapter_decodes_encoded_batch_before_per_record_validation(monke
         assert "block_ids" in submit_schema["properties"]["records"]["description"]
 
         class SDK:
+            kwargs = {}
+
             def bind_tools(self, _tools):
                 return self
 
-            async def ainvoke(self, _messages):
-                return messages_from_dict([completion.agent_message])[0]
+            def _get_request_payload(self, _messages, **_options):
+                return {}
+
+        async def aggregate(_payload, _progress):
+            message = messages_from_dict([completion.agent_message])[0]
+            message.response_metadata["finish_reason"] = (
+                "tool_calls" if message.tool_calls else "stop"
+            )
+            return message
 
         # 保留真实适配器的原生参数门禁，避免可控路由跳过它而掩盖整批拒绝。
         gateway = object.__new__(AgentChat)
-        gateway.model, gateway._stream_chat, gateway._max_tokens = SDK(), False, 4096
+        gateway.model, gateway._stream_chat, gateway._max_tokens = SDK(), True, 4096
+        gateway._api_mode, gateway._api_key = "chat_completions", None
+        gateway._timeout, gateway._total_timeout = 5, None
+        gateway._aggregate_chat_stream = aggregate
         return await gateway.chat(messages, tools)
 
     monkeypatch.setattr(ScriptedRouter, "chat", checked_chat)

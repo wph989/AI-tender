@@ -167,7 +167,6 @@ export async function mockApi(page: Page) {
             bindings: [],
             failover_limit: 1,
             max_total_requests: 3,
-            deadline_seconds: 120,
           },
         ],
       };

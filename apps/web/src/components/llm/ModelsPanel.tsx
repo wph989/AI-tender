@@ -34,6 +34,7 @@ import {
   capabilityLabel,
   message,
   validityLabel,
+  withinNumericRule,
 } from "@/lib/llm/format";
 import type {
   AdapterProfile,
@@ -325,7 +326,8 @@ export function ModelsPanel({ providers, models, profiles, fields = {}, onChange
                 </span>
               </div>
               <p className="mt-3 text-sm text-slate-600">
-                {m.api_mode} · 超时 {m.timeout_seconds}s · 失败后额外重试{" "}
+                {m.api_mode} · {m.kind === "language" ? "响应间隔" : "超时"} {m.timeout_seconds}s
+                {m.kind === "language" && ` · 单次总时限 ${m.total_timeout_seconds == null ? "不限制" : `${m.total_timeout_seconds}s`}`} · 失败后额外重试{" "}
                 {m.extra_retries} 次
               </p>
               {m.kind === "language" && (
@@ -558,6 +560,9 @@ function ModelForm({
       : defaultConfiguration(initial),
   );
   const choose = (p?: AdapterProfile) => {
+    if (!model && p?.kind !== kind) {
+      form.setFieldValue("timeout_seconds", p?.kind === "language" ? 10 : 90);
+    }
     setMode(p?.api_mode ?? "");
     form.setFieldValue("api_mode", p?.api_mode);
     setConfiguration(defaultConfiguration(p));
@@ -575,7 +580,8 @@ function ModelForm({
         api_mode: mode,
         model_id: model?.model_id ?? "",
         display_name: model?.display_name ?? "",
-        timeout_seconds: model?.timeout_seconds ?? 90,
+        timeout_seconds: model?.timeout_seconds ?? (kind === "language" ? 10 : 90),
+        total_timeout_seconds: model?.total_timeout_seconds ?? null,
         extra_retries: model?.extra_retries ?? 1,
       }}
       onFinish={(values) => {
@@ -594,6 +600,7 @@ function ModelForm({
             ),
           ),
           timeout_seconds: values.timeout_seconds,
+          total_timeout_seconds: selected.kind === "language" ? values.total_timeout_seconds ?? null : null,
           extra_retries: values.extra_retries,
           temperature:
             configuration.values.temperature == null
@@ -703,20 +710,40 @@ function ModelForm({
         />
       )}
       <Form.Item
-        label="超时（秒）"
+        label={kind === "language" ? "响应间隔超时（秒）" : "超时（秒）"}
+        extra={kind === "language" ? "从发送请求开始等待首个有效增量，之后每收到正文、推理或工具参数增量重新计时；心跳不续期。" : undefined}
         name="timeout_seconds"
         rules={[
           {
             required: true,
             type: "number",
-            min: fields.timeout_seconds?.min,
-            max: fields.timeout_seconds?.max,
-            message: "请输入允许范围内的秒数",
+            message: "请输入大于 0 的秒数",
+            validator: async (_, value) => {
+              if (!withinNumericRule(value, fields.timeout_seconds ?? { label: "超时", type: "number", min: 0, exclusive_min: true })) {
+                throw new Error("请输入大于 0 的秒数");
+              }
+            },
           },
         ]}
       >
         <InputNumber min={fields.timeout_seconds?.min} max={fields.timeout_seconds?.max} />
       </Form.Item>
+      {kind === "language" && (
+        <Form.Item
+          label="单次请求总时限（秒）"
+          name="total_timeout_seconds"
+          extra="留空表示不限制；每次请求独立计时，模块总预算仍然生效。"
+          rules={[{
+            validator: async (_, value) => {
+              if (value != null && (!withinNumericRule(value, fields.total_timeout_seconds ?? { label: "总时限", type: "number", min: 0, exclusive_min: true }))) {
+                throw new Error("请输入大于 0 的秒数，或留空关闭");
+              }
+            },
+          }]}
+        >
+          <InputNumber placeholder="不限制" />
+        </Form.Item>
+      )}
       <Form.Item
         label="失败后额外重试次数"
         name="extra_retries"
