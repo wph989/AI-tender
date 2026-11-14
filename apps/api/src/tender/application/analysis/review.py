@@ -135,14 +135,18 @@ def _reads(flow, entries) -> list[dict]:
     for event in getattr(flow.research, "events", []):
         if event["action"] != "read_result" or not ids & set(event["anchor_ids"]):
             continue
-        for key in event.get("block_ids", []):
+        selected = event.get("block_ids", [])
+        if event.get("prepared_for_review") and event.get("dependencies"):
+            selected = {key for anchor in ids & set(event["anchor_ids"])
+                        for key in event["dependencies"].get(anchor, [])}
+        for key in selected:
             row = flow.research.seen.get(key)
             if row is None:
                 continue
             identity = row["source_id"], row.get("version_id"), row.get("parse_run_id")
             group = groups.setdefault(identity, {"rows": {}, "limited": False, "continue": set()})
             group["rows"][row["offset"]] = key
-            group["limited"] |= event.get("read_limited", False)
+            group["limited"] |= event.get("read_limited", False) or event.get("truncated", False)
             group["continue"].update(event.get("continue_from", []))
     result = []
     for (sid, version, run), group in groups.items():
@@ -255,7 +259,8 @@ def _issue_inputs(flow, issue) -> list[str]:
     ]
 
 
-def batches(flow, topic: str, repair_issues: list[dict]) -> tuple[list[dict], dict]:
+def batches(flow, topic: str, repair_issues: list[dict], *,
+            frozen_packets: list[dict] | None = None) -> tuple[list[dict], dict]:
     entries = [e for e in flow.entries if e["topic"] == topic]
     keys = {key for e in entries for key in e["record_keys"]}
     items = [
@@ -282,14 +287,19 @@ def batches(flow, topic: str, repair_issues: list[dict]) -> tuple[list[dict], di
     base = {
         "protocol": "combined-v3",
         "domain_rules": flow.state.get("review_rules", ""),
+        "field_policy": "按Skill明确要求及原文核对；可缺省字段未填写不构成否决，"
+                        "仅报告影响结论、适用范围或执行的具体遗漏。",
+        "packet_policy": "完整checks保留整轮核对清单；每项record_ids是本包负责的完整事项，"
+                         "navigation_record_ids由其它包负责，不能因导航无正文判遗漏。"
+                         "本包查漏依据实际交付原文和未核事项，不能要求其它包的事项重复展开。",
         "topic": topic,
         "checks": [
             {
                 "scope": e["scope"],
                 "checks": e["checks"],
                 "unexamined": e.get("unreviewed_evidence", []),
-                "tasks": list(e["tasks"].values()),
-                "references": e["references"],
+                "tasks": list({fingerprint(t): t for t in e["tasks"].values()}.values()),
+                "references": list({fingerprint(r): r for r in e["references"]}.values()),
             }
             for e in entries
         ],
@@ -326,6 +336,15 @@ def batches(flow, topic: str, repair_issues: list[dict]) -> tuple[list[dict], di
             spans.append(span)
         contexts[f"evidence:{key}:0"] = {"evidence": span}
 
+    from tender.application.knowledge.content import citation
+
+    all_refs.update({key: citation(row, row["content"])
+                     for key, row in flow.research.seen.items()})
+    context = {"contexts": contexts, "refs": all_refs, "items": items, "cache_keys": cache_keys}
+    if frozen_packets is not None:
+        # 恢复只重建当前授权的定位与投影上下文，旧请求体不再经过新版分包和容量规则。
+        return frozen_packets, context
+
     def add_refs(packet):
         selected = {row["key"] for row in packet["records"]}
         evidence_keys = {span["id"] for span in packet["evidence"]}
@@ -351,6 +370,15 @@ def batches(flow, topic: str, repair_issues: list[dict]) -> tuple[list[dict], di
              "source_id": flow.research.seen[key]["source_id"]}
             for key in sorted(ids - delivered)
         ]
+        shown = {row["record_id"] for row in packet["records"] + packet["context_records"]}
+        # 所有范围清单继续保留，但明确本包与导航事项，避免其它范围的正文被误报缺失。
+        packet["checks"] = []
+        for check, entry in zip(base["checks"], entries, strict=True):
+            owned = {row["record_id"] for row in mapped if row["key"] in entry["record_keys"]}
+            packet["checks"].append(check | {
+                "record_ids": sorted(shown & owned),
+                "navigation_record_ids": sorted(owned - shown),
+            })
         return packet
 
     packets, current = [], copy.deepcopy(base)
@@ -392,16 +420,7 @@ def batches(flow, topic: str, repair_issues: list[dict]) -> tuple[list[dict], di
             current = candidate
     if current["records"] or current["evidence"] or not packets:
         packets.append(add_refs(current))
-    from tender.application.knowledge.content import citation
-
-    all_refs.update({key: citation(row, row["content"])
-                     for key, row in flow.research.seen.items()})
-    return packets, {
-        "contexts": contexts,
-        "refs": all_refs,
-        "items": items,
-        "cache_keys": cache_keys,
-    }
+    return packets, context
 
 
 def validate(result: dict, payload: dict) -> None:
@@ -440,11 +459,12 @@ def validate(result: dict, payload: dict) -> None:
         elif review.get("supported") is False and not messages:
             errors.append((path + ".issues", "未通过时须写明具体正文、范围或依据问题及修法"))
         selected = review.get("block_ids")
+        record_allowed = set(payload.get("record_evidence_ids", {}).get(key, allowed))
         if (not isinstance(selected, list) or any(not isinstance(v, str) for v in selected)
-                or len(set(selected)) != len(selected) or set(selected) - allowed
+                or len(set(selected)) != len(selected) or set(selected) - record_allowed
                 or review.get("supported") is True and not selected):
             errors.append((path + ".block_ids", "须为无重复的本包原文ID数组，通过项不得为空；可选："
-                           + allowed_values(allowed)))
+                           + allowed_values(record_allowed)))
     # 导航不含正文，不能据此否决其它包的事项；必要依赖已通过context_records完整交付。
     record_ids = {row["record_id"] for row in
                   payload["records"] + payload.get("context_records", [])}
@@ -465,7 +485,10 @@ def validate(result: dict, payload: dict) -> None:
         allowed_records = record_ids & set(payload.get("issue_record_ids", {}).get(
             issue.get("topic"), record_ids,
         ))
-        for field, allowed in (("record_ids", allowed_records), ("evidence_ids", evidence_ids)):
+        topic_evidence = evidence_ids & set(payload.get("issue_evidence_ids", {}).get(
+            issue.get("topic"), evidence_ids,
+        ))
+        for field, allowed in (("record_ids", allowed_records), ("evidence_ids", topic_evidence)):
             ids = issue.get(field)
             if (not isinstance(ids, list) or any(not isinstance(i, str) for i in ids)
                     or len(ids) != len(set(ids)) or set(ids) - allowed):
@@ -536,11 +559,61 @@ async def _review_packet(flow, payload, context, review, save) -> dict:
 
 
 def _merge_packets(packets: list[dict]) -> dict:
-    """只合并完整的单包主题；共享事项和原文保留一份，核对清单仍按主题区分。"""
+    """共享正文只交付一份，核对清单和可选证据仍保留各主题的归属。"""
+    merged = copy.deepcopy(packets[0])
+    merged["topics"] = list(dict.fromkeys(p["topic"] for p in packets))
+    merged["issue_record_ids"], merged["issue_evidence_ids"] = {}, {}
+    merged["record_evidence_ids"] = {}
+    for p in packets:
+        ids = {span["id"] for span in p["evidence"] + p["context_evidence"]}
+        records = {r["record_id"] for r in p["records"] + p["context_records"]}
+        merged["issue_record_ids"].setdefault(p["topic"], []).extend(sorted(records))
+        merged["issue_evidence_ids"].setdefault(p["topic"], []).extend(sorted(ids))
+        for row in p["records"]:
+            rid = row["record_id"]
+            previous = merged["record_evidence_ids"].get(rid, ids)
+            merged["record_evidence_ids"][rid] = sorted(set(previous) & ids)
+    for field in ("issue_record_ids", "issue_evidence_ids"):
+        merged[field] = {key: sorted(set(ids)) for key, ids in merged[field].items()}
+    for field in ("checks", "searches", "reads"):
+        merged[field] = list({fingerprint(row | {"topic": p["topic"]}):
+                              row | {"topic": p["topic"]}
+                              for p in packets for row in p[field]}.values())
+    for field in ("records", "record_index", "evidence", "context_records", "context_evidence",
+                  "repair_issues"):
+        merged[field] = list({fingerprint(row): row for p in packets for row in p[field]}.values())
+    records = {row["record_id"] for row in merged["records"]}
+    evidence = {row["id"] for row in merged["evidence"]}
+    merged["context_records"] = [r for r in merged["context_records"]
+                                  if r["record_id"] not in records]
+    merged["context_evidence"] = [r for r in merged["context_evidence"]
+                                   if r["id"] not in evidence]
+    shown = records | {row["record_id"] for row in merged["context_records"]}
+    checks: dict[str, dict] = {}
+    for row in merged["checks"]:
+        key = fingerprint({k: v for k, v in row.items()
+                           if k not in {"record_ids", "navigation_record_ids"}})
+        check = checks.setdefault(key, row | {"record_ids": [], "navigation_record_ids": []})
+        assigned = set(check["record_ids"]) | set(row.get("record_ids", []))
+        navigation = set(check["navigation_record_ids"]) | set(row.get("navigation_record_ids", []))
+        # 合包后已交付的正文升级为本包责任，不再保留“其它包导航”的过期描述。
+        check.update(record_ids=sorted(assigned | navigation & shown),
+                     navigation_record_ids=sorted(navigation - shown))
+    merged["checks"] = list(checks.values())
+    merged["citations"] = {key: value for p in packets for key, value in p["citations"].items()}
+    return merged
+
+
+def _call_payload(flow, packets: list[dict]) -> dict:
+    if len(packets) == 1:
+        return packets[0]
+    if not flow.data["audit"].get("packet_plan", {}).get("legacy_grouping"):
+        return _merge_packets(packets)
+    # 旧冻结计划的隐式合包也属于请求身份；保持原请求体才能复用路由及审查保存的完整回执。
     merged = copy.deepcopy(packets[0])
     merged["topics"] = [p["topic"] for p in packets]
     merged["issue_record_ids"] = {
-        p["topic"]: [row["record_id"] for row in p["record_index"]] for p in packets
+        p["topic"]: [r["record_id"] for r in p["record_index"]] for p in packets
     }
     for field in ("checks", "searches", "reads"):
         merged[field] = [row | {"topic": p["topic"]} for p in packets for row in p[field]]
@@ -551,6 +624,23 @@ def _merge_packets(packets: list[dict]) -> dict:
     return merged
 
 
+def _shareable(packets: list[dict], candidate: dict, limits) -> bool:
+    """只合并确实共享依赖且正文一致的输入，保留不同版本及冲突的独立审查。"""
+    def spans(packet):
+        return {row["id"]: row for row in packet["evidence"] + packet["context_evidence"]}
+
+    existing = {key: row for p in packets for key, row in spans(p).items()}
+    incoming = spans(candidate)
+    shared = existing.keys() & incoming.keys()
+    if not shared or any(existing[key]["text"] != incoming[key]["text"] for key in shared):
+        return False
+    records = {r["record_id"]: r for p in packets for r in p["records"] + p["context_records"]}
+    if any(r["record_id"] in records and r != records[r["record_id"]]
+           for r in candidate["records"] + candidate["context_records"]):
+        return False
+    return fits(_merge_packets(packets + [candidate]), limits)
+
+
 def plan_batches(flow, topics, signatures, repair) -> tuple[dict, dict]:
     """冻结完整分包计划，预算、执行和中断恢复均消费同一份输入。"""
     audit = flow.data["audit"]
@@ -559,85 +649,114 @@ def plan_batches(flow, topics, signatures, repair) -> tuple[dict, dict]:
     plans, errors = {}, {}
     for topic in topics:
         try:
-            packets, context = batches(flow, topic, [i for i in repair if i["topic"] == topic])
-            if reusable and topic in saved.get("topics", {}):
-                packets = saved["topics"][topic]
+            frozen = saved.get("topics", {}).get(topic) if reusable else None
+            packets, context = batches(flow, topic, [i for i in repair if i["topic"] == topic],
+                                       frozen_packets=frozen)
+            if frozen is None and len(packets) > 1:
+                compacted: list[dict] = []
+                for packet in packets:
+                    if compacted and _shareable([compacted[-1]], packet, flow.research.limits):
+                        compacted[-1] = _merge_packets([compacted[-1], packet])
+                    else:
+                        compacted.append(packet)
+                packets = compacted
             plans[topic] = packets, context
         except TopicIncomplete as exc:
             errors[topic] = str(exc)
     return plans, errors
 
 
-def review_call_count(flow, topics, signatures, repair) -> int:
-    plans, errors = plan_batches(flow, topics, signatures, repair)
-    calls = len(errors)
-    group: list[dict] = []
-    previous_context = None
+def _call_groups(flow, topics, signatures, plans) -> list[list[list]]:
+    """实际请求分组冻结在检查点；旧计划继续沿用原有隐式合包及逐包输入。"""
+    audit = flow.data["audit"]
+    saved = audit.get("packet_plan", {})
+    if saved.get("signatures") == signatures:
+        if "call_groups" in saved:
+            return saved["call_groups"]
+        saved["legacy_grouping"] = True
+        legacy_groups: list[list[list]] = []
+        for topic in topics:
+            if topic not in plans:
+                continue
+            packets, context = plans[topic]
+            for index, packet in enumerate(packets):
+                group = legacy_groups[-1] if legacy_groups else []
+                if len(packets) == 1 and group and all(
+                    len(plans[t][0]) == 1 and context["contexts"] == plans[t][1]["contexts"]
+                    and packet["evidence"] == plans[t][0][i]["evidence"] for t, i in group
+                ) and fits(_call_payload(flow, [plans[t][0][i] for t, i in group] + [packet]),
+                           flow.research.limits):
+                    group.append([topic, index])
+                else:
+                    legacy_groups.append([[topic, index]])
+        saved["call_groups"] = legacy_groups
+        return legacy_groups
+    groups: list[list[list]] = []
     for topic in topics:
-        completed = flow.data["audit"].get("completed_topics", {}).get(
-            str(flow.data["audit"]["round"]) + ":" + topic,
-        )
-        if completed and completed["signature"] == signatures[topic]:
-            continue
         if topic not in plans:
             continue
-        packets, context = plans[topic]
-        pending = [p for p in packets if fingerprint(["combined-v3", p]) not in
-                   flow.data["audit"]["results"]]
-        if not pending:
-            continue
-        if len(packets) != 1:
-            calls += len(pending)
-            continue
-        same_context = not group or (context["contexts"] == previous_context
-                                    and packets[0]["evidence"] == group[0]["evidence"])
-        if group and (not same_context or not fits(_merge_packets(group + packets),
-                                                   flow.research.limits)):
+        for index, packet in enumerate(plans[topic][0]):
+            # 已保存逐包回执保留独立身份，不因新分组重发。
+            if fingerprint(["combined-v3", packet]) in audit["results"]:
+                groups.append([[topic, index]])
+                continue
+            for group in groups:
+                if topic in {t for t, _ in group}:
+                    continue
+                packets = [plans[t][0][i] for t, i in group]
+                if any(fingerprint(["combined-v3", p]) in audit["results"] for p in packets):
+                    continue
+                if _shareable(packets, packet, flow.research.limits):
+                    group.append([topic, index])
+                    break
+            else:
+                groups.append([[topic, index]])
+    audit["packet_plan"] = {"signatures": signatures,
+        "topics": {topic: packets for topic, (packets, _) in plans.items()}, "call_groups": groups}
+    return groups
+
+
+def review_call_count(flow, topics, signatures, repair) -> int:
+    plans, _errors = plan_batches(flow, topics, signatures, repair)
+    groups = _call_groups(flow, topics, signatures, plans)
+    calls = 0
+    results = flow.data["audit"]["results"]
+    for group in groups:
+        packets = [plans[t][0][i] for t, i in group if t in plans]
+        if (packets and fingerprint(["combined-v3", _call_payload(flow, packets)]) not in results
+                and any(fingerprint(["combined-v3", p]) not in results for p in packets)):
             calls += 1
-            group = []
-        group.extend(packets)
-        previous_context = context["contexts"]
-    return calls + bool(group)
+    return calls
+
+
+def _update_call_progress(flow, plans, groups) -> None:
+    audit = flow.data["audit"]
+    completed = 0
+    for group in groups:
+        packets = [plans[t][0][i] for t, i in group if t in plans]
+        key = fingerprint(["combined-v3", _call_payload(flow, packets)]) if packets else None
+        completed += bool(packets) and (key in audit["results"] or all(
+            fingerprint(["combined-v3", packet]) in audit["results"] for packet in packets))
+    audit["progress"].update(completed_packets=completed, completed_calls=completed)
 
 
 async def _prefetch_small_topics(flow, topics, signatures, plans, review, save) -> None:
     audit = flow.data["audit"]
-    groups: list[list[tuple[str, list[dict], dict]]] = []
-    group: list[tuple[str, list[dict], dict]] = []
-    for topic in topics:
-        completed = audit.get("completed_topics", {}).get(str(audit["round"]) + ":" + topic)
-        if completed and completed["signature"] == signatures[topic]:
+    for group in _call_groups(flow, topics, signatures, plans):
+        if not any(t == topics[0] for t, _ in group):
             continue
-        if topic not in plans:
+        members = [(t, i) for t, i in group if t in plans]
+        if len(members) < 2:
             continue
-        packets, context = plans[topic]
-        if len(packets) != 1:
+        packets = [plans[t][0][i] for t, i in members]
+        if all(fingerprint(["combined-v3", p]) in audit["results"] for p in packets):
             continue
-        # 已持久化的逐主题判定直接复用，不能为合包再次请求模型。
-        if fingerprint(["combined-v3", packets[0]]) in audit["results"]:
-            continue
-        candidate = [*group, (topic, packets, context)]
-        # 只合并共享原文及已准备依赖的主题，否则拆回缓存会漏掉跨主题证据依赖。
-        same_context = not group or (
-            context["contexts"] == group[0][2]["contexts"]
-            and packets[0]["evidence"] == group[0][1][0]["evidence"]
-        )
-        if group and (not same_context or not fits(
-                _merge_packets([p[0] for _, p, _ in candidate]), flow.research.limits)):
-            groups.append(group)
-            group = []
-        group.append((topic, packets, context))
-    groups.append(group)
-    # 每次只预取即将处理的一组；后组失败不能使前组已核实内容来不及保存。
-    for group in groups[:1]:
-        if len(group) < 2:
-            continue
-        payload = _merge_packets([packets[0] for _, packets, _ in group])
-        context = {field: {key: value for _, _, ctx in group for key, value in ctx[field].items()}
+        payload = _call_payload(flow, packets)
+        context = {field: {key: value for t, _ in members
+                           for key, value in plans[t][1][field].items()}
                    for field in ("contexts", "refs")}
         result = await _review_packet(flow, payload, context, review, save)
-        for topic, packets, _ctx in group:
-            packet = packets[0]
+        for (topic, _), packet in zip(members, packets, strict=True):
             ids = {row["record_id"] for row in packet["records"]}
             projected = result | {
                 "reviews": {rid: verdict for rid, verdict in result["reviews"].items()
@@ -646,6 +765,8 @@ async def _prefetch_small_topics(flow, topics, signatures, plans, review, save) 
             }
             validate(projected, packet)
             audit["results"][fingerprint(["combined-v3", packet])] = projected
+        # 同一主题可能预取多个合包；每组完成即更新，不能等整个主题结束才显示进度。
+        _update_call_progress(flow, plans, _call_groups(flow, topics, signatures, plans))
         await save(flow.state)
 
 
@@ -706,22 +827,24 @@ async def audit_combined(flow, review, save) -> bool:
         topics = [topic for topic in topics
                   if signatures[topic] != audit.get("signatures", {}).get(topic)]
     plans, capacity_errors = plan_batches(flow, topics, signatures, repair)
-    audit["packet_plan"] = {"signatures": signatures,
-                            "topics": {topic: packets for topic, (packets, _) in plans.items()}}
+    groups = _call_groups(flow, topics, signatures, plans)
     audit["progress"] = {"stage": "repair" if audit["round"] else "initial",
                          "repairs_used": audit["round"],
                          "repairs_limit": flow.research.limits.max_review_repairs,
                          "completed_packets": 0,
-                         "total_packets": sum(len(packets) for packets, _ in plans.values()),
+                         "total_packets": len(groups),
+                         "total_calls": len(groups),
+                         "total_topic_packets": sum(len(p) for p, _ in plans.values()),
                          "unresolved_issues": len(audit.get("issues", []))}
     AnalysisTransitions(flow.state).start_review()
+    _update_call_progress(flow, plans, groups)
     await save(flow.state)
     for topic_index, topic in enumerate(topics):
         completed_key = str(audit["round"]) + ":" + topic
         completed = audit.setdefault("completed_topics", {}).get(completed_key)
         if completed and completed["signature"] == signatures[topic]:
             found.extend(completed["issues"])
-            audit["progress"]["completed_packets"] += len(plans.get(topic, ([],))[0])
+            _update_call_progress(flow, plans, groups)
             continue
         await _prefetch_small_topics(flow, topics[topic_index:], signatures, plans, review, save)
         if topic in capacity_errors:
@@ -748,7 +871,7 @@ async def audit_combined(flow, review, save) -> bool:
                         "evidence_ids": [], "record_keys": [item["business"]["key"]]})
         for payload in packets:
             results.append((payload, await _review_packet(flow, payload, context, review, save)))
-            audit["progress"]["completed_packets"] += 1
+            _update_call_progress(flow, plans, groups)
             await save(flow.state)
         # 一个主题所有片段及依赖核清后才允许发布其中的支持性成果。
         by_id = {i["id"]: i for i in flow.state.get("staged_items", []) if i.get("business")}

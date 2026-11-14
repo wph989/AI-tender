@@ -1001,7 +1001,8 @@ class ResearchMiddleware(AgentMiddleware):
         from tender.application.analysis.data import missing_scope_refs
 
         invalid = [item for item in self.state.get("staged_items", [])
-                   if missing_scope_refs(item["business"]["scope"],
+                   if item["business"]["scope"]["kind"] == "unknown"
+                   or missing_scope_refs(item["business"]["scope"],
                                          item["business"].get("citations", []))]
         if invalid:
             flow.data.pop("synthesis_finished", None)
@@ -1010,8 +1011,11 @@ class ResearchMiddleware(AgentMiddleware):
             if self.state["prevalidation_failures"] >= 3:
                 raise TopicIncomplete("旧草稿连续三次未通过标段预校验，请按原文修正范围后补跑")
             return self.feedback("；".join(
-                item["business"]["key"] + "：scope.lot_refs须填写引文中的标段原文编号或名称，"
-                "并同步修正关联工作范围" for item in invalid
+                item["business"]["key"] + (
+                    "：范围unknown须依据原文明示修正为公共或具体标段，并同步关联工作范围"
+                    if item["business"]["scope"]["kind"] == "unknown" else
+                    "：scope.lot_refs须填写引文中的标段原文编号或名称，并同步修正关联工作范围"
+                ) for item in invalid
             ))
         self.state.pop("prevalidation_failures", None)
         anchors = {ref["block_id"] for item in self.state.get("staged_items", [])
@@ -1021,27 +1025,16 @@ class ResearchMiddleware(AgentMiddleware):
             for key in sorted(anchors)
         ])
         if self.state.get("review_context_key") != context_key:
-            before = set(self.research.seen)
             try:
                 payload = await self.research.review_context(anchors)
             except EvidenceBudgetError as exc:
                 self.state["stop_reason"] = {
                     "code": "review_capacity", "stage": "review",
-                    "message": "审查必要依赖超过证据容量；请调整额度后补跑继续",
+                    "message": "审查必要依赖超过证据容量；" + str(exc),
+                    "capacity": exc.capacity,
                 }
                 raise TopicIncomplete(str(exc)) from exc
-            for topic in sorted({entry["topic"] for entry in flow.entries}):
-                # 邻域仅归入引用了相应来源的主题，避免无关主题因补齐依赖反复失效。
-                ids = {key for entry in flow.entries if entry["topic"] == topic
-                       for key in entry["evidence_ids"]}
-                sources = {self.research.seen[key]["source_id"] for key in ids}
-                selected = payload | {"blocks": [row for row in payload.get("blocks", [])
-                    if self.research.seen[row.get("id", row.get("block_id"))]["source_id"]
-                    in sources]}
-                selected_ids = {row.get("id", row.get("block_id"))
-                                for row in selected["blocks"]}
-                flow.evidence(set(self.research.seen) - (selected_ids - before), [topic], selected,
-                              update_progress=False)
+            flow.bind_dependencies(payload)
             self.state["review_context_key"] = context_key
             self.state["research"] = self.research.checkpoint()
             await self.save(self.state)
@@ -2395,11 +2388,11 @@ def build_module_agent(
 
     async def read_document_v3(
         block_id: str | Annotated[list[str], Field(min_length=1, max_length=4)],
-        before: Annotated[int, Field(ge=0, le=11)] = 2,
-        after: Annotated[int, Field(ge=0, le=11)] = 2,
+        before: Annotated[int, Field(ge=0, le=11)] = 1,
+        after: Annotated[int, Field(ge=0, le=11)] = 1,
         work_ids: list[str] | None = None,
     ) -> dict:
-        """围绕已读block_id补读连续条款；最多4个锚点，重叠窗口合并。"""
+        """围绕已读ID默认前后各一块，同元素续段自动补齐；更远条款按边界ID续读。"""
         anchors = [block_id] if isinstance(block_id, str) else block_id
         if set(anchors) - research.seen.keys():
             raise ToolValidationError.at("unread_anchor", "block_id",
@@ -2425,12 +2418,12 @@ def build_module_agent(
 
     async def read_document(
         block_id: str | Annotated[list[str], Field(min_length=1, max_length=4)],
-        before: Annotated[int, Field(ge=0, le=11)] = 2,
-        after: Annotated[int, Field(ge=0, le=11)] = 2,
+        before: Annotated[int, Field(ge=0, le=11)] = 1,
+        after: Annotated[int, Field(ge=0, le=11)] = 1,
         topic_keys: list[str] | None = None,
         work: str | list[str] | None = None,
     ) -> dict:
-        """按已知ID补读连续条款；block_id可为最多4个ID，重叠窗口自动合并。单锚点最多12块。"""
+        """按已知ID补读连续条款；常规邻域每侧最多一块，同元素续段自动补齐，0/0只回读。"""
         keys = flow.topic_keys(topic_keys, block_id=block_id, work=work) if flow else []
         if flow:
             flow.data["active_topics"] = keys
@@ -2438,10 +2431,9 @@ def build_module_agent(
         if any(type(n) is not int or n < 0 for n in (before, after)):
             raise ToolArgumentError("before/after 必须为非负整数")
         before_ids = set(research.seen)
-        # schema 允许单侧到11；运行时按 before 优先、after 补足的顺序收敛到合计11，
-        # 契约与执行一致，避免模型并行请求大窗口时被当成工具失败终止整个模块。
-        applied_before = min(before, 11)
-        applied_after = min(after, 11 - applied_before)
+        # 兼容旧窗口参数，但常规邻域每侧只读一块；实际范围与续读边界通过回执说明。
+        applied_before = min(before, 1)
+        applied_after = min(after, 1)
         budget_full = len(research.seen) >= research.limits.max_evidence_blocks
         if budget_full:
             # 此时邻域无法接纳新块，只回读已登记原块。
@@ -2460,10 +2452,19 @@ def build_module_agent(
                 "warning": "证据额度已满，本次仅回读已登记原块，未补入邻域；未核对部分保留缺口。",
             }
         elif truncated:
-            result["warning"] = (
-                "补读窗口连同当前块最多12块，已按顺序截断；不要扩大窗口重试，"
-                "未读部分用相邻块继续补读或登记缺口。"
-            )
+            # 底层还会给出软容量未交付的锚点，兼容旧窗口时必须保留这些直接续读位置。
+            result["continue_from"] = list(dict.fromkeys(
+                [*result.get("continue_from", []),
+                 *(key for window in result.get("windows", [])
+                   for key in (window["first_id"], window["last_id"]))]
+            ))
+            if not result.get("read_limited"):
+                result["warning"] = "常规邻域每侧最多一块，同元素续段已补齐；更远条款按边界ID续读。"
+        # 工具兼容层收窄了旧参数，研究账仍须保留原请求及真实边界供独立审查核对。
+        if research.events and research.events[-1]["action"] == "read_result":
+            research.events[-1].update(requested=requested, applied=result["applied"],
+                                       truncated=truncated,
+                                       continue_from=result.get("continue_from", []))
         if flow:
             flow.evidence(before_ids, keys, result)
         elif set(research.seen) != before_ids:
@@ -2704,6 +2705,48 @@ def build_module_agent(
                         "提交未成功。" + detail + "。请修正后重新提交。"
                     ) from batch_error
             # 辅助说明可沿用检索账或由服务端补齐；缺少一份空清单不应丢掉有依据的正文。
+            dependency_payload = None
+            if flow and flow.research_first:
+                previous = {i["business"]["key"]: i for i in state.get("staged_items", [])}
+
+                async def prepare_dependencies(candidates):
+                    all_items = previous | {i["business"]["key"]: i for i in candidates}
+                    anchors = {ref["block_id"] for item in all_items.values()
+                               for ref in item["business"].get("citations", [])}
+                    return await research.review_context(anchors)
+
+                try:
+                    dependency_payload = await prepare_dependencies(prepared)
+                except EvidenceBudgetError:
+                    # 父子与关系端点属于同组；容量失败只拒绝该组，其它独立事项可继续暂存。
+                    groups: list[list[dict]] = []
+                    for item in prepared:
+                        business = item["business"]
+                        linked = {business["key"], *(business.get(k) for k in (
+                            "parent_key", "subject_key", "object_key",
+                        )), *business.get("requirement_keys", [])} - {None, ""}
+                        matching = [group for group in groups if any(
+                            linked & {v["business"]["key"], *(v["business"].get(k) for k in (
+                                "parent_key", "subject_key", "object_key",
+                            )), *v["business"].get("requirement_keys", [])} for v in group
+                        )]
+                        for group in matching:
+                            groups.remove(group)
+                        groups.append([v for group in matching for v in group] + [item])
+                    accepted = []
+                    for group in groups:
+                        try:
+                            dependency_payload = await prepare_dependencies(accepted + group)
+                            accepted.extend(group)
+                        except EvidenceBudgetError as exc:
+                            rejected.extend({"index": next(n for n, r in enumerate(records)
+                                                           if r.key == item["business"]["key"]),
+                                "key": item["business"]["key"], "title": item["business"]["title"],
+                                "error": str(exc), "code": "review_capacity",
+                                "capacity": exc.capacity,
+                            } for item in group)
+                    prepared = accepted
+                state["research"] = research.checkpoint()
             if flow:
                 if flow.simplified:
                     original_works = ResearchLedger(flow).submission_works()
@@ -2739,6 +2782,10 @@ def build_module_agent(
                                                      w["check"] == old["check"])
                                                 for old in previous_works)]
                 flow.bind_records(prepared)
+                if dependency_payload is not None:
+                    flow.bind_dependencies(dependency_payload, [
+                        *state.get("staged_items", []), *prepared,
+                    ])
             research_summary = research_summary or state.get("research_completed", {}).get(
                 "research_summary", "研究中暂存有据事项",
             )
@@ -2878,7 +2925,8 @@ def build_module_agent(
         receipts = rejected + [
             {"index": index, "id": record_identity(state, record.key),
              "status": "rejected" if record.key in business_rejected else "accepted",
-             **({"error": business_rejected[record.key]["error"]}
+             **({k: v for k, v in business_rejected[record.key].items()
+                 if k in {"error", "code", "capacity"}}
                 if record.key in business_rejected else {})}
             for index, record in adapted
         ]

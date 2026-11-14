@@ -328,6 +328,7 @@ class AnalysisExecutor:
                 seen=prior.get("seen", {}),
                 events=prior.get("events", []),
                 tool_calls=prior.get("tool_calls", 0),
+                dependencies=prior.get("dependencies", {}),
             )
             model = await asyncio.to_thread(
                 self.model_factory,

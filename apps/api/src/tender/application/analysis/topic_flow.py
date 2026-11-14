@@ -516,6 +516,24 @@ class TopicFlow:
                     self.evidence(set(self.research.seen), owners,
                                   {"already_read": [ref["block_id"]]}, update_progress=False)
 
+    def bind_dependencies(self, payload: dict, items: list[dict] | None = None) -> None:
+        """依赖跟随实际引文与工作归属，不能因同文件而使无关主题失效。"""
+        for item in items if items is not None else self.state.get("staged_items", []):
+            business = item.get("business", {})
+            entries = [entry for entry in self.entries
+                       if business.get("key") in entry["record_keys"]]
+            ids = {key for ref in business.get("citations", [])
+                   for key in payload.get("dependencies", {}).get(ref["block_id"], [])}
+            for key in sorted(ids):
+                # 主题索引保留共享归属，工作证据只写入真正拥有该事项的范围组。
+                owners = self.data["evidence_topics"].setdefault(key, [])
+                self.data["evidence_topics"][key] = sorted(
+                    set(owners) | {entry["topic"] for entry in entries},
+                )
+                for entry in entries:
+                    entry["evidence_ids"] = sorted(set(entry["evidence_ids"]) | {key})
+        self.sync()
+
     def migrate_scopes(self, updates: list[TopicUpdate], entries: dict) -> dict[str, set[str]]:
         """只在进度副本上迁移，全部参数通过后才生效；替代声明随检查点支持纠正重提。"""
         targets = {identity(u.topic, u.scope_value()): u for u in updates}

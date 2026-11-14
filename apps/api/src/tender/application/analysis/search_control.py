@@ -116,11 +116,26 @@ class TopicSearch:
                                      else w["check"] == choice["work"])), None)
                 if matched:
                     choice["id"] = matched["id"]
+        audit = self.flow.data.get("audit", {})
+        issues = audit.get("remaining", audit.get("issues", []))
+        if self.flow.data.get("protocol") == "research-v3" and audit.get("round") and issues:
+            affected = {key for issue in issues for key in issue.get("record_keys", [])}
+            work_ids = {wid for key in affected for wid in items.get(key, {}).get("work_ids", [])}
+            issue_tasks = set(audit.get("issue_task_ids", []))
+            # 修复只为未决问题取证；新的附件、续段及冲突须与问题的实际目标或锚点相连。
+            result = [choice for choice in result if choice["id"] in work_ids
+                      or set(choice["record_keys"]) & affected
+                      or choice.get("task_id") in issue_tasks
+                      or choice["kind"] == "reference" and any(
+                          issue["topic"] == choice["topic"] and (
+                              choice.get("from_block_id") in issue.get("evidence_ids", [])
+                              or choice["work"] == issue.get("target")
+                          ) for issue in issues)]
         return result
 
     def begin(self, name: str, args: dict) -> list[dict]:
         self.flow.data.pop("active_work", None)
-        quote_only = name == "read_document" and args.get("before", 2) == args.get("after", 2) == 0
+        quote_only = name == "read_document" and args.get("before", 1) == args.get("after", 1) == 0
         if self.flow.simplified and not self.flow.researching and not quote_only:
             raise ToolArgumentError("综合阶段须用update_research的reopen明确重开具体工作后再检索")
         raw_keys, block_id = args.get("topic_keys"), args.get("block_id")
@@ -138,13 +153,13 @@ class TopicSearch:
             # 门禁先于工具schema，先收敛窗口类型，避免坏参数在range中击穿整批执行。
             args = dict(args)
             for field in ("before", "after"):
-                value = args.get(field, 2)
+                value = args.get(field, 1)
                 if isinstance(value, str) and value.isdecimal():
                     value = int(value)
                 if type(value) is not int or not 0 <= value <= 11:
                     raise ToolArgumentError(field + "须为0～11的整数")
                 args[field] = value
-        if name == "read_document" and args.get("before", 2) == args.get("after", 2) == 0:
+        if name == "read_document" and args.get("before", 1) == args.get("after", 1) == 0:
             return []
         try:
             # 工具schema允许数字字符串；门禁发生在schema之前，也须兼容其整数归一化。
@@ -220,7 +235,8 @@ class TopicSearch:
                             and row["offset"] == self.flow.research.seen[key]["offset"] + step
                             for row in self.flow.research.seen.values())
                     for key in anchors if key in self.flow.research.seen
-                    for step in range(-args.get("before", 2), args.get("after", 2) + 1)
+                    for step in range(-min(args.get("before", 1), 1),
+                                      min(args.get("after", 1), 1) + 1)
                     if self.flow.research.seen[key]["offset"] + step >= 0)
                 continuation = (unread or paging if self.flow.data.get("protocol") == "research-v3"
                                 else self.flow.simplified or name == "read_document" or paging)

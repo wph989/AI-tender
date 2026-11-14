@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from tender.application.knowledge.content import normalized
+from tender.application.knowledge.content import fingerprint, normalized
 from tender.application.shared.validation import InputError, allowed_values
 from tender.ports.repository.knowledge.sources import ChunkWindow
 
@@ -30,6 +30,10 @@ class WorkClosed(ToolArgumentError):
 
 class EvidenceBudgetError(ValueError):
     """证据块预算已满；拒绝新增原文但允许模型基于已有证据完成分析，属于可自纠正错误。"""
+
+    def __init__(self, message: str, *, capacity: dict | None = None) -> None:
+        super().__init__(message)
+        self.capacity = capacity
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,13 @@ class AgentLimits:
 SEARCH_CACHE_ENTRIES = 8
 
 
+def _dependency_fingerprint(row: dict) -> str:
+    # 检索分数和处理状态不属于原文身份，否则检索命中与仓储补读会被误判为不同版本。
+    return fingerprint([row.get(k) for k in (
+        "source_id", "version_id", "parse_run_id", "block_id", "offset", "element_id", "content",
+    )])
+
+
 @dataclass
 class ResearchSession:
     sources: Sequence[dict]
@@ -86,6 +97,9 @@ class ResearchSession:
     expand: Expand | None = None
     # 问答保留原协议；专题解析在构图时开启，避免把位置和检索分数交给分析模型。
     compact_results: bool = False
+    # 缓存真实依赖身份；新进程首次使用仍重新读取，防止恢复后沿用撤权或旧版本正文。
+    dependencies: dict[str, dict] = field(default_factory=dict)
+    _validated_dependencies: set[str] = field(default_factory=set, repr=False)
     # 专题解析的候选缓存：同一查询按 offset 翻页时不再重复 embedding/重排/DB 查询。
     _search_cache: dict[tuple, tuple[list[dict], dict]] = field(default_factory=dict, repr=False)
     # 同一查询的并发分页只召回一次；不同查询仍可并行。锁的数量受本轮工具预算约束。
@@ -104,12 +118,50 @@ class ResearchSession:
     async def review_context(self, anchors: set[str]) -> dict:
         """程序补齐已知引文的邻域；沿用授权和证据上限，不伪造Agent工具调用。"""
         await self.authorize()
+        cached, pending = {}, set()
+        for anchor in sorted(anchors):
+            key = _dependency_fingerprint(self.seen[anchor])
+            value = self.dependencies.get(key)
+            if (key in self._validated_dependencies and value
+                    and all(k in self.seen and _dependency_fingerprint(self.seen[k]) == version
+                            for k, version in value["versions"].items())):
+                cached[anchor] = value["block_ids"]
+            else:
+                pending.add(anchor)
+        # 审查必须接纳全部依赖；工具补读则可在完整元素之间按软容量截断交付。
+        blocks, prepared = await self._context_blocks(pending, 1, 1, extend=True,
+                                                      check_capacity=True)
+        blocks = list({r["block_id"]: r for r in [
+            *(self.seen[k] for ids in cached.values() for k in ids), *blocks,
+        ]}.values())
+        await self.authorize()
+        async with self._lock:
+            result = self._remember_complete(blocks)
+            for anchor, ids in prepared.items():
+                key = _dependency_fingerprint(self.seen[anchor])
+                self.dependencies[key] = {"block_ids": ids, "versions": {
+                    k: _dependency_fingerprint(self.seen[k]) for k in ids
+                }}
+                self._validated_dependencies.add(key)
+        dependencies = cached | prepared
+        if pending:
+            self.events.append({"action": "read_result", "anchor_ids": sorted(pending),
+                                "block_ids": sorted({k for ids in prepared.values() for k in ids}),
+                                "dependencies": prepared, "prepared_for_review": True})
+        return result | {"dependencies": dependencies}
+
+    async def _context_blocks(self, anchors: set[str], before: int, after: int,
+                              *, extend: bool,
+                              check_capacity: bool = False) -> tuple[list[dict], dict]:
+        """合并普通邻域，再沿锚点元素读到边界；探边的其它条款不额外入账。"""
         ranges: dict[int, list[tuple[int, int]]] = {}
         for key in sorted(anchors):
             row = self.seen[key]
             offset = row["offset"]
-            ranges.setdefault(row["source_id"], []).append((max(0, offset - 1), offset + 2))
+            ranges.setdefault(row["source_id"], []).append((max(0, offset - before),
+                                                          offset + after + 1))
         blocks = []
+        required_ids: set[str] = set()
         for source_id, windows in ranges.items():
             source = next(s for s in self.sources if s["source_id"] == source_id)
             merged: list[list[int]] = []
@@ -122,13 +174,18 @@ class ResearchSession:
                 for offset in range(start, end, 12):
                     await self.authorize()
                     window = await self.read(source, offset, min(12, end - offset))
+                    window = self._validate_window(source, window, offset, min(12, end - offset))
                     blocks.extend(window.rows)
+                    required_ids.update(row["block_id"] for row in window.rows)
+                    if check_capacity:
+                        self._check_evidence_capacity(required_ids, lower_bound=True)
         # 长表格/段落可能横跨很多块；沿已知元素读至边界，不能把固定邻域当作完整依赖。
         by_position = {(r["source_id"], r["offset"]): r for r in blocks}
         checked = set(by_position)
         pending = [(self.seen[key]["source_id"], self.seen[key]["offset"],
-                    self.seen[key]["element_id"]) for key in anchors]
+                    self.seen[key]["element_id"]) for key in anchors] if extend else []
         visited = set()
+        included = set(by_position)
         while pending:
             sid, offset, element_id = pending.pop()
             if (sid, offset) in visited:
@@ -139,29 +196,79 @@ class ResearchSession:
                     continue
                 position = sid, neighbor
                 if position not in checked:
-                    if len(checked) >= self.limits.max_evidence_blocks:
-                        raise EvidenceBudgetError("审查条款续段超过证据上限，无法完整准备依赖")
                     await self.authorize()
                     source = next(s for s in self.sources if s["source_id"] == sid)
                     window = await self.read(source, neighbor, 1)
+                    window = self._validate_window(source, window, neighbor, 1)
                     checked.add(position)
                     for row in window.rows:
                         by_position[row["source_id"], row["offset"]] = row
                 adjacent = by_position.get(position)
                 if adjacent and adjacent["element_id"] == element_id:
+                    included.add(position)
+                    required_ids.add(adjacent["block_id"])
+                    if check_capacity:
+                        # 只计入已确认的必要续段，探边发现的其它元素不占依赖额度。
+                        self._check_evidence_capacity(required_ids, lower_bound=True)
                     pending.append((sid, neighbor, element_id))
-        blocks = list(by_position.values())
+        blocks = [by_position[position] for position in sorted(included)]
         await self.authorize()
         if anchors - {r["block_id"] for r in blocks}:
             raise PermissionError("审查引文已失效，请基于最新资料重新分析")
-        async with self._lock:
-            result = self._remember(blocks, deduplicate=False)
-        if result.get("omitted_blocks"):
-            raise EvidenceBudgetError("审查必要邻域超过证据上限，请调整证据额度后补跑")
-        self.events.append({"action": "read_result", "anchor_ids": sorted(anchors),
-                            "block_ids": sorted(r["block_id"] for r in blocks),
-                            "prepared_for_review": True})
-        return result
+        dependencies = {}
+        for key in sorted(anchors):
+            anchor = self.seen[key]
+            actual = next(r for r in blocks if r["block_id"] == key)
+            if _dependency_fingerprint(anchor) != _dependency_fingerprint(actual):
+                raise PermissionError("审查引文内容或版本已变化，请基于最新资料重新分析")
+            positions = {anchor["offset"]}
+            if extend:
+                for direction in (-1, 1):
+                    offset = anchor["offset"] + direction
+                    while (adjacent := by_position.get((anchor["source_id"], offset))):
+                        if adjacent["element_id"] != anchor["element_id"]:
+                            break
+                        positions.add(offset)
+                        offset += direction
+            positions.update(range(max(0, anchor["offset"] - before),
+                                   anchor["offset"] + after + 1))
+            dependencies[key] = [r["block_id"] for r in blocks
+                                 if r["source_id"] == anchor["source_id"]
+                                 and r["offset"] in positions]
+        return blocks, dependencies
+
+    def _validate_window(self, source: dict, window: ChunkWindow, offset: int,
+                         limit: int) -> ChunkWindow:
+        identity = tuple(source[k] for k in ("source_id", "version_id", "parse_run_id"))
+        if any(tuple(r[k] for k in ("source_id", "version_id", "parse_run_id")) != identity
+               for r in window.rows):
+            raise PermissionError("补读返回了其它来源或错误版本的资料")
+        selected = [r for r in window.rows if offset <= r["offset"] < offset + limit]
+        if window.total is not None and {r["offset"] for r in selected} != set(
+                range(offset, min(offset + limit, window.total))):
+            raise PermissionError("补读原文窗口不完整，请基于最新资料重新分析")
+        return ChunkWindow(selected, window.total, window.has_more)
+
+    def _check_evidence_capacity(self, block_ids: set[str], *, lower_bound: bool = False) -> None:
+        additional = len(block_ids - self.seen.keys())
+        required = len(self.seen) + additional
+        if required > self.limits.max_evidence_blocks:
+            capacity = {"used": len(self.seen), "additional": additional, "required": required,
+                        "limit": self.limits.max_evidence_blocks}
+            # 提前停止尚未读完整条款，已确认并集是下界，不能冒充精确的总需求。
+            qualifier = "至少" if lower_bound else ""
+            if lower_bound:
+                capacity["lower_bound"] = True
+            raise EvidenceBudgetError(
+                f"已保留{len(self.seen)}块，新增{qualifier}{additional}块，"
+                f"共需{qualifier}{required}块，"
+                f"上限{self.limits.max_evidence_blocks}块", capacity=capacity,
+            )
+
+    def _remember_complete(self, blocks: list[dict]) -> dict:
+        # 必要依赖不能像检索候选一样逐块省略；完整批次验证成功后才替换证据账。
+        self._check_evidence_capacity({r["block_id"] for r in blocks})
+        return self._remember(blocks, deduplicate=False)
 
     def _sources(self, scope: str, source_id: int | None = None) -> list[dict]:
         if scope not in {"project", "reference"}:
@@ -451,8 +558,11 @@ class ResearchSession:
         self, block_id: str | list[str], before: int = 2, after: int = 2,
     ) -> dict:
         """只允许围绕已读 ID 补读，服务端解析位置，防止模型猜测偏移或跨版本读取。"""
-        if any(type(n) is not int or n < 0 for n in (before, after)) or before + after > 11:
+        if (any(type(n) is not int or not 0 <= n <= 11 for n in (before, after))
+                or not self.compact_results and before + after > 11):
             raise ToolArgumentError("before/after 必须为非负整数，连同当前块每次最多12块")
+        if self.compact_results:
+            return await self._read_compact(block_id, before, after)
         if isinstance(block_id, list):
             return await self._read_batch(block_id, before, after)
         row = self.seen.get(block_id)
@@ -483,6 +593,73 @@ class ResearchSession:
             "action": "read_result", "anchor_ids": [block_id], "before": before, "after": after,
             "block_ids": [r.get("id", r.get("block_id")) for r in result["blocks"]],
         })
+        return result
+
+    async def _read_compact(self, block_id: str | list[str], before: int, after: int) -> dict:
+        anchors = [block_id] if isinstance(block_id, str) else list(dict.fromkeys(block_id))
+        if not 1 <= len(anchors) <= 4 or set(anchors) - self.seen.keys():
+            raise ToolArgumentError(
+                "block_id：须提供1到4个已读ID；可选ID：" + allowed_values(self.seen),
+            )
+        await self._begin("read_evidence", {"block_id": block_id, "before": before, "after": after})
+        applied = {"before": min(before, 1), "after": min(after, 1)}
+        blocks, dependencies = await self._context_blocks(
+            set(anchors), applied["before"], applied["after"], extend=bool(before or after),
+        )
+        # 上下文只在完整元素之间截断；长段/表格本身始终作为整体交付。
+        remaining = max(1024, (self.limits.context_tokens - self.limits.max_output_tokens) // 2)
+        groups: list[list[dict]] = []
+        for row in blocks:
+            if groups and all(row[k] == groups[-1][-1][k] for k in (
+                    "source_id", "element_id")) and row["offset"] == groups[-1][-1]["offset"] + 1:
+                groups[-1].append(row)
+            else:
+                groups.append([row])
+        selected: list[dict] = []
+        for group in groups:
+            size = sum(len(r["content"]) + len(r["block_id"]) + 32 for r in group)
+            # 邻块不能抢占首个锚点的完整元素；即使超过软交付目标，也要完整返回该条款。
+            has_anchor = any(r["block_id"] in anchors for r in selected)
+            if selected and size > remaining and (has_anchor or not any(
+                    r["block_id"] in anchors for r in group)):
+                break
+            selected.extend(group)
+            remaining -= size
+        limited = len(selected) < len(blocks)
+        blocks = selected
+        await self.authorize()
+        async with self._lock:
+            result = self._remember_complete(blocks)
+        windows = []
+        previous = None
+        for row in blocks:
+            if previous and row["source_id"] == previous["source_id"] and (
+                    row["offset"] == previous["offset"] + 1):
+                windows[-1]["last_id"] = row["block_id"]
+            else:
+                windows.append({"first_id": row["block_id"], "last_id": row["block_id"]})
+            previous = row
+        truncated = applied != {"before": before, "after": after}
+        continuation = list(dict.fromkeys(key for window in windows
+                                         for key in (window["first_id"], window["last_id"])))
+        if limited:
+            # 多锚点批次未交付的锚点原本就已读，可直接续读，不能只给前一窗口的边界。
+            continuation.extend(key for key in anchors
+                                if key not in {r["block_id"] for r in blocks}
+                                and key not in continuation)
+        result.update(requested={"before": before, "after": after}, applied=applied,
+                      truncated=truncated, windows=windows, read_limited=limited,
+                      dependencies=dependencies, continue_from=continuation
+                      if truncated or limited else [])
+        self.events.append({"action": "read_result", "anchor_ids": anchors,
+                            "block_ids": [r["block_id"] for r in blocks],
+                            "windows": windows, "truncated": truncated, "applied": applied,
+                            "read_limited": limited,
+                            "continue_from": result["continue_from"]})
+        if truncated:
+            result["warning"] = "常规邻域每侧最多一块，同元素续段已补齐；更远条款按边界ID续读。"
+        if limited:
+            result["warning"] = "批量原文达到上下文容量，仅返回已读区间；按边界ID继续读取。"
         return result
 
     async def _read_batch(self, block_ids: list[str], before: int, after: int) -> dict:
@@ -583,4 +760,5 @@ class ResearchSession:
         }
 
     def checkpoint(self) -> dict[str, Any]:
-        return {"seen": self.seen, "events": self.events, "tool_calls": self.tool_calls}
+        return {"seen": self.seen, "events": self.events, "tool_calls": self.tool_calls,
+                "dependencies": self.dependencies}

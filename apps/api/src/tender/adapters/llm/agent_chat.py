@@ -19,6 +19,7 @@ from tender.adapters.llm.response_timeout import (
     response_timeout,
     responses_has_increment,
 )
+from tender.adapters.llm.usage import log_usage
 from tender.core.error_details import (
     quota_window,
     raise_stream_error,
@@ -86,6 +87,7 @@ class AgentChat:
     ) -> None:
         self._timeout, self._total_timeout = timeout, total_timeout
         self._api_mode = api_mode
+        self._model = model
         self._api_key = api_key
         self._max_tokens = max_tokens
         self._stream_chat = (
@@ -166,6 +168,9 @@ class AgentChat:
                         merged = await self._aggregate_messages_stream(payload, progress)
                     else:
                         merged = await self._aggregate_gemini_stream(payload, progress)
+                    if merged is not None:
+                        log_usage(self._model, self._api_mode, merged.usage_metadata or {},
+                                  agent=True)
                     # LangChain会自动补齐半截JSON；成功结算前必须核对聚合后的原始参数。
                     for call in getattr(merged, "tool_call_chunks", []):
                         try:

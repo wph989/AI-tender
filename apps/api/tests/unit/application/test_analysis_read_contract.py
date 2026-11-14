@@ -1,4 +1,4 @@
-"""补读窗口契约：运行时按 before 优先截断，参数超限不得终止模块。"""
+"""解析补读兼容旧参数，实际常规邻域每侧最多一块，并如实报告读取范围。"""
 
 import asyncio
 import json
@@ -74,22 +74,64 @@ def run_read(arguments, *, limits=None, count=15, read=None):
     return asyncio.run(run())
 
 
-def test_read_document_clamps_sum_over_eleven_and_reports_applied_window():
+def test_read_document_clamps_old_wide_window_to_one_neighbor():
     research, state = run_read({"block_id": "s1r1c5", "before": 11, "after": 11})
     result = payload(state)
     assert result["requested"] == {"before": 11, "after": 11}
-    # before 优先：先取满向前窗口，after 不再扩张总量。
-    assert result["applied"] == {"before": 11, "after": 0}
-    assert result["truncated"] is True and "截断" in result["warning"]
-    assert [b["id"] for b in result["blocks"]] == [f"s1r1c{i}" for i in range(6)]
+    assert result["applied"] == {"before": 1, "after": 1}
+    assert result["truncated"] is True and result["continue_from"]
+    assert [b["id"] for b in result["blocks"]] == [f"s1r1c{i}" for i in range(4, 7)]
     assert set(research.seen) >= {b["id"] for b in result["blocks"]}
+    event = next(e for e in research.events if e["action"] == "read_result"
+                 and e["anchor_ids"] == ["s1r1c5"])
+    assert event["requested"] == result["requested"] and event["truncated"]
+    assert event["continue_from"] == result["continue_from"]
 
 
-def test_read_document_clamps_before_first_then_after():
+def test_read_document_clamps_both_sides_independently():
     _, state = run_read({"block_id": "s1r1c5", "before": 8, "after": 8})
     result = payload(state)
-    assert result["applied"] == {"before": 8, "after": 3}
+    assert result["applied"] == {"before": 1, "after": 1}
     assert result["truncated"] is True
+
+
+@pytest.mark.parametrize("protocol", ["research-v2", "research-v3"])
+def test_clamped_batch_read_keeps_undelivered_anchor_and_capacity_warning(protocol):
+    from test_analysis_topic_flow import snapshot
+
+    async def run():
+        data = rows(8)
+        for row in data[1:4]:
+            row.update(element_id=100, content="完整表格条件" * 1000)
+        research = session(data)
+        research.seen = {data[i]["block_id"]: data[i] for i in (1, 6)}
+        state = {}
+        graph, _ = build_module_agent(
+            key=KEY, model=RoutedAgentModel(router=ScriptedRouter([])),
+            research=research, state=state,
+            snapshot=snapshot(("a",)) | {"__analysis_flow_version__": protocol},
+            checkpointer=InMemorySaver(), reserve_tool=noop, save=noop,
+        )
+        state["topic_flow"]["evidence_topics"] = {key: ["a"] for key in research.seen}
+        tool = graph.nodes["tools"].bound.tools_by_name["read_document"]
+        response = await tool.ainvoke(call("read_document", {
+            "block_id": ["s1r1c1", "s1r1c6"], "before": 2, "after": 2,
+        }, "limited-batch"))
+        assert response.status == "success"
+        result = json.loads(response.content)
+        assert [row["id"] for row in result["blocks"]] == [f"s1r1c{i}" for i in range(4)]
+        assert result["read_limited"] and result["truncated"]
+        assert result["continue_from"] == ["s1r1c0", "s1r1c3", "s1r1c6"]
+        assert "上下文容量" in result["warning"]
+        event = research.events[-1]
+        assert event["continue_from"] == result["continue_from"]
+        assert event["read_limited"]
+        reread = await tool.ainvoke(call("read_document", {
+            "block_id": "s1r1c6", "before": 0, "after": 0,
+        }, "continue-anchor"))
+        assert [row["id"] for row in json.loads(reread.content)["blocks"]] == ["s1r1c6"]
+
+    asyncio.run(run())
 
 
 def test_read_document_full_budget_clamps_to_quote_only_without_tool_error():
@@ -131,10 +173,10 @@ def test_read_document_result_never_claims_unread_neighbours():
     _, state = run_read({"block_id": "s1r1c3", "before": 2, "after": 2}, read=read)
     result = payload(state)
     assert [b["id"] for b in result["blocks"]] == [
-        f"s1r1c{i}" for i in range(1, 6)
+        f"s1r1c{i}" for i in range(2, 5)
     ]
-    assert result["applied"] == {"before": 2, "after": 2}
-    assert result["truncated"] is False
+    assert result["applied"] == {"before": 1, "after": 1}
+    assert result["truncated"] is True
 
 
 def test_read_document_schema_failure_is_correctable_not_terminal():

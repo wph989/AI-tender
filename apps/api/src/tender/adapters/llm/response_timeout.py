@@ -67,7 +67,8 @@ async def response_timeout(interval: float, total: float | None = None):
             raise progress.failure() from exc
         raise
     finally:
-        logger.info("model.response_timing", timeout_kind=progress.kind,
+        # 常规调用只在调试时记录计时，避免高频请求淹没业务日志。
+        logger.debug("model.response_timing", timeout_kind=progress.kind,
                     first_increment_ms=(round((progress.first - progress.started) * 1000)
                                         if progress.first is not None else None),
                     max_increment_gap_ms=round(max(

@@ -811,6 +811,7 @@ def test_native_adapter_decodes_encoded_batch_before_per_record_validation(monke
         gateway = object.__new__(AgentChat)
         gateway.model, gateway._stream_chat, gateway._max_tokens = SDK(), True, 4096
         gateway._api_mode, gateway._api_key = "chat_completions", None
+        gateway._model = "fixture"
         gateway._timeout, gateway._total_timeout = 5, None
         gateway._aggregate_chat_stream = aggregate
         return await gateway.chat(messages, tools)

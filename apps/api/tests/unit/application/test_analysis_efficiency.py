@@ -88,14 +88,14 @@ def test_batch_reads_merge_overlapping_windows_and_preserve_clause_order():
 
         research.read = tracked
         result = await research.read_evidence(["s1r1c5", "s1r1c2", "s1r1c20"], 2, 3)
-        assert reads == [(0, 9), (18, 6)]
+        assert reads == [(1, 6), (19, 3)]
         assert [r["id"] for r in result["blocks"]] == [
-            f"s1r1c{i}" for i in [*range(9), *range(18, 24)]
+            f"s1r1c{i}" for i in [*range(1, 7), *range(19, 22)]
         ]
         assert research.tool_calls == 1
         assert result["windows"] == [
-            {"first_id": "s1r1c0", "last_id": "s1r1c8"},
-            {"first_id": "s1r1c18", "last_id": "s1r1c23"},
+            {"first_id": "s1r1c1", "last_id": "s1r1c6"},
+            {"first_id": "s1r1c19", "last_id": "s1r1c21"},
         ]
 
     asyncio.run(run())
@@ -124,7 +124,7 @@ def test_batch_read_capacity_exposes_unread_boundary_and_can_continue():
         result = await research.read_evidence(["s1r1c0", "s1r1c3"], 0, 8)
         assert result["read_limited"] and len(result["blocks"]) < 12
         last = result["blocks"][-1]["id"]
-        assert result["windows"][0]["last_id"] == last
+        assert result["windows"][-1]["last_id"] == last
         assert "s1r1c11" not in research.seen
         from tender.application.analysis.review import batches
         from tender.application.analysis.topic_flow import TopicFlow
@@ -180,13 +180,13 @@ def test_reused_read_updates_new_topic_ownership_without_another_storage_read(wi
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("anchors,before,after,expected", [
-    ([2, 7], 2, 8, [(0, 12), (12, 4)]),
-    ([0, 12, 24, 36], 0, 11, [(0, 12), (12, 12), (24, 12), (36, 12)]),
+@pytest.mark.parametrize("anchors,before,after", [
+    ([2, 7], 2, 8),
+    ([0, 12, 24, 36], 0, 11),
 ])
-def test_batch_read_splits_merged_window_at_repository_limit(anchors, before, after, expected):
+def test_batch_read_completes_long_element_with_bounded_repository_windows(anchors, before, after):
     async def run():
-        rows = [block() | {"block_id": f"s1r1c{i}", "offset": i, "element_id": i,
+        rows = [block() | {"block_id": f"s1r1c{i}", "offset": i, "element_id": 1,
                            "content": f"条款{i}"} for i in range(50)]
         research = session(rows)
         research.compact_results = True
@@ -201,11 +201,10 @@ def test_batch_read_splits_merged_window_at_repository_limit(anchors, before, af
 
         research.read = bounded_read
         result = await research.read_evidence([rows[i]["block_id"] for i in anchors], before, after)
-        assert calls == expected
-        last = anchors[-1] + after
-        assert [r["id"] for r in result["blocks"]] == [f"s1r1c{i}" for i in range(last + 1)]
+        assert calls and all(1 <= limit <= 12 for _, limit in calls)
+        assert [r["id"] for r in result["blocks"]] == [f"s1r1c{i}" for i in range(50)]
         assert research.tool_calls == 1
-        assert result["windows"] == [{"first_id": "s1r1c0", "last_id": f"s1r1c{last}"}]
+        assert result["windows"] == [{"first_id": "s1r1c0", "last_id": "s1r1c49"}]
 
     asyncio.run(run())
 

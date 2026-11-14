@@ -90,6 +90,16 @@ def read_errors(directory: Path) -> str:
     )
 
 
+def test_model_usage_debug_is_filtered_by_default_info_level(options):
+    from tender.adapters.llm.usage import log_usage
+
+    configure_logging("worker", replace(options, level="INFO"))
+    log_usage("fixture", "chat_completions", {"prompt_tokens": 2, "completion_tokens": 3})
+    get_logger(__name__).info("model.call", status="ok")
+    runtime.shutdown_logging()
+    assert [row["event"] for row in read_logs(options.directory)] == ["model.call"]
+
+
 def record(message="中文日志"):
     return logging.LogRecord("tender.test", logging.INFO, __file__, 1, message, (), None)
 

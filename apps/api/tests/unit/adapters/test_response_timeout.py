@@ -656,9 +656,12 @@ def test_agent_accepts_full_json_when_stream_parameter_is_ignored(protocol, mode
             await api._async_httpx_client.aclose()
             api._async_httpx_client = client
         try:
-            assert (
-                await model.chat([message_to_dict(HumanMessage(content="测试"))], [])
-            ).content == "完成"
+            with capture_logs() as logs:
+                assert (
+                    await model.chat([message_to_dict(HumanMessage(content="测试"))], [])
+                ).content == "完成"
+            entries = [e for e in logs if e["event"] == "model.usage"]
+            assert len(entries) == 1 and entries[0]["log_level"] == "debug"
         finally:
             await model.aclose()
 

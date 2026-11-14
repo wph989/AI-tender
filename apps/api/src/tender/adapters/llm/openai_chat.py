@@ -11,6 +11,7 @@ import httpx
 
 from tender.adapters.llm.completion_stream import CompletionStream, sse_data
 from tender.adapters.llm.response_timeout import response_timeout
+from tender.adapters.llm.usage import log_usage
 from tender.core.error_details import raise_for_status
 from tender.domain.shared.errors import (
     InvalidModelOutput,
@@ -113,6 +114,12 @@ class OpenAIChatModel:
                         else:
                             # 兼容忽略 stream 的供应商，完整模型数据到达才算首个增量。
                             if isinstance(payload, dict):
+                                log_usage(
+                                    payload.get("model") or payload.get("modelVersion")
+                                    or self._model,
+                                    self._api_mode,
+                                    payload.get("usage") or payload.get("usageMetadata") or {},
+                                )
                                 if self._api_mode == "responses":
                                     parts = [
                                         p
@@ -150,6 +157,8 @@ class OpenAIChatModel:
                             self._api_mode != "chat_completions" and collector.done
                         ):
                             break
+                    if collector.done:
+                        log_usage(collector.model, self._api_mode, collector.usage)
                     payload = collector.result()
                 except (ValueError, TypeError, KeyError, AttributeError) as exc:
                     raise ModelUnavailable("LLM 流式响应结构无效", http_status=200) from exc
