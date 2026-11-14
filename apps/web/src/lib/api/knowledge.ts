@@ -36,6 +36,7 @@ export function loadReportRecords(report: AnalysisReport, signal?: AbortSignal):
       "GET", undefined, signal,
     ).then(
       (data) => ({ ...module, status: data.status, progress: data.progress,
+        quality_status: data.quality_status, quality_issues: data.quality_issues,
         items: recordItems(data), records_error: undefined, records_loading: false }),
     ).catch((reason: unknown) => ({
       ...module, items: [], records_loading: false,

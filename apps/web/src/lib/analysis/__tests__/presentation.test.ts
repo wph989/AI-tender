@@ -77,6 +77,16 @@ it("显示文案相同的未知标段缺口仍按原始范围区分", () => {
   expect(groupGaps(gaps).map((group) => group.gaps.length)).toEqual([1, 1]);
 });
 
+it("稳定问题ID跨主题只统计一次，独立标段缺口及待补材料分别保留", () => {
+  const base = { key: "a", issueId: "date-a", action: "provide_input" as const,
+    detail: "具体日期待核对", moduleKey: "opening", topicTitle: "开标时间",
+    scope: { kind: "lots" as const, lot_refs: ["标段一"] } };
+  const groups = groupGaps([base, { ...base, key: "b", topicTitle: "异议时限" },
+    { ...base, key: "c", issueId: "date-b", scope: { kind: "lots", lot_refs: ["标段二"] } }]);
+  expect(groups.flatMap((group) => group.gaps)).toHaveLength(2);
+  expect(groups.every((group) => group.category === "待补充材料")).toBe(true);
+});
+
 
 it("新增证据影响的旧核实事项保留正文并进入待核对筛选", () => {
   const old = item("old", { review_status: "needs_review" });

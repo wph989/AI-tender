@@ -14,6 +14,7 @@ from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.projects.files import role_is_parseable
 from tender.application.shared.errors import Conflict, Forbidden, InvalidArgument, NotFound
 from tender.config.schema import document_execution_snapshot, parse_options
+from tender.domain.knowledge.text import CHUNK_VERSION
 from tender.ports.configuration.registry import ConfigReader
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.repository.knowledge.management import KnowledgeRepository
@@ -40,6 +41,8 @@ def visible_items(
                     ):
                         raise LookupError("已解除知识库关联")
                     element_key = (
+                        ref.get("source_id"),
+                        ref.get("block_id"),
                         ref.get("version_id"),
                         ref.get("parse_run_id"),
                         ref.get("element_id"),
@@ -56,7 +59,7 @@ def visible_items(
                 # 历史报告可能把同块其它事实当摘录；展示前按值回查元素原文收敛定位，
                 # 只在原文里确定性找到该值时改写，找不到就保留原引用，不伪造位置。
                 refs.append(
-                    dict(ref)
+                    {**ref, "bbox": resolved["bbox"], "page_no": resolved["page_no"]}
                     if item.get("output")
                     else align_citation(
                         {str(ref.get("block_id")): resolved},
@@ -135,11 +138,14 @@ class KnowledgeService:
             source["semantic_ready"] = bool(
                 embedding
                 and source["index_status"] == "completed"
+                and source.get("chunk_version") == CHUNK_VERSION
                 and source["embedding_signature"] == embedding["signature"]
                 and source["dimension"]
             )
             source["needs_reindex"] = bool(
-                embedding and source["index_status"] == "completed" and not source["semantic_ready"]
+                source["index_status"] == "completed" and (
+                    source.get("chunk_version") != CHUNK_VERSION
+                    or (embedding and not source["semantic_ready"]))
             )
         return {
             **collection,

@@ -9,9 +9,7 @@ export function findCitationResult(
 ) {
   const candidates = modules.flatMap((module) => module.items.flatMap((item) => {
     const matches = item.values.flatMap((value) => value.citations).filter((candidate) =>
-      candidate.source_id === ref.source_id && candidate.version_id === ref.version_id
-      && candidate.parse_run_id === ref.parse_run_id && candidate.element_id === ref.element_id,
-    );
+      citationLocationKey(candidate) === citationLocationKey(ref));
     return matches.length ? [{ module, item, exact: matches.some((c) => c.quote === ref.quote) }] : [];
   }));
   return candidates.find(({ item }) => item.id === activeItemId)
@@ -21,9 +19,21 @@ export function findCitationResult(
     ?? candidates[0];
 }
 
-/** 摘录是证据内容，元素身份才是跳转位置；不按页码合并同页不同原文块。 */
+/** 同一长元素可派生不同范围的大块；页码和真实区域共同确定位置，同区域仍合并。 */
 export function citationLocationKey(ref: Citation): string {
-  return [ref.source_id, ref.version_id, ref.parse_run_id, ref.element_id].join(":");
+  return JSON.stringify([ref.source_id, ref.version_id, ref.parse_run_id,
+    ref.element_id, ref.page_no, ref.bbox]);
+}
+
+/** PDF角标与定位入口共用区域身份；选中的引用替换同区域摘录，不覆盖其他区域。 */
+export function viewerCitations(citations: Citation[], selected: Citation): Citation[] {
+  const locations = new Map<string, Citation>();
+  for (const ref of citations) {
+    if (ref.source_id === selected.source_id && ref.version_id === selected.version_id
+      && ref.parse_run_id === selected.parse_run_id) locations.set(citationLocationKey(ref), ref);
+  }
+  locations.set(citationLocationKey(selected), selected);
+  return [...locations.values()];
 }
 
 export function groupCitationLocations(refs: Citation[]) {
@@ -31,8 +41,9 @@ export function groupCitationLocations(refs: Citation[]) {
   for (const ref of refs) {
     const key = citationLocationKey(ref);
     const location = locations.get(key);
-    if (location) location.quotes.add(ref.quote);
-    else locations.set(key, { ref, quotes: new Set([ref.quote]) });
+    const quotes = ref.excerpts ?? (ref.quote ? [ref.quote] : []);
+    if (location) quotes.forEach((quote) => location.quotes.add(quote));
+    else locations.set(key, { ref, quotes: new Set(quotes) });
   }
   return [...locations.values()];
 }

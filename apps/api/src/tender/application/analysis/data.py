@@ -10,6 +10,7 @@ from uuid import UUID, uuid4, uuid5
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tender.application.analysis.output import canonical_topic, record_output
+from tender.application.analysis.quality import aggregate_quality, quality_status
 from tender.application.analysis.state import published_items
 from tender.application.knowledge.content import (
     dedupe_citations,
@@ -423,6 +424,9 @@ def module_data(state: dict) -> dict:
         records.append(record)
     return {
         "schema_version": DATA_VERSION, "records": records, "evidence": evidence,
+        "quality_status": quality_status(state),
+        "quality_issues": copy.deepcopy(state.get("quality_issues", [])),
+        "quality_input_signature": state.get("quality_input_signature"),
         "coverage": copy.deepcopy(state.get("business_coverage", [])),
         "gaps": copy.deepcopy(state.get("business_gaps", [])),
         "topics": copy.deepcopy(state.get("business_topics", [])),
@@ -553,6 +557,11 @@ def assemble_dataset(
         "lots": [{**lot, "scope": resolve_scope(lot["scope"], lots)}
                  if "scope" in lot else copy.deepcopy(lot) for lot in lots],
         "facts": [], "requirements": [],
+        "quality_status": aggregate_quality([
+            quality_status(m.get("business_data") or {}) for m in modules]),
+        "quality_issues": [{**issue, "module_key": m["module_key"]}
+                           for m in modules
+                           for issue in (m.get("business_data") or {}).get("quality_issues", [])],
         "format_nodes": [], "relations": [], "coverage": [], "gaps": [],
     }
     records, by_key = [], {}

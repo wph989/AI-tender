@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { findCitationResult, groupCitationLocations, presentCitations } from "../citations";
+import { findCitationResult, groupCitationLocations, presentCitations, viewerCitations } from "../citations";
 import type { AnalysisField, AnalysisModule, Citation } from "@/types/knowledge";
 
 const ref: Citation = {
@@ -94,4 +94,25 @@ it("评分优先在满分入口合并同位置摘录，空内容不占用定位�
   expect(presentCitations(record).content).toEqual({ 评分项: [[]], 满分分值: [[source]], 评分标准: [[], [second]], 备注: [] });
   const empty = item({ 背景: "" }, { 背景: [[source]] }, [source]);
   expect(presentCitations(empty)).toEqual({ content: { 背景: [] }, extra: [source] });
+});
+
+it("同一长元素的大块区域分别定位，后续条件不能被首块的坐标覆盖", () => {
+  const first: Citation = { ...source, bbox: [0.1, 0.1, 0.8, 0.8] };
+  const second: Citation = { ...source, bbox: [0.1, 0.1, 0.8, 0.95], quote: "补充条件须提交证明材料。" };
+  const record = item({ 要求摘要: "实施要求" }, { 要求摘要: [[first]] }, [first, second]);
+  const result = presentCitations(record);
+  expect(result.content["要求摘要"]).toEqual([[first]]);
+  expect(result.extra).toEqual([second]);
+  expect(groupCitationLocations([first, second])).toHaveLength(2);
+  expect(viewerCitations([first, second], first)).toEqual([first, second]);
+  expect(viewerCitations([first, second], second)).toEqual([first, second]);
+  const modules = [module(1, [citedItem("first", first), citedItem("second", second)])];
+  expect(findCitationResult(modules, second, "first")?.item.id).toBe("second");
+});
+
+it("同区域只保留一个入口和框，跨页仍独立且当前点击摘录优先", () => {
+  const detail: Citation = { ...source, quote: "同位置的补充说明。" };
+  const nextPage: Citation = { ...source, page_no: 2 };
+  expect(groupCitationLocations([source, detail, nextPage])).toHaveLength(2);
+  expect(viewerCitations([source, nextPage], detail)).toEqual([detail, nextPage]);
 });

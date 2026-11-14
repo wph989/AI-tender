@@ -75,6 +75,8 @@ class KnowledgeChunk(Base):
     char_end: Mapped[int] = mapped_column(Integer)
     chapter: Mapped[str] = mapped_column(Text)
     content: Mapped[str] = mapped_column(Text)
+    # 检索上下文不覆盖原文，否则引用摘录与PDF坐标会失去逐块对应关系。
+    locations: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
     embedding: Mapped[list[float] | None] = mapped_column(ARRAY(Double))
 
 

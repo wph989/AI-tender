@@ -571,8 +571,13 @@ class NativeRouter:
 
     async def complete(self, prompt):
         await self.reserve()
+        payload = json.loads(prompt.rsplit("\n", 1)[-1])
+        blocks = [s["id"] for s in payload["evidence"] + payload["context_evidence"]]
         return Completion(
-            content=json.dumps({"reviews": {}, "issues": []}), model="fixture"
+            content=json.dumps({"reviews": {}, "issues": [], "check_results": {
+                check["check_id"]: {"status": "not_required", "summary": "已核对测试资料无适用事项",
+                    "record_ids": [], "block_ids": blocks[:1], "issue_indexes": []}
+                for check in payload.get("check_items", [])}}), model="fixture"
         )
 
     async def complete_validated(self, prompt, *, validate=None, validate_input=None, **kwargs):
@@ -596,10 +601,11 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
     env.db.execute("UPDATE analysis_report SET skill_snapshot=CAST(:s AS JSONB) WHERE id=:id",
                    {"s": json.dumps(row["skill_snapshot"]), "id": row["id"]})
     with env.engine.begin() as conn:
+        # 两个独立条款才能验证最终选证过滤；相邻无编号的同文段现在会在入库前合并。
         conn.execute(
             text("""INSERT INTO element
             (version_id,run_id,page_no,order_no,anchor,type,text,bbox_x0,bbox_y0,bbox_x1,bbox_y1)
-            SELECT version_id,run_id,1,2,'p1b2','text',text,0.2,0.3,0.9,0.4
+            SELECT version_id,run_id,1,2,'p1b2','text','2. 质保要求：' || text,0.2,0.3,0.9,0.4
             FROM element LIMIT 1""")
         )
     row, sources = worker.prepare_report(env.db, row)
@@ -660,7 +666,10 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
             selected.append(bid)
             return Completion(content=json.dumps({"reviews": {row["record_id"]: {
                 "supported": True, "issues": [], "block_ids": [bid],
-            }}, "issues": []}), model="fixture")
+            }}, "issues": [], "check_results": {check["check_id"]: {
+                "status": "covered", "summary": "已核对三年质保及适用范围",
+                "record_ids": [row["record_id"]], "block_ids": [bid], "issue_indexes": [],
+            } for check in payload["check_items"]}}), model="fixture")
 
     async def retrieve(db, selected_sources, query, *args, **kwargs):
         return db.readable_chunks(selected_sources[0]), {"mode": "keyword"}
@@ -868,7 +877,8 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     )[0]["module_key"]
     result = analysis_api.retry_report(
         runtime.report["id"],
-        analysis_api.RetryInput(module_keys=[key], max_output_tokens=262144, timeout_seconds=1200),
+        analysis_api.RetryInput(module_keys=[key], mode="resume",
+                                max_output_tokens=262144, timeout_seconds=1200),
         env.request,
     )
     assert result["status"] == "pending"
@@ -1193,7 +1203,7 @@ def test_explicit_retry_reparses_completed_module_from_scratch(env):
     )
     assert [row["attempt"] for row in rows] == [1, 2]
     # 重新解析不能继承旧草稿，否则新图会直接以旧成果收尾，等于没有重跑。
-    assert rows[1]["state"] == {}
+    assert rows[1]["state"] == {"execution_mode": "restart"}
     assert (
         env.db.rows("SELECT status FROM analysis_module WHERE id=:id", {"id": module_id})[0][
             "status"

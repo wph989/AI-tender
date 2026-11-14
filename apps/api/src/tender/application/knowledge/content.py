@@ -19,7 +19,7 @@ from tender.application.shared.validation import (
 
 # 分块与去标签的纯规则落 domain，adapters 的检索仓储也要用；这里按用例层的入口再导出。
 from tender.domain.knowledge.search import keywords
-from tender.domain.knowledge.text import plain_text, split_elements
+from tender.domain.knowledge.text import chunk_locations, plain_text, split_elements
 from tender.domain.shared.digest import fingerprint
 
 __all__ = [
@@ -384,7 +384,31 @@ def citation(row: Mapping[str, Any], quote: str) -> dict:
             "file_name",
             "purpose",
         )
-    } | {"quote": quote}
+    } | {"quote": quote, **({"locations": row["locations"]}
+                            if row.get("locations") else {})}
+
+
+def _quoted_locations(row: Mapping[str, Any], quote: str) -> list[dict]:
+    """摘录匹配使用完整大块的字符范围，跨页摘录分别绑定真实原文。"""
+    body = str(row["content"])
+    locations = chunk_locations({**row, "content": body})
+    matched = [place | {"quote": quote} for place in locations
+               if normalized(quote) in normalized(place["content"])]
+    if matched:
+        return matched
+    # 页间换行可以省略，但坐标范围始终来自完整正文，不能拿短quote代替正文切片。
+    comparable, indexes = _index_map(body)
+    needle = match_text(quote)
+    found = comparable.find(needle)
+    if found < 0 or not needle:
+        return locations
+    start, end = indexes[found], indexes[found + len(needle) - 1] + 1
+    result = []
+    for place, span in zip(locations, row["locations"], strict=True):
+        left, right = max(start, span["char_start"]), min(end, span["char_end"])
+        if left < right and body[left:right].strip():
+            result.append(place | {"quote": body[left:right].strip()})
+    return result
 
 
 def validate_items(
@@ -464,6 +488,15 @@ def validate_items(
                     continue
                 try:
                     registered = citation(read_blocks[str(ref["block_id"])], quote)
+                    if registered.get("locations"):
+                        # 定位使用入库大块的页级坐标；模型无需选择内部元素或抄录坐标。
+                        source = {**registered,
+                                  "content": read_blocks[str(ref["block_id"])]["content"]}
+                        locations = (chunk_locations(source) if source_locations
+                                     else _quoted_locations(source, quote))
+                        refs.extend({k: v for k, v in place.items() if k != "content"}
+                                    for place in locations)
+                        continue
                     refs.append(
                         align_citation(read_blocks, registered, value) if align else registered
                     )

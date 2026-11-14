@@ -6,6 +6,7 @@ import os
 
 import pytest
 import test_deepagents_runtime
+from analysis_review_fixture import check_results
 from test_deepagents_runtime import prepared_runtime, publishable_state
 
 from tender.application.analysis.research import ResearchSession
@@ -57,13 +58,19 @@ def test_frozen_shared_review_survives_saved_response_without_resetting_attempt_
         assert review_call_count(flow, *review_scope(flow)) == 1
         if legacy:
             flow.data["audit"]["packet_plan"].pop("call_groups")
+            # 真实旧计划没有后续新增的核对回执及逐事项候选字段，不能用半新半旧形状模拟恢复。
+            for packets in flow.data["audit"]["packet_plan"]["topics"].values():
+                for packet in packets:
+                    packet.pop("check_items", None)
+                    packet.pop("record_evidence_ids", None)
         calls = []
 
         async def review(payload):
             runtime.reserve("model")
             calls.append(payload)
             return {"reviews": {r["record_id"]: {"supported": True, "issues": [],
-                    "block_ids": r["block_ids"]} for r in payload["records"]}, "issues": []}
+                    "block_ids": r["block_ids"]} for r in payload["records"]}, "issues": [],
+                    "check_results": check_results(payload)}
 
         async def interrupt(value):
             value["research"] = research.checkpoint()

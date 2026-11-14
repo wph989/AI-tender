@@ -41,6 +41,7 @@ class AnalysisInput(StrictModel):
 
 class RetryInput(StrictModel):
     module_keys: list[str] = Field(default_factory=list, max_length=13)
+    mode: Literal["restart", "resume"] | None = None
     # 补跑与配置中心统一允许正整数，避免接口额外挡住较小或较大的输出预算。
     max_output_tokens: int | None = Field(
         default=None, **field_bounds("analysis.max_output_tokens")
@@ -190,6 +191,7 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             module_keys=payload.module_keys,
             max_output_tokens=payload.max_output_tokens,
             timeout_seconds=payload.timeout_seconds,
+            mode=payload.mode,
         )
     except ServiceError as exc:
         raise as_api_problem(exc) from exc

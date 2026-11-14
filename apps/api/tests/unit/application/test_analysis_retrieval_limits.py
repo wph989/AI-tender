@@ -411,8 +411,12 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
             store, model_factory=Mock(return_value=AsyncMock()),
             embedding_gateway=Mock(), rerank_gateway=Mock(), checkpoints=saver,
         )
+        # 输入签名须包含尚未交付的资料和参考资料，不能只记录当前可检索正文。
+        snapshot = [SOURCE, {"source_id": 98, "version_id": 2, "parse_run_id": None}]
+        references = [{"source_id": 99, "version_id": 3, "parse_run_id": 3}]
         await executor.execute_module(
             {"id": 1, "project_id": 10,
+             "source_snapshot": snapshot, "reference_snapshot": references,
              "skill_snapshot": {"__analysis_flow_version__": "research-v3"}, "category": "goods",
              "topics": [], "lot_settings": []},
             {"id": 2, "module_key": "deposit_requirement_parsing", "attempt": 1}, [SOURCE],
@@ -421,6 +425,11 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
         runtime.finish.assert_called_once()
         assert runtime.finish.call_args.args[0] == "completed"
         store.search_candidates.assert_called_once()
+        from tender.application.knowledge.content import source_signature
+
+        assert runtime.run["state"]["quality_input_signature"] == source_signature(
+            snapshot + references,
+        )
 
     asyncio.run(run())
 

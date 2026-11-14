@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -76,8 +77,11 @@ from tender.domain.knowledge.text import (
     CHUNK_VERSION,
     chunk_bbox,
     chunk_block_id,
+    chunk_locations,
+    iter_element_chunks,
+    iter_retrieval_chunks,
     plain_text,
-    split_elements,
+    retrieval_block_id,
 )
 from tender.ports.configuration.registry import ActiveConfig
 from tender.ports.repository.knowledge.retrieval import SearchCandidates
@@ -347,6 +351,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                 index.embedding_signature,
                 index.embedding_model_id,
                 index.dimension,
+                index.chunk_version,
                 index.error_message.label("index_error"),
             )
             .where(
@@ -383,6 +388,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                 current_index.c.embedding_signature,
                 current_index.c.embedding_model_id,
                 current_index.c.dimension,
+                current_index.c.chunk_version,
                 current_index.c.index_error,
             )
             .select_from(KnowledgeSource)
@@ -468,26 +474,29 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
 
     def readable_chunks(self, source: dict[str, Any]) -> list[dict[str, Any]]:
         """分块由元素派生，元素越界一次也不额外查库。"""
-        if source.get("index_id") and source.get("index_status") == "completed":
+        legacy = source.get("chunk_format_version") == "1"
+        if source.get("index_id") and source.get("index_status") == "completed" and not legacy:
             rows = indexed_chunks(self, source)
             if rows is not None:
                 return rows
         elements = self.blocks(source)
-        by_id = {element["id"]: element for element in elements}
         result = []
-        for offset, chunk in enumerate(split_elements(elements)):
-            element = by_id[chunk["element_id"]]
+        iterator = iter_element_chunks if legacy else iter_retrieval_chunks
+        identify = chunk_block_id if legacy else retrieval_block_id
+        for element, chunk in iterator(elements):
+            offset = chunk["ordinal"]
             result.append(
                 {
                     **source,
                     **chunk,
                     "offset": offset,
-                    "block_id": chunk_block_id(
+                    "block_id": identify(
                         source["source_id"], source["parse_run_id"], offset
                     ),
                     "anchor": element["anchor"],
                     "page_no": element["page_no"],
-                    "bbox": chunk_bbox(element),
+                    "bbox": (chunk_locations(chunk)[0]["bbox"] if chunk.get("locations")
+                             else chunk_bbox(element)),
                 }
             )
         return result
@@ -549,6 +558,36 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
         if with_content:
             # 展示层要按元素原文回查值的位置，这里顺带返回，避免为同一权限再查一次。
             resolved["content"] = plain_text(row)
+        group = re.fullmatch(r"s(\d+)r(\d+)g2c(\d+)", str(ref.get("block_id", "")))
+        if group:
+            if (int(group[1]), int(group[2])) != (ref["source_id"], ref["parse_run_id"]):
+                raise LookupError("大块与引用来源身份不一致")
+            with self.engine.connect() as connection:
+                saved = connection.execute(select(KnowledgeChunk.locations, KnowledgeChunk.content)
+                    .join(KnowledgeIndex, KnowledgeIndex.id == KnowledgeChunk.index_id)
+                    .where(KnowledgeIndex.source_id == ref["source_id"],
+                           KnowledgeIndex.version_id == ref["version_id"],
+                           KnowledgeIndex.run_id == ref["parse_run_id"],
+                           KnowledgeIndex.status == "completed",
+                           KnowledgeIndex.chunk_version == CHUNK_VERSION,
+                           KnowledgeChunk.ordinal == int(group[3]))
+                    .order_by(KnowledgeIndex.id.desc()).limit(1)).mappings().first()
+                if saved is None:
+                    # 索引构建期间也可定位，按同一分块规则读取到目标块即停止。
+                    for _, chunk in iter_retrieval_chunks(
+                        connection.execute(self._blocks_query(ref)).mappings(),
+                    ):
+                        if chunk["ordinal"] == int(group[3]):
+                            saved = chunk
+                            break
+            locations = chunk_locations({**resolved, **saved}) if saved else []
+            place = next((p for p in locations if p["page_no"] == row["page_no"]
+                          and p["element_id"] == ref["element_id"]), None)
+            if place is None:
+                raise LookupError("引用位置不属于已交付大块")
+            resolved["bbox"] = place["bbox"]
+            if with_content:
+                resolved["content"] = place["content"]
         return resolved
 
     def source_for_processing(self, source_id: int) -> dict[str, Any] | None:
@@ -827,6 +866,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                 "char_end": chunk["char_end"],
                 "chapter": chunk["chapter"],
                 "content": chunk["content"],
+                "locations": chunk.get("locations"),
                 "embedding": vectors[position] if vectors else None,
             }
             for position, chunk in enumerate(chunks)
@@ -840,6 +880,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                 .where(KnowledgeIndex.id == index_id)
                 .values(
                     status="completed",
+                    chunk_version=CHUNK_VERSION,
                     embedding_model_id=config["id"] if config else None,
                     embedding_signature=config["signature"] if config else None,
                     dimension=len(vectors[0]) if vectors else None,
@@ -1413,14 +1454,16 @@ class KnowledgeSession:
         self, report_id: int, keys: list[str], *, explicit: bool
     ) -> list[dict[str, Any]]:
         statement = (
-            select(AnalysisModule.id, AnalysisModule.status)
+            select(AnalysisModule.id, AnalysisModule.status, AnalysisModule.business_data)
             .where(AnalysisModule.report_id == report_id, AnalysisModule.module_key.in_(keys))
             .with_for_update()
         )
         if not explicit:
             # 部分完成的模块仍有未核实主题，补跑时与失败模块一样需要重跑。
             statement = statement.where(
-                AnalysisModule.status.in_(("failed", "canceled", "partial"))
+                or_(AnalysisModule.status.in_(("failed", "canceled", "partial")),
+                    AnalysisModule.business_data["quality_status"].astext.in_(
+                        ("needs_review", "needs_input")))
             )
         return [dict(row) for row in self._connection().execute(statement).mappings().all()]
 

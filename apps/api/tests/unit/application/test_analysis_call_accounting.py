@@ -272,6 +272,7 @@ def test_executor_settles_restored_unavailable_window_without_losing_verified_re
             embedding_gateway=Mock(), rerank_gateway=Mock(), checkpoints=checkpoints,
         )
         report = {"id": 1, "project_id": 1, "category": "engineering", "topics": [],
+                  "source_snapshot": [], "reference_snapshot": [],
                   "lot_settings": [], "skill_snapshot": skill_snapshot()
                   | {"__analysis_flow_version__": "research-v3"}}
         await executor.execute_module(report, {"module_key": "project_basic_info_parsing",

@@ -590,7 +590,8 @@ def test_large_topic_packets_preserve_complete_items_without_repeating_all_bodie
         from tender.application.analysis.review import batches, fits
 
         flow = await flow_fixture()
-        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=6000)
+        # 同次审查增加逐方向语义回执后，仍验证分包不会复制整主题正文。
+        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=8000)
         template = flow.state["staged_items"][0]
         items = []
         for index in range(30):

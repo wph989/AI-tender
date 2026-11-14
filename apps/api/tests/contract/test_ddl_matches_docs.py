@@ -59,6 +59,12 @@ class _MigrationSpec:
 
 _MIGRATIONS: tuple[_MigrationSpec, ...] = (
     _MigrationSpec(
+        "0021_knowledge_context.py",
+        (("设计/14-知识库与综合分析实现.md", 2),),
+        require_tables=False,
+        require_indexes=False,
+    ),
+    _MigrationSpec(
         "0020_llm_response_timeout.py",
         (("设计/12-LLM管理与模型路由.md", 4),),
         require_tables=False,

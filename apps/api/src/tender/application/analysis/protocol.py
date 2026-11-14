@@ -42,7 +42,9 @@ block_ids只选择实际已读原文；不要输出citations、页码、坐标�
 这些含义直接写content，不重复提交conditions/materials/scoring、category或gaps。
 新增证据只改写受影响草稿，其余保留；同一缺口连续两批无新增关联证据、业务草稿变化或具体待办解决就停止补查。
 真实续页或明确未读转引仍受总预算约束。笔记改写、重复提交和其他工作的变化不算推进。
-依据充分时complete_research简述结论：有草稿直接审查，无草稿才综合，最后一批final=true。
+结束前逐项核对工作索引的完整检查目标；同主题已有一条事实不能代替其它独立目标。
+原文实质转引须补读对应正文，单份前附表或索引不能代替公告、标段清单及相关细则。
+依据充分时complete_research简述结论及未核清目标：有草稿直接审查，无草稿才综合，最后一批final=true。
 not_found只表示本次范围未找到；未决转引、混范围、缺资料通过update_research保存，不编造不存在断言。
 补遗替代已确认范围用replaces_scopes；新增并存标段只填scope。重开具体工作用status=reopen。
 工具逐项回执中accepted已保存；仅修正rejected，使用当前工作索引和已有事项id，勿重建整批。
@@ -640,17 +642,32 @@ class ResearchLedger:
         # 尚未迁移的工作已在当前索引中，只补充已迁移或退出索引的原始ID。
         origins = [work for key, work in self.flow.data.get("synthesis_work_origins", {}).items()
                    if current_scopes.get(key) != work["scope"]]
+
+        def prompt_index(rows):
+            index = self.work_index(rows)
+            # 长审查待办只在索引保留摘要；完整原因及目标由原工作ID按需读取。
+            for group in index:
+                for item in group["items"]:
+                    if item["kind"] != "task":
+                        continue
+                    item.pop("target", None)
+                    if len(item["check"]) > 80:
+                        item["check"] = item["check"][:80] + "…"
+                        item["context_required"] = True
+            return index
+
         return json.dumps(
             {
                 "phase": self.flow.data.get("phase", "research"),
                 **({"research_stop_reason": self.flow.data["research_stop_reason"]}
                    if self.flow.data.get("research_stop_reason") else {}),
-                "works": self.work_index(works),
-                **({"synthesis_work_origins": self.work_index(origins)} if origins else {}),
+                "works": prompt_index(works),
+                **({"synthesis_work_origins": prompt_index(origins)} if origins else {}),
                 "next_action": ("理解本批原文并暂存有据事项；"
                                 "依据充分则complete_research，仅补查具体缺口"
                                 if self.flow.researching else "统一综合，最后一批final=true"),
-                "notes": "完整笔记及原文按需get_research_context分页读取",
+                "notes": "任务check是摘要；完整原因、target、笔记及原文"
+                         "按work_id用get_research_context分页读取",
                 "unexamined": [
                     {"topic": e["topic"], "scope": e["scope"], "ids": e["unreviewed_evidence"]}
                     for e in self.flow.entries
@@ -663,7 +680,8 @@ class ResearchLedger:
                         "status": i.get("verification", "pending"),
                         "scope": i["business"]["scope"],
                         "work_ids": i.get("work_ids", []),
-                        "issues": i.get("verification_issues", []),
+                        # 原因全文按工作分页读取；补跑时逐项重复注入会放大首请求。
+                        "issue_count": len(i.get("verification_issues", [])),
                     }
                     for i in self.flow.state.get("staged_items", [])
                     if i.get("business")

@@ -173,8 +173,9 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
         const item = report?.modules.flatMap((module) => module.items).find((entry) => entry.id === itemId);
         const scopedRefs = itemId ? item?.values.flatMap((value) => value.citations) ?? [] : answerRefs;
         const location = citationLocationKey(ref);
-        setSelectedQuotes([...new Set([ref.quote, ...scopedRefs
-          .filter((candidate) => citationLocationKey(candidate) === location).map((candidate) => candidate.quote)])]);
+        setSelectedQuotes([...new Set([ref, ...scopedRefs
+          .filter((candidate) => citationLocationKey(candidate) === location)]
+          .flatMap((candidate) => candidate.excerpts ?? [candidate.quote]).filter(Boolean))]);
         setSelected(resolved);
         activateItem(itemId);
         setMobileDocument(true);
@@ -557,8 +558,9 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
                     setSelected(null); setActiveItem(undefined); setActiveModuleId(null); refresh();
                   }}
                   onLocate={(ref, itemId) => void locate(ref, itemId)} onRefresh={refresh}
-                  onAction={(action, keys) => void perform(() => knowledgeRequest(
-                    `/analysis/reports/${report.id}/${action}`, "POST", keys ? { module_keys: keys } : {},
+                  onAction={(action, keys, mode) => void perform(() => knowledgeRequest(
+                    `/analysis/reports/${report.id}/${action}`, "POST", action === "retry"
+                      ? { ...(keys ? { module_keys: keys } : {}), mode } : {},
                   ))} />
               )}
             </div>

@@ -381,13 +381,15 @@ def test_shared_record_keeps_global_issue_identity_for_each_topic_after_unrelate
             pass
 
         assert not await audit_combined(flow, review, save)
-        original_ids = {issue["topic"]: issue["issue_id"] for issue in flow.data["audit"]["issues"]}
+        original_ids = {topic: issue["issue_id"] for issue in flow.data["audit"]["issues"]
+                        for topic in issue["topics"]}
         assert set(original_ids) == {"a", "b"}
         independent["business"]["conditions"]["expression"] = "独立事项的新条件"
         assert await audit_combined(flow, review, save)
         remaining = flow.data["audit"]["remaining"]
-        assert len(remaining) == 2
-        assert {issue["topic"]: issue["issue_id"] for issue in remaining} == original_ids
+        assert len(remaining) == 1
+        assert {topic: issue["issue_id"] for issue in remaining
+                for topic in issue["topics"]} == original_ids
         assert [item["business"]["key"] for item in published_items(flow.state, final=True)] == [
             "independent",
         ]
@@ -414,9 +416,10 @@ def test_stop_reason_reports_concrete_gap_and_actual_publishable_results(has_res
                     )
             return result
 
-        with pytest.raises(TopicIncomplete):
-            await execute(records, state=state, review=review,
-                          limits=AgentLimits(max_review_repairs=0))
+        await execute(records, state=state, review=review,
+                      limits=AgentLimits(max_review_repairs=0))
+        assert state["quality_status"] == "needs_review"
+        assert state["topic_flow"]["phase"] == "completed"
         reason = state["stop_reason"]["message"]
         assert "质保期限缺少明确原文依据" in reason
         assert ("已保留1项核实成果" if has_results else "当前没有可发布成果") in reason

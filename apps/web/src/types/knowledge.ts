@@ -1,5 +1,17 @@
+export type QualityStatus = "verified" | "needs_review" | "needs_input" | "unknown";
+export interface QualityIssue {
+  scope?: AnalysisScope;
+  issue_id: string; kind: string; action: "read" | "repair" | "provide_input";
+  topic: string; topics?: string[]; detail: string; target: string;
+}
+export const QUALITY_LABELS: Record<QualityStatus, string> = {
+  verified: "核实通过", needs_review: "结论待复核", needs_input: "资料待核对", unknown: "质量未记录",
+};
+
 /** 引用保留全部来源身份，避免切文件或重新解析后误用同名锚点。 */
 export interface Citation {
+  excerpts?: string[];
+  excerpt_status?: "matched" | "block_only";
   source_id: number;
   collection_id: number;
   project_id: number;
@@ -22,6 +34,7 @@ export interface FieldValue {
 
 /** 分类与列由服务端从 Skill 固定，正文由 Agent 综合生成，引用单独绑定。 */
 export interface AnalysisOutput {
+  title_column?: string;
   version: string;
   layout: "table" | "list" | "tree";
   columns: string[];
@@ -80,6 +93,9 @@ export interface KnowledgeCollection {
 }
 
 export interface AnalysisModule {
+  input_changed?: boolean;
+  quality_status?: QualityStatus;
+  quality_issues?: QualityIssue[];
   id: number;
   module_key: string;
   title: string;
@@ -114,6 +130,8 @@ export interface TopicProgress {
 }
 
 export interface AgentRun {
+  mode?: "restart" | "resume";
+  quality_status?: QualityStatus;
   id: number;
   attempt: number;
   status: string;
@@ -133,6 +151,7 @@ export interface AgentRun {
 }
 
 export interface AnalysisReport {
+  quality_status?: QualityStatus;
   canceling?: boolean;
   id: number;
   status: string;
@@ -224,6 +243,8 @@ export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"
 }
 
 export interface ModuleRecords {
+  quality_status?: QualityStatus;
+  quality_issues?: QualityIssue[];
   progress?: TopicProgress;
   // schema_version 与 status 仅随契约透传，前端尚无版本分支；读取方不要据此推断兼容性。
   schema_version: string;
@@ -233,11 +254,13 @@ export interface ModuleRecords {
   evidence: Record<string, Citation>;
   output_schema: {
     version: string;
-    sections: { title: string; layout: AnalysisOutput["layout"]; columns: string[] }[];
+    sections: { title: string; layout: AnalysisOutput["layout"]; columns: string[]; title_column?: string }[];
   };
 }
 
 export interface AnalysisGap {
+  issue_id?: string;
+  action?: "read" | "repair" | "provide_input";
   code: string;
   detail: string;
   scope: AnalysisScope;
@@ -257,6 +280,8 @@ export interface AnalysisCoverage {
 }
 
 export interface AnalysisDataset {
+  quality_status?: QualityStatus;
+  quality_issues?: QualityIssue[];
   schema_version: string;
   lots: (BusinessRecord & { lot_id: number; code: string | null; aliases: string[] })[];
   facts: BusinessRecord[];

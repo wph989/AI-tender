@@ -24,7 +24,10 @@ from tender.domain.knowledge.text import (
     CHUNK_VERSION,
     chunk_bbox,
     chunk_block_id,
+    chunk_locations,
     iter_element_chunks,
+    iter_retrieval_chunks,
+    retrieval_block_id,
 )
 from tender.ports.repository.knowledge.retrieval import SearchCandidates
 from tender.ports.repository.knowledge.sources import ChunkWindow
@@ -65,9 +68,15 @@ def _payload(row: Mapping[str, Any], source: dict) -> dict:
         result.pop("bbox_" + axis, None)
     result.update(
         offset=row["ordinal"],
-        block_id=chunk_block_id(source["source_id"], source["parse_run_id"], row["ordinal"]),
+        block_id=retrieval_block_id(source["source_id"], source["parse_run_id"], row["ordinal"]),
         bbox=chunk_bbox(row),
     )
+    if source.get("chunk_format_version") == "1":
+        result["block_id"] = chunk_block_id(
+            source["source_id"], source["parse_run_id"], row["ordinal"],
+        )
+    if row.get("locations"):
+        result["bbox"] = chunk_locations(result)[0]["bbox"]
     return result
 
 
@@ -79,6 +88,7 @@ def _columns():
         KnowledgeChunk.char_end,
         KnowledgeChunk.chapter,
         KnowledgeChunk.content,
+        KnowledgeChunk.locations,
         Element.anchor,
         Element.page_no,
         Element.bbox_x0,
@@ -115,7 +125,8 @@ def read_chunk_window(store, source: dict, offset: int, limit: int) -> ChunkWind
     if offset < 0 or not 1 <= limit <= 12:
         raise ValueError("补读范围无效")
     with store.engine.connect() as connection:
-        if source.get("index_id"):
+        legacy = source.get("chunk_format_version") == "1"
+        if source.get("index_id") and not legacy:
             valid = connection.execute(select(KnowledgeIndex.id).where(
                 *_ready_index(source["index_id"]),
                 KnowledgeIndex.source_id == source["source_id"],
@@ -142,7 +153,8 @@ def read_chunk_window(store, source: dict, offset: int, limit: int) -> ChunkWind
             store._blocks_query(source).execution_options(stream_results=True, max_row_buffer=16),
         )
         with result:
-            for element, chunk in iter_element_chunks(result.mappings()):
+            iterator = iter_element_chunks if legacy else iter_retrieval_chunks
+            for element, chunk in iterator(result.mappings()):
                 total = chunk["ordinal"] + 1
                 if chunk["ordinal"] >= offset + limit:
                     return ChunkWindow(rows, None, True)
@@ -179,7 +191,7 @@ def search_candidates(
     indexed = []
     fallback = []
     for order, source in enumerate(sources):
-        if source.get("index_id") in ready:
+        if source.get("index_id") in ready and source.get("chunk_format_version") != "1":
             embedding = (
                 case(
                     (
@@ -214,6 +226,7 @@ def search_candidates(
                         row["char_end"],
                         row["chapter"],
                         row["content"],
+                        row.get("locations"),
                         row["anchor"],
                         row["page_no"],
                         *bbox,
@@ -232,6 +245,7 @@ def search_candidates(
             ("char_end", Integer),
             ("chapter", Text),
             ("content", Text),
+            ("locations", JSONB),
             ("anchor", Text),
             ("page_no", Integer),
             ("bbox_x0", Double),

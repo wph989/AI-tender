@@ -708,6 +708,8 @@ class TopicFlow:
             audited = reviewed_topics(self)
         items = {e["business"]["key"]: e for e in self.state.get("staged_items", [])
                  if e.get("business")}
+        remaining_topics = {topic for issue in self.data["audit"].get("remaining", [])
+                            for topic in issue.get("topics", [issue["topic"]])}
         coverage: list[dict] = []
         gaps: list[dict] = []
         for entry in self.entries:
@@ -718,6 +720,20 @@ class TopicFlow:
                            and r.get("review_status") != "needs_review"
                            and covers_topic_scope(r["business"]["scope"], entry["scope"])
                            for r in records)
+            audit_clear = (entry["topic"] in audited and entry["topic"] not in remaining_topics
+                           and reviewed and (not records or entry["scope"]["kind"] != "unknown"))
+            if audit_clear:
+                # 当前签名下的整项审查已覆盖检查方向、待办和转引；旧受阻说明不能再造遗漏。
+                # 保留原任务与原文说明，仅关闭它们的工作状态，供历史追踪和新输入重新核对。
+                for task in entry["tasks"].values():
+                    if task["status"] != "resolved":
+                        task.update(status="resolved", resolved_by="independent_review")
+                for reference in entry["references"]:
+                    if reference["status"] != "resolved":
+                        reference["status"] = "resolved"
+                entry.update(requested_status="ready", blocked_checks=[],
+                             checked=list(entry["checks"]), unreviewed_evidence=[],
+                             detail="独立审查已完成，无未决问题")
             tasks = list(entry["tasks"].values())
             # 耗尽的核对项及转引仍是缺口；其余可处理工作不能随之被封锁。
             blocked_checks = set(entry.get("blocked_checks", [])) - set(entry["checked"])
@@ -755,7 +771,8 @@ class TopicFlow:
                     "key": "finding:" + fingerprint([entry["topic"], entry["scope"], check]),
                     "topic": entry["topic"], "scope": entry["scope"],
                     "code": "search_exhausted", "detail": check + "：" + finding["detail"],
-                } for check, finding in findings.items() if finding["status"] == "not_found")
+                } for check, finding in findings.items()
+                    if finding["status"] == "not_found" and entry["topic"] not in audited)
                 studied = (entry["requested_status"] == "ready"
                            and entry["scope"]["kind"] != "unknown"
                            and set(entry["checks"]) <= findings.keys()
@@ -769,13 +786,8 @@ class TopicFlow:
                                      and reviewed)
                 if self.simplified and self.data["audit"].get("done"):
                     # 统一审查已核对完整清单和未处理线索；研究时无需先重复生成findings。
-                    # 受阻事项保留缺口，正文仍须有正确范围并全部通过支持性审查。
-                    ready = (entry["topic"] in audited
-                             and not any(i["topic"] == entry["topic"]
-                                     for i in self.data["audit"].get("remaining", []))
-                             and not blocked and entry["requested_status"] != "blocked"
-                             and entry["scope"]["kind"] != "unknown"
-                             and (bool(records) or proof or absent) and reviewed)
+                    # 没有业务记录的主题也可以结束核对；不能为其伪造公共范围或不适用证明。
+                    ready = audit_clear
             if ready:
                 entry["status"] = "ready"
             elif (entry["requested_status"] == "blocked" and not pending
@@ -795,6 +807,8 @@ class TopicFlow:
             if self.research_first:
                 coverage_status = ("searched_not_found" if ready and absent else
                                    "extracted" if ready and records else "pending")
+                if audit_clear and not records:
+                    coverage_status = "searched_not_found"
                 if self.simplified and ready and absent and all(
                     f.get("disposition") == "not_applicable" for f in findings.values()
                 ):
@@ -802,7 +816,8 @@ class TopicFlow:
             coverage.append({"topic": entry["topic"], "scope": entry["scope"],
                              "status": coverage_status,
                              "record_keys": entry["record_keys"], "detail": entry["detail"]})
-            if entry["status"] != "ready":
+            # 正常审查已覆盖的主题只发布真实问题账；工作状态不再额外复制一条缺口。
+            if entry["status"] != "ready" and entry["topic"] not in audited:
                 gaps.append({"key": "topic:" + identity(entry["topic"], entry["scope"]),
                              "topic": entry["topic"], "scope": entry["scope"],
                              "code": "search_exhausted", "detail": entry["detail"]})

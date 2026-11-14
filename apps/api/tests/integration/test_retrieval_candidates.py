@@ -11,6 +11,7 @@ from tender.adapters.pg.models import KnowledgeChunk, KnowledgeIndex
 from tender.adapters.pg.repositories.knowledge.store import KnowledgeStore
 from tender.api.knowledge import routes as knowledge
 from tender.application.knowledge.content import rank_chunks
+from tender.domain.knowledge.text import CHUNK_VERSION
 
 environment = fixtures.environment
 
@@ -27,7 +28,7 @@ def indexed_sources(environment, count=2):
         ], 2):
             connection.execute(text("""INSERT INTO element
                 (version_id,run_id,page_no,order_no,anchor,type,text)
-                VALUES (:version,:run,1,:ordinal,:anchor,'text',:content)"""),
+                VALUES (:version,:run,1,:ordinal,:anchor,'title',:content)"""),
                 {"version": version, "run": run, "ordinal": ordinal,
                  "anchor": f"p1b{ordinal}", "content": content})
     own = knowledge.project_knowledge(pid, request)["collection_id"]
@@ -38,7 +39,7 @@ def indexed_sources(environment, count=2):
         chunks = db.readable_chunks(source)
         index_id = connection.execute(insert(KnowledgeIndex).values(
             source_id=source["source_id"], version_id=source["version_id"],
-            run_id=source["parse_run_id"], status="completed", chunk_version="1",
+            run_id=source["parse_run_id"], status="completed", chunk_version=CHUNK_VERSION,
             embedding_signature="test-space", dimension=2,
         ).returning(KnowledgeIndex.id)).scalar_one()
         connection.execute(insert(KnowledgeChunk), [{
@@ -175,7 +176,7 @@ def test_unindexed_window_stops_streaming_at_requested_prefix(environment, monke
 
     db, sources, _ = indexed_sources(environment, count=1)
     environment[1].execute(text("UPDATE knowledge_index SET chunk_version='old'"))
-    original = retrieval.iter_element_chunks
+    original = retrieval.iter_retrieval_chunks
     visited = []
 
     def observe(elements):
@@ -183,6 +184,6 @@ def test_unindexed_window_stops_streaming_at_requested_prefix(environment, monke
             visited.append(chunk["ordinal"])
             yield element, chunk
 
-    monkeypatch.setattr(retrieval, "iter_element_chunks", observe)
+    monkeypatch.setattr(retrieval, "iter_retrieval_chunks", observe)
     assert len(db.read_chunk_window(sources[0], 0, 1).rows) == 1
     assert visited == [0, 1]

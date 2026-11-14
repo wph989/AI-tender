@@ -13,12 +13,12 @@ from test_deep_analysis import KEY, ScriptedRouter, call
 from tender.application.analysis.agent import RoutedAgentModel, build_module_agent, invoke_module
 from tender.application.analysis.data import module_data
 from tender.application.analysis.protocol import PROTOCOL_VERSION
-from tender.application.analysis.review import validate
+from tender.application.analysis.review import check_ownership, validate
 from tender.domain.shared.errors import InvalidModelOutput
 
 
 def approve(payload):
-    return {
+    result = {
         "reviews": {
             row["record_id"]: {
                 "supported": True,
@@ -29,6 +29,21 @@ def approve(payload):
         },
         "issues": [],
     }
+    if payload.get("check_items"):
+        blocks = [r["id"] for r in payload["evidence"] + payload["context_evidence"]]
+        result["check_results"] = {
+            check["check_id"]: {
+                "status": "covered" if check["record_ids"] else "not_required",
+                "summary": "已核对当前方向的质保事实及项目适用条件",
+                "record_ids": check["record_ids"], "block_ids": (
+                    next((r["block_ids"][:1] for r in
+                          payload["records"] + payload["context_records"]
+                          if r["record_id"] in check["record_ids"]), blocks[:1])),
+                "issue_indexes": [],
+            } for raw_check in payload["check_items"]
+            for check in [raw_check | check_ownership(payload, raw_check)]
+        }
+    return result
 
 
 async def execute(records, *, review=None, tail=(), limits=None, search_args=None,
@@ -377,7 +392,7 @@ def test_distinct_synthesis_batches_make_progress_without_blocking_another_topic
 
 @pytest.mark.parametrize("dependent", [False, True])
 @pytest.mark.parametrize("affected_topic", ["a", "b"])
-def test_unscoped_review_issue_preserves_unrelated_results_and_revokes_dependents(
+def test_associated_review_issue_preserves_unrelated_results_and_revokes_dependents(
     dependent, affected_topic,
 ):
     async def run():
@@ -409,7 +424,7 @@ def test_unscoped_review_issue_preserves_unrelated_results_and_revokes_dependent
             if affected_topic in payload.get("topics", [payload["topic"]]):
                 verdict["issues"] = [{
                     "topic": affected_topic, "kind": "scope", "detail": "本子主题范围待确认",
-                    "target": "本子主题条款", "evidence_ids": [], "record_ids": [],
+                    "target": "本子主题条款", "evidence_ids": [], "record_ids": [affected["id"]],
                 }]
             return verdict
 
@@ -421,7 +436,7 @@ def test_unscoped_review_issue_preserves_unrelated_results_and_revokes_dependent
             expected_keys.add(other["business"]["key"])
         assert all(set(issue["record_keys"]) == expected_keys
                    for issue in flow.data["audit"]["issues"])
-        assert {issue["topic"] for issue in flow.data["audit"]["issues"]} == (
+        assert {topic for issue in flow.data["audit"]["issues"] for topic in issue["topics"]} == (
             {"a", "b"} if dependent else {affected_topic}
         )
         assert {i["id"] for i in published_items(state, final=True)} == (

@@ -341,6 +341,7 @@ def test_no_supported_items_keeps_module_failed(monkeypatch):
         executor.execute_module(
             {
                 "id": 5, "project_id": 1, "category": "goods",
+                "source_snapshot": [], "reference_snapshot": [],
                 "lot_settings": [], "topics": [], "skill_snapshot": {},
             },
             {"id": 7, "module_key": next(iter(MODULES)), "attempt": 1},

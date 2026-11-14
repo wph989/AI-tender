@@ -193,6 +193,8 @@ def test_packaged_examples_accept_minimal_topic_progress_without_extra_empty_sub
 
 @pytest.mark.parametrize("key", MODULES)
 def test_thirteen_topic_review_packets_keep_domain_rules_properties_and_quotes(key):
+    from test_analysis_combined_review import approve
+
     from tender.application.analysis.data import semantic_payload
     from tender.application.analysis.review import batches, fits, validate
 
@@ -221,10 +223,7 @@ def test_thirteen_topic_review_packets_keep_domain_rules_properties_and_quotes(k
         assert packet["domain_rules"] == rules
         for row in packet["records"]:
             seen[row["record_id"]] = row["business"]
-        validate({"reviews": {row["record_id"]: {
-            "supported": True, "issues": [],
-            "block_ids": row["block_ids"],
-        } for row in packet["records"]}, "issues": []}, packet)
+        validate(approve(packet), packet)
         assert all(span["text"] == research.seen[span["id"]]["content"]
                    for span in packet["evidence"] + packet["context_evidence"])
     assert seen.keys() == {i["id"] for i in prepared}

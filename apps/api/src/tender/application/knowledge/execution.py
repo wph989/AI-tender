@@ -12,6 +12,7 @@ from tender.application.knowledge.qa_agent import answer_with_agent
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
 from tender.core.logging import get_logger
+from tender.domain.knowledge.text import CHUNK_VERSION
 from tender.domain.shared.errors import TenderError
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.llm.rerank import RerankModel
@@ -27,7 +28,10 @@ DISPATCH_KINDS = ("index", "report", "answer")
 def dispatch_ready(db: KnowledgeDispatchRepository) -> list[tuple[str, int]]:
     """登记到期索引并领取可派发任务；投递哪条消息由调度侧按 kind 决定。"""
     for source in db.sources(db.collections_pending_index()):
-        if source_state(source) in {"ready", "partial"} and not source["index_id"]:
+        if source_state(source) in {"ready", "partial"} and (
+            not source["index_id"] or (source.get("index_status") == "completed"
+                                      and source.get("chunk_version") != CHUNK_VERSION)
+        ):
             db.create_index(source)
     return [
         (kind, record_id)
@@ -85,7 +89,9 @@ def graph_expand(
         if not element_ids:
             continue
         for block in db.readable_chunks(source):
-            if block["element_id"] in element_ids and block["block_id"] not in seen:
+            if (block["element_id"] in element_ids or any(
+                    place["element_id"] in element_ids for place in block.get("locations", [])
+            )) and block["block_id"] not in seen:
                 hits.append(block)
                 seen.add(block["block_id"])
     return hits, selected
@@ -140,12 +146,18 @@ class KnowledgeExecutor:
             vectors = None
             if config:
                 client = self.embedding_gateway(config)
-                vectors = []
-                for start in range(0, len(chunks), 16):
+                # 入库前已组成完整条款；相同文字复用向量，来源与定位仍分别保存。
+                passages = list(dict.fromkeys(r["content"] for r in chunks))
+                embedded = []
+                for start in range(0, len(passages), 16):
                     db.renew_lease("index", index_id)
-                    vectors.extend(
-                        await client.embed([r["content"] for r in chunks[start : start + 16]])
+                    embedded.extend(
+                        await client.embed(passages[start : start + 16])
                     )
+                if len(embedded) != len(passages):
+                    raise ValueError("向量模型返回数量与检索单元数量不一致")
+                by_content = dict(zip(passages, embedded, strict=True))
+                vectors = [by_content[r["content"]] for r in chunks]
                 if vectors and any(len(v) != len(vectors[0]) for v in vectors):
                     raise ValueError("向量模型在索引期间改变了维度")
             db.complete_index(index_id, chunks=chunks, vectors=vectors, config=config)

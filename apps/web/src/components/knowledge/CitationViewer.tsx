@@ -8,6 +8,7 @@ import { useLocate } from "@/hooks/useLocate";
 import { usePageRegistry } from "@/hooks/usePageRenderer";
 import { knowledgeRequest } from "@/lib/api/knowledge";
 import { toBbox } from "@/lib/api/wire";
+import { citationLocationKey, viewerCitations } from "@/lib/analysis/citations";
 import { destroyPdfDocument, loadPdfDocument } from "@/lib/pdf/document";
 import { useViewerStore } from "@/lib/store/viewerStore";
 import type { EvidenceIndex, EvidenceItem, EvidenceTarget } from "@/lib/viewer/evidenceIndex";
@@ -26,7 +27,7 @@ interface Props {
 export function CitationViewer({ selected, citations, quotes, onReverse }: Props) {
   // 默认预览只需要文件身份，不伪造引用、页码锚点或高亮区域。
   const citation = "source_id" in selected ? selected : null;
-  const excerpts = quotes?.length ? quotes : citation ? [citation.quote] : [];
+  const excerpts = (quotes?.length ? quotes : citation ? citation.excerpts ?? [citation.quote] : []).filter(Boolean);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [pages, setPages] = useState<WirePageMeta[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -38,12 +39,7 @@ export function CitationViewer({ selected, citations, quotes, onReverse }: Props
   const refs = useMemo(() => {
     if (!citation) return [];
     // 多条结论可引用同一原文块；只画一次框和角标，避免重复标记干扰原文阅读。
-    const blocks = new Map<number, Citation>();
-    for (const ref of citations) {
-      if (ref.source_id === citation.source_id && ref.version_id === citation.version_id && ref.parse_run_id === citation.parse_run_id) blocks.set(ref.element_id, ref);
-    }
-    blocks.set(citation.element_id, citation);
-    return [...blocks.values()];
+    return viewerCitations(citations, citation);
   }, [citations, citation]);
   const index = useMemo<EvidenceIndex>(() => {
     const byPage = new Map<number, EvidenceItem[]>();
@@ -80,7 +76,8 @@ export function CitationViewer({ selected, citations, quotes, onReverse }: Props
     // 报告轮询只更新角标集合，不应把正在阅读的用户重新滚回旧引用。
     if (lastLocated.current === citation) return;
     lastLocated.current = citation;
-    void locate({ evidenceId: Math.max(1, refs.findIndex((r) => r.element_id === citation.element_id && r.quote === citation.quote) + 1),
+    void locate({ evidenceId: Math.max(1, refs.findIndex((r) =>
+      citationLocationKey(r) === citationLocationKey(citation)) + 1),
       anchor: citation.anchor, pageNo: citation.page_no, bbox: toBbox(citation.bbox), label: citation.file_name });
   }, [pdf, pages, citation, locate, refs]);
 
@@ -92,7 +89,7 @@ export function CitationViewer({ selected, citations, quotes, onReverse }: Props
       onLocate={(item) => { const ref = refs[item.evidenceId - 1]; if (ref) onReverse?.(ref); }} />
       : <p className="p-8 text-slate-500">正在打开文档…</p>}</div>
     {/* 多摘录可点击或触屏展开；每段仍是原始引文，不拼接后冒充一条证据。 */}
-    {citation && (excerpts.length > 1
+    {citation && excerpts.length > 0 && (excerpts.length > 1
       ? <details key={excerpts.join("\u0000")} className="citation-excerpt">
           <summary>查看本事项的 {excerpts.length} 条原文摘录</summary>
           {excerpts.map((quote, index) => <blockquote key={index}>{quote}</blockquote>)}

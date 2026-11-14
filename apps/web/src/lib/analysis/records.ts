@@ -38,6 +38,7 @@ export function recordItems(data: ModuleRecords): AnalysisField[] {
       note, record,
       output: {
         version, layout: section.layout, columns: section.columns,
+        title_column: section.title_column,
         key: record.key, content: record.content, citations: contentCitations, parent_key: record.parent_key ?? null,
         node_type: record.node_type ?? null,
       },

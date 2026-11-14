@@ -17,7 +17,7 @@ def evidence_version(row: dict) -> str:
     # 检索分数和排序会随查询改变，不能让它们撤销同一来源版本原文的去重资格。
     return fingerprint({key: row.get(key) for key in (
         "source_id", "collection_id", "project_id", "parse_run_id", "version_id",
-        "block_id", "element_id", "offset", "content",
+        "block_id", "element_id", "offset", "content", "locations",
     )})
 
 
@@ -129,7 +129,9 @@ def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
                           "status": note.get("status", work["status"]),
                           "notes": note.get("notes") or [note.get("detail")
                                                         or finding.get("detail", "")],
-                          "evidence_ids": sorted(ids), "target": work.get("target", "")})
+                          "evidence_ids": sorted(ids), "target": work.get("target", ""),
+                          **({"issue_id": task["issue_id"], "action": task.get("action", "read")}
+                             if task.get("issue_id") else {})})
         if entry["references"]:
             units.append({"kind": "references", "topic": entry["topic"], "scope": entry["scope"],
                           "references": entry["references"]})
@@ -161,7 +163,8 @@ def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
                                    if k != "text"},
                       "topics": sorted({known[wid]["topic"] for wid in item.get("work_ids", [])
                                         if wid in known}),
-                      "review_status": item.get("review_status")})
+                      "review_status": item.get("review_status"),
+                      "verification_issues": item.get("verification_issues", [])})
         evidence.update(r["block_id"] for r in business.get("citations", []))
         pending.extend(business[k] for k in ("parent_key", "subject_key", "object_key")
                        if business.get(k) and business[k] not in visited)

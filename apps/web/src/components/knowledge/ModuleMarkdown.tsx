@@ -244,11 +244,6 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
   };
   const heading = (item: AnalysisField) => <header className="result-record-heading">
     <div><h5>{renderInline(item.field)}</h5>{scope(item)}</div>
-    {item.output?.content["满分分值"] && <span className="result-score">满分 {renderInline(
-      [item.output.content["满分分值"]].flat().join("；"))}
-      {!!citations.get(item.id)?.content["满分分值"]?.flat().length && <ValueLocates inline refs={citations.get(item.id)!.content["满分分值"]!.flat()}
-        onLocate={(ref) => onLocate(ref, item.id)} />}
-    </span>}
   </header>;
   const fields = (item: AnalysisField) => {
     const output = item.output;
@@ -283,9 +278,7 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
     {[...groups.entries()].map(([name, rows]) => {
       const output = rows.find((item) => item.output)?.output;
       const keyValue = output?.columns.length === 2 && output.columns[0] === "字段" && output.columns[1] === "内容";
-      // 短价格事项保留横向比较；长条款与评分档次用完整宽度阅读。
-      const comparable = output?.layout === "table" && rows.some((item) =>
-        ["price_requirement_parsing", "deposit_requirement_parsing", "biz_standard_parsing"].includes(item.record?.module_key ?? ""));
+      // 同组事项统一用表格比较，列名和内容仍来自冻结声明，长列表保留在单元格内。
       return <section key={name} className="module-group" data-result-group={name}>
         {name !== "未分类" && <h4 className="module-group-title">{name}</h4>}
         {keyValue ? <table className="module-table module-kv-table" aria-label={name}>
@@ -305,12 +298,18 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
               </td>
             </tr>)}</tbody>;
           })}
-        </table> : comparable && output ? <div className="overflow-x-auto"><table className="module-table module-structured-table">
-          <thead><tr><th scope="col">事项与范围</th>{output.columns.map((column) => <th scope="col" key={column}>{column}</th>)}</tr></thead>
+        </table> : output ? <div className="overflow-x-auto"><table className="module-table module-structured-table" aria-label={name}>
+          <thead><tr>{output.columns.map((column) => <th scope="col" key={column}>{column}</th>)}</tr></thead>
           <tbody>{rows.map((item) => <tr key={item.id} {...identity(item)}>
-            <th scope="row">{heading(item)}{relationLinks(item)}</th>
             {output.columns.map((column, index) => <td key={column} data-label={column} className="module-markdown-body">
-              {content(item.output?.content[column], item, column) || <span className="text-slate-400">本项未提供</span>}
+              {/* 标题来源列已经包含事项名称；缺少声明的历史记录也避免逐字重复。 */}
+              {index === 0 && !output.title_column && item.field !== [item.output?.content[column]].flat().join("；")
+                && <h5>{renderInline(item.field)}</h5>}
+              {/* 分值只在所属列展示，避免标题与单元格重复绘制同一定位入口。 */}
+              <div className={column === "满分分值" ? "result-score" : undefined}>
+                {content(item.output?.content[column], item, column) || <span className="text-slate-400">本项未提供</span>}
+              </div>
+              {column === (output.title_column ?? output.columns[0]) && <>{scope(item)}{relationLinks(item)}</>}
               {index === output.columns.length - 1 && <>{details(item)}{references(item)}</>}
             </td>)}
           </tr>)}</tbody>

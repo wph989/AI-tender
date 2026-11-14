@@ -13,7 +13,6 @@ from test_deep_analysis import call
 from tender.application.analysis.data import module_data
 from tender.application.analysis.protocol import ResearchLedger
 from tender.application.analysis.search_control import TopicSearch
-from tender.application.analysis.topic_flow import TopicIncomplete
 
 
 def finish(key="ready"):
@@ -65,11 +64,16 @@ def test_semantic_completion_does_not_bypass_independent_omission_review():
                 "evidence_ids": ["s1r1c0"], "record_ids": [], "kind": "omission",
             }]}
 
-        with pytest.raises(TopicIncomplete):
-            await execute([summary_record()], research_steps=[finish()], review=missing,
-                          tail=[finish("repair-ready"), call("submit_analysis", {
-                              "records": [], "final": True,
-                          }, "repair-final")])
+        state, _, _, _ = await execute(
+            [summary_record()], research_steps=[finish()], review=missing,
+            tail=[finish("repair-ready"), call("submit_analysis", {
+                "records": [], "final": True,
+            }, "repair-final")],
+        )
+        assert state["quality_status"] == "needs_review"
+        assert len(state["draft"]["fields"]) == 1
+        assert len(state["business_gaps"]) == len(state["quality_issues"]) == 1
+        assert state["business_gaps"][0]["issue_id"] == state["quality_issues"][0]["issue_id"]
         # 空提交没有改变内容或依据，沿用原问题直接结束，不再发送复核。
         assert len(calls) == 1
 
@@ -278,5 +282,171 @@ def test_new_evidence_revokes_completed_absence_even_without_business_records():
         research.seen["s1r1c1"] = block() | {"block_id": "s1r1c1", "content": "质保五年"}
         flow.evidence(before, ["a"], {"blocks": [{"id": "s1r1c1"}]})
         assert flow.researching and flow.entries[0]["status"] != "ready"
+
+    asyncio.run(run())
+
+
+def test_review_resolution_closes_old_blocked_work_without_creating_omissions():
+    async def run():
+        from tender.application.analysis.quality import issue_identity
+
+        state = {}
+        issue = {"topic": "a", "kind": "omission", "action": "read",
+                 "target": "可选签到步骤", "scope": {"kind": "common", "lot_refs": []},
+                 "detail": "未见签到步骤", "evidence_ids": ["s1r1c0"], "record_keys": []}
+        issue_id = issue_identity(issue)
+        calls = []
+
+        async def review(payload):
+            calls.append(payload)
+            result = approve(payload)
+            if len(calls) == 1:
+                result["issues"] = [{k: issue[k] for k in (
+                    "topic", "kind", "action", "target", "detail", "evidence_ids", "scope"
+                )} | {"record_ids": []}]
+            return result
+
+        state, _, _, _ = await execute(
+            [summary_record(work_ids=["w1"])], state=state, keys=("a", "b"),
+            search_args={"query": "质保及可选材料", "work": ["w1", "w2"]},
+            research_steps=[call("update_research", {"updates": [{
+                "work_ids": ["w2"], "status": "blocked", "detail": "原文未规定备用材料",
+                "evidence_ids": ["s1r1c0"],
+            }]}, "unrequired-materials"), finish()], review=review,
+            tail=[call("update_research", {"updates": [{
+                "work_ids": ["w3"], "status": "blocked",
+                "detail": "核对原文后确认未规定签到步骤，无具体遗漏",
+                "evidence_ids": ["s1r1c0"],
+            }]}, "check-optional-step"), finish("repair-ready"),
+                  call("submit_analysis", {"records": [summary_record(
+                      key="additional", work_ids=["w1"], title="已核对的质保条件"
+                  )], "final": True}, "repair-final")],
+        )
+        audit = state["topic_flow"]["audit"]
+        assert audit["done"] and not audit["remaining"]
+        assert state["quality_status"] == "verified" and not state["quality_issues"]
+        assert len(module_data(state)["records"]) == 2
+        assert not state["business_gaps"]
+        entries = list(state["topic_flow"]["entries"].values())
+        assert all(e["status"] == "ready" for e in entries)
+        task = next(e["tasks"][issue_id] for e in entries if issue_id in e["tasks"])
+        assert task["status"] == "resolved" and task["resolved_by"] == "independent_review"
+        # 空主题只结束核对流程；不能为它伪造公共适用范围或不适用证明。
+        empty = next(e for e in entries if e["topic"] == "b")
+        assert not empty["record_keys"] and empty["scope"]["kind"] == "unknown"
+        assert not empty.get("findings")
+
+    asyncio.run(run())
+
+
+def test_review_closes_old_reference_and_replays_after_serialized_restore():
+    book, flow, state, research = ledger()
+
+    async def run():
+        from synthesis_fixtures import noop
+
+        from tender.application.analysis.data import DataScope
+        from tender.application.analysis.output import ReferenceTrace
+        from tender.application.analysis.review import audit_combined
+        from tender.application.analysis.topic_flow import TopicFlow, TopicUpdate
+
+        flow.apply([TopicUpdate(topic="a", scope=DataScope(kind="common"),
+            evidence_ids=["s1r1c0"], references=[ReferenceTrace(
+                topic="a", from_block_id="s1r1c0", target="可选说明", status="missing",
+            )])], set())
+        book.finish("原文未规定可选要求，交由独立审查核对")
+
+        async def review(payload):
+            assert any(ref["target"] == "可选说明" for check in payload["checks"]
+                       for ref in check["references"])
+            return approve(payload)
+
+        assert await audit_combined(flow, review, noop)
+        restored = TopicFlow(json.loads(json.dumps(state, ensure_ascii=False)), research)
+        assert restored.entries[0]["references"][0]["status"] == "resolved"
+        assert restored.entries[0]["status"] == "ready"
+        # 审查后改变原文必须使缓存失效，旧任务的关闭不能替新证据背书。
+        research.seen["s1r1c0"]["content"] += "；另有例外"
+        restored.sync()
+        assert restored.entries[0]["status"] != "ready"
+
+    asyncio.run(run())
+
+
+def test_mixed_supported_fact_and_independent_gap_reaches_review_without_being_dropped():
+    async def run():
+        raw = block() | {"content": "质保三年；起算日期详见第一章公告"}
+        record = summary_record(content={"字段": "质保期限",
+            "内容": "质保期限为三年，起算日期未载明，需核对转引公告"})
+        calls = []
+
+        async def review(payload):
+            calls.append(payload)
+            assert len(payload["records"]) == 1
+            return approve(payload) | {"issues": [{
+                "topic": "a", "detail": "起算日期需定向补读转引公告", "target": "公告/起算日期",
+                "evidence_ids": ["s1r1c0"], "record_ids": [], "kind": "omission", "action": "read",
+            }]}
+
+        state, _, _, _ = await execute([record], evidence_rows=[raw], review=review,
+            tail=[finish("repair-ready"), call("submit_analysis", {
+                "records": [], "final": True,
+            }, "repair-final")])
+        assert len(calls) == 1 and len(state["staged_items"]) == 1
+        assert len(module_data(state)["records"]) == 1
+        assert len(state["quality_issues"]) == len(state["business_gaps"]) == 1
+        assert state["quality_issues"][0]["target"] == "公告/起算日期"
+
+    asyncio.run(run())
+
+
+def test_unproven_absence_is_rejected_by_independent_review():
+    async def run():
+        from tender.application.analysis.research import AgentLimits
+
+        async def review(payload):
+            assert len(payload["records"]) == 1
+            result = approve(payload)
+            verdict = next(iter(result["reviews"].values()))
+            verdict.update(supported=False, issues=["单块原文不能证明整个项目没有质保要求"])
+            return result
+
+        state, _, _, _ = await execute([summary_record(content={
+            "字段": "质保要求", "内容": "项目未规定质保要求",
+        })], review=review, limits=AgentLimits(max_review_repairs=0))
+        assert not module_data(state)["records"]
+        assert len(state["staged_items"]) == 1
+        assert state["quality_status"] == "needs_review"
+
+    asyncio.run(run())
+
+
+def test_submission_removes_discarded_draft_indexes_but_keeps_research_tasks():
+    from tender.application.analysis.protocol import ResearchDelta
+
+    book, flow, state, _ = ledger()
+    book.update([ResearchDelta(work_ids=["w1"], detail="已核对质保条款",
+                              evidence_ids=["s1r1c0"], scope={"kind": "common", "lot_refs": []})])
+    entry = flow.entries[0]
+    entry["record_keys"] = ["discarded"]
+    entry["tasks"]["trace"] = {"detail": "重新核对旧草稿的条款", "target": "质保条款",
+                                "status": "pending", "record_keys": ["discarded"],
+                                "evidence_ids": []}
+    entry.update(evidence_ids=[], unreviewed_evidence=[], findings={})
+    flow.data["phase"] = "research"
+    state["business_gaps"] = [{"key": "record:discarded", "topic": "a",
+                              "scope": entry["scope"], "code": "unknown_condition",
+                              "detail": "旧关键词过滤的缺口"}]
+
+    async def run():
+        result, _, _, packets = await execute([summary_record()], state=state,
+                                              research_steps=[finish()])
+        entries = list(result["topic_flow"]["entries"].values())
+        assert all("discarded" not in e["record_keys"] for e in entries)
+        assert any(task["detail"] == "重新核对旧草稿的条款" for packet in packets
+                   for check in packet["checks"] for task in check["tasks"])
+        assert len(module_data(result)["records"]) == 1
+        assert result["quality_status"] == "verified"
+        assert not result["business_gaps"]
 
     asyncio.run(run())

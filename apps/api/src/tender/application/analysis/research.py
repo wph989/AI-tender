@@ -80,6 +80,7 @@ def _dependency_fingerprint(row: dict) -> str:
     # 检索分数和处理状态不属于原文身份，否则检索命中与仓储补读会被误判为不同版本。
     return fingerprint([row.get(k) for k in (
         "source_id", "version_id", "parse_run_id", "block_id", "offset", "element_id", "content",
+        "locations",
     )])
 
 

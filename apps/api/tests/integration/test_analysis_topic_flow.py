@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 import test_deepagents_runtime
+from analysis_review_fixture import check_results
 from test_deepagents_runtime import prepared_runtime, publishable_state, report
 
 from tender.application.analysis.protocol import PROTOCOL_VERSION
@@ -29,7 +30,7 @@ def test_merged_batch_read_uses_bounded_postgres_windows(env):
     # 多个独立元素确保原文派生至少16块，真实仓储仍执行每次最多12块的契约。
     env.db.execute("""INSERT INTO element
         (version_id,run_id,page_no,order_no,anchor,type,text,bbox_x0,bbox_y0,bbox_x1,bbox_y1)
-        SELECT e.version_id,e.run_id,1,g.n,'p1b' || g.n,'text','独立条款' || g.n,0,0,1,1
+        SELECT e.version_id,e.run_id,1,g.n,'p1b' || g.n,'title','独立条款' || g.n,0,0,1,1
         FROM (SELECT version_id,run_id FROM element LIMIT 1) e
         CROSS JOIN generate_series(2,20) AS g(n)""")
     row, sources = test_deepagents_runtime.worker.prepare_report(env.db, row)
@@ -422,9 +423,12 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
             elif self.calls == 2:
                 name, args = "search_document", {"query": "质保", "work_ids": ["w1", "w2"]}
             elif self.calls == 3:
+                evidence = next(json.loads(m["data"]["content"])["blocks"][0]["id"]
+                                for m in messages if m["type"] == "tool"
+                                and m["data"].get("name") == "search_document")
                 name, args = "update_research", {"updates": [{
                     "work_ids": ["w1", "w2"], "scope": {"kind": "common", "lot_refs": []},
-                    "detail": "已核对完整条款", "evidence_ids": ["s1r1c0"],
+                    "detail": "已核对完整条款", "evidence_ids": [evidence],
                 }]}
             else:
                 index = 0 if self.calls == 4 else 1
@@ -457,7 +461,9 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
             reviews = {row["record_id"]: {"supported": True, "issues": [],
                        "block_ids": row["block_ids"]}
                        for row in payload["records"]}
-            return Completion(content=json.dumps({"reviews": reviews, "issues": []}),
+            checks = check_results(payload)
+            return Completion(content=json.dumps({"reviews": reviews, "issues": [],
+                                                   "check_results": checks}),
                               model="offline")
 
         async def aclose(self):
@@ -476,7 +482,8 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
         stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
                              {"id": run["id"]})[0]
         assert stored["model_calls"] == max_calls and len(completed) == 0
-        assert all(e["findings"] for e in stored["state"]["topic_flow"]["entries"].values())
+        assert stored["state"]["research"]["seen"]
+        assert stored["state"]["staged_items"]
         assert any(g["key"] == "execution:incomplete"
                    for g in stored["state"]["business_gaps"])
         return
@@ -490,7 +497,7 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
     assert len(completed[0]["records"]) == 2
     # 同一原文可置于共享上下文，核对完整发送内容，避免把位置优化误判成丢失证据。
     spans = completed[0]["evidence"] + completed[0]["context_evidence"]
-    assert len(spans) == 1 and spans[0]["id"] == "s1r1c0"
+    assert len(spans) == 1 and spans[0]["id"] == "s1r1g2c0"
     stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
                          {"id": run["id"]})[0]
     assert stored["state"]["topic_flow"]["audit"]["done"]
@@ -515,6 +522,6 @@ def test_new_report_researches_before_synthesis_and_independent_audit(env, monke
         pass
 
     assert run_async(audit_combined(restored, forbidden, save))
-    research.seen["s1r1c0"]["content"] += "但补遗变更质保期限"
+    research.seen["s1r1g2c0"]["content"] += "但补遗变更质保期限"
     with pytest.raises(TopicIncomplete, match="数据变化"):
         run_async(audit_combined(restored, forbidden, save))

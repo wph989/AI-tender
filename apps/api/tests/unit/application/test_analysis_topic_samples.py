@@ -140,6 +140,8 @@ def test_annotated_sample_preserves_all_items_and_avoids_old_result_resubmission
 
 
 async def run_combined_sample():
+    from test_analysis_combined_review import approve
+
     from tender.application.analysis.review import review_combined
 
     rows = [block() | value for value in SAMPLE["blocks"]]
@@ -175,7 +177,7 @@ async def run_combined_sample():
                        "block_ids": [next(r["block_id"] for r in SAMPLE["expected"]
                                           if r["key"] == row["key"])]}
                        for row in payload["records"]}
-            result = Completion(content=json.dumps({"reviews": reviews, "issues": []}),
+            result = Completion(content=json.dumps(approve(payload) | {"reviews": reviews}),
                                 model="offline")
             validate(result)
             return result

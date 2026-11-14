@@ -154,7 +154,7 @@ def accessible_data(
             for ref in record.get("citations", []):
                 identity = tuple(ref.get(k) for k in (
                     "source_id", "collection_id", "project_file_id", "project_id", "version_id",
-                    "parse_run_id", "element_id", "anchor",
+                    "parse_run_id", "element_id", "anchor", "block_id",
                 ))
                 if identity not in checked:
                     try:
@@ -173,6 +173,8 @@ def accessible_data(
     if unavailable:
         # 缺口文本也可能重述撤销资料；此时仅保留访问状态，不泄露历史内容。
         result["gaps"] = [data_gap("source_unavailable", "部分依据已删除或撤销访问，请更新分析")]
+        result["quality_issues"] = []
+        result["quality_status"] = "unknown"
         result["coverage"] = []
         result["relations"] = [r for r in result["relations"]
                                if r.get("subject_id") not in unavailable

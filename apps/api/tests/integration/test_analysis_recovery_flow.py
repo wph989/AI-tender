@@ -5,6 +5,7 @@ import os
 
 import pytest
 import test_deepagents_runtime
+from analysis_review_fixture import check_results
 from test_deepagents_runtime import (
     NativeRouter,
     prepared_runtime,
@@ -248,7 +249,8 @@ def test_saved_business_update_resumes_graph_without_reapplying_or_resettling(
             return Completion(content=json.dumps({"reviews": {
                 row["record_id"]: {"supported": True, "issues": [],
                                    "block_ids": row["block_ids"]}
-                for row in payload["records"]}, "issues": []}), model="fixture")
+                for row in payload["records"]}, "issues": [],
+                "check_results": check_results(payload)}), model="fixture")
 
     monkeypatch.setattr(ResearchLedger, "update_batch", update)
     monkeypatch.setattr(AgentRuntime, "save", save)

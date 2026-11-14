@@ -81,6 +81,7 @@ def test_retry_preserves_evidence_and_results_with_fresh_tool_budget(
     result = service.retry_report(
         27, module_keys=["project_basic_info_parsing"], max_output_tokens=None,
         timeout_seconds=None,
+        mode="resume",
     )
 
     assert result == {"id": 27, "status": "pending"}

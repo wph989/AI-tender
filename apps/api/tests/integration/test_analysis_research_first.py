@@ -11,8 +11,9 @@ import pytest
 import test_deepagents_runtime
 from test_deepagents_runtime import prepared_runtime, publishable_state, report
 
-from tender.application.analysis.service import AnalysisService
 from tender.application.analysis.topic_flow import OUTPUT_MODE, OUTPUT_MODE_KEY
+from tender.config.registry import ConfigRegistry
+from tender.core.di import create_analysis_service
 
 env = test_deepagents_runtime.env
 pytestmark = pytest.mark.skipif(
@@ -118,9 +119,9 @@ def test_explicit_retry_keeps_research_notes_even_without_business_records(env):
         runtime.release()
     env.db.execute("UPDATE analysis_report SET status='partial' WHERE id=:id",
                    {"id": runtime.report["id"]})
-    AnalysisService(env.db, 1, None, None, None).retry_report(
+    create_analysis_service(env.engine, 1, ConfigRegistry(env.engine)).retry_report(
         runtime.report["id"], module_keys=["project_basic_info_parsing"],
-        max_output_tokens=None, timeout_seconds=None,
+        max_output_tokens=None, timeout_seconds=None, mode="resume",
     )
     row = env.db.rows("SELECT state,model_calls,tool_calls,attempt FROM agent_module_run "
                       "WHERE module_id=:id ORDER BY attempt DESC LIMIT 1",
@@ -212,9 +213,9 @@ def test_retry_restores_examined_notes_and_todos_before_any_check_is_completed(e
         runtime.release()
     env.db.execute("UPDATE analysis_report SET status='failed' WHERE id=:id",
                    {"id": runtime.report["id"]})
-    AnalysisService(env.db, 1, None, None, None).retry_report(
+    create_analysis_service(env.engine, 1, ConfigRegistry(env.engine)).retry_report(
         runtime.report["id"], module_keys=["project_basic_info_parsing"],
-        max_output_tokens=None, timeout_seconds=None,
+        max_output_tokens=None, timeout_seconds=None, mode="resume",
     )
     row = env.db.rows("SELECT state,model_calls,tool_calls,attempt FROM agent_module_run "
                       "WHERE module_id=:id ORDER BY attempt DESC LIMIT 1",

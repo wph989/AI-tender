@@ -397,13 +397,18 @@ def rejected_record_gaps(state: dict) -> dict[str, dict]:
     }
 
 
-def validate_project_claims(fields: list[dict], project_id: int) -> None:
+def validate_project_claims(
+    fields: list[dict], project_id: int, *, defer_semantics: bool = False,
+) -> None:
     """拒绝可确定的证据范围错误，不能把模型的 supported 当成权限或缺失证明。"""
     for field in fields:
         refs = [ref for value in field["values"] for ref in value["citations"]]
         own = {ref["source_id"] for ref in refs if ref["project_id"] == project_id}
         if not own:
             raise ValueError("项目结论及参考建议都须引用本项目相关要求；参考建议还须保留参考来源")
+        if defer_semantics and field.get("business"):
+            # 完整业务记录交由独立审查区分事实、独立缺口和修订，关键词不能整条撤销有效结论。
+            continue
         body = (
             field["field"]
             + field.get("note", "")
@@ -966,7 +971,7 @@ class ResearchMiddleware(AgentMiddleware):
 
     async def advance_research(self) -> dict | None:
         """草稿齐备后只进入合并审查，避免每次暂存触发一次支持性模型请求。"""
-        from tender.application.analysis.review import audit_combined
+        from tender.application.analysis.review import audit_combined, reviewed_topics
         from tender.application.analysis.state import published_items
 
         flow = self.topic_flow
@@ -1007,17 +1012,37 @@ class ResearchMiddleware(AgentMiddleware):
         if invalid:
             flow.data.pop("synthesis_finished", None)
             flow.data["phase"] = "synthesis"
-            self.state["prevalidation_failures"] = self.state.get("prevalidation_failures", 0) + 1
+            invalid_ids = {item["id"] for item in invalid}
+            previous_ids = set(self.state.get("prevalidation_invalid_ids", []))
+            # 修掉部分旧草稿就是有效推进，不能把逐批修正计成连续无进展失败。
+            self.state["prevalidation_failures"] = (
+                1 if invalid_ids < previous_ids else self.state.get("prevalidation_failures", 0) + 1
+            )
+            self.state["prevalidation_invalid_ids"] = sorted(invalid_ids)
+            corrections = [{
+                "id": item["id"], "title": item["business"]["title"],
+                "scope": item["business"]["scope"], "work_ids": item.get("work_ids", []),
+                "block_ids": list(dict.fromkeys(ref["block_id"]
+                    for ref in item["business"].get("citations", []))),
+                "issue": ("范围unknown须依据原文修正为公共或具体标段"
+                          if item["business"]["scope"]["kind"] == "unknown" else
+                          "scope.lot_refs须填写引文中的标段原文编号或名称"),
+            } for item in invalid]
             if self.state["prevalidation_failures"] >= 3:
-                raise TopicIncomplete("旧草稿连续三次未通过标段预校验，请按原文修正范围后补跑")
-            return self.feedback("；".join(
-                item["business"]["key"] + (
-                    "：范围unknown须依据原文明示修正为公共或具体标段，并同步关联工作范围"
-                    if item["business"]["scope"]["kind"] == "unknown" else
-                    "：scope.lot_refs须填写引文中的标段原文编号或名称，并同步修正关联工作范围"
-                ) for item in invalid
-            ))
+                message = (f"仍有{len(invalid)}项草稿范围未修正，连续三轮未减少，"
+                           "请依据原文修正后补跑")
+                self.state["stop_reason"] = {"code": "scope_prevalidation", "stage": "synthesis",
+                                             "message": message, "records": corrections}
+                await self.save(self.state)
+                raise TopicIncomplete(message)
+            # 对外修改协议使用程序id；内部key只能索引仓储，不能当作修改身份交给模型。
+            return self.feedback(
+                "修正已有草稿，修改用id，勿省略id另建重复事项；按work_ids读取完整正文，"
+                "同步关联工作范围，再以submit_analysis提交完整content："
+                + json.dumps(corrections, ensure_ascii=False, separators=(",", ":"))
+            )
         self.state.pop("prevalidation_failures", None)
+        self.state.pop("prevalidation_invalid_ids", None)
         anchors = {ref["block_id"] for item in self.state.get("staged_items", [])
                    for ref in item["business"].get("citations", [])}
         context_key = fingerprint([
@@ -1062,22 +1087,48 @@ class ResearchMiddleware(AgentMiddleware):
                 "独立审查发现具体待办；按问题定向修复后提交，只复核修改及受影响内容"
             )
         flow.sync()
-        if flow.data["audit"].get("remaining") or any(e["status"] != "ready" for e in flow.entries):
-            remaining = flow.data["audit"].get("remaining", [])
+        remaining = flow.data["audit"].get("remaining", [])
+        if not remaining and any(e["status"] != "ready" for e in flow.entries):
+            # 工作账与审查回执不一致属于执行异常，不能把程序状态捏造成业务遗漏。
+            self.state["stop_reason"] = {
+                "code": "review_state_unsettled", "stage": "review",
+                "message": "审查回执与研究状态未收敛，需恢复执行后核对",
+            }
+            await self.save(self.state)
+            raise TopicIncomplete(self.state["stop_reason"]["message"])
+        if remaining:
+            from tender.application.analysis.quality import settle_quality
+
+            remaining = settle_quality(self.state, remaining, audited_topics=reviewed_topics(flow))
             details = [issue["detail"] for issue in remaining] or [
                 entry["detail"] for entry in flow.entries if entry["status"] != "ready"
             ]
+            # 同一事项的问题跨主题只计一次；不同事项同样的错误仍须分别计数。
+            if remaining:
+                details = [issue["detail"].strip() for issue in remaining]
             # 中断说明必须对应实际发布投影，零成果不能显示“已保留结果”。
             published_count = len(published_items(self.state, final=True))
             outcome = (f"已保留{published_count}项核实成果" if published_count
                        else "当前没有可发布成果")
             self.state["stop_reason"] = {
                 "code": "review_issues_remaining", "stage": "review",
-                "message": f"审查后仍有{len(details)}个具体问题：{details[0][:300]}；"
-                + outcome + "，可补跑继续",
+                "message": f"本次执行已结束，审查仍有{len(details)}项待核对："
+                + details[0][:300].rstrip("；。 ") + "；"
+                + outcome + ("，补充资料后可重新核对"
+                             if self.state["quality_status"] == "needs_input"
+                              else "，可补跑继续"),
             }
             await self.save(self.state)
-            raise TopicIncomplete("仍有未解决内容，保留通过合并审查的有效成果及具体缺口")
+            # 独立审查已经正常结束；业务缺口进入质量状态，不再伪装成执行异常。
+            flow.data["phase"] = "completed"
+            self.build_draft({"research_summary": "解析与独立审查已结束，待核对事项单独保留"},
+                             published_items(self.state, final=True))
+            await self.save(self.state)
+            return None
+        from tender.application.analysis.quality import settle_quality
+
+        settle_quality(self.state, [], audited_topics=reviewed_topics(flow))
+        flow.data["phase"] = "completed"
         feedback = self.build_draft({"research_summary": "研究、综合及独立合并审查完成"},
                                     published_items(self.state, final=True))
         await self.save(self.state)
@@ -1159,13 +1210,22 @@ class ResearchMiddleware(AgentMiddleware):
                     entry["business"]["key"] for entry in fields
                     if entry.get("business") and entry.get("verification") == "supported"
                 }
+                audited = set()
+                if self.topic_flow and self.topic_flow.simplified:
+                    from tender.application.analysis.review import reviewed_topics
+
+                    audited = reviewed_topics(self.topic_flow)
+                    # 已审主题的真实问题由审查问题账发布，不能再从空覆盖行生成行政性缺口。
+                    self.state["business_gaps"] = [g for g in self.state.get("business_gaps", [])
+                        if not (g["key"].startswith("coverage:") and g["topic"] in audited)]
                 for entry in coverage:
                     if entry["status"] == "extracted" and not set(entry["record_keys"]) <= accepted:
                         entry.update(status="pending", detail="主题关联的条目尚未全部通过校验")
-                    if entry["status"] in {"pending", "searched_not_found"} and not any(
+                    if (entry["topic"] not in audited
+                            and entry["status"] in {"pending", "searched_not_found"} and not any(
                         g["key"] == "research:" + entry["topic"]
                         for g in self.state.get("business_gaps", [])
-                    ):
+                    )):
                         gap = {
                             "key": "coverage:" + fingerprint([entry["topic"], entry["scope"]]),
                             "topic": entry["topic"], "scope": entry["scope"],
@@ -2592,6 +2652,7 @@ def build_module_agent(
         ]
         previous = {entry["id"]: entry for entry in state.get("staged_items", [])}
         submitted = {entry["id"] for entry in items}
+        defer_semantics = bool(flow and flow.simplified)
         staged, errors = [], []
         exhausted = False
         for entry in (previous | {entry["id"]: entry for entry in items}).values():
@@ -2604,7 +2665,7 @@ def build_module_agent(
                 if old.get("verification") == "supported":
                     staged.append(old)
                 continue
-            if is_absence_claim(entry):
+            if not defer_semantics and is_absence_claim(entry):
                 # “未规定”等占位不是业务数据，检索范围说明无需再送模型反复判错。
                 middleware.record_gap(entry, "本次未核对到明确依据", "unknown_condition")
                 # 无依据的改写不应删除同一事项已经通过校验的版本。
@@ -2612,7 +2673,8 @@ def build_module_agent(
                     staged.append(old)
                 continue
             try:
-                validate_project_claims([entry], research.project_id)
+                validate_project_claims([entry], research.project_id,
+                                        defer_semantics=defer_semantics)
             except ValueError as exc:
                 failures = correction_count(state, entry)
                 exhausted |= failures >= research.limits.max_validation_failures
@@ -2645,6 +2707,13 @@ def build_module_agent(
                 entry["review_evidence_ids"] = old.get("review_evidence_ids", [])
             staged.append(entry)
         transitions.replace_items(staged)
+        if flow:
+            available = {entry["business"]["key"] for entry in staged if entry.get("business")}
+            # 失败提交保留待办说明，但工作归属不能留下已丢弃草稿的悬空索引。
+            for entry in flow.entries:
+                entry["record_keys"] = [key for key in entry["record_keys"] if key in available]
+                for task in entry["tasks"].values():
+                    task["record_keys"] = [key for key in task["record_keys"] if key in available]
         if errors:
             message = "已核实条目保留，请修正：" + "；".join(errors)
             if exhausted:

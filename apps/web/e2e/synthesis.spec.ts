@@ -116,6 +116,40 @@ test.beforeEach(async ({ page }) => {
 });
 test.afterEach(() => expect(errors).toEqual([]));
 
+test("执行完成与资料质量分别展示，缺件在材料未变化时不重复补跑", async ({ page }) => {
+  const selected = { ...modules[0]!, quality_status: "needs_input" as const, quality_issues: [{
+    issue_id: "missing-announcement", kind: "reference", action: "provide_input" as const,
+    topic: "opening", detail: "第一章招标公告未提供，具体日期待核对", target: "第一章招标公告",
+  }] };
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+    status: "completed", quality_status: "needs_input", modules: [{ ...selected, items: [] }],
+  }) }));
+  await page.route("**/api/v1/analysis/reports/1/modules/*/records", (route) => route.fulfill({
+    json: { ...records(selected), quality_status: selected.quality_status,
+      quality_issues: selected.quality_issues },
+  }));
+  await page.reload();
+  await expect(page.locator(".results-report-bar")).toContainText("已完成");
+  await expect(page.locator(".results-report-bar")).toContainText("资料待核对");
+  await expect(page.getByRole("button", { name: "补跑未完成模块", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "重新解析本模块", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: /待核对/ }).click();
+  await expect(page.getByText("第一章招标公告未提供，具体日期待核对", { exact: true })).toBeVisible();
+});
+
+test("无可靠摘录时仍直接打开真实原文块，不展示空摘录或切片选择器", async ({ page }) => {
+  const data = records(modules[0]!);
+  data.evidence.source = { ...citation, quote: "", excerpts: [], excerpt_status: "block_only" };
+  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) =>
+    route.fulfill({ json: data }));
+  await page.reload();
+  await page.locator('[data-report-item="background"]').getByRole("button", { name: /^定位/ }).click();
+  const viewer = page.getByRole("region", { name: "引用原文", exact: true });
+  await expect(viewer.locator("canvas").first()).toBeVisible();
+  await expect(viewer.locator(".citation-excerpt")).toHaveCount(0);
+  await expect(viewer.locator("[data-active-evidence]")).toHaveCount(1);
+});
+
 test("逐条依据校验失败只阻断当前专题，仍能切换到其它有效专题", async ({ page }) => {
   const invalid = records(modules[0]!);
   invalid.records[0]!.content_evidence = { 背景: [] };
@@ -256,6 +290,9 @@ test("技术专题展示综合摘要、独立任务和逐条要求，并能打�
   await expect(body.getByRole("heading", { name: "技术方案要求", exact: true })).toBeVisible();
   await expect(body.getByText("制定分阶段迁移方案并说明回退与服务保障。", { exact: true })).toBeVisible();
   await expect(body.getByText("必须提供可执行的回退方案。", { exact: true })).toBeVisible();
+  await expect(body.getByRole("table")).toHaveCount(2);
+  await expect(body.getByRole("table", { name: "技术方案要求", exact: true }).getByRole("columnheader"))
+    .toHaveText(["章节来源", "要求摘要", "关键要求"]);
   await expect(body).not.toContainText("内部业务投影");
   await expect(body).not.toContainText("原始段落：");
   await page.screenshot({ path: info.outputPath("synthesis-review-collapsed.png"), fullPage: true });
@@ -280,10 +317,10 @@ test("技术专题展示综合摘要、独立任务和逐条要求，并能打�
 test("评分专题使用 Skill 的列名并保留各评分档次", async ({ page }, info) => {
   await selectModule(page, 2);
   const table = page.getByRole("region", { name: "评分办法", exact: true })
-    .locator(".module-result-list");
+    .getByRole("table", { name: "商务评分标准", exact: true });
   await expect(table.getByRole("heading", { name: "业绩评分" })).toBeVisible();
-  await expect(table.locator(".result-score")).toHaveText("满分 6分");
-  await expect(table.locator("dt")).toHaveText(["评分项", "评分标准（原文摘录）"]);
+  await expect(table.locator('td[data-label="满分分值"]')).toHaveText("6分");
+  await expect(table.getByRole("columnheader")).toHaveText(["评分项", "满分分值", "评分标准（原文摘录）"]);
   await expect(table.getByRole("listitem")).toHaveCount(2);
   await expect(table).toContainText("最高6分；须提供合同及验收证明。");
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
@@ -456,7 +493,7 @@ test("KV 每行仅显示定位图标，拆行后仍定位本行原文", async ({
   await expect(viewer.locator("[data-active-evidence]")).toHaveAttribute("data-active-anchor", "p1b2");
 });
 
-test("多处同页依据保留完整摘录，去重后仍能准确定位第二处", async ({ page }) => {
+test("多处同页依据分别直接定位，去重后仍能准确定位第二处", async ({ page }) => {
   const data = records(modules[0]!);
   const second = { ...citation, element_id: 2, anchor: "p1b2", quote: "第二处完整依据：例外条件仍须保留。" };
   data.evidence = { source: citation, duplicate: citation, second };
@@ -464,13 +501,12 @@ test("多处同页依据保留完整摘录，去重后仍能准确定位第二�
   await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({ json: second }));
   await page.reload();
-  await page.locator('[data-report-item="migration"]').getByRole("button", { name: "查看 2 处依据" }).click();
-  const picker = page.getByRole("region", { name: "选择原文依据" });
-  await expect(picker.getByRole("button")).toHaveCount(2);
-  await expect(picker).toContainText(citation.quote);
-  await expect(picker).toContainText(second.quote);
+  const locators = page.locator('[data-report-item="migration"]').getByRole("button", { name: /^定位：/ });
+  await expect(locators).toHaveCount(2);
+  await expect(locators.first()).toHaveAttribute("title", new RegExp(citation.quote));
+  await expect(locators.last()).toHaveAttribute("title", new RegExp(second.quote));
   const resolved = page.waitForRequest("**/knowledge/citations/resolve");
-  await picker.getByRole("button").filter({ hasText: second.quote }).click();
+  await locators.last().click();
   expect((await resolved).postDataJSON()).toMatchObject({ element_id: 2, anchor: "p1b2" });
   await expect(page.getByRole("region", { name: "引用原文", exact: true })).toContainText(second.quote);
 });
@@ -674,13 +710,13 @@ test("模块标签和三种重解析操作直接可用，提交范围互不混�
   await page.keyboard.press("ArrowRight");
   await expect(tabs.locator('[data-module-id="2"]')).toHaveAttribute("aria-selected", "true");
   await page.getByRole("button", { name: "重新解析本模块", exact: true }).click();
-  await expect.poll(() => requests).toEqual([{ module_keys: ["scoring_standard_parsing"] }]);
+  await expect.poll(() => requests).toEqual([{ module_keys: ["scoring_standard_parsing"], mode: "restart" }]);
   await page.getByRole("button", { name: "补跑未完成模块", exact: true }).click();
   await expect.poll(() => requests).toHaveLength(2);
-  expect(requests[1]).toEqual({});
+  expect(requests[1]).toEqual({ mode: "resume" });
   await page.getByRole("button", { name: "全部重新解析", exact: true }).click();
   await expect.poll(() => requests).toHaveLength(3);
-  expect(requests[2]).toEqual({ module_keys: modules.map((module) => module.module_key) });
+  expect(requests[2]).toEqual({ module_keys: modules.map((module) => module.module_key), mode: "restart" });
   await selectModule(page, 0);
   await expect(actions.getByRole("button", { name: "重新解析本模块", exact: true })).toBeDisabled();
 });
@@ -1103,6 +1139,8 @@ test("审查展示分包和修复进度，部分完成显示具体停止原因",
   }) }));
   await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => {
     const data = records(modules[0]!);
+    // 独立记录接口是专题状态的实际来源，必须与本次终态报告保持一致。
+    data.status = "partial";
     data.progress = { phase: "review", audit_round: 1, review: {
       stage: "repair", completed_packets: 2, total_packets: 3,
       repairs_used: 1, repairs_limit: 2, unresolved_issues: 1,
@@ -1113,6 +1151,8 @@ test("审查展示分包和修复进度，部分完成显示具体停止原因",
   const progress = page.getByRole("status", { name: "解析进展" });
   await expect(progress).toContainText("定向复核 · 已完成 2/3 包");
   await expect(progress).toContainText("已用修复 1/2 次 · 剩余问题 1 项");
+  await expect(progress).not.toContainText("正在独立审查");
+  await expect(page.getByText("本次执行已结束，已展示 2 条结果；仍有待核对事项，处理后可补跑。", { exact: true })).toBeVisible();
   await page.locator(".module-operations > summary").click();
   const history = page.getByRole("list", { name: "历次分析记录", exact: true });
   await expect(history).toContainText("模型请求成功 4 次 · 工具执行成功 5 次");

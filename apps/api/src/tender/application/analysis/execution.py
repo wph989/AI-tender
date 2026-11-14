@@ -26,7 +26,7 @@ from tender.application.analysis.runtime import AgentRuntime, check_report_acces
 from tender.application.analysis.search_control import TopicSearch
 from tender.application.analysis.skills import MODULES
 from tender.application.analysis.topic_flow import TopicIncomplete, enabled
-from tender.application.knowledge.content import encode, normalized, source_state
+from tender.application.knowledge.content import encode, normalized, source_signature, source_state
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
 from tender.core.error_details import error_detail
@@ -312,12 +312,24 @@ class AnalysisExecutor:
                 return await asyncio.to_thread(db.read_chunk_window, source, offset, limit)
 
             state = runtime.run["state"]
+            state.setdefault("execution_mode", "restart" if runtime.run.get("attempt", 1) == 1
+                             else "resume")
+            # 与补跑和页面使用同一完整输入快照，部分资料尚不可读时也不丢失其身份。
+            state["quality_input_signature"] = source_signature(
+                report["source_snapshot"] + report["reference_snapshot"],
+            )
             from tender.application.analysis.protocol import PROTOCOL_VERSION
 
             if report["skill_snapshot"].get("__analysis_flow_version__") != PROTOCOL_VERSION:
                 raise ValueError("解析协议已升级，旧检查点不能恢复；请重新创建报告")
             limits = AgentLimits(**runtime.run["limits"])
             prior = state.get("research", {})
+            # 历史attempt已交付的小块身份不能被新分块重新解释；从零重解析始终使用新大块。
+            legacy_sources = {row["source_id"] for key, row in prior.get("seen", {}).items()
+                              if key == (f"s{row['source_id']}r{row['parse_run_id']}"
+                                         f"c{row['offset']}" )}
+            sources = [{**source, "chunk_format_version": "1"}
+                       if source["source_id"] in legacy_sources else source for source in sources]
             research = ResearchSession(
                 sources,
                 report["project_id"],
@@ -474,6 +486,8 @@ class AnalysisExecutor:
                 logger.info(
                     "module.result",
                     status="completed",
+                    execution_mode=state["execution_mode"],
+                    quality_status=state.get("quality_status", "unknown"),
                     attempt=module.get("attempt"),
                     queue_ms=queue_ms,
                     duration_ms=int((time.monotonic() - started) * 1000),
@@ -554,6 +568,7 @@ class AnalysisExecutor:
     ) -> None:
         """模型或校验不可用时收尾：有已核实成果才是 partial，否则明确失败。"""
         reason = str(exc)
+        state["quality_status"] = "needs_review"
         if task and not task.done():
             task.cancel()
             with suppress(asyncio.CancelledError, Exception):

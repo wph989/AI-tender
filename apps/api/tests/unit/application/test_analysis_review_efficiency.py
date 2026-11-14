@@ -46,7 +46,7 @@ def test_packet_checks_distinguish_local_records_from_other_packet_navigation():
         flow.data["entries"].pop(identity("b", other["scope"]))
         other.update(topic="a", scope=second["business"]["scope"])
         flow.data["entries"][identity("a", other["scope"])] = other
-        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=8000)
+        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=10500)
         packets, _ = batches(flow, "a", [])
         assert len(packets) == 2
         for packet in packets:
@@ -107,7 +107,7 @@ def test_prefetched_shared_call_updates_progress_before_next_group_is_sent():
         lot.update(scope=second["business"]["scope"], record_keys=["second"])
         flow.data["entries"] = {identity(topic, entry["scope"]): entry | {"topic": topic}
                                 for topic in ("a", "b") for entry in (common, lot)}
-        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=9000)
+        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=10500)
         topics, signatures, repair = review_scope(flow)
         assert review_call_count(flow, topics, signatures, repair) == 2
         plans, _ = plan_batches(flow, topics, signatures, repair)
@@ -294,6 +294,11 @@ def test_legacy_implicit_merge_keeps_saved_request_identity_before_projection():
         next(e for e in flow.entries if e["topic"] == "b")["evidence_ids"] = ["s1r1c0"]
         topics, signatures, repair = review_scope(flow)
         plans, _ = plan_batches(flow, topics, signatures, repair)
+        # 真实旧检查点未包含逐事项候选表；冻结旧形状后验证不会改写请求身份。
+        for packets, _ in plans.values():
+            for packet in packets:
+                packet.pop("record_evidence_ids", None)
+                packet.pop("check_items", None)
         flow.data["audit"]["packet_plan"] = {"signatures": signatures,
             "topics": {topic: packets for topic, (packets, _) in plans.items()}}
         assert review_call_count(flow, topics, signatures, repair) == 1
