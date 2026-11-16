@@ -415,7 +415,7 @@ class _RetryStore:
         return {
             "id": report_id, "project_id": 1, "status": "partial",
             "runtime_version": RUNTIME_VERSION,
-            "skill_snapshot": {"__analysis_flow_version__": "research-v3"},
+            "skill_snapshot": {"__analysis_flow_version__": "skill-agent-v1"},
             "coverage": {"mode": "agent_research"},
         }
 
@@ -427,46 +427,20 @@ class _RetryStore:
 
 
 def test_partial_report_retry_selects_partial_modules():
-    verified = {
-        "id": "rec1", "field": "质保期限", "group": "",
-        "values": [{
-            "value": "质保三年",
-            "citations": [{
-                "block_id": "s1r1c0", "quote": "质保三年",
-                "source_id": 1, "project_id": 1,
-            }],
-        }],
-        "verification": "supported",
-    }
-    previous = {
-        "staged_items": [verified],
-        "staged_items_verified": True,
-        "verification_degraded": {"reason": "旧降级", "pending_count": 1},
-        "argument_failures": 4,
-        "argument_failure_rounds": {"round": "r1", "tools": ["read_document"]},
-        "evidence_budget_failures": 2,
-        "failure_policy_version": 2,
-        "model_unavailable_retries": 2,
-    }
+    from test_analysis_agent_workspace import approve, saved, workspace
+
+    book = workspace()
+    approve(book, saved(book))
+    previous = copy.deepcopy(book.state)
     tx = _RetryTx([{"id": 9, "status": "partial"}], previous)
-    service = AnalysisService(
-        _RetryStore(tx), 1, Mock(), Mock(), Mock(),
-    )
+    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
     result = service.retry_report(
         3, module_keys=[], max_output_tokens=None, timeout_seconds=None
     )
     assert result["status"] == "pending"
     assert tx.retry_call == (3, list(MODULES), False)
-    assert tx.reset == [] and tx.pending == [9]
+    assert tx.reset is None and tx.pending == [9]
     carried = tx.inserted[0]["state"]
-    assert carried["staged_items"] == [verified]
-    assert carried["staged_items_verified"] is True
-    for key in (
-        "verification_degraded",
-        "argument_failures",
-        "argument_failure_rounds",
-        "evidence_budget_failures",
-        "failure_policy_version",
-        "model_unavailable_retries",
-    ):
-        assert key not in carried
+    assert carried["staged_items"] == previous["staged_items"]
+    assert carried["agent_workspace"]["reviews"] == previous["agent_workspace"]["reviews"]
+    assert not carried["agent_workspace"]["finalized"]

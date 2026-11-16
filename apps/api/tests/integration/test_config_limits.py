@@ -98,26 +98,21 @@ def test_retrieval_config_metadata_bounds_and_migration_seed(runtime):
             release(request, patch)
 
 
-def test_finish_correction_config_is_editable_seeded_and_frozen_for_new_reports(runtime):
+def test_old_finish_correction_config_is_readonly_and_snapshot_remains_readable(runtime):
     request, connection, pid = runtime
     entry = next(item for item in config.list_items(request)["items"]
                  if item["key"] == "analysis.max_finish_corrections")
-    assert entry["value"] == entry["default"] == 2 and entry["minimum"] == 1
-    assert entry["writable"] and "maximum" not in entry
-    assert connection.execute(text("""SELECT default_value FROM config_item
-        WHERE key='analysis.max_finish_corrections'""")).scalar_one() == 2
-    with pytest.raises(ApiProblem):
-        release(request, {"analysis.max_finish_corrections": 0})
-    release(request, {"analysis.max_finish_corrections": 5})
+    assert entry["value"] == entry["default"] == 2
+    assert not entry["writable"]
+    for value in (0, 5):
+        with pytest.raises(ApiProblem):
+            release(request, {"analysis.max_finish_corrections": value})
     add_source(connection, pid, "质保三年")
     analysis_api.save_settings(pid, analysis_api.AnalysisSettings(category="goods"), request)
     report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     frozen = connection.execute(text("SELECT runtime_settings FROM analysis_report WHERE id=:id"),
                                 {"id": report["id"]}).scalar_one()
-    assert frozen["max_finish_corrections"] == 5
-    release(request, {"analysis.max_finish_corrections": 8})
-    assert connection.execute(text("SELECT runtime_settings FROM analysis_report WHERE id=:id"),
-                              {"id": report["id"]}).scalar_one()["max_finish_corrections"] == 5
+    assert frozen["max_finish_corrections"] == 2
 
 
 def test_saved_retrieval_config_freezes_report_and_filters_real_document_chunks(runtime):
@@ -154,7 +149,8 @@ def test_saved_retrieval_config_freezes_report_and_filters_real_document_chunks(
                                    compact_results=True)
         result = await research.search("alpha beta gamma", "project")
         assert len(result["blocks"]) == len(research.seen) == 3
-        assert all(set(row) == {"id", "text"} and row["text"] == "alpha beta gamma"
+        assert all(set(row) == {"id", "text", "source_id", "chapter"}
+                   and row["text"] == "alpha beta gamma"
                    for row in result["blocks"])
         # 高阈值不允许拿一次关键词命中冒充相似资料，也不能以空结果推断全文没有要求。
         assert (await research.search("alpha delta epsilon", "project"))["blocks"] == []

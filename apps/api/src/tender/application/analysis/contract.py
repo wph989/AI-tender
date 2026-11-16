@@ -6,4 +6,7 @@
 
 from __future__ import annotations
 
-RUNTIME_VERSION = "deepagents-0.7.22-v5-records"
+RUNTIME_VERSION = "deepagents-0.7.22-v6-records"
+FLOW_VERSION = "skill-agent-v1"
+# 执行协议升级不改变正式数据格式；历史成果仍可读取和定位。
+READABLE_RUNTIMES = {RUNTIME_VERSION, "deepagents-0.7.22-v5-records"}

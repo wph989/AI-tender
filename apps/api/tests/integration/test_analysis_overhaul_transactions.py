@@ -43,7 +43,7 @@ def terminal_module(env, status):
 
 
 @pytest.mark.parametrize("status", ["completed", "failed", "partial", "canceled"])
-def test_restart_clears_projection_and_keeps_history_in_real_postgres(env, status):
+def test_restart_keeps_formal_projection_and_history_until_final_in_real_postgres(env, status):
     runtime, old = terminal_module(env, status)
     service = create_analysis_service(env.engine, 1, ConfigRegistry(env.engine))
     service.retry_report(runtime.report["id"], module_keys=[KEY], mode="restart",
@@ -56,8 +56,9 @@ def test_restart_clears_projection_and_keeps_history_in_real_postgres(env, statu
     assert runs[-1]["state"] == {"execution_mode": "restart"}
     module = env.db.rows("SELECT * FROM analysis_module WHERE id=:id",
                          {"id": runtime.run["module_id"]})[0]
-    assert module["items"] == [] and module["business_data"] == {}
-    assert env.db.report(runtime.report["id"])["summary"] == []
+    assert module["items"][0]["field"] == "旧成果"
+    assert module["business_data"] == {"quality_status": "needs_review"}
+    assert env.db.report(runtime.report["id"])["summary"] == module["items"]
 
 
 def test_restart_rolls_back_cleanup_when_new_run_insert_fails(env, monkeypatch):
@@ -80,14 +81,14 @@ def test_restart_rolls_back_cleanup_when_new_run_insert_fails(env, monkeypatch):
 
 
 def test_new_attachment_reopens_confirmed_missing_input_and_preserves_current_evidence(env):
-    from test_analysis_research_first import state_with_notes
+    from test_analysis_research_first import agent_state_with_notes
 
     runtime = prepared_runtime(env, topic_flow=True)
     assert runtime.claim()
-    state = state_with_notes()
+    state = agent_state_with_notes()
     row = env.db.read_chunk_window(runtime.sources[0], 0, 1).rows[0]
     state["research"] = {"seen": {row["block_id"]: row}, "events": [], "tool_calls": 2}
-    state["topic_flow"]["audit"].update(version="combined-v3", done=True)
+    state["agent_workspace"]["finalized"] = True
     try:
         runtime.save(state)
         runtime.finish("completed", state=state)
@@ -107,13 +108,13 @@ def test_new_attachment_reopens_confirmed_missing_input_and_preserves_current_ev
                          "ORDER BY attempt DESC LIMIT 1",
                          {"id": runtime.run["module_id"]})[0]["state"]
     assert row["block_id"] in latest["research"]["seen"]
-    assert latest["topic_flow"]["phase"] == "research"
-    assert not latest["topic_flow"]["audit"].get("done")
+    assert not latest["agent_workspace"]["finalized"]
+    assert not latest["agent_workspace"]["reviews"]
     assert len(env.db.report(runtime.report["id"])["source_snapshot"]) == 2
 
 
 def test_local_restart_keeps_other_modules_new_input_signal_in_real_postgres(env):
-    from test_analysis_research_first import state_with_notes
+    from test_analysis_research_first import agent_state_with_notes
 
     runtime = prepared_runtime(env, topic_flow=True)
     report_id = runtime.report["id"]
@@ -122,9 +123,9 @@ def test_local_restart_keeps_other_modules_new_input_signal_in_real_postgres(env
     other = next(row for row in modules if row["id"] != first["id"])
     old_signature = source_signature(runtime.report["source_snapshot"]
                                      + runtime.report["reference_snapshot"])
-    state = state_with_notes()
+    state = agent_state_with_notes()
     state["quality_input_signature"] = old_signature
-    state["topic_flow"]["audit"].update(version="combined-v3", done=True)
+    state["agent_workspace"]["finalized"] = True
     # 不调用供应商，模拟两专题已确认缺件；其他专题已完成，避免混入无关补跑。
     env.db.execute("UPDATE agent_module_run SET status='completed' WHERE module_id IN "
                    "(SELECT id FROM analysis_module WHERE report_id=:id)",
@@ -169,5 +170,4 @@ def test_local_restart_keeps_other_modules_new_input_signal_in_real_postgres(env
     latest = env.db.rows("SELECT * FROM agent_module_run WHERE module_id=:id "
                          "ORDER BY attempt DESC LIMIT 1", {"id": other["id"]})[0]
     assert latest["attempt"] == 2 and latest["state"]["execution_mode"] == "resume"
-    assert latest["state"]["topic_flow"]["phase"] == "research"
-    assert not latest["state"]["topic_flow"]["audit"].get("done")
+    assert not latest["state"]["agent_workspace"]["finalized"]

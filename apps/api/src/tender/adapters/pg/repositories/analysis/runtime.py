@@ -43,10 +43,12 @@ _REPORT_LOCK_KEY = "analysis_report:{}"
 
 # 下面这几条必须与 pg_locks 联合判断「是否还有执行者持有配额锁」，故保留裸 SQL。
 # 判断「无执行者」是跨进程语义，拆分成分步查询会留下先判断后被占用的竞态窗口。
+# pg_locks可见整个实例；配额及所有权只认当前数据库，否则另一库的同号运行会误占或冒用锁。
 _OCCUPIED_SQL = """
 SELECT count(*) FROM pg_locks l
 JOIN agent_module_run a ON a.id=l.objid::bigint
 WHERE l.locktype='advisory' AND l.classid=:ns AND l.objsubid=2
+  AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
   AND l.granted AND a.company_id=:company
 """
 
@@ -56,6 +58,7 @@ FROM analysis_module m
 WHERE a.module_id=m.id AND m.report_id=:report AND a.status='running'
   AND a.lease_until IS NOT NULL AND a.lease_until<now()
   AND NOT EXISTS (SELECT 1 FROM pg_locks l WHERE l.locktype='advisory'
+    AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
     AND l.classid=:ns AND l.objid=a.id AND l.objsubid=2 AND l.granted)
 RETURNING a.module_id
 """
@@ -65,6 +68,7 @@ UPDATE agent_module_run a SET status='pending',owner=NULL,lease_until=NULL
 FROM analysis_module m
 WHERE a.module_id=m.id AND m.report_id=:report AND a.status='running'
   AND NOT EXISTS (SELECT 1 FROM pg_locks l WHERE l.locktype='advisory'
+    AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
     AND l.classid=:ns AND l.objid=a.id AND l.objsubid=2 AND l.granted)
 RETURNING a.module_id
 """
@@ -74,6 +78,7 @@ SELECT a.id FROM agent_module_run a
 JOIN analysis_module m ON m.id=a.module_id WHERE m.report_id=:report
   AND a.status IN ('pending','running') AND NOT EXISTS (
     SELECT 1 FROM pg_locks l WHERE l.locktype='advisory' AND l.classid=:ns
+      AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
       AND l.objid=a.id AND l.objsubid=2 AND l.granted)
 ORDER BY a.started_at IS NULL,a.id LIMIT 1
 """
@@ -84,6 +89,7 @@ error_message='用户取消任务',finished_at=now(),lease_until=NULL,owner=NULL
 FROM analysis_module m WHERE a.module_id=m.id AND m.report_id=:id
 AND a.status IN ('pending','running') AND NOT EXISTS (
     SELECT 1 FROM pg_locks l WHERE l.locktype='advisory' AND l.classid=:ns
+    AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
     AND l.objid=a.id AND l.objsubid=2 AND l.granted
 )
 """
@@ -271,44 +277,7 @@ class AgentRunStore:
                 self.run = dict(row)
                 if resuming:
                     # 已独占旧运行后才释放悬挂预占；已保存有效返回的请求可直接补结算。
-                    windows = conn.execute(select(AgentModelInvocation.progress).where(
-                        AgentModelInvocation.run_id == self.run["id"],
-                    )).scalars().all()
-                    for window in windows:
-                        record = window.get("success_record")
-                        if record:
-                            self._settle(conn, "model",
-                                         f"{record['invocation_id']}:{record['request_ordinal']}",
-                                         "ok", record)
-                    conn.execute(update(AgentCallAttempt).where(
-                        AgentCallAttempt.run_id == self.run["id"],
-                        AgentCallAttempt.status == "running",
-                    ).values(status="unknown", detail={"reason": "旧执行者失联，结果未知"}))
-                    # 已取得旧模块的独占锁，原执行者不再存活；未回传的请求必须显式标为未知。
-                    purpose = (
-                        f"analysis:{self.report['id']}:{self.run['module_key']}"
-                        f":{self.run['attempt']}"
-                    )
-                    unknown = (
-                        conn.execute(
-                            update(LlmCallLog)
-                            .where(
-                                LlmCallLog.status == "running",
-                                LlmCallLog.purpose == purpose,
-                            )
-                            .values(
-                                status="unknown",
-                                error_message="worker中断，供应商结果未知；释放成功额度预占",
-                            )
-                            .returning(LlmCallLog.id)
-                        )
-                        .scalars()
-                        .all()
-                    )
-                    if unknown:
-                        self.store.append_run_event(
-                            self.run["id"], "requests_unknown", {"call_ids": list(unknown)}
-                        )
+                    self._recover_calls(conn)
                 conn.execute(
                     update(AnalysisModule)
                     .where(AnalysisModule.id == self.run["module_id"])
@@ -331,6 +300,50 @@ class AgentRunStore:
                     conn.commit()
                 conn.close()
 
+    def _recover_calls(self, conn: Connection) -> None:
+        """恢复与到期收尾共用同一结算事务，不能留下未回传请求占用成功额度。"""
+        windows = conn.execute(select(AgentModelInvocation.progress).where(
+            AgentModelInvocation.run_id == self.run["id"],
+        )).scalars().all()
+        for window in windows:
+            record = window.get("success_record")
+            if record:
+                self._settle(conn, "model",
+                             f"{record['invocation_id']}:{record['request_ordinal']}",
+                             "ok", record)
+        conn.execute(update(AgentCallAttempt).where(
+            AgentCallAttempt.run_id == self.run["id"],
+            AgentCallAttempt.status == "running",
+        ).values(status="unknown", detail={"reason": "旧执行者失联，结果未知"}))
+        # 调用方已独占旧模块或原子终止无执行者的排队行；未回传的请求必须显式标为未知。
+        module_key = self.run.get("module_key") or conn.execute(
+            select(AnalysisModule.module_key).where(AnalysisModule.id == self.run["module_id"]),
+        ).scalar_one()
+        purpose = (
+            f"analysis:{self.report['id']}:{module_key}"
+            f":{self.run['attempt']}"
+        )
+        unknown = (
+            conn.execute(
+                update(LlmCallLog)
+                .where(
+                    LlmCallLog.status == "running",
+                    LlmCallLog.purpose == purpose,
+                )
+                .values(
+                    status="unknown",
+                    error_message="worker中断，供应商结果未知；释放成功额度预占",
+                )
+                .returning(LlmCallLog.id)
+            )
+            .scalars()
+            .all()
+        )
+        if unknown:
+            conn.execute(insert(AgentRunEvent).values(
+                run_id=self.run["id"], kind="requests_unknown", detail={"call_ids": list(unknown)},
+            ))
+
     def guard(self) -> None:
         if self._guard_execution() <= datetime.now(UTC):
             raise TimeoutError("模块总时长预算已耗尽，恢复不会重置时限")
@@ -346,6 +359,7 @@ class AgentRunStore:
                 WHERE a.id=:id AND a.owner=CAST(:owner AS UUID) AND a.status='running'
                   AND a.lease_until>now() AND EXISTS (SELECT 1 FROM pg_locks l
                     WHERE l.locktype='advisory' AND l.classid=:ns AND l.objid=a.id
+                      AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
                       AND l.objsubid=2 AND l.granted)"""),
                 {"id": self.run["id"], "owner": self.owner, "ns": QUOTA_NAMESPACE},
             ).scalar_one_or_none()
@@ -400,6 +414,7 @@ class AgentRunStore:
             raise InterruptedError("模块所有权已改变，不能结算旧调用")
         locked = conn.execute(text("""SELECT 1 FROM pg_locks l
             WHERE l.locktype='advisory' AND l.classid=:ns AND l.objid=:id
+              AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
               AND l.objsubid=2 AND l.granted"""),
             {"ns": QUOTA_NAMESPACE, "id": self.run["id"]}).first()
         if locked is None:
@@ -612,6 +627,7 @@ class AgentRunStore:
                 valid = conn.execute(text("""SELECT 1 FROM agent_module_run a
                     WHERE a.id=:id AND a.lease_until>now() AND EXISTS
                     (SELECT 1 FROM pg_locks l WHERE l.locktype='advisory'
+                     AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
                      AND l.classid=:ns AND l.objid=a.id AND l.objsubid=2 AND l.granted)"""),
                     {"id": self.run["id"], "ns": QUOTA_NAMESPACE}).first()
                 if valid is None:
@@ -669,6 +685,10 @@ class AgentRunStore:
             self.finish(status, error)
             return
         with self.engine.begin() as conn:
+            # 到期可在claim前退出，但结算必须先排除仍在执行的旧进程；该锁天然隔离数据库。
+            if not conn.execute(text("SELECT pg_try_advisory_xact_lock(:ns,:id)"),
+                                {"ns": QUOTA_NAMESPACE, "id": self.run["id"]}).scalar_one():
+                return
             changed = conn.execute(
                 update(AgentModuleRun)
                 .where(
@@ -679,6 +699,7 @@ class AgentRunStore:
                 .returning(AgentModuleRun.module_id, AgentModuleRun.finished_at)
             ).mappings().one_or_none()
             if changed:
+                self._recover_calls(conn)
                 conn.execute(
                     update(AnalysisModule)
                     .where(AnalysisModule.id == changed["module_id"])
@@ -686,6 +707,7 @@ class AgentRunStore:
                 )
         if changed:
             self.run.update(status=status, error_message=error, finished_at=changed["finished_at"])
+            self._refresh_counts()
 
     def _publish(self, conn: Connection, publish: dict[str, Any]) -> None:
         """发布通过校验的成果与关系；单独成方法以便在 savepoint 内失败即回滚。"""

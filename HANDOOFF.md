@@ -1,5 +1,119 @@
 # 前端界面重构交接
 
+> **2026-11-16 审查问题修复**：修复两项代码审查问题。`drafts.py` 的缺件凭据改为严格嵌套输入模型，校验文件名、原文ID数组和资料ID数组；错误通过既有工具反馈返回同一Agent，更新问题时也校验沿用的凭据。最终范围比较按冻结标段目录统一编号、名称和别名，拒绝歧义简称，未进入目录的标段继续按原文比较。新增11项回归覆盖错误后纠正提交、父子节点与关系端点别名互认、不同标段及歧义拒绝。定向31项通过，统一 `scripts/check-backend.ps1` **1776通过／13跳过**（199.49秒），Ruff、5项分层及协议／真实装配mypy通过。未提交、未重载服务、未调用真实模型；下方真实语义验收未通过状态仍有效，live-v6冻结资源未覆盖此次修复。
+
+> **2026-11-16 20:05 最终续接状态：核心实现完成，真实语义验收未通过，未上线**。v6开标50/run1465 completed（9模型/19工具/302.5秒，输入201166/输出18645）；商务50/run1461 completed（21模型/42工具/641.6秒，输入958515/输出40174）。两项source/config终态均未变化，最终正文等于所选草稿。完整人工semantic.json、audit-view.txt及历史在C恢复根live-v6/results。开标异议与线上抽K已正确，但程序仍混合“检查密封/电子解密”且自查放行。商务付款/文件交付改善，仍漏责任条款，未读c10/c69/c265核清期限，草稿错误引用c185代替c190；final关联问题被拒后清空问题record_ids，未决冲突仍留正文。独立缺件留存正常。不能计通过，未启动round2/3或13专题。
+>
+> **验证终态**：backend-v6-final.log 1765通过/13跳过，Ruff/5分层/mypy通过；PG恢复后pg-v6-retry.log **64通过**（196秒），覆盖恢复/真实装配/正式数据。首次pg-v6-focused.log在PG停机时8连接超时、1取消计时失败，已由恢复后同组全绿覆盖。此前PG全量249、前端67与typecheck、定位6项仍有效。本轮新增补读/上下文变更均在最新统一检查及专项中。源码冻结live-v6共338文件，worktree-v6备份133未提交文件，最后文档另同步。
+>
+> **无在途真实模型验收**，勿重复运行已有版本轮次；继续前先读semantic失败依据。C盘原生PG55456已恢复，三个隔离库保持；未重载业务服务、不启动WSL、不提交。下一步须解决同Agent自查未落实到正文与遗漏问题，然后新冻结版本首轮通过才冷启动复测，再13专题。避免继续堆同义提示或给代码增加语义否决/独立审查来掩盖失败；四附件仍缺。
+
+
+> **2026-11-16 晚间：v6真实首轮在途**。原生PG55456在凌晨系统终止后已退出，首次v6启动连接超时、没有created.json也没有模型调用；使用原C盘pgdata恢复成功，未改业务服务。v6重试日志`live-v6/opening-1-retry.log`／`biz-1-retry.log`；开标报告50/run1465 exec62785，商务报告50/run1461 exec51942，均round1。先查terminal/progress再续接，不重复创建。
+>
+> 最新统一`backend-v6-final.log` **1765通过/13跳过**（109秒），Ruff/五分层/实际装配mypy全过；首次统一唯一失败是批量读取测试仍期待旧单侧1块范围，按新请求窗口修正后25专项过，再统一全绿。PG专项exec9604曾等数据库，现在已连接并在测试，日志`pg-v6-focused.log`。133个未提交文件严格UTF8/无NUL并备份于worktree-v6；338源码与live-v6逐字节一致。辅助pg_ctl启动命令exec41581已无pg_ctl进程但句柄可能仍在，勿因会话未退出终止PG。无上线、提交、WSL。
+
+
+> **2026-11-16 00:20续接：v5两项均失败，v6已冻结待首轮**。v5开标49/1464 completed，45模型/50工具/17分52秒；初稿正确邮件异议被自查改错为冲突，未决问题又标resolved。v5商务49/1460 completed，78模型/80工具/33分16秒；期限改善但付款/例外遗漏、自查失实、保证金越界。两项semantic.json及audit-view.txt在live-v5/results，正文与最终所选草稿一致；不计冷启动通过。
+>
+> **新增工具修复**：research.py取消compact读取每侧1块限制，尊重请求窗口（常规总12块，元素完整性/上下文/证据总预算保留）；skill_agent.py上下文按草稿→关联完整原文排列并去重，草稿内只保留引文ID防止摘录挤占页面；公共Skill明确按record_ids选草稿并沿分页核对。反例先失败后通过。旧阶段工具自身限制未改。当前backend-v6.log统一检查exec21885、pg-v6-focused.log恢复/真实装配/正式数据exec9604在运行。live-v6已冻结338资源文件（包括上述改动），尚未启动真实轮。新辅助audit_run.py整理终态轨迹，必须另提供人工verdict才能生成semantic.json，不会自动判语义通过。无上线、提交、WSL。
+
+
+> **单Agent验收续接：v4已失败结束，v5在途，勿上线**：v4开标48/run1463 completed，11模型/17工具/312秒，仍漏读c68前附表线上异议并遗漏c30开标后线上抽K；商务48/run1459 completed，19模型/32工具/约8分钟，未读c10/c63/c265期限，遗漏通用条款条件例外。两项semantic.json已保存，不能计通过。统一backend-v4.log为1763通过/13跳过。
+>
+> 最后两处Skill修改已冻结为恢复根`live-v5`（338文件）：商务区分输出边界与阅读范围，先取公告/前附表/填写期限；开标回读前附表整行，并提示chapter仅供导航。**当前开标49/run1464，exec6813；商务49/run1460，exec2590；均round1**。分别沿用两个隔离库、原模型/预算/资料，日志live-v5/opening-1.log、biz-1.log；先读terminal和progress核对终态，勿重复创建。无服务重载、提交或WSL。此段取代下方v4在途描述。
+
+
+> **2026-11-15 23:25 单Agent真实验收续接：未通过，勿上线**：仍执行用户完整计划，无提交/WSL/服务重载。C根 `C:/Users/wph98/.codex/recovery/AI-tender-agent-led-20261115`。真实v1两轮已终态且semantic.json判失败：开标45/run1460为工具容器类型错误+后备503/断流/超时；商务46/run1457 completed但期限冲突、结算遗漏、专用例外丢失。v2开标46/run1461 completed但邮件/现场异议混用；商务47/run1458 completed但已读c265的“签订日起2年”错记缺失，未读c10/c63/c69，整条付款和交付因缺参数丢弃。v3仅开标47/run1462 completed，纠正程序缺项、异议移出草稿，但误称没有优先规则且将尚未解决的问题resolved，仍失败。三版均保存semantic.json及初稿/自查/修改/最终轨迹，不计冷启动通过。
+>
+> 新修：WorkspaceTool只对具有Pydantic反馈能力的工具将完整JSON参数错误交回同一Agent（内部x-tender-tool-validation不发供应商）；非法JSON/名称/ID/截断仍拦截。新增类型反馈、批检索子查询断连不重复扣预算、父路径变化、关系端点变化及范围扩大反例。最终范围比较已取证原文标段名，不依赖另一专题先发布数据库ID。错误反馈带字段；坏内层JSON字符串报告位置而不回显正文。Skill要求保存后get_research_context回读再自查、先核对项目身份/方式/优先规则，分开已知义务与缺失参数，删除争议正文时仍保持问题open；商务与开标细则补对应反例。
+>
+> **当前真实在途（勿重复创建）**：v4冻结338文件、`live-v4/acceptance.py`，开标exec66246，商务exec87097，均round1、新建报告、原模型/资料/80模型100工具3600秒。先读`live-v4/<opening|biz>-1.log`和results目录，报告/run以created/progress为准。两个库仍C原生PG55456的parse_1349_other_acceptance / parse_1349_acceptance。v4对应最新源码；v1/v2/v3冻结目录不可覆盖。先两项首轮语义通过才各冷启动2、3，再13专题；四份附件仍缺。
+>
+> 验证：`backend-v2-final.log`1762通过/13跳过；`pg-v2.log`249通过（219秒），`pg-v3-focused.log`25保存点恢复/数据读取通过；前端types-v2通过、tests-v2为67通过。新增错误反馈之后19专项过，统一`backend-v4.log`正在运行exec1362。源码与文档有本轮新增未提交变更，最终必须再核对日志、严格UTF8/diff与更新工程24及本交接。尚未安全加载三服务。此段取代下面v1“正在运行”的旧状态。
+>
+
+> **2026-11-15 单Agent链路重构续接（真实验收待完成，勿直接上线）**：用户已授权完整实施每专题单Agent＋Skill方案。生产已接`skill_agent.py`，新增`drafts.py`和公共流程Skill，13专题资源同步；协议`skill-agent-v1`／runtime v6。草稿版本、自查、稳定问题ID、回放、补跑、独立缺件与最终原子发布已实现；重跑不清空旧正式数据，正式数据未变不增加快照版本，v5历史可读但不可执行。没有提交、启动WSL或加载业务服务。
+>
+> 验证根`C:/Users/wph98/.codex/recovery/AI-tender-agent-led-20261115/`：`backend-final2.log`统一1755通过／13跳过（123秒），`pg-final.log`隔离PG249通过（258秒），`pg-recovery.log`10项包含研究、草稿、自查、修改、final五保存点断连恢复通过；前端67单测、typecheck通过，浏览器92项中88通过，4失败修复后新进度2项及定位4项共6通过（`frontend-location-final.log`）。最后新增父路径／关系端点一致性校验已在PG249中覆盖，仍需补专门反例并统一复验。
+>
+> **真实首轮准备/运行现场**：C盘PG55456。冻结338源码文件于`live-v1/apps/api/src`，脚本`live-v1/acceptance.py`；开标隔离库`parse_1349_other_acceptance`新报告45，商务`parse_1349_acceptance`新报告46，各round1，exec开标13366／商务96636。先读`live-v1/<opening|biz>-1.log`及`results/<module>/1/{progress,terminal,result}.json`核实是否在途，禁止重复收费创建。先前两次启动分别被数据库地址检查和历史派生标段检查拦住，均无模型请求；已显式设置隔离库、将本次报告lot_settings冻结回原43的空数组（项目目录不变），使用`--execute-created`仅在报告waiting且零运行行时继续。原预算80模型／100工具／3600秒，模型配置和资料保持。真实准确性未判定，两项通过后各再冷启动两轮并扩展13专题。四份附件仍缺。
+>
+> **操作注意**：每条exec独立设置C盘RUFF_CACHE_DIR／MYPY_CACHE_DIR；PowerShell重定向默认UTF16，日志用`Out-File -Encoding utf8`。旧测试日志部分UTF16可Get-Content识别，源码一律UTF8。勿直接凭历史PID杀进程。前端现有3000服务PID17932被复用验收，不是本轮启动。保存点恢复和旧参数用例已迁新协议，旧阶段纯函数测试仍保留。待继续：真实验收、完整工具契约复查、最终文档状态、活动任务检查后安全加载三服务、交接收尾，不自动提交。
+
+
+> **2026-11-15 20:02 本轮验证收尾**：单Worker部署完成，当前三个服务及现场见下段。统一入口1748通过/13跳过中的3个失败（一次5秒计时超时、两项mypy内部缓存错误）在新C盘MYPY_CACHE_DIR下全部复验通过（169.43秒），日志`single-worker-checks-retry.log`；没有修改计时上限或放宽类型检查。Ruff/5项分层、46项启动检查、3项队列覆盖、PG全量247通过。相关测试进程已结束。默认进程精简目标已完成；原解析准确性、缺件跨包收敛与完整13专题验收仍待继续，不能标记原解析目标完成。
+
+> **2026-11-15 19:57 单Worker切换完成**：正式脚本已清理用户19:23启动的旧六服务，当前仅API31456、全队列Worker34556、Beat36580。Celery inspect确认唯一节点`tender-worker@DESKTOP-NAL6HD9`消费全部五队列，active/reserved均空，业务六类活动均0；API健康，配置指纹与切换前完全一致。记录C备份根`single-worker-pre-switch.json`、`single-worker-after.json`。源码/文档等47个未提交文件已严格UTF-8与diff核对并备份至`single-worker-worktree/`，无提交。PG全量247通过（529.20秒）；统一1748通过/13跳过，3失败为5秒增量计时超时和mypy两项INTERNAL ERROR，正用新C缓存复验exec44476，日志`single-worker-checks-retry.log`。Ruff及5项分层通过。
+>
+> 完整生产审查回放已找到四包最终结果，均在`evidence-first/.tmp/production-replay/results.json`：开标材料主包failed，补充包返回空issues；商务主包157.485秒仍read、补充包210.703秒provide_input（实际附件转引c208在补充包）。因此两项人工定向对照改善不能外推完整生产通过，商务分包结论合并仍需核对。没有在途回放请求，勿再沿下方旧“商务在途”状态处理。
+
+> **2026-11-15 19:53 用户要求恢复简单启动**：用户指出默认四组Worker没有必要，明确“继续”执行合并。`scripts/start-backend.ps1`、Compose、环境模板与启动/架构文档已恢复默认API＋单Worker＋Beat，单Worker消费`convert,parse,tender,poll,analysis`，7线程沿用原本地总执行槽位。保留旧scheduler/poller/analysis身份识别用于清理。46项脚本身份/预检和3项队列覆盖通过，Compose解析及PowerShell BOM通过。业务六类活动、四个旧Worker active/reserved均0，配置指纹`93b6f139e2223328759b87e5c82290f2076d3d1b54815024ea77ac5c5f129472`，记录C备份根`single-worker-before.json`。尚待统一检查、PG验证与安全切换；exec47269统一、70758 PG，日志`single-worker-backend.log`和`single-worker-pg.log`。不要重复启动服务或测试。
+>
+> 解析续接新增修复：审查原文先行、先解释适用性再判断支持性；规则指纹进入请求与缓存身份，防止规则更新后复用旧通过回执。缓存反例先失败后通过，80项专项通过。C备份根`input-findings/.tmp/evidence-first-replay/results.json`两项对照均改善（材料否决、商务provide_input），但完整生产包回放`evidence-first/.tmp/production-replay/`材料主包失败：覆盖回执格式、后备503和输出未完整结束；补充材料包返回空issues。回放进程已终止，商务在途请求结果尚须核对，不重复收费重跑。新审查提示附有尾部指令，旧测试模型仅解析末行JSON导致8项PG和1项单测失败，已修正夹具按protocol JSON行解析；另2项日志启动子进程30秒超时待统一复验。G盘Ruff缓存损坏出现NUL及panic，统一重跑改用C盘RUFF_CACHE_DIR，源码没有因此改动。完整解析准确性/效率目标仍未达成。
+>
+> 操作事故：清理旧验证进程时错误包含另一`G:/aicode/docx-sdk`工作区pytest PID31024/28832，已向用户说明误停，未自行重跑他项测试。此后进程操作须以当前工作区、命令行和创建时间核对身份，禁止沿旧PID清单直接终止。
+
+> **2026-11-15 续接指定会话**：已读取`01a1d9e8-09a1-7a43-ac99-8e440e63300b`及原目标。其23:55前的落盘进度晚于下方22:50交接：重复新增返回原record_id、适用性回执、缺件线索传递均已在源码；最终统一**1750通过／13跳过**，PG全量**247通过**，日志C备份根`input-findings-backend-final.log`、`input-findings-pg-final.log`。335源码逐文件与`input-findings/source-manifest.json`一致，指纹`3d4206fc1e1af2668f317703c84114b279f5e196c44420138835dbe3c8969c18`。
+>
+> 旧真实轮均已终态：开标44/run1458 completed/verified，18发布、15分52秒，人工准确性失败（2018日期、现场材料、A/B程序、重复新增）；商务45/run1455 completed，43分6秒、6发布、13个待核对问题。三条适用性定向复核只拦住旧日期和两套程序。`input-findings/.tmp/context-replay/results.json`进一步确认：人工补c57/c59/c68/c69后到场材料仍supported=true；生产分包传缺件线索后商务仍返回read。不能把自动化检查当作语义通过。
+>
+> C盘原生PG55456于11-15 01:43停止；本次19:04使用原pgdata及显式`-p 55456 -h 127.0.0.1`恢复。当前API8300未监听；尚未加载23:55补丁。正在进行原文先行、依据先于判定的两项顺序对照，脚本C备份根`input-findings/replay-evidence-first.py`，exec63470，输出`input-findings/.tmp/evidence-first-replay/`，禁止重复收费启动。原模型、原文、草稿和额度保持。完整13专题正常资料验收仍缺四份附件；不启动WSL，不提交。
+
+> **2026-11-14 22:50 最新续接**：已读取指定会话的原始用户任务及本交接。开标44/run1456已completed/verified，22:26:13–22:36:46、10分33秒、7发布，但人工核对**准确性失败**：旧广州地址、到场原件材料、A现场/B电子两套程序仍被支持。旧exec90465已回收。材料包缺c68/c57/c59，流程包虽有c68/c69仍误判适用性；旧原文证据和终态完整保存在post-recovery目录。
+>
+> 新补丁：按工作读取的草稿正文及每个长正文片段带修改用record_id；两项恢复反例先失败后通过。研究/审查明确先判项目身份、已选方式和原文优先顺序，再提取生效要求；控制依据关联全部受影响工作并保留引用或显式事项依赖。没有按地址、年份或标题硬编码删除。源码`3b11ddff0a66abc6acf8a90b57745b38e4c4122053ef6b5e733b95c55d48b63e`，工作区与C active335文件逐字节一致；d988源码存备份根source-d988074c。
+>
+> **真实开标新轮在途**：PG55456、报告44/run1458、exec **5366**，22:48:32冷启动，原材料/配置/额度一致。脚本`active/.tmp/parse-1349-live-applicability.py`，产物`active/.tmp/parse-1349/live/opening_requirement_parsing/applicability/`，只读脚本`active/.tmp/parse-1349-inspect-applicability.py`。勿重复启动、勿修改在用源码。统一首次1734通过/13跳过、1个旧手工夹具无id失败；补齐生产必有id后统一重跑exec **53868**，日志备份根applicability-backend-final.log。业务服务仍22:27的d988，尚未加载此补丁。
+
+> **2026-11-14 22:27 续接进度**：到期恢复补丁最终统一1733通过／13跳过（241.12秒）、PG全量247通过（285.57秒），Ruff/分层/mypy通过，39049/92987已回收。旧C库1452/1453遗留预占已用同一仓储逻辑清理，保存内容及deadline不变，`orphan-settlement.json`：商务40ok/12error/3unknown，开标2ok/1error/1unknown，均无running请求。
+>
+> **新开标正在执行**：C盘PG55456，报告44/run1456，exec **90465**，源码d988074c；脚本`C:/Users/wph98/.codex/recovery/AI-tender-20261114-2015/active/.tmp/parse-1349-live-post-recovery.py`，产物`active/.tmp/parse-1349/live/opening_requirement_parsing/post-recovery/`，勿重复启动。只读脚本同目录`parse-1349-inspect-post-recovery.py`，传`opening_requirement_parsing`；源码及产物在C盘，部署环境仍读取原G盘.env。G盘旧PG55455已正常停止。
+>
+> **22:27已加载最终d988补丁**：54868已回收，前后六类活动均0，API健康，配置值与发布指纹相同。PID api18360、documents27536、scheduler41700、poller36844、analysis40940、beat26208。正式启动脚本日志在C备份根`final-services-load.log`。工程23/24已补存储根因、迁移校验及新恢复修复；完整附件路径问题仍等待用户。
+
+> **2026-11-14 22:20 最新状态：存储故障已隔离，验收待新补跑**：20:13原生PG55455写WAL遇Windows483（致命设备硬件I/O错误），系统同刻及20:06有Disk0的154事件；G盘位于Disk0。两项真实进程均退出，不能再沿用下方“在途”。PG20:15自动恢复后已导出两库；当前G盘PG55455已正常停止，业务API健康。
+>
+> **C盘独立备份与运行目录**：`C:/Users/wph98/.codex/recovery/AI-tender-20261114-2015/`位于另一物理Disk1。766个文件（约25MB）逐一SHA256通过，含未提交源码/文档/全部1349取证；两个自包含dump约92/91MB。备份的335源码文件仍固定10c4460d，不覆盖。新原生PG **55456**，数据`pgdata/`、程序`pgsql/`、日志`pg-server.log`，已恢复`parse_1349_acceptance`及`parse_1349_other_acceptance`，另建隔离测试库`parse_1349_tests`。两库17类关键表（含完整检查点、调用账、原文及模型配置）与原库内容散列一致：`database-restore-audit.json`。
+>
+> 两轮旧期限均已过，经生产执行器按原时限收尾：商务45/run1452、开标44/run1453在C库均failed，原因“模块总时长预算已耗尽，恢复不会重置时限”；未新增模型请求。结果位于备份根的`.tmp/parse-1349/live/<module>/delivery-recovered/`，对应脚本`.tmp/parse-1349-live-recovered.py`；终态收尾进程已回收。原商务仅复核12/21，重复草稿及缺件收敛仍未通过。开标新轮在硬件中断前只有2次成功模型、1次records容器类型错误及1次未返回请求，不能计语义通过。
+>
+> **新补丁已写，最终验证中**：到期检查在claim前退出导致旧预占及llm_call_log永远running；`AgentRunStore._recover_calls`复用既有幂等结算，abandon先取当前库运行事务锁，再原子终止pending并结算已保存成功、其余unknown，保护真实持锁执行者。新增`test_expired_recovery_settles_saved_results_and_closes_orphan_attempts`先失败后通过；11项恢复/跨库锁/硬配额专项通过。统一检查exec **39049**、PG全量exec **92987**，日志在C盘备份根`expired-recovery-backend.log`及`expired-recovery-pg.log`。**业务服务仍是20:08的10c版本，尚未加载这项新补丁。**
+>
+> 新源码指纹`d988074c274066ee389d5b89a4446183293ffe738000838ab59969d025117e4c`，335文件已复制并校验到C盘备份根`active/apps/api/src/tender/`，元数据`active/source-manifest.json`。准备好的恢复补跑脚本`active/.tmp/parse-1349-live-post-recovery.py`，读取原G盘部署配置但源码与运行产物在C盘；启动须设`PYTHONPATH=<active>/apps/api/src`、`PYTHONDONTWRITEBYTECODE=1`和端口55456的对应DATABASE_URL。脚本用原报告mode=resume创建新attempt，原材料/配置须一致，`post-recovery/created.json`防重复；**尚未启动**。仍需先结算旧终态遗留调用账（调用同一恢复仓储逻辑，不能推测成功），再完成检查/加载/真实补跑。四份完整附件位置仍待用户提供。
+
+> **2026-11-14 20:08 最新续接，解析目标未完成**：已读取会话`01a1d93b-eccd-75d0-915e-1187443c9794`，其19:25落盘内容晚于下方19:10交接。跨库锁过滤已覆盖全部8处遗漏查询（另有1处原已正确），候选原文超容量分片及大块只重验本块已实现。全量回归发现新加covered/unsupported强拒绝造成6项失败，现改为沿用同次明确否决生成needs_action与修复问题，保持原结论不可发布且二次校验幂等，避免整包重试。
+>
+> 最终源码`10c4460d0334cb7ff7ef61a4d071ccb534ca5f8c6c722e303d8fdddb0d64d845`。统一后端**1733通过／13跳过**（113.84秒），Ruff/五项分层/协议与真实装配mypy通过：`.tmp/parse-1349-resume-backend-delivery.log`；PG全量**246通过**（258.54秒），最终否决处理改动后核心PG**60通过**（233.44秒），分别`-resume-pg.log`、`-resume-pg-final.log`。91项否决与语义专项通过；31个改动文件严格UTF-8及diff通过，审计`.tmp/parse-1349/resume-file-audit.json`。测试会话已回收。
+>
+> **当前在途，勿重复创建**：新开标delivery脚本`.tmp/parse-1349-live-delivery.py`，隔离库`parse_1349_other_acceptance`报告44/run1453，exec **60130**；使用restart冷启动，产物`.tmp/parse-1349/live/opening_requirement_parsing/delivery/`，启动前source/reference/runtime与原报告43逐项相同。只读用`.tmp/parse-1349-live-inspect.py --delivery opening_requirement_parsing`。原商务convergence报告45/run1452，exec **24636**对应进程40264仍存活，最近复核9/21，原863d源码已保存在`.tmp/parse-1349/source-863d48a0/`，不能视为最新代码验收；原开标convergence44/1451已failed，15分48秒，回执错误及503，旧46841可回收。旧原业务43保持取消。
+>
+> **20:08已安全加载业务服务**：正式`scripts/start-backend.ps1 -Force`完成，API健康，前后六类业务活动均0、0022已应用，配置值及发布指纹相同。PID api10896、documents32132、scheduler50016、poller46116、analysis43496、beat39004；日志`.tmp/parse-1349-resume-services-load.log`，18186已回收。新开标1453已running并正常发出模型请求，未被另一库旧商务锁阻塞。不更改模型/参数/额度，不设置300秒限时，不新增app、不启动WSL、不提交。
+>
+> 真实商务恢复又新增多条同标题同范围的付款/期限事项，较旧已核实内容更简略，审查量扩大；需继续核对终态和恢复时的重复新增问题。已再次询问四份完整附件所在项目/目录，尚待用户回复，完整资料13专题验收仍缺基线。工程23/24已补最新根因；待新开标结果逐项核对网上方式、时间、异议、旧广州纸质片段及完整定位，再更新最终状态。
+
+> **2026-11-14 19:10 最新续接，目标仍active**：源码已更新为`863d48a0096da0bd6abf6bed22c8639748e590cb000298eb5309499bbf7b0c7e`。最终商务45/1451已完成：28分39秒、13发布、8个read问题，code_unchanged=true；开标44/1450已partial：15分51秒，地点条目加候选原文超容量。两个final会话63849/53738均已回收。随后修复待补读问题被当作固定结论缓存、缺件合并丢说明/依据、研究叙述和旧问题重复占容量、共享原文导致错配复核问题；真实跨包check使用partition/covered_here，各包必须实际核对，不能互相deferred。原开标回放4包，含纠错预留8857/11913/11953/11830估算token，全部原文保留；旧商务14问题回放8请求，全部有责任包及完整依据。
+>
+> 统一后端**1721通过／13跳过**（107.33秒），后加3项分包门禁专项通过，Ruff/分层/mypy通过；日志`.tmp/parse-1349-convergence-backend-final.log`。真实PG全量**238通过**（217.02秒），`.tmp/parse-1349-convergence-pg.log`。source最后仅在PG启动后调整模式字段的容量预留与格式，统一检查包含最终代码。代码未加载业务服务，仍是18:12版本。
+>
+> **真实补跑进行中，勿重复创建或修改src干扰语义验收**：脚本`.tmp/parse-1349-live-convergence.py`，产物`.tmp/parse-1349/live/<module>/convergence/`。商务库`parse_1349_acceptance`报告45/run1452，exec **24636**；开标库`parse_1349_other_acceptance`报告44/run1451，exec **46841**。两者原生PG55455，原模型/材料/额度，created.json防重复。只读观察`.tmp/parse-1349-live-inspect.py --convergence`。
+>
+> **新发现待修复：跨库配额锁误算**。商务1452排队无模型请求，是`adapters/pg/repositories/analysis/runtime.py`的_OCCUPIED/_FIRST_WAITING/_REAP/_REQUEUE/_CANCEL五条pg_locks查询未过滤database，另一库开标1451的锁误匹配本库旧1451，max_inflight被误占。不是业务源文件或模型故障。开标结束释放锁后商务可自然开始。已添加`test_other_database_advisory_lock_cannot_occupy_or_protect_local_run`，使用现有postgres库的独立命名空间锁；claim/reap/requeue/cancel四例均稳定失败（原反例）。**尚未修改生产SQL**，待当前语义验收终态后加current_database()过滤并复验、统一检查和安全加载。原业务43保持取消，模型参数/300秒/新增app/WSL/自动提交约束保持。
+
+> **2026-11-14 18:25 续接**：最终商务报告45/run1451仍运行（63849），初审5/11；开标已用冻结business.dump的第二独立库`parse_1349_other_acceptance`启动最终轮，报告44/run1450、exec **53738**，产物`.tmp/parse-1349/live/opening_requirement_parsing/final/`，脚本`.tmp/parse-1349-live-other.py`。两轮源指纹仍7f4591fc…，禁止重复启动；`.tmp/parse-1349-live-inspect.py`同时只读更新两轮状态、账和输入一致性。开标约3分钟进入4请求初审，草稿混有旧纸质地址，必须等审查修复后逐项验收。商务范围已全部确认common，初审保留质量合格并追到c208，待核对缺件收敛。
+>
+> 另外已复现**缺件问题合并丢依据**：`quality.merge_issues`先read后provide_input时只升级action，丢失missing_input并保留旧补读detail。新增`test_cross_topic_missing_attachment_keeps_confirmed_details_and_proof`两种顺序反例，当前1失败/1通过，**尚未修改src**，待两轮自然结束后补上确认说明及依据，再统一检查。原始八专题回放`.tmp/parse-1349/coverage-diagnostic.json`确认项目概况的互相deferred在现代码已无跨包责任；否决qualification及保证金refund仍有同范围跨包，需继续真实验证，不放宽门禁。
+
+> **2026-11-14 18:12，13:49批次故障修复续接（最新状态，未提交，已加载）**：项目16／报告43已于16:36取消，原运行1437–1449均终止；下文14:07“报告43仍运行”已过时。本轮修复最终供应商批次工具schema丢失、关键词被余弦阈值错误过滤、首次规则读取误算空转、发布与独立审查语义冲突、大块重复扩邻域及坏审查回执二次崩溃，区分排队和执行耗时。随后真实轨迹再修复章节归属丢失、补充包重复核对、旧复核问题未带原文、累计错误ID平方反馈及纯哈希错误文案。完整现场`.tmp/parse-1349/`，工程23/24记录根因和原文基准。
+>
+> 最终统一后端**1712通过／13跳过**（100.67秒），Ruff、五项分层及协议／真实装配mypy通过，`.tmp/parse-1349-backend-acceptance.log`；最终PG全量235通过、3项旧id/text夹具失败，同步章节字段后3项复验通过（7.41秒），`.tmp/parse-1349-pg-delivery.log`及`-pg-fixtures-fixed.log`。初版全量238通过留在`-pg-full.log`。相关exec测试句柄均已回收。27个改动文件严格UTF-8与diff通过（后续文档更新应再核对），`.tmp/parse-1349/file-audit.json`。
+>
+> **最终商务验收正在执行，禁止重复启动或修改src干扰此轮验证**：当前业务库完整副本`parse_1349_acceptance`，原生PG55455，项目16／报告45／run1451，exec会话**63849**，脚本`.tmp/parse-1349-live-final.py biz_standard_parsing`，产物`.tmp/parse-1349/live/biz_standard_parsing/final/`。源码指纹`7f4591fc9218b8b217df27b24187eae3b81c32cf24829f571f47b76cadf79ea6`。约两分钟已从c63提取合同签订起两年、质量合格及预付款28天发票条件，继续研究。`progress.json`可读，必须结合exec会话判断是否在途；只读诊断脚本`.tmp/parse-1349-final-progress.py`保存当前状态。尚须核对真实商务附件转引c208、完整付款条件、矛盾缺口消除及最终引用；不自动resume或重复收费。
+>
+> 原商务诊断轮报告44/run1450已于18:05自然completed/needs_review，44分52秒、7发布／11草稿、22问题，48模型尝试（29ok／13error／6unknown）、24工具（23ok／1error），无pending预占及活动报告，54850已回收；终态code_unchanged=false。两年期限补出后仍留“期限未找到”、空白合同格式误称专用前附表，3条付款被缺比例整体否决，准确性未通过；`semantic.json`已记录。最终规则另明确独立缺金额不得否决正确付款时点。原文`.tmp/parse-1349/source-blocks.json`：c10/c63/c265为两年，c218是合同格式；四附件转引c142/c208/c263/c280。14问题离线复核重放责任／事项／证据全部完整，`repair-replay.json`；计划9→11，实际效率待最终轮。
+>
+> **18:12已安全加载最终业务服务**：前后六类活动均0，0022已应用且仅更新说明，config_item除description外及全部config_release指纹相同，API健康。正式脚本新PID api35988、documents45044、scheduler37552、poller32240、analysis38836、beat41340；日志`.tmp/parse-1349-business-final-load.log`及`runtime-before/after.json`，迁移前后原快照另存`runtime-migration-before/after.json`。隔离63849持续运行。下一步继续最终商务及其他代表性专题真实验收、逐条语义和定位核验、更新文档。5分钟仅性能预期，不加300秒限时；不改模型，不新增测试app、不启动WSL、不自动提交。解析goal仍active，真实完整准确与效率目标尚未达成。
+
 > **2026-11-14 14:07 审查问题修复交付（未提交，业务活动期间未加载）**：用户要求修复四个审查问题。已按专题自身输入签名保留局部restart后其他needs_input专题的新增资料信号，页面input_changed与resume事务统一，执行器保存完整项目／参考快照；短问答引文按完整大块字符范围构建真实单页／跨页定位；非对象missing_input转为既有模型协议错误；前端定位、PDF角标及反查按来源／版本／批次／元素／页码／bbox去重，同元素不同区域独立、同区域合并。大块ID及入库规则保持。
 >
 > 最终统一后端**1688通过／13跳过**（110.74秒），Ruff、五项分层及协议／真实装配mypy通过，日志`.tmp/review-fixes-backend-delivery.log`。最终全量真实PG**238通过**（252.34秒），`.tmp/review-fixes-pg-full.log`；后端专项67通过、执行器兼容及完整快照37通过、真实PG事务／模块输入变化／跨页定位16通过，前端类型与67单测通过。已补齐代表生产契约的旧执行器报告夹具，并加入暂不可读及参考资料签名断言。

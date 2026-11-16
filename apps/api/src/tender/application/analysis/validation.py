@@ -59,7 +59,11 @@ def record_issues(state: dict, tool: str, issues: list[ToolIssue], call_id: str,
                      record_ids=sorted(identifiers),
                      pending_record_ids=sorted(pending | set(issue.record_ids)),
                      remaining_attempts=max(0, limit - entry["attempts"]))
-        result.append({k: v for k, v in entry.items() if k != "call_ids"} | {"key": key})
+        # 完整历史与未决身份只存问题账；逐条反馈只定位当前对象，避免同批累计ID平方膨胀。
+        result.append({k: v for k, v in entry.items() if k != "call_ids"} | {
+            "key": key, "record_ids": list(issue.record_ids),
+            "pending_record_ids": sorted(set(issue.record_ids)),
+        })
     return result
 
 

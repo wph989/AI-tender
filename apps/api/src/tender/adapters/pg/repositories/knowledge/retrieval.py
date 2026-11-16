@@ -302,9 +302,8 @@ def search_candidates(
     scored = select(
         *(lowered.c[name] for name in candidates.c.keys()),
         hits.label("hits"),
-        ((hits > 0) & (hits / max(1, len(tokens)) >= (
-            min_similarity if min_similarity is not None else 0
-        ))).label("lexical"),
+        # 与领域排序一致：关键词独立召回，语义阈值仅约束余弦相似度。
+        (hits > 0).label("lexical"),
         (embedding.is_not(None) & (cosine >= (
             min_similarity if min_similarity is not None else -1
         ))).label("semantic"),

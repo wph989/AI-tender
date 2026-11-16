@@ -69,6 +69,20 @@ def _decode_containers(value: Any, schema: dict, root: dict) -> Any:
     return value
 
 
+def _tool_schema(value: Any, *, validation: bool = False) -> Any:
+    """供应商看到完整字段；明确支持逐项回执的工具把条目错误留给工具处理。"""
+    if isinstance(value, list):
+        return [_tool_schema(item, validation=validation) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: _tool_schema(item, validation=validation) for key, item in value.items()
+              if key not in {"x-tender-partial-items", "x-tender-tool-validation"}}
+    if validation and value.get("x-tender-partial-items") is True:
+        # 仍校验批次类型、长度、必填项和final；单条失败不得丢弃同批有效业务成果。
+        result["items"] = {}
+    return result
+
+
 class AgentChat:
     def __init__(
         self,
@@ -150,7 +164,7 @@ class AgentChat:
             # 业务调用记录保存在本项目，不能因终端残留 tracing 配置外发标书正文。
             with tracing_context(enabled=False):
                 # 先构造中立消息和供应商载荷，响应计时从实际发送前开始。
-                bound = self.model.bind_tools(tools) if tools else None
+                bound = self.model.bind_tools(_tool_schema(tools)) if tools else None
                 options = dict(bound.kwargs) if bound is not None else {}
                 if self._api_mode == "generate_content":
                     payload = self.model._prepare_request(messages_from_dict(messages), **options)
@@ -314,16 +328,23 @@ class AgentChat:
             if call["name"] not in required:
                 # 模型可把正文误塞进工具名，不能回显未知名称；只给出服务端允许的名单。
                 issues.append("未知工具；当前可用工具：" + "、".join(required))
-            elif absent := required[call["name"]] - call["args"].keys():
-                # 缺项来自本次工具schema，无需回显参数值或整份模型响应即可准确纠正。
-                issues.append(call["name"] + " 缺少必填参数：" + "、".join(sorted(absent)))
             else:
                 schema = next(t["function"].get("parameters", {}) for t in tools
                               if t["function"]["name"] == call["name"])
                 # 兼容网关把数组或对象再次编码为字符串；先按schema归一化，再计成功和交给工具。
                 call["args"] = _decode_containers(call["args"], schema, schema)
+                if schema.get("x-tender-tool-validation") is True:
+                    # 新Agent的工具能返回可纠正反馈；完整JSON参数应进入同一会话，
+                    # 不能因字段类型错误换模型并丢失本次草稿。工具仍须校验后才执行。
+                    continue
+                if absent := required[call["name"]] - call["args"].keys():
+                    issues.append(call["name"] + " 缺少必填参数：" + "、".join(sorted(absent)))
+                    continue
                 # 完整协议类型在成功结算前校验；范围和引文等业务规则仍由工具执行判断。
-                for error in list(Draft202012Validator(schema).iter_errors(call["args"]))[:6]:
+                validation_schema = _tool_schema(schema, validation=True)
+                for error in list(Draft202012Validator(validation_schema).iter_errors(
+                    call["args"],
+                ))[:6]:
                     path = ".".join(str(p) for p in error.absolute_path) or "args"
                     issues.append(call["name"] + "." + path
                                   + " 不符合工具JSON Schema的 " + error.validator + " 约束")

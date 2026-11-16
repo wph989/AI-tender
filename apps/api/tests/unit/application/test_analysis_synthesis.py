@@ -89,7 +89,8 @@ def test_every_frozen_module_has_usable_synthesis_format(key):
     from tender.application.analysis.protocol import CONTRACT as RESEARCH_RULES
 
     assert "coverage.json" in rules and "无需quote" in RESEARCH_RULES
-    assert "work_ids" in snapshot[key + "/references/output_format.md"]
+    assert "version" in snapshot[key + "/references/output_format.md"]
+    assert "record_review" in snapshot["analysis_workflow/SKILL.md"]
     assert all(topic.get("checks") for topic in json.loads(
         snapshot[key + "/references/coverage.json"]
     ))

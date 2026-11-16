@@ -35,6 +35,10 @@ def merge_issues(issues: list[dict]) -> list[dict]:
             # 新证据确认缺件后需要用户输入；历史“补读”指令不能继续驱动空转。
             if issue["action"] == "provide_input":
                 previous["action"] = "provide_input"
+                # 缺件确认必须连同依据和说明替换旧补读指令，否则等待资料却没有可操作的补件信息。
+                previous["detail"] = issue["detail"]
+                if issue.get("missing_input"):
+                    previous["missing_input"] = issue["missing_input"]
         else:
             result[key] = issue
     return list(result.values())
@@ -85,6 +89,16 @@ def refresh_input(state: dict, sources: list[dict]) -> None:
     state.pop("review_context_key", None)
     state["business_gaps"] = []
     state.pop("research_completed", None)
+    if state.get("agent_workspace"):
+        # 新资料使旧自查失效，但工作方法仍由Agent安排，不创建旧阶段状态。
+        workspace = state["agent_workspace"]
+        workspace.update(reviews={}, finalized=False, final_ids=[], draft_receipts={})
+        for issue in workspace["issues"].values():
+            if issue.get("action") == "provide_input":
+                issue.update(action="read", status="open",
+                             detail="资料已更新，重新核对：" + issue["detail"])
+                issue.pop("missing_input", None)
+        return
     flow = state.get("topic_flow", {})
     flow.update(phase="research", audit={"round": 0, "results": {}})
     flow.pop("synthesis_finished", None)

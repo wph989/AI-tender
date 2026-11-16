@@ -411,9 +411,11 @@ def test_typed_bad_record_does_not_renumber_valid_identity_and_can_be_corrected(
             batch(["质保"]),
             call("submit_analysis", {"records": [raw(id=[], content=7), raw()],
                                      "final": False}, "draft"),
-            call("submit_analysis", {"records": [raw(id=identity)], "final": False}, "correct"),
+            call("submit_analysis", {"records": [raw(id=identity, content={
+                "字段": "替换部件质保", "内容": "五年"})], "final": False}, "correct"),
             call("complete_research", {"research_summary": "已核对"}, "done"),
-        ], state=state)
+        ], state=state, research=session([block() | {
+            "content": "主设备质保三年，替换部件质保五年。"}]))
         await invoke_module(graph, files, thread_id="typed", task="保留有效事项")
         receipts = json.loads(state["tool_results"]["call_draft"]["data"]["content"])["records"]
         assert "progress" not in json.loads(state["tool_results"]["call_draft"]["data"]["content"])

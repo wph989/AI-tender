@@ -39,6 +39,11 @@ def clear_record_gaps(state: dict, item_ids: set[str]) -> None:
 
 def published_items(snapshot: dict, *, final: bool = False) -> list[dict]:
     """待修订版本校验期间仍显示旧核实内容；最终成果只消费当前有效版本。"""
+    if workspace := snapshot.get("agent_workspace"):
+        if not workspace.get("finalized"):
+            return []
+        items = {item["id"]: item for item in snapshot.get("staged_items", [])}
+        return [items[rid] for rid in workspace["final_ids"] if rid in items]
     flow = snapshot.get("topic_flow", {})
     deferred = flow.get("output_mode") == "after-research"
     if deferred and not final and not flow.get("release_results"):

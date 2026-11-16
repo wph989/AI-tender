@@ -35,7 +35,8 @@ export function loadReportRecords(report: AnalysisReport, signal?: AbortSignal):
       `/analysis/reports/${report.id}/modules/${encodeURIComponent(module.module_key)}/records`,
       "GET", undefined, signal,
     ).then(
-      (data) => ({ ...module, status: data.status, progress: data.progress,
+      (data) => ({ ...module, status: data.status, progress: module.progress?.protocol === "skill-agent-v1"
+        ? module.progress : data.progress,
         quality_status: data.quality_status, quality_issues: data.quality_issues,
         items: recordItems(data), records_error: undefined, records_loading: false }),
     ).catch((reason: unknown) => ({

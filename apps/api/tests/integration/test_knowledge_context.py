@@ -95,7 +95,9 @@ def test_model_receives_only_large_block_id_and_full_clause(environment):
     research = ResearchSession([source], source["project_id"], retrieve, read, authorize,
                                compact_results=True)
     result = asyncio.run(research.search("开标", "project"))
-    assert result["blocks"] == [{"id": chunks[0]["block_id"], "text": chunks[0]["content"]}]
+    assert result["blocks"] == [{"id": chunks[0]["block_id"], "text": chunks[0]["content"],
+                                "source_id": chunks[0]["source_id"],
+                                "chapter": chunks[0]["chapter"]}]
     assert "g2c" in result["blocks"][0]["id"]
     assert citation(chunks[0], chunks[0]["content"])["locations"] == chunks[0]["locations"]
 

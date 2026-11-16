@@ -120,9 +120,9 @@ def test_record_context_keeps_explicit_cross_topic_parent_and_citations():
     book, _, state, research = scoped_ledger()
     work_id = selected_work(book)
     state["staged_items"] = [
-        {"business": {"key": "child", "parent_key": "parent", "citations": [],
+        {"id": "child-id", "business": {"key": "child", "parent_key": "parent", "citations": [],
                       "scope": {"kind": "lots", "lot_refs": ["A"]}}, "work_ids": [work_id]},
-        {"business": {"key": "parent", "title": "跨主题父条件", "citations": [
+        {"id": "parent-id", "business": {"key": "parent", "title": "跨主题父条件", "citations": [
             {"block_id": "s1r1c3", "quote": research.seen["s1r1c3"]["content"]}]}}
     ]
     text = json.dumps(book.context([work_id], limit=12000), ensure_ascii=False)

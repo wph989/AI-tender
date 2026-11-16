@@ -17,7 +17,7 @@ def evidence_version(row: dict) -> str:
     # 检索分数和排序会随查询改变，不能让它们撤销同一来源版本原文的去重资格。
     return fingerprint({key: row.get(key) for key in (
         "source_id", "collection_id", "project_id", "parse_run_id", "version_id",
-        "block_id", "element_id", "offset", "content", "locations",
+        "block_id", "element_id", "offset", "chapter", "content", "locations",
     )})
 
 
@@ -158,7 +158,8 @@ def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
             units.append({"kind": "missing_dependency", "record_key": key})
             continue
         business = item["business"]
-        units.append({"kind": "record", "record_key": key,
+        # 修改接口只接受回执id；正文和分片都带上它，恢复后无需跨索引猜测业务身份。
+        units.append({"kind": "record", "record_id": item["id"], "record_key": key,
                       "business": {k: v for k, v in semantic_payload(business).items()
                                    if k != "text"},
                       "topics": sorted({known[wid]["topic"] for wid in item.get("work_ids", [])
@@ -177,6 +178,7 @@ def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
             fragmented.append(unit)
         else:
             fragmented.extend({"kind": "note_fragment", "id": fingerprint(unit)[:16],
+                               **({"record_id": unit["record_id"]} if "record_id" in unit else {}),
                                "topics": unit.get("topics", [unit.get("topic")]),
                                "start": start, "total": len(text), "text": text[start:start + 1000]}
                               for start in range(0, len(text), 1000))
@@ -187,6 +189,8 @@ def work_units(flow, works: list[dict], work_ids: list[str]) -> list[dict]:
                 "关联原文已变化或缺失，请重新核对工作依据", tuple(work_ids))])
         text = row["content"]
         fragmented.extend({"kind": "evidence", "id": key, "start": start, "total": len(text),
+                           **{k: row[k] for k in ("source_id", "chapter")
+                              if row.get(k) is not None},
                            "version": evidence_version(row), "text": text[start:start + 1000]}
                           for start in range(0, max(1, len(text)), 1000))
     return fragmented
@@ -263,6 +267,10 @@ def evidence_message(message: ToolMessage, messages, seen: dict) -> ToolMessage:
             versions[key] = evidence_version(seen[key])
     for unit in _evidence_units(payload):
         key = unit.get("id")
+        if key in seen:
+            # 摘要后补回以及旧回执重放同样保留章节，不能把合同格式重新变成无归属正文。
+            unit.update({k: seen[key][k] for k in ("source_id", "chapter")
+                         if seen[key].get(k) is not None})
         if key in seen and versions.get(key) != evidence_version(seen[key]):
             if message.name == "get_research_context":
                 return message.model_copy(update={

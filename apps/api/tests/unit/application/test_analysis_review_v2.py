@@ -29,7 +29,7 @@ async def flow_fixture(repairs=1):
 
 def issue(payload):
     return {"topic": "a", "detail": "质保范围需补充条件", "kind": "unsupported",
-            "record_ids": [payload["record_index"][0]["record_id"]],
+            "record_ids": [payload["records"][0]["record_id"]],
             "evidence_ids": ["s1r1c0"], "target": "质保条款"}
 
 
@@ -78,6 +78,55 @@ def test_unchanged_repair_ends_without_another_request():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("confirmed_missing", [False, True])
+def test_read_question_can_finish_after_repair_without_changing_supported_fact(confirmed_missing):
+    async def run():
+        flow, requests = await flow_fixture(), []
+        flow.research.seen["s1r1c0"]["content"] += "；其他特殊要求详见附件甲。"
+
+        async def review(payload):
+            requests.append(copy.deepcopy(payload))
+            result = approve(payload)
+            if len(requests) == 1:
+                result["issues"] = [issue(payload) | {
+                    "kind": "reference", "action": "read", "target": "附件甲",
+                    "detail": "核对附件甲是否已随项目资料提供",
+                }]
+            elif confirmed_missing:
+                old, = payload["repair_issues"]
+                result["issues"] = [{
+                    "topic": "a", "kind": "reference", "action": "provide_input",
+                    "issue_id": old["issue_id"], "target": "附件甲",
+                    "detail": "目录只有主文件，实际转引的附件甲尚未提供",
+                    "record_ids": [], "evidence_ids": ["s1r1c0"],
+                    "missing_input": {"file_name": "附件甲", "reference_ids": ["s1r1c0"],
+                        "checked_source_ids": [s["source_id"] for s in payload["documents"]
+                                               if s["project_id"] == payload["project_id"]]},
+                }]
+            if result["issues"]:
+                for receipt in result.get("check_results", {}).values():
+                    receipt.update(status="needs_action", issue_indexes=[0])
+            return result
+
+        async def save(_):
+            pass
+
+        assert not await audit_combined(flow, review, save)
+        # 确认目录缺件不需要伪造业务改动或新的原文；跨检查点仍应完成这一次定向复核。
+        flow = TopicFlow(json.loads(json.dumps(flow.state)), flow.research)
+        assert await audit_combined(flow, review, save)
+        assert len(requests) == 2
+        assert requests[1]["repair_issues"]
+        assert not requests[1]["records"] and requests[1]["context_records"]
+        remaining = flow.data["audit"]["remaining"]
+        assert [i["action"] for i in remaining] == (["provide_input"] if confirmed_missing else [])
+        assert flow.state["staged_items"][0]["verification"] == "supported"
+        assert await audit_combined(flow, review, save)
+        assert len(requests) == 2
+
+    asyncio.run(run())
+
+
 def test_packets_contain_full_semantic_index_and_direct_source_within_input_limit():
     async def run():
         flow = await flow_fixture()
@@ -86,7 +135,7 @@ def test_packets_contain_full_semantic_index_and_direct_source_within_input_limi
         for packet in packets:
             assert packet["protocol"] == "combined-v3"
             assert _tokens(prompt(packet)) + 2048 <= 6000
-            assert packet["record_index"][0]["business"]["title"]
+            assert packet["records"][0]["business"]["title"]
             assert any(row["business"]["content"] for row in
                        packet["records"] + packet["context_records"])
             if packet["records"]:
@@ -135,7 +184,8 @@ def test_plan_progress_includes_all_packets_before_the_first_request_and_survive
     async def run():
         from tender.application.analysis.research import AgentLimits
 
-        limits = AgentLimits(max_output_tokens=500)
+        # 新回执增加逐项适用性理由；保持两条左右的小包，继续验证启动前总量与恢复身份。
+        limits = AgentLimits(max_output_tokens=900)
         records = [summary_record(key=f"r{i}", content={"字段": f"事项{i}", "内容": "质保三年"})
                    for i in range(5)]
         state, _, _, _ = await execute(records, limits=limits)

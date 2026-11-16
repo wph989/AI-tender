@@ -214,7 +214,7 @@ services:
               capabilities: [gpu]
 
   # 一次性迁移；失败即中断启动，避免 api / worker 跑在半旧半新的表结构上
-  # 应用服务（migrate / api / 四组 worker / beat / web）只在 --profile app 时启动：
+  # 应用服务（migrate / api / worker / beat / web）只在 --profile app 时启动：
   # 默认的「只起依赖」跑法用不到它们（应用在宿主机直接跑）。
   migrate:
     profiles: ["app"]
@@ -260,7 +260,7 @@ services:
       retries: 5
       start_period: 20s
 
-  # 转换/提交、轮询、调度、分析使用独立执行池，长任务不占用控制任务的槽位。
+  # 一个 worker 消费全部业务队列，减少常驻进程；并发额度仍由配置中心控制。
   worker:
     profiles: ["app"]
     <<: *api-base
@@ -272,11 +272,13 @@ services:
       - --quiet
       - worker
       - -Q
-      - convert,parse
+      - convert,parse,tender,poll,analysis
       - -n
-      - documents@%h
+      - tender-worker@%h
+      - -P
+      - threads
       - -c
-      - ${WORKER_CONCURRENCY:-4}
+      - ${WORKER_CONCURRENCY:-7}
       - -l
       - info
     environment: *api-env
@@ -290,94 +292,7 @@ services:
       migrate:
         condition: service_completed_successfully
 
-  worker-scheduler:
-    profiles: ["app"]
-    <<: *api-base
-    restart: unless-stopped
-    command:
-      - celery
-      - -A
-      - tender.worker.celery_app
-      - --quiet
-      - worker
-      - -Q
-      - tender
-      - -n
-      - scheduler@%h
-      - -c
-      - ${SCHEDULER_CONCURRENCY:-1}
-      - -l
-      - info
-    environment: *api-env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
-      migrate:
-        condition: service_completed_successfully
-
-  worker-poller:
-    profiles: ["app"]
-    <<: *api-base
-    restart: unless-stopped
-    command:
-      - celery
-      - -A
-      - tender.worker.celery_app
-      - --quiet
-      - worker
-      - -Q
-      - poll
-      - -n
-      - poller@%h
-      - -c
-      - ${POLLER_CONCURRENCY:-2}
-      - -l
-      - info
-    environment: *api-env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
-      migrate:
-        condition: service_completed_successfully
-
-  worker-analysis:
-    profiles: ["app"]
-    <<: *api-base
-    restart: unless-stopped
-    command:
-      - celery
-      - -A
-      - tender.worker.celery_app
-      - --quiet
-      - worker
-      - -Q
-      - analysis
-      - -n
-      - analysis@%h
-      - -c
-      - ${ANALYSIS_CONCURRENCY:-2}
-      - -l
-      - info
-    environment: *api-env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
-      migrate:
-        condition: service_completed_successfully
-
-  # 派发闸门：每 5 秒读 L1 配置、数在途、只提交差额（worker/dispatch.py）。
+  # 每秒投递文档调度消息，worker 按配置中心的配额和间隔派发差额。
   # 只能有一个实例：多实例会各算一份差额，虽然靠 job.dispatched_at 兜底，但不提高吞吐。
   beat:
     profiles: ["app"]

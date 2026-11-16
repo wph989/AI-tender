@@ -172,13 +172,14 @@ async def run_combined_sample():
     class Reviewer:
         async def complete_validated(self, prompt, *, validate=None, **kwargs):
             prompts.append(prompt)
-            payload = json.loads(prompt.rsplit("\n", 1)[-1])
-            reviews = {row["record_id"]: {"supported": True, "issues": [],
-                       "block_ids": [next(r["block_id"] for r in SAMPLE["expected"]
-                                          if r["key"] == row["key"])]}
-                       for row in payload["records"]}
-            result = Completion(content=json.dumps(approve(payload) | {"reviews": reviews}),
-                                model="offline")
+            # 原文后的输出顺序指令不是JSON正文，按请求行读取完整审查包。
+            payload = json.loads(next(line for line in prompt.splitlines()
+                                      if line.startswith('{"protocol":')))
+            response = approve(payload)
+            for row in payload["records"]:
+                response["reviews"][row["record_id"]]["block_ids"] = [next(
+                    r["block_id"] for r in SAMPLE["expected"] if r["key"] == row["key"])]
+            result = Completion(content=json.dumps(response), model="offline")
             validate(result)
             return result
     async def review(payload):

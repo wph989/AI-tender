@@ -13,11 +13,12 @@ from test_analysis_synthesis import execute
 from test_deep_analysis import call
 
 from tender.application.analysis.data import GapInput, SynthesisRecord, prepare_records
+from tender.application.analysis.drafts import DraftRecord, DraftWorkspace
 from tender.application.analysis.output import output_schema
 from tender.application.analysis.policy import load_module_skill
-from tender.application.analysis.protocol import ResearchLedger, SubmissionRecord
 from tender.application.analysis.skills import MODULES, RESOURCE_ROOT, skill_snapshot
 from tender.application.analysis.topic_flow import TopicFlow
+from tender.application.shared.validation import InputError
 
 LEGACY = json.loads((
     Path(__file__).resolve().parents[2] / "fixtures/analysis/legacy_skill_formats.json"
@@ -38,7 +39,7 @@ def examples(path):
 def business_record(record):
     from tender.application.knowledge.content import fingerprint
 
-    SubmissionRecord.model_validate(record)
+    DraftRecord.model_validate(record)
     payload = {k: v for k, v in record.items() if k not in {"work_ids", "block_ids", "id"}}
     name = payload["content"].get("要求摘要", next(iter(payload["content"].values())))
     payload.setdefault("title", ("；".join(name) if isinstance(name, list) else name)[:300])
@@ -51,7 +52,7 @@ def business_record(record):
 
 def legacy_submission(submission):
     return {"records": [business_record(r).model_dump() for r in submission["records"]],
-            "final": submission["final"]}
+            "final": True}
 
 
 def example_rows(value, *, cross_file=False):
@@ -141,10 +142,10 @@ def test_packaged_examples_pass_real_record_and_citation_validation(path):
     for value in cases:
         seen = {row["block_id"]: row for row in example_rows(value)}
         state = {"output_schema": output_schema(SNAPSHOT, key), "staged_items": []}
-        assert value["submissions"][-1]["final"] is True
-        for index, submission in enumerate(value["submissions"]):
+        assert value["submissions"][-1]["final"] is False
+        for submission in value["submissions"]:
             assert isinstance(submission["records"], list)
-            assert submission["final"] == (index == len(value["submissions"]) - 1)
+            assert submission["final"] is False
             raw = [business_record(r) for r in submission["records"]]
             entries = prepare_records(raw, state, seen, key)
             state["staged_items"].extend(entries)
@@ -158,37 +159,53 @@ def test_packaged_examples_pass_real_record_and_citation_validation(path):
 
 
 @pytest.mark.parametrize("path", EXAMPLE_PATHS, ids=lambda p: str(p.relative_to(RESOURCE_ROOT)))
-def test_packaged_examples_accept_minimal_topic_progress_without_extra_empty_submission(path):
-    from types import SimpleNamespace
-
+def test_packaged_drafts_can_be_reviewed_and_finalized_without_stage_controller(path):
     key = path.relative_to(RESOURCE_ROOT).parts[0]
-    topics = json.loads(SNAPSHOT[key + "/references/coverage.json"])
     for value in examples(path):
         seen = {row["block_id"]: row for row in example_rows(value)}
-        state = {"output_schema": output_schema(SNAPSHOT, key), "business_topics": topics}
-        flow = TopicFlow(state, SimpleNamespace(seen=seen))
-        # 模拟此前检索已经归档原文；局部样例不声明整份文件所有主题已完成。
-        for block_id in seen:
-            flow.associate(block_id, [topic["key"] for topic in topics])
-        for submission in value["submissions"]:
-            prepared = prepare_records([business_record(r)
-                                        for r in submission["records"]], state, seen, key)
-            updates = [u for item, record in zip(prepared, submission["records"], strict=True)
-                       for u in ResearchLedger(flow).record_updates([item], record["work_ids"])]
-            merged = {}
-            for update in updates:
-                token = (update.topic, json.dumps(update.scope_value(), sort_keys=True))
-                if token in merged:
-                    merged[token].record_keys.extend(update.record_keys)
-                else:
-                    merged[token] = update
-            updates = flow.prepare_updates(prepared, list(merged.values()))
-            flow.validate_records(prepared, updates)
-            available = {i["business"]["key"] for i in [*state.get("staged_items", []), *prepared]}
-            flow.apply(updates, available)
-            state.setdefault("staged_items", []).extend(prepared)
-        if any(s["records"] for s in value["submissions"]):
-            assert value["submissions"][-1]["records"], "有据批次可直接请求完成检查"
+        state = {"output_schema": output_schema(SNAPSHOT, key)}
+        book = DraftWorkspace(state, seen, key)
+        for index, submission in enumerate(value["submissions"]):
+            result = book.save_records(submission["records"], f"sample:{index}")
+            assert not result["rejected"], result
+        records = list(book.items().values())
+        book.record_review([{"record_id": item["id"], "version": item["draft_version"],
+            "status": "passed", "reason": "测试人工样例与原文逐项一致",
+            "block_ids": [r["block_id"] for r in item["business"]["citations"]]}
+            for item in records], [], "checked")
+        assert "draft" not in state
+        if any(item["business"]["scope"]["kind"] == "unknown" for item in records):
+            with pytest.raises(InputError, match="适用范围"):
+                book.finalize([item["id"] for item in records], "范围仍待确认")
+            # 局部样例故意没有范围依据；模拟后续读到范围原文，再由Agent明确改稿。
+            seen["scope-proof"] = block() | {
+                "block_id": "scope-proof", "content": "本项目上述要求适用于全部标段。"
+            }
+            for item in records:
+                row = copy.deepcopy(item["business"])
+                if row["scope"]["kind"] != "unknown":
+                    continue
+                by_key = {i["business"]["key"]: i["id"] for i in book.items().values()}
+                payload = {k: row[k] for k in DraftRecord.model_fields if k in row
+                           and k not in {"id", "key"}}
+                for field in ("parent_key", "subject_key", "object_key"):
+                    if payload.get(field):
+                        payload[field] = by_key[payload[field]]
+                payload["requirement_keys"] = [by_key[k] for k in row["requirement_keys"]]
+                payload.update(id=item["id"], version=item["draft_version"],
+                               scope={"kind": "common", "lot_refs": []},
+                               block_ids=[r["block_id"] for r in row["citations"]]
+                               + ["scope-proof"])
+                result = book.save_records([payload], "resolve:" + item["id"])
+                assert not result["rejected"], result
+            records = list(book.items().values())
+            book.record_review([{"record_id": item["id"], "version": item["draft_version"],
+                "status": "passed", "reason": "补读适用范围后复核全部样例",
+                "block_ids": [r["block_id"] for r in item["business"]["citations"]]}
+                for item in records], [], "scope-reviewed")
+        book.finalize([item["id"] for item in records], "人工样例数据契约核对完成")
+        assert len(state["draft"]["business_data"]["records"]) == len(records)
+        assert "topic_flow" not in state
 
 
 @pytest.mark.parametrize("key", MODULES)

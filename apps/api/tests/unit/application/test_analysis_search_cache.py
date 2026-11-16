@@ -22,7 +22,8 @@ def test_different_queries_do_not_reuse_each_others_candidates(queries):
         research.retrieve = retrieve
         for query in queries:
             result = await research.search(query, "project")
-            assert result["blocks"] == [{"id": query, "text": query}]
+            assert result["blocks"] == [{"id": query, "text": query,
+                                        "source_id": 1, "chapter": "质保"}]
         assert calls == list(queries)
 
     asyncio.run(run())

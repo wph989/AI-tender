@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -28,13 +28,16 @@ CONTRACT = """按冻结Skill研究并增量暂存完整业务事项。程序维�
 先list_documents核对项目资料。search_document_batch每批1到4个具体缺口，分别填写query/work_ids；
 相同查询先合并，正文去重后交付。单查询search_document也使用work_ids，示例：
 {"query":"招标公告","work_ids":["w1"]}；页长由程序控制，不传limit。
+每个query围绕一个具体字段或条款，勿拼接整份核对清单；首批同时定位当前项目公告或前附表。
 已有原文直接分析，不反复检索已解决内容。
 read_document可围绕最多4个已读block_id补读并合并重叠窗口；真实续页沿用next_offset。
 has_more不代表必须翻完；in_context表示同版本全文仍在上下文。摘要后缺失原文可get_research_context补回。
 每批后先理解原文并submit_analysis(final=false)暂存完整事项，草稿不展示。update_research仅保存具体线索和待办。
 submit_analysis使用records/final；每项kind/group/content/block_ids/work_ids，content列名取冻结输出声明。
+kind只选fact（事实）、requirement（要求）、lot（标段）、format_node（格式节点）、relation（关系）。
 新增省略key和id，程序回执index/id/status；修改用id。仅同批相互引用允许临时key；
 parent_key/subject_key/object_key/requirement_keys可引用本批临时key或已有程序id。
+恢复或修复时先读相关work_ids的已有正文，使用其中record_id修改同一事项；换措辞或补充条件仍是修改。
 标题由声明的title_column生成；标段lot、格式节点format_node、缺少标题来源列时必须提供title原文名称。
 关联当前工作范围均已确认且一致时可省略scope；未知、混合或首次拆标段必须显式声明，不能默认common。
 block_ids只选择实际已读原文；不要输出citations、页码、坐标、摘抄或内部身份，无需quote。
@@ -44,6 +47,12 @@ block_ids只选择实际已读原文；不要输出citations、页码、坐标�
 真实续页或明确未读转引仍受总预算约束。笔记改写、重复提交和其他工作的变化不算推进。
 结束前逐项核对工作索引的完整检查目标；同主题已有一条事实不能代替其它独立目标。
 原文实质转引须补读对应正文，单份前附表或索引不能代替公告、标段清单及相关细则。
+chapter保留章节归属；通用条款提及专用条款仍属通用条款，空白合同格式不能代替已填写的项目要求。
+先核清项目身份、实际采用的方式及原文明示的条款优先顺序，再提取当前生效要求。
+同文件可夹杂其它项目或未选用模板；“上述时间”等跨块指代须追读，不凭文件名或较新年份判定适用。
+互斥分支不能无条件并列；已有明确选择或替代条款时据此归纳，无法消解的冲突登记具体待办。
+决定多个工作的身份、方式、优先顺序等原文，用update_research的evidence_ids关联全部受影响work_ids；
+提交事项的block_ids保留直接依据及决定适用性的依据。依赖另一事项的生效条件用requirement_keys关联其id。
 依据充分时complete_research简述结论及未核清目标：有草稿直接审查，无草稿才综合，最后一批final=true。
 not_found只表示本次范围未找到；未决转引、混范围、缺资料通过update_research保存，不编造不存在断言。
 补遗替代已确认范围用replaces_scopes；新增并存标段只填scope。重开具体工作用status=reopen。
@@ -105,7 +114,8 @@ def batch_field(model: type[BaseModel], **kwargs):
             return {k: inline(v) for k, v in value.items()}
         return value
 
-    return Field(json_schema_extra={"items": inline(schema)}, **kwargs)
+    return Field(json_schema_extra={"items": inline(schema), "x-tender-partial-items": True},
+                 **kwargs)
 
 
 class SubmissionRecord(DataInput):
@@ -129,6 +139,21 @@ class SubmissionRecord(DataInput):
     predicate: Literal["supersedes", "conflicts", "requires", "contains"] | None = None
     subject_key: str | None = None
     object_key: str | None = None
+
+
+class SubmissionInput(DataInput):
+    # LangChain从函数签名推导时会丢弃Field的items扩展；显式模型确保供应商看到逐项协议，
+    # 容器保留Any，坏条目仍由中间件隔离，不能让整批有效事项一起失败。
+    records: list[Any] = batch_field(SubmissionRecord, description=(
+        "完整事项数组；每项kind/group/content/block_ids/work_ids，修改使用回执id；"
+        "content列名按冻结输出声明填写"
+    ))
+    final: bool = False
+
+
+class ResearchUpdateInput(DataInput):
+    updates: list[Any] = batch_field(ResearchDelta, min_length=1, max_length=50,
+                                    description="逐项研究增量，accepted已保存，仅修正rejected")
 
 
 def submission_records(raw: list[SubmissionRecord], state: dict, works: list[dict],
@@ -162,6 +187,7 @@ def submission_records(raw: list[SubmissionRecord], state: dict, works: list[dic
     prepared, errors = [], []
     for index, (record, key) in enumerate(zip(raw, keys, strict=True)):
         index = indices[index] if indices is not None else index
+        duplicate_id = None
         try:
             if key is None:
                 raise InputError.for_field("id",
@@ -213,6 +239,18 @@ def submission_records(raw: list[SubmissionRecord], state: dict, works: list[dic
                 raise InputError.for_field("requirement_keys",
                                     "requirement_keys须引用同批临时key或已有程序id")
             payload["requirement_keys"] = [refs[v] for v in record.requirement_keys]
+            candidate = payload | {"title": title, "scope": scope.model_dump()}
+            if key not in positions:
+                # 原文、范围和全部提交属性完全一致才拒绝重复新增；不按标题或近似正文合并。
+                # 回执直接给出已有id，让后续改写、补证或关联其它工作走正常修改路径。
+                duplicate_id = next((item["id"] for item in state.get("staged_items", [])
+                    if item.get("business") and all(
+                        item["business"].get(name) == value for name, value in candidate.items())
+                    and {ref["block_id"] for ref in item["business"].get("citations", [])}
+                    == set(record.block_ids)), None)
+                if duplicate_id:
+                    raise InputError.for_field(
+                        "id", "与已保存事项的正文、范围及原文完全一致，使用已有id：" + duplicate_id)
             if key not in positions:
                 positions[key] = next_position
                 next_position += 1
@@ -222,7 +260,8 @@ def submission_records(raw: list[SubmissionRecord], state: dict, works: list[dic
                 "sort_order": positions[key], "structuring": "complete",
             })))
         except (InputError, ValidationError) as exc:
-            errors.append({"index": index, "id": record_identity(state, key) if key else record.id,
+            errors.append({"index": index, "id": duplicate_id or (
+                record_identity(state, key) if key else record.id),
                            "status": "rejected", "error": str(exc),
                            "field_issues": getattr(exc, "field_issues", [])})
     return prepared, errors
@@ -663,7 +702,8 @@ class ResearchLedger:
                    if self.flow.data.get("research_stop_reason") else {}),
                 "works": prompt_index(works),
                 **({"synthesis_work_origins": prompt_index(origins)} if origins else {}),
-                "next_action": ("理解本批原文并暂存有据事项；"
+                "next_action": ("按work_ids读取已有事项，修改用record_id；"
+                                "理解原文并暂存有据事项；"
                                 "依据充分则complete_research，仅补查具体缺口"
                                 if self.flow.researching else "统一综合，最后一批final=true"),
                 "notes": "任务check是摘要；完整原因、target、笔记及原文"

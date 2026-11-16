@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 
-from tender.application.analysis.contract import RUNTIME_VERSION
+from tender.application.analysis.contract import READABLE_RUNTIMES, RUNTIME_VERSION
 from tender.application.analysis.data import (
     DATA_VERSION,
     assemble_dataset,
@@ -15,8 +15,15 @@ from tender.application.knowledge.content import fingerprint, source_state
 from tender.ports.repository.analysis.reports import ReportRepository
 
 
-def snapshot_manifest(status: str, runs: list[dict], modules: list[dict]) -> str:
-    """发布和取数共用同一指纹，取消补跑不能使上一批成果重新有效。"""
+def snapshot_manifest(
+    status: str, runs: list[dict], modules: list[dict], *, runtime_version: str | None = None,
+) -> str:
+    """发布和取数共用指纹；新协议仅在正式业务数据变化时产生新版本。"""
+    if runtime_version == RUNTIME_VERSION:
+        # 新运行的状态变化不是正式数据变更；中断重跑应继续保留上一轮同一快照。
+        return fingerprint([runtime_version, [
+            [m["module_key"], m["business_data"]] for m in modules
+        ]])
     return fingerprint([status, runs, [
         [m["module_key"], m["status"], m["business_data"]] for m in modules
     ]])
@@ -42,14 +49,15 @@ def snapshot_matches_report(db: ReportRepository, snapshot: dict) -> bool:
     return (
         state["status"] not in {"waiting", "pending", "running"}
         and not unfinished_runs(state["runs"])
-        and snapshot_manifest(state["status"], state["runs"], state["modules"])
+        and snapshot_manifest(state["status"], state["runs"], state["modules"],
+                              runtime_version=snapshot["input_snapshot"].get("runtime_version"))
         == snapshot["manifest_hash"]
     )
 
 
 def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
     report = db.report(report_id)
-    if report is None or report["runtime_version"] != RUNTIME_VERSION:
+    if report is None or report["runtime_version"] not in READABLE_RUNTIMES:
         return None
     if report["status"] in {"waiting", "pending", "running"}:
         return None
@@ -63,7 +71,8 @@ def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
         if unfinished_runs(runs):
             return None
         modules = session.report_modules(report_id)
-        digest = snapshot_manifest(locked["status"], runs, modules)
+        digest = snapshot_manifest(locked["status"], runs, modules,
+                                   runtime_version=locked["runtime_version"])
         existing = session.snapshot_by_manifest(report_id, digest)
         if existing:
             return existing

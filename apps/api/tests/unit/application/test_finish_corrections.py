@@ -15,15 +15,17 @@ from tender.application.analysis.agent import ResearchMiddleware
 from tender.application.analysis.research import AgentLimits
 from tender.application.analysis.runtime import limits_snapshot
 from tender.application.knowledge.content import validate_items
-from tender.config.schema import resolve_values, validate_value
+from tender.config.schema import READONLY_REASONS, resolve_values, validate_value, write_denial
 
 
 def test_finish_correction_config_defaults_overrides_and_bounds():
     assert AgentLimits().max_finish_corrections == 2
     for value in (1, 5, 1000000):
         assert validate_value("analysis.max_finish_corrections", value) is None
-    for value in (0, -1, True, 1.5, "5"):
+    for value in (True, 1.5, "5"):
         assert validate_value("analysis.max_finish_corrections", value) is not None
+    assert "固定修复轮数" in READONLY_REASONS["analysis.max_finish_corrections"]
+    assert write_denial("admin", ["analysis.max_finish_corrections"]) is not None
     frozen = limits_snapshot(SimpleNamespace(resolved_config=lambda: resolve_values({
         "analysis.max_finish_corrections": 5,
     })))

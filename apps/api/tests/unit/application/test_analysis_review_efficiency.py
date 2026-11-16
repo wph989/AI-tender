@@ -35,6 +35,304 @@ async def shared_flow():
     return flow
 
 
+def test_changed_review_policy_cannot_reuse_saved_approval(monkeypatch):
+    from tender.application.analysis import review as module
+    from tender.application.analysis.state import published_items
+
+    async def run():
+        flow = await flow_fixture(repairs=0)
+        calls = []
+        interrupted = False
+
+        async def review(payload):
+            calls.append(copy.deepcopy(payload))
+            result = approve(payload)
+            if len(calls) > 1:
+                for verdict in result["reviews"].values():
+                    verdict.update(supported=False, issues=["旧现场要求与项目电子开标方式冲突"])
+            return result
+
+        async def save(_):
+            nonlocal interrupted
+            # 复现回执已保存、尚未投影时升级审查规则；新规则不能沿用旧请求的通过回执。
+            if not interrupted and flow.data["audit"]["results"]:
+                interrupted = True
+                raise ConnectionError("旧审查回执已保存")
+
+        with pytest.raises(ConnectionError, match="旧审查回执"):
+            await audit_combined(flow, review, save)
+        monkeypatch.setattr(module, "REVIEW_RULES", module.REVIEW_RULES + "\n新增明确适用性要求")
+        assert await audit_combined(flow, review, save)
+        assert len(calls) == 2
+        assert not published_items(flow.state, final=True)
+        assert flow.data["audit"]["remaining"]
+
+    asyncio.run(run())
+
+
+def test_missing_source_disposition_reaches_review_and_invalidates_old_topic_completion():
+    from tender.application.analysis.review import reviewed_topics
+
+    async def run():
+        flow = await flow_fixture()
+
+        async def review(payload):
+            return approve(payload)
+
+        async def save(_):
+            pass
+
+        assert await audit_combined(flow, review, save)
+        assert reviewed_topics(flow) == {"a"}
+        # 研究已核清缺件而草稿正文未变时，不能静默沿用“已核清完整资料”的旧主题资格。
+        note = {"status": "missing_source", "detail": "已核清目录，附件甲未随项目提供",
+                "evidence_ids": ["s1r1c0"], "notes": ["重复研究叙述" * 600]}
+        flow.entries[0]["dispositions"] = {"w1": note, "w2": copy.deepcopy(note)}
+        assert reviewed_topics(flow) == set()
+        packets, _ = batches(flow, "a", [])
+        findings = [hint for packet in packets for check in packet["checks"]
+                    for hint in check.get("input_findings", [])]
+        assert findings and findings[0]["detail"] == note["detail"]
+        assert all(hint["evidence_ids"] for hint in findings)
+        assert "重复研究叙述" not in json.dumps(packets, ensure_ascii=False)
+        for packet in packets:
+            shown = {e["id"] for e in packet["evidence"] + packet["context_evidence"]}
+            assert all(set(hint["evidence_ids"]) <= shown for check in packet["checks"]
+                       for hint in check.get("input_findings", []))
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("explicit_dependency", [False, True])
+def test_large_chunks_keep_explicit_dependencies_without_automatic_whole_section_neighbours(
+    explicit_dependency,
+):
+    async def run():
+        flow = await flow_fixture()
+        original = flow.research.seen["s1r1c0"]
+        original["chunk_version"] = "2"
+        other = original | {"block_id": "s1r1c1", "element_id": 2, "offset": 1,
+                            "content": "另一节的独立事项及条件。"}
+        flow.research.seen[other["block_id"]] = other
+        flow.entries[0]["evidence_ids"].append(other["block_id"])
+        record = flow.state["staged_items"][0]
+        if explicit_dependency:
+            record["review_evidence_ids"] = [other["block_id"]]
+        packets, _ = batches(flow, "a", [])
+        primary = next(p for p in packets if p["records"])
+        expected = {"s1r1c0", "s1r1c1"} if explicit_dependency else {"s1r1c0"}
+        assert set(primary["record_evidence_ids"][record["id"]]) == expected
+        # 其它已读正文仍接受查漏；不把相关性优化变成丢弃原文或免审。
+        assert {e["id"] for p in packets for e in p["evidence"] + p["context_evidence"]} == {
+            "s1r1c0", "s1r1c1",
+        }
+        assert record["id"] not in {r["record_id"] for r in primary["record_index"]}
+
+    asyncio.run(run())
+
+
+def test_additional_evidence_packet_does_not_repeat_complete_check_responsibility():
+    async def run():
+        flow = await flow_fixture()
+        flow.research.seen["s1r1c0"]["chunk_version"] = "2"
+        flow.state["staged_items"][0]["business"]["content"] = {"内容": "已确认条款" * 400}
+        extra = flow.research.seen["s1r1c0"] | {
+            "block_id": "s1r1c1", "offset": 1, "element_id": 2,
+            "content": "补充条款" * 1100,
+        }
+        flow.research.seen[extra["block_id"]] = extra
+        flow.entries[0]["evidence_ids"].append(extra["block_id"])
+        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=11000)
+        repair = [{"topic": "a", "kind": "unsupported", "action": "repair",
+                   "issue_id": "a" * 64, "detail": "原条款条件需要核对", "target": "原条款",
+                   "record_keys": [flow.state["staged_items"][0]["business"]["key"]],
+                   "evidence_ids": ["s1r1c0"]}]
+        packets, _ = batches(flow, "a", repair)
+        assert len(packets) == 2
+        primary, additional = packets
+        assert primary["check_items"]
+        assert additional["check_items"] == []
+        # 补充包仍逐块查漏，发现真实遗漏时须进入原问题账，不能因此免审或丢掉证据。
+        assert additional["checks"] and additional["evidence"][0]["id"] == "s1r1c1"
+        assert additional["record_index"]
+        assert primary["repair_issues"] == repair
+        assert additional["repair_issues"] == []
+        frozen, _ = batches(flow, "a", [], frozen_packets=copy.deepcopy(packets))
+        assert frozen == packets
+
+        calls = []
+
+        async def review(payload):
+            calls.append(payload)
+            result = approve(payload)
+            if not payload["check_items"]:
+                result["issues"] = [{"topic": "a", "kind": "omission", "action": "repair",
+                    "detail": "补充条款规定的独立费用未提取", "target": "独立费用",
+                    "record_ids": [], "evidence_ids": ["s1r1c1"]}]
+            return result
+
+        async def save(_):
+            pass
+
+        assert not await audit_combined(flow, review, save)
+        assert len(calls) == 2
+        assert any(i["target"] == "独立费用" for i in flow.data["audit"]["issues"])
+
+    asyncio.run(run())
+
+
+def test_research_narrative_does_not_displace_complete_evidence_in_review():
+    async def run():
+        flow = await flow_fixture()
+        flow.state["research_completed"] = {"research_summary": "研究过程的重复说明" * 1200}
+        repair = [{"topic": "a", "kind": "reference", "action": "read",
+                   "issue_id": "a" * 64, "detail": "核对原文约定的完整条件", "target": "条款",
+                   "record_keys": [flow.state["staged_items"][0]["business"]["key"]],
+                   "evidence_ids": ["s1r1c0"]}]
+        flow.entries[0]["tasks"]["review-question"] = repair[0] | {
+            "task_id": "review-question", "review_issue": True, "status": "pending",
+        }
+        packets, _ = batches(flow, "a", repair)
+        primary, = packets
+        assert primary["repair_issues"] == repair
+        assert primary["records"][0]["business"]["content"]
+        assert next(e["text"] for e in primary["evidence"] + primary["context_evidence"]
+                    if e["id"] == "s1r1c0") == flow.research.seen["s1r1c0"]["content"]
+        # 复核问题只传一次，独立审查始终消费完整事项、真实原文和结构化研究账。
+        assert all(not c["tasks"] for c in primary["checks"])
+
+    asyncio.run(run())
+
+
+def test_shared_source_does_not_pull_another_records_repair_candidates_into_every_packet():
+    async def run():
+        flow = await flow_fixture()
+        first = flow.state["staged_items"][0]
+        second = copy.deepcopy(first)
+        second["id"] = "second"
+        second["business"].update(key="second", title="第二事项")
+        first["business"]["content"] = {"内容": "甲" * 2000}
+        flow.state["staged_items"].append(second)
+        flow.entries[0]["record_keys"].append("second")
+        source = flow.research.seen["s1r1c0"]
+        source["chunk_version"] = "2"
+        flow.research.seen["s1r1c8"] = source | {
+            "block_id": "s1r1c8", "offset": 8, "element_id": 9, "content": "乙" * 4000,
+        }
+        second["review_evidence_ids"] = ["s1r1c8"]
+        flow.entries[0]["evidence_ids"].append("s1r1c8")
+        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=11000)
+        repair = [{"topic": "a", "kind": "conflict", "action": "read",
+                   "issue_id": "b" * 64, "detail": "核对第二事项的修订", "target": "第二事项",
+                   "record_keys": ["second"], "evidence_ids": ["s1r1c0"]}]
+        packets, _ = batches(flow, "a", repair)
+        primary = next(p for p in packets
+                       if any(r["record_id"] == first["id"] for r in p["records"]))
+        assert primary["repair_issues"] == []
+        assert "s1r1c8" not in {e["id"] for e in primary["evidence"] + primary["context_evidence"]}
+        owner = next(p for p in packets if p["repair_issues"])
+        assert "second" in {r["key"] for r in owner["records"] + owner["context_records"]}
+        assert "s1r1c8" in {e["id"] for e in owner["evidence"] + owner["context_evidence"]}
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_candidate_overflow_keeps_complete_record_in_each_part_and_combines_verdicts(conflict):
+    from tender.application.analysis.review import fits
+    from tender.application.analysis.state import published_items
+
+    async def run():
+        flow = await flow_fixture(repairs=0)
+        item = flow.state["staged_items"][0]
+        anchor = flow.research.seen["s1r1c0"]
+        anchor["chunk_version"] = "2"
+        extras = [f"s1r1c{i}" for i in range(1, 4)]
+        for offset, key in enumerate(extras, 1):
+            flow.research.seen[key] = anchor | {
+                "block_id": key, "offset": offset, "element_id": offset + 1,
+                "content": "需要逐条核对的补充候选原文。" * 180,
+            }
+        item["review_evidence_ids"] = extras
+        flow.entries[0]["evidence_ids"].extend(extras)
+        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=10500)
+        packets, _ = batches(flow, "a", [])
+        assert len(packets) > 1
+        assert all(fits(p, flow.research.limits) for p in packets)
+        full_record = packets[0]["records"][0]
+        assert all(p["records"] == [full_record] for p in packets)
+        assert all("s1r1c0" in p["record_evidence_ids"][item["id"]] for p in packets)
+        assert {key for p in packets for key in p["record_evidence_ids"][item["id"]]} == {
+            "s1r1c0", *extras,
+        }
+        calls = []
+
+        async def review(payload):
+            calls.append(payload)
+            result = approve(payload)
+            if conflict and extras[-1] in payload["record_evidence_ids"][item["id"]]:
+                result["reviews"][item["id"]].update(
+                    supported=False, issues=["补充条款改变了原结论的适用条件"],
+                )
+            # 前面的分片通过不能提前发布；全部补充候选核清后才合并支持性判定。
+            assert item.get("review_status") != "current"
+            return result
+
+        async def save(_):
+            pass
+
+        item["review_status"] = "needs_review"
+        assert await audit_combined(flow, review, save)
+        assert len(calls) == len(packets)
+        assert (item["verification"] == "supported") is not conflict
+        assert bool(published_items(flow.state)) is not conflict
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("omission", [False, True])
+def test_partitioned_checks_combine_every_packets_findings_without_mutual_deferral(omission):
+    from tender.application.analysis.review import validate
+
+    async def run():
+        flow = await flow_fixture(repairs=0)
+        first = flow.state["staged_items"][0]
+        second = copy.deepcopy(first)
+        second["id"] = "second"
+        second["business"].update(key="second", title="地点")
+        flow.state["staged_items"].append(second)
+        flow.entries[0]["record_keys"].append("second")
+        first["business"]["content"] = {"内容": "时间条件" * 800}
+        second["business"]["content"] = {"内容": "地点条件" * 800}
+        flow.research.limits = replace(flow.research.limits, review_max_input_tokens=10500)
+        calls = []
+
+        async def review(payload):
+            calls.append(payload)
+            assert all(c["coverage_mode"] == "partition" for c in payload["check_items"])
+            result = approve(payload)
+            for receipt in result["check_results"].values():
+                receipt.update(status="covered_here", issue_indexes=[])
+            if omission and len(calls) == 2:
+                result["issues"] = [{"topic": "a", "kind": "omission", "action": "read",
+                    "target": "地点的变更通知", "detail": "已读原文的变更通知要求未提取",
+                    "record_ids": [], "evidence_ids": ["s1r1c0"]}]
+                for receipt in result["check_results"].values():
+                    receipt.update(status="needs_action", issue_indexes=[0])
+            validate(result, payload)
+            return result
+
+        async def save(_):
+            pass
+
+        assert await audit_combined(flow, review, save)
+        assert len(calls) == 2
+        assert not flow.data["audit"]["execution_errors"]
+        assert bool(flow.data["audit"]["remaining"]) is omission
+
+    asyncio.run(run())
+
+
 def test_packet_checks_distinguish_local_records_from_other_packet_navigation():
     async def run():
         flow = await shared_flow()
@@ -63,6 +361,30 @@ def test_packet_checks_distinguish_local_records_from_other_packet_navigation():
         assert {rid for check in merged["checks"] for rid in check["record_ids"]} == {
             first["id"], second["id"],
         }
+
+    asyncio.run(run())
+
+
+def test_repair_issue_keeps_new_comparison_evidence_with_its_record():
+    async def run():
+        flow = await flow_fixture()
+        original = flow.research.seen["s1r1c0"]
+        original["chunk_version"] = "2"
+        flow.research.seen["s1r1c7"] = original | {
+            "block_id": "s1r1c7", "offset": 7, "element_id": 8,
+            "content": "专用条款：本项目质保五年。", "chapter": "专用合同条款",
+        }
+        item = flow.state["staged_items"][0]
+        repair = [{"topic": "a", "kind": "conflict", "action": "repair",
+                   "issue_id": "b" * 64, "detail": "核对通用与专用期限差异", "target": "质保期限",
+                   "record_keys": [item["business"]["key"]], "evidence_ids": ["s1r1c7"]}]
+        packets, _ = batches(flow, "a", repair)
+        primary, = packets
+        assert primary["repair_issues"] == repair
+        assert {span["id"] for span in primary["evidence"] + primary["context_evidence"]} == {
+            "s1r1c0", "s1r1c7",
+        }
+        assert "s1r1c7" in primary["record_evidence_ids"][item["id"]]
 
     asyncio.run(run())
 

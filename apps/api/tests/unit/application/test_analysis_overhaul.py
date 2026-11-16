@@ -22,7 +22,7 @@ def test_restart_discards_all_analysis_state_for_every_terminal_status(status, m
     service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
     service.retry_report(3, module_keys=["project_basic_info_parsing"],
                          max_output_tokens=None, timeout_seconds=None, mode=mode)
-    assert tx.reset == [9] and tx.pending == [9]
+    assert tx.reset is None and tx.pending == [9]
     assert tx.inserted[0]["state"] == {"execution_mode": "restart"}
     assert previous["research"]["tool_calls"] == 100
 
@@ -42,15 +42,37 @@ def test_confirmed_missing_input_does_not_restart_on_the_same_materials():
     assert not tx.inserted
 
 
+@pytest.mark.parametrize("confirmed_first", [False, True])
+def test_cross_topic_missing_attachment_keeps_confirmed_details_and_proof(confirmed_first):
+    from tender.application.analysis.quality import settle_quality
+
+    pending = {"topic": "payment", "kind": "reference", "action": "read",
+               "target": "附件2商务规范书", "detail": "需补读商务规范书",
+               "record_keys": [], "evidence_ids": ["c208"]}
+    confirmed = pending | {
+        "topic": "acceptance", "action": "provide_input",
+        "detail": "已核对全部项目资料，附件2商务规范书未提供，请补充该附件。",
+        "missing_input": {"file_name": "商务规范书", "reference_ids": ["c208"],
+                          "checked_source_ids": [14]},
+    }
+    state = {}
+    settle_quality(state, [confirmed, pending] if confirmed_first else [pending, confirmed])
+    issue, = state["quality_issues"]
+    # 跨主题合并不能只改为等待资料却丢掉实际缺件依据，或继续展示旧的补读指令。
+    assert state["quality_status"] == "needs_input"
+    assert issue["missing_input"] == confirmed["missing_input"]
+    assert issue["detail"] == confirmed["detail"]
+    assert issue["topics"] == ["acceptance", "payment"]
+    assert state["business_gaps"][0]["detail"] == confirmed["detail"]
+    assert "missing_input" not in pending
+
+
 def test_partial_restart_does_not_consume_another_modules_input_change():
-    from test_analysis_compact_protocol import ledger
+    from test_analysis_agent_workspace import workspace
 
     old = [{"source_id": 1, "project_id": 1, "version_id": 1, "parse_run_id": 1}]
     current = old + [{"source_id": 2, "project_id": 1, "version_id": 2, "parse_run_id": 2}]
-    _, flow, previous, _ = ledger()
-    flow.data["audit"].update(version="combined-v3", done=True, remaining=[{
-        "topic": flow.entries[0]["topic"], "action": "provide_input",
-    }])
+    previous = workspace().state
     previous["quality_input_signature"] = source_signature(old)
     tx = _RetryTx([{"id": 9, "status": "completed"}], previous)
     store = _RetryStore(tx)
@@ -71,8 +93,8 @@ def test_partial_restart_does_not_consume_another_modules_input_change():
                          max_output_tokens=None, timeout_seconds=None)
     carried = tx.inserted[-1]["state"]
     assert tx.pending == [10] and len(tx.inserted) == 2
-    assert carried["topic_flow"]["phase"] == "research"
-    assert not carried["topic_flow"]["audit"].get("done")
+    assert "topic_flow" not in carried
+    assert not carried["agent_workspace"]["finalized"]
 
 
 def test_unchanged_module_does_not_resume_only_because_report_snapshot_is_old():
@@ -117,25 +139,20 @@ def test_qa_quote_uses_full_large_block_offsets_and_only_its_actual_pages(quote,
         "\n".join(texts[:2]) if ref["page_no"] == 1 else texts[-1]) for ref in refs)
 
 
-def test_resume_schedules_existing_unresolved_issue_instead_of_only_replaying_review():
-    from test_analysis_compact_protocol import ledger
+def test_resume_retains_unresolved_issue_for_same_agent_without_stage_switch():
+    from test_analysis_agent_workspace import workspace
 
-    _, flow, state, _ = ledger()
-    issue = {"topic": flow.entries[0]["topic"], "issue_id": "existing-gap", "kind": "omission",
-             "action": "read", "detail": "补读附件", "target": "附件甲", "record_keys": [],
-             "evidence_ids": []}
-    flow.data["audit"] = {"version": "combined-v3", "round": 1, "done": True,
-                          "issues": [issue], "remaining": [issue]}
+    book = workspace()
+    receipt = book.record_review([], [{"topic": "warranty", "target": "起算点",
+        "detail": "需补读起算点", "action": "read"}], "issue")
     tx = _RetryTx([{"id": 9, "status": "completed", "business_data": {
-        "quality_status": "needs_review"}}], state)
+        "quality_status": "needs_review"}}], book.state)
     service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
     service.retry_report(3, module_keys=[], max_output_tokens=None,
                          timeout_seconds=None, mode="resume")
-    carried = tx.inserted[0]["state"]["topic_flow"]
-    assert carried["phase"] == "research" and not carried["synthesis_finished"]
-    entry = next(e for e in carried["entries"].values() if e["topic"] == issue["topic"])
-    assert entry["tasks"]["existing-gap"]["status"] == "pending"
-    assert entry["tasks"]["existing-gap"]["issue_id"] == "existing-gap"
+    carried = tx.inserted[0]["state"]
+    assert "topic_flow" not in carried
+    assert carried["agent_workspace"]["issues"][receipt["issues"][0]["id"]]["status"] == "open"
 
 
 @pytest.mark.parametrize("kind,action,quality", [

@@ -29,6 +29,13 @@ interface Props {
   onAction: (action: "retry" | "cancel", keys?: string[], mode?: "restart" | "resume") => void;
 }
 
+const AGENT_ACTIVITIES: Record<string, string> = {
+  list_documents: "核对资料清单", search_document: "检索原文", search_document_batch: "检索原文",
+  search_knowledge: "查阅参考资料", read_document: "阅读原文", read_file: "查阅分析规则",
+  update_research: "记录研究发现", get_research_context: "回读草稿与依据",
+  submit_analysis: "保存分析结果", record_review: "记录自查结论",
+};
+
 /** 专题正文是唯一主阅读入口，快照只补充范围、关联及待核对信息。 */
 export function AnalysisResults({ report, reports, activeModuleId, activeItem, locationRevision, busy, running,
   onChooseReport, onChooseModule, onActiveItem, onLocate, onRefresh, onAction }: Props) {
@@ -253,9 +260,17 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           {module.quality_status === "needs_input" && "；补充所列资料后可重新核对。"}
         </p>}
         {module.status === "partial" && <p className="notice" role="status">
-          本次执行已结束，已展示 {module.items.length} 条结果；仍有待核对事项，处理后可补跑。
+          {module.progress?.protocol === "skill-agent-v1"
+            ? "本次执行已中断，草稿和自查记录已保存，可补跑继续处理。正式结果在最终提交后更新。"
+            : `本次执行已结束，已展示 ${module.items.length} 条结果；仍有待核对事项，处理后可补跑。`}
         </p>}
-        {module.progress && <div className="module-progress-summary" role="status" aria-label="解析进展">
+        {module.progress?.protocol === "skill-agent-v1" && <div className="module-progress-summary" role="status" aria-label="解析进展">
+          <p>{isActive(module.status) ? "正在分析" : "本次执行已结束"}
+            {module.progress.activity && ` · 最近活动：${AGENT_ACTIVITIES[module.progress.activity] ?? "处理分析任务"}`}</p>
+          <p>已保存 {module.progress.draft_count ?? 0} 条草稿 · 当前版本已自查 {module.progress.reviewed_count ?? 0} 条
+            {" · "}未决问题 {module.progress.unresolved_issues ?? 0} 项</p>
+        </div>}
+        {module.progress && module.progress.protocol !== "skill-agent-v1" && <div className="module-progress-summary" role="status" aria-label="解析进展">
           {/* 终态可能保留最后阶段的进度，不能据此把已结束的执行显示成正在审查。 */}
           <p>{isActive(module.status) ? module.progress.phase === "research" ? "正在研究原文"
             : module.progress.phase === "synthesis" ? "正在综合结果"
@@ -321,7 +336,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
                   : "正在检索与核对原文，已有可靠结果会持续保存。"
               : "本次还没有可用的分析结果，可展开上方记录查看原因。"}</p>}
         {/* 详细工作账供需要时展开；轮询不自动打开，避免打断正文阅读。 */}
-        {module.progress && <details className="coverage-details">
+        {module.progress && module.progress.protocol !== "skill-agent-v1" && <details className="coverage-details">
           <summary>查看核对详情</summary>
           <ul>{module.progress.topics.map((topic, index) => <li key={`${topic.topic}:${index}`}>
             <strong>{topic.title}</strong>{" · "}

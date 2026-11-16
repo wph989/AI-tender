@@ -125,7 +125,7 @@ class AgentRuntime:
         *,
         state: dict | None = None,
     ) -> None:
-        topic_settlement = bool(state and state.get("topic_flow")
+        topic_settlement = bool(state and (state.get("topic_flow") or state.get("agent_workspace"))
                                 and status in {"partial", "failed"})
         if status in {"completed", "partial"} or topic_settlement:
             # 部分发布同样要复核报告状态、所有权、租约与资料权限。
@@ -147,7 +147,7 @@ class AgentRuntime:
             publish = self._staged_payload(state or {}, include_relations=True)
         else:
             publish = None
-        if state and state.get("topic_flow"):
+        if state and (state.get("topic_flow") or state.get("agent_workspace")):
             self.store.finish(status, error, publish=publish, state=state)
         else:
             self.store.finish(status, error, publish=publish)
@@ -177,6 +177,7 @@ class AgentRuntime:
                 "research": current.get("research", {}),
                 "topics": current.get("topic_flow", {}),
                 "drafts": current.get("staged_items", []),
+                "agent_workspace": current.get("agent_workspace", {}),
                 "gaps": current.get("business_gaps", []),
                 "research_conclusion": current.get("research_completed", {}),
                 "tool_errors": [value["data"] for value in current.get("tool_results", {}).values()
@@ -205,6 +206,8 @@ class AgentRuntime:
     @staticmethod
     def _staged_payload(state: dict, *, include_relations: bool = False) -> dict | None:
         """未完成也保存已核实字段的展示投影；未通过校验时不发布。"""
+        if state.get("agent_workspace"):
+            return None
         if not state.get("staged_items_verified") and not state.get("topic_flow"):
             return None
         payload = {

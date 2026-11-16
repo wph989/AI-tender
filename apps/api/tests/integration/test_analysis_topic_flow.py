@@ -7,10 +7,9 @@ from uuid import uuid4
 
 import pytest
 import test_deepagents_runtime
-from analysis_review_fixture import check_results
 from test_deepagents_runtime import prepared_runtime, publishable_state, report
 
-from tender.application.analysis.protocol import PROTOCOL_VERSION
+from tender.application.analysis.contract import FLOW_VERSION as PROTOCOL_VERSION
 from tender.application.analysis.service import AnalysisService
 from tender.application.analysis.topic_flow import FLOW_KEY, TopicFlow, TopicUpdate
 
@@ -390,138 +389,84 @@ def test_check_exhaustion_preserves_other_work_and_stable_task_ids_across_reload
 
 
 @pytest.mark.parametrize("max_calls", [4, 5, 6, 40])
-def test_new_report_researches_before_synthesis_and_independent_audit(env, monkeypatch, max_calls):
-    import json
-
+def test_single_agent_can_search_after_review_and_budget_never_publishes_draft(
+    env, monkeypatch, max_calls,
+):
     from langchain_core.messages import AIMessage, message_to_dict
 
     from tender.adapters.pg.analysis.checkpoints import run_async
+    from tender.application.analysis.drafts import DraftWorkspace
     from tender.ports.llm.chat import Completion
 
     runtime = prepared_runtime(env, topic_flow=True)
     env.db.execute("""UPDATE agent_module_run SET limits=jsonb_set(limits,'{max_model_calls}',
                    CAST(:calls AS JSONB)) WHERE id=:id""",
                    {"calls": str(max_calls), "id": runtime.run["id"]})
-    key = "project_basic_info_parsing"
-    topics = [{"key": "warranty", "title": "质保", "checks": ["期限"]},
-              {"key": "quantity", "title": "采购数量", "checks": ["数量"]}]
-    snapshot = runtime.report["skill_snapshot"]
-    snapshot[key + "/references/coverage.json"] = json.dumps(topics, ensure_ascii=False)
-    env.db.execute("UPDATE analysis_report SET skill_snapshot=CAST(:rules AS JSONB) WHERE id=:id",
-                   {"rules": json.dumps(snapshot), "id": runtime.report["id"]})
-    observed, completed = [], []
+    observed = []
 
     class Router(test_deepagents_runtime.NativeRouter):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-
         async def chat(self, messages, tools):
+            if self.calls < 2:
+                return await super().chat(messages, tools)
             await self.reserve()
             self.calls += 1
-            if self.calls == 1:
-                name, args = "list_documents", {}
-            elif self.calls == 2:
-                name, args = "search_document", {"query": "质保", "work_ids": ["w1", "w2"]}
-            elif self.calls == 3:
-                evidence = next(json.loads(m["data"]["content"])["blocks"][0]["id"]
-                                for m in messages if m["type"] == "tool"
-                                and m["data"].get("name") == "search_document")
-                name, args = "update_research", {"updates": [{
-                    "work_ids": ["w1", "w2"], "scope": {"kind": "common", "lot_refs": []},
-                    "detail": "已核对完整条款", "evidence_ids": [evidence],
+            names = {t["function"]["name"] for t in tools}
+            assert {"submit_analysis", "record_review", "search_document"} <= names
+            assert "complete_research" not in names
+            result = next(json.loads(m["data"]["content"]) for m in messages
+                if m["type"] == "tool" and m["data"].get("name") == "search_document")
+            bid = result["blocks"][0]["id"]
+            if self.calls == 3:
+                name, args = "submit_analysis", {"records": [{
+                    "kind": "requirement", "group": "项目基本信息",
+                    "content": {"字段": "质保期限", "内容": "质保三年"},
+                    "scope": {"kind": "common"}, "block_ids": [bid],
                 }]}
             else:
-                index = 0 if self.calls == 4 else 1
-                if index == 1:
-                    saved = env.db.rows("SELECT business_data FROM analysis_module WHERE id=:id",
-                                        {"id": runtime.run["module_id"]})[0]
-                    observed.append(saved["business_data"])
-                topic = topics[index]
-                result = next(json.loads(m["data"]["content"]) for m in reversed(messages)
-                              if m["type"] == "tool" and m["data"].get("name") == "search_document")
-                block_id = (result["blocks"][0]["id"] if result["blocks"]
-                            else result["already_read"][0])
-                quote = "质保三年" if index == 0 else "采购交换机10台"
-                scope = {"kind": "common", "lot_refs": []}
-                name, args = "submit_analysis", {"records": [{
-                    "kind": "requirement", "title": topic["title"],
-                    "group": "项目基本信息", "content": {"字段": topic["title"], "内容": quote},
-                    "scope": scope, "block_ids": [block_id],
-                    "work_ids": [f"w{index + 1}"],
-                }], "final": index == 1}
-            return self.respond(Completion(
-                content="", model="offline", agent_message=message_to_dict(
-                    AIMessage(content="", tool_calls=[{"name": name, "args": args,
-                                                       "id": f"incremental-{self.calls}"}]))))
+                receipt = next(json.loads(m["data"]["content"])["accepted"][0]
+                    for m in messages if m["type"] == "tool"
+                    and m["data"].get("name") == "submit_analysis")
+                if self.calls == 4:
+                    name, args = "record_review", {"records": [{
+                        "record_id": receipt["id"], "version": 1, "status": "passed",
+                        "reason": "原文质保三年，核对期限与范围", "block_ids": [bid],
+                    }]}
+                elif self.calls == 5:
+                    observed.append(env.db.rows("SELECT items FROM analysis_module WHERE id=:id",
+                                    {"id": runtime.run["module_id"]})[0]["items"])
+                    name, args = "search_document", {"query": "采购数量"}
+                else:
+                    name, args = "submit_analysis", {"final": True,
+                        "record_ids": [receipt["id"]], "summary": "核对质保及相关要求"}
+            return self.respond(Completion(content="", model="fixture",
+                agent_message=message_to_dict(AIMessage(content="", tool_calls=[{
+                    "name": name, "args": args, "id": f"single-{self.calls}",
+                }]))))
 
         async def complete(self, prompt):
-            await self.reserve()
-            payload = json.loads(prompt.rsplit("\n", 1)[-1])
-            completed.append(payload)
-            reviews = {row["record_id"]: {"supported": True, "issues": [],
-                       "block_ids": row["block_ids"]}
-                       for row in payload["records"]}
-            checks = check_results(payload)
-            return Completion(content=json.dumps({"reviews": reviews, "issues": [],
-                                                   "check_results": checks}),
-                              model="offline")
-
-        async def aclose(self):
-            pass
+            raise AssertionError("不得调用独立审查模型")
 
     monkeypatch.setattr(env.executor, "model_factory",
                         lambda feature, purpose, **kwargs: Router(purpose=purpose, **kwargs))
     run = env.db.rows("SELECT a.*,m.module_key FROM agent_module_run a JOIN analysis_module m "
                       "ON m.id=a.module_id WHERE a.id=:id", {"id": runtime.run["id"]})[0]
     run_async(env.executor.execute_module(runtime.report, run, runtime.sources))
-    module = env.db.rows("SELECT status,business_data FROM analysis_module WHERE id=:id",
+    stored = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", {"id": run["id"]})[0]
+    module = env.db.rows("SELECT * FROM analysis_module WHERE id=:id",
                          {"id": run["module_id"]})[0]
-    if max_calls in {4, 5}:
-        assert module["status"] == "failed"
-        assert len(module["business_data"]["records"]) == 0
-        stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
-                             {"id": run["id"]})[0]
-        assert stored["model_calls"] == max_calls and len(completed) == 0
-        assert stored["state"]["research"]["seen"]
-        assert stored["state"]["staged_items"]
-        assert any(g["key"] == "execution:incomplete"
-                   for g in stored["state"]["business_gaps"])
+    assert "topic_flow" not in stored["state"]
+    assert stored["model_calls"] == min(max_calls, 6)
+    assert len(stored["state"]["staged_items"]) == 1
+    if max_calls < 6:
+        assert module["status"] == "partial"
+        assert not module["items"] and not module["business_data"].get("records")
+        assert not stored["state"]["agent_workspace"]["finalized"]
         return
-    assert module["status"] == "completed"
-    assert len(observed) == 1 and len(observed[0]["records"]) == 0
-    assert len(module["business_data"]["records"]) == 2
-    # 两主题合包后六次预算已足够；原文只传一份，核对清单仍包含全部主题。
-    assert len(completed) == 1
-    assert set(completed[0]["topics"]) == {"quantity", "warranty"}
-    assert {row["topic"] for row in completed[0]["checks"]} == {"quantity", "warranty"}
-    assert len(completed[0]["records"]) == 2
-    # 同一原文可置于共享上下文，核对完整发送内容，避免把位置优化误判成丢失证据。
-    spans = completed[0]["evidence"] + completed[0]["context_evidence"]
-    assert len(spans) == 1 and spans[0]["id"] == "s1r1g2c0"
-    stored = env.db.rows("SELECT state,model_calls FROM agent_module_run WHERE id=:id",
-                         {"id": run["id"]})[0]
-    assert stored["state"]["topic_flow"]["audit"]["done"]
-    assert set(stored["state"]["topic_flow"]["audit"]["completed_topics"]) == {
-        "0:quantity", "0:warranty",
-    }
-    assert stored["model_calls"] == 6
-    # JSON审查账从真实数据库恢复后复用已完成请求，资料版本变化则拒绝旧完成状态。
-    from tender.application.analysis.research import AgentLimits
-    from tender.application.analysis.review import audit_combined
-    from tender.application.analysis.topic_flow import TopicIncomplete
-
-    research = SimpleNamespace(seen=stored["state"]["research"]["seen"],
-                               events=stored["state"]["research"]["events"],
-                               sources=runtime.sources, limits=AgentLimits())
-    restored = TopicFlow(stored["state"], research)
-
-    async def forbidden(_):
-        raise AssertionError("恢复不应新增模型请求")
-
-    async def save(_):
-        pass
-
-    assert run_async(audit_combined(restored, forbidden, save))
-    research.seen["s1r1g2c0"]["content"] += "但补遗变更质保期限"
-    with pytest.raises(TopicIncomplete, match="数据变化"):
-        run_async(audit_combined(restored, forbidden, save))
+    assert module["status"] == "completed" and observed == [[]]
+    assert len(module["business_data"]["records"]) == 1
+    state = stored["state"]
+    book = DraftWorkspace(state, state["research"]["seen"], run["module_key"])
+    rid = state["staged_items"][0]["id"]
+    assert book.review_current(rid)
+    book.seen[next(iter(book.seen))]["content"] += "补遗修改质保期限"
+    assert not book.review_current(rid)

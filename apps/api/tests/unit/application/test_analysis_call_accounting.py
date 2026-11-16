@@ -227,8 +227,7 @@ def test_legacy_exhausted_window_uses_incomplete_settlement_without_a_new_reques
 def test_executor_settles_restored_unavailable_window_without_losing_verified_results(
     monkeypatch, has_results,
 ):
-    from synthesis_fixtures import summary_record
-    from test_analysis_combined_review import execute
+    from test_analysis_agent_workspace import approve, saved, workspace
 
     from tender.application.analysis import execution
     from tender.application.analysis.research import AgentLimits
@@ -236,10 +235,10 @@ def test_executor_settles_restored_unavailable_window_without_losing_verified_re
     from tender.application.analysis.state import published_items
 
     async def run():
-        state, _, _, _ = await execute([summary_record()])
-        state.pop("draft", None)
-        if not has_results:
-            state["staged_items"] = []
+        book = workspace()
+        if has_results:
+            approve(book, saved(book))
+        state = book.state
         records, store = [], InvocationStore()
         gateway = _ScriptedGateway({"a": [ModelUnavailable("上游504", http_status=504)]})
         router = RoutingModel("analysis", "fixture", [_candidate("a", 1)], gateway,
@@ -274,14 +273,15 @@ def test_executor_settles_restored_unavailable_window_without_losing_verified_re
         report = {"id": 1, "project_id": 1, "category": "engineering", "topics": [],
                   "source_snapshot": [], "reference_snapshot": [],
                   "lot_settings": [], "skill_snapshot": skill_snapshot()
-                  | {"__analysis_flow_version__": "research-v3"}}
+                  | {"__analysis_flow_version__": "skill-agent-v1"}}
         await executor.execute_module(report, {"module_key": "project_basic_info_parsing",
                                                "attempt": 1}, [])
         runtime.abandon.assert_not_called()
         runtime.finish.assert_called_once_with(
-            "partial" if has_results else "failed", "上游504", state=state,
+            "partial", "上游504", state=state,
         )
-        assert len(published_items(state, final=True)) == int(has_results)
+        assert not published_items(state, final=True)
+        assert len(state["staged_items"]) == int(has_results)
         assert len(records) == 1 and store.rows == original
         assert not any(call.args[0] == "model_unavailable_recovery"
                        for call in runtime.event.call_args_list)

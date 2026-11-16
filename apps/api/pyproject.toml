@@ -73,6 +73,7 @@ files = [
     "src/tender/application/analysis/search_control.py",
     "src/tender/application/analysis/protocol.py", "src/tender/application/analysis/review.py",
     "src/tender/application/analysis/context.py",
+    "src/tender/application/analysis/drafts.py", "src/tender/application/analysis/skill_agent.py",
     "src/tender/application/analysis/runtime.py", "src/tender/adapters/analysis/file_archive.py",
     "src/tender/application/jobs/service.py", "src/tender/domain/knowledge/text.py",
     "src/tender/adapters/pg/repositories/analysis/reports.py",

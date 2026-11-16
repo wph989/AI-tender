@@ -130,8 +130,15 @@ class ResearchSession:
             else:
                 pending.add(anchor)
         # 审查必须接纳全部依赖；工具补读则可在完整元素之间按软容量截断交付。
-        blocks, prepared = await self._context_blocks(pending, 1, 1, extend=True,
+        # 入库大块已含完整条款；重新核对本块身份即可，自动邻域会引入无关整节并耗尽证据额度。
+        complete = {key for key in pending if self.seen[key].get("chunk_version") == "2"}
+        blocks, prepared = await self._context_blocks(complete, 0, 0, extend=False,
                                                       check_capacity=True)
+        legacy_blocks, legacy_prepared = await self._context_blocks(
+            pending - complete, 1, 1, extend=True, check_capacity=True,
+        )
+        blocks.extend(legacy_blocks)
+        prepared.update(legacy_prepared)
         blocks = list({r["block_id"]: r for r in [
             *(self.seen[k] for ids in cached.values() for k in ids), *blocks,
         ]}.values())
@@ -321,7 +328,9 @@ class ResearchSession:
             remembered[key] = dict(row)
             by_element.setdefault(element, []).append(remembered[key])
             blocks.append(
-                {"id": key, "text": row["content"]}
+                # 章节区分已填写条款、通用条款和空白格式，精简输出也不能丢失这一语义。
+                {"id": key, "text": row["content"],
+                 **{k: row[k] for k in ("source_id", "chapter") if row.get(k) is not None}}
                 if self.compact_results
                 else {
                     k: row[k]
@@ -560,7 +569,7 @@ class ResearchSession:
     ) -> dict:
         """只允许围绕已读 ID 补读，服务端解析位置，防止模型猜测偏移或跨版本读取。"""
         if (any(type(n) is not int or not 0 <= n <= 11 for n in (before, after))
-                or not self.compact_results and before + after > 11):
+                or before + after > 11):
             raise ToolArgumentError("before/after 必须为非负整数，连同当前块每次最多12块")
         if self.compact_results:
             return await self._read_compact(block_id, before, after)
@@ -603,7 +612,9 @@ class ResearchSession:
                 "block_id：须提供1到4个已读ID；可选ID：" + allowed_values(self.seen),
             )
         await self._begin("read_evidence", {"block_id": block_id, "before": before, "after": after})
-        applied = {"before": min(before, 1), "after": min(after, 1)}
+        # 新Agent自行选择阅读窗口；每侧强截到一块会把一次连续补读放大成多轮模型调用。
+        # 仍由上层12块常规窗口、下方完整元素软容量和证据总预算约束实际交付。
+        applied = {"before": before, "after": after}
         blocks, dependencies = await self._context_blocks(
             set(anchors), applied["before"], applied["after"], extend=bool(before or after),
         )
@@ -640,7 +651,7 @@ class ResearchSession:
             else:
                 windows.append({"first_id": row["block_id"], "last_id": row["block_id"]})
             previous = row
-        truncated = applied != {"before": before, "after": after}
+        truncated = limited
         continuation = list(dict.fromkeys(key for window in windows
                                          for key in (window["first_id"], window["last_id"])))
         if limited:
@@ -657,8 +668,6 @@ class ResearchSession:
                             "windows": windows, "truncated": truncated, "applied": applied,
                             "read_limited": limited,
                             "continue_from": result["continue_from"]})
-        if truncated:
-            result["warning"] = "常规邻域每侧最多一块，同元素续段已补齐；更远条款按边界ID续读。"
         if limited:
             result["warning"] = "批量原文达到上下文容量，仅返回已读区间；按边界ID继续读取。"
         return result

@@ -7,7 +7,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseInput(
     (Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8), [ref]$tokens, [ref]$parseErrors
 )
 if ($parseErrors.Count -gt 0) { throw $parseErrors[0] }
-foreach ($name in @('Get-BackendServiceName', 'ConvertTo-ServiceRecord', 'Test-ServiceIdentity', 'Stop-ServiceProcess', 'Get-StrayProcesses', 'Invoke-BackendStop')) {
+foreach ($name in @('Get-ServiceDefs', 'Get-BackendServiceName', 'ConvertTo-ServiceRecord', 'Test-ServiceIdentity', 'Stop-ServiceProcess', 'Get-StrayProcesses', 'Invoke-BackendStop')) {
     $node = $ast.Find({ param($entry)
         $entry -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $entry.Name -eq $name
     }, $true)
@@ -50,10 +50,16 @@ function New-FakeProcess {
     }
 }
 
+$definitions = @(Get-ServiceDefs)
+Assert-True (($definitions.Name -join ',') -eq 'api,worker,beat') '默认只应启动 API、一个 Worker 和 Beat'
+$worker = $definitions | Where-Object { $_.Name -eq 'worker' }
+Assert-True ($worker.Args -contains 'convert,parse,tender,poll,analysis') '单 Worker 必须消费全部业务队列'
+
 foreach ($entry in @(
     @('api', '-m uvicorn tender.api.app:app --port 8300'),
     @('worker', '-m celery -A tender.worker.celery_app worker -P threads'),
-    @('worker', '-m celery -A tender.worker.celery_app worker -Q convert,parse -n tender-documents@host'),
+    @('worker', '-m celery -A tender.worker.celery_app worker -Q convert,parse,tender,poll,analysis -n tender-worker@host'),
+    # 旧实例仍需可识别，-Stop 才能在切换时清理历史四组进程。
     @('scheduler', '-m celery -A tender.worker.celery_app worker -Q tender -n tender-scheduler@host'),
     @('poller', '-m celery -A tender.worker.celery_app worker -Q poll -n tender-poller@host'),
     @('analysis', '-m celery -A tender.worker.celery_app worker -Q analysis -n tender-analysis@host'),

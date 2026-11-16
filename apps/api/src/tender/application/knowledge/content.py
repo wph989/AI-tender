@@ -540,7 +540,8 @@ def rank_chunks(
     min_similarity: float | None = None,
 ) -> list[dict]:
     tokens = keywords(query)
-    # 相关度阈值与词法排序共用同一份命中数，避免对同一批块重复做全文扫描。
+    # 关键词是备选检索线索，命中数用于排序；不能把向量阈值当作词语共现比例，
+    # 否则并列检索“付款 比例 发票”会漏掉只说明付款比例的真实条款。
     hits = [sum(t in str(r["content"]).lower() for t in tokens) for r in rows]
     similarities: dict[int, float] = {}
 
@@ -560,8 +561,7 @@ def rank_chunks(
         ((score, i) for i, score in enumerate(hits)),
         reverse=True,
     )
-    lists = [[i for score, i in lexical
-              if score > 0 and score / max(1, len(tokens)) >= threshold]]
+    lists = [[i for score, i in lexical if score > 0]]
     if vector is not None:
         semantic = sorted(
             (

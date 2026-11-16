@@ -113,6 +113,7 @@ def test_gated_keys_only_keeps_l2() -> None:
 @pytest.mark.parametrize("key", [
     entry.key for entry in schema.ITEMS
     if entry.key.startswith("analysis.") and entry.value_type == "int"
+    and entry.key not in schema.READONLY_REASONS
 ])
 def test_analysis_budgets_have_no_artificial_maximum(key: str) -> None:
     assert schema.validate_value(key, 1000000) is None

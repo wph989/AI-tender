@@ -1,11 +1,10 @@
-"""模型不可用时的同线程有界恢复：不换 attempt、不重置预算、耗尽后部分发布。"""
+"""单Agent同线程恢复：不换attempt、不重置预算、中断不发布草稿。"""
 
 import json
 import os
 
 import pytest
 import test_deepagents_runtime
-from analysis_review_fixture import check_results
 from test_deepagents_runtime import (
     NativeRouter,
     prepared_runtime,
@@ -14,7 +13,6 @@ from test_deepagents_runtime import (
 
 from tender.adapters.pg.analysis.checkpoints import run_async
 from tender.application.analysis import execution as worker
-from tender.application.analysis.protocol import ResearchLedger
 from tender.application.analysis.runtime import AgentRuntime
 from tender.domain.shared.errors import ModelUnavailable
 
@@ -28,17 +26,13 @@ def compact_runtime(env):
 
 
 def verified_state(key):
+    from tender.application.analysis.drafts import AGENT_PROTOCOL
+
     state = publishable_state(key)
-    state["topic_flow"] = {
-        "protocol": "research-v3",
-        "output_mode": "after-research",
-        "phase": "synthesis",
-        "entries": {},
-        "evidence_topics": {},
-        "audit": {"round": 0, "results": {}, "record_topics": {"keep": []}},
-    }
+    state["agent_workspace"] = {"protocol": AGENT_PROTOCOL, "reviews": {}, "issues": {},
+        "notes": {}, "history": [], "finalized": False, "final_ids": []}
     for item in state["staged_items"]:
-        item["review_status"] = "current"
+        item["draft_version"] = 1
     return state
 
 
@@ -104,13 +98,13 @@ def test_model_unavailable_resumes_same_thread_with_bounded_attempts(env, monkey
     )
     assert [event["detail"]["attempt"] for event in events] == [1, 2]
     # 两次失败恢复同样占用模型预算，不能通过恢复获得额外请求次数。
-    assert row[0]["model_calls"] == 7  # 两次失败、四次主模型、一次合包审查。
+    assert row[0]["model_calls"] == 6  # 两次失败和四次主模型，无独立审查。
 
 
 def test_model_unavailable_exhaustion_finishes_partial_with_supported_items(env, monkeypatch):
     runtime = compact_runtime(env)
     run = module_run(env, runtime)
-    # 预置一条已核实成果：恢复耗尽后只能发布它，不能把模块记成 completed。
+    # 预置草稿：恢复耗尽后保留检查点，正式结果仍为空。
     seeded = verified_state(run["module_key"])
     seeded["staged_items"] = [
         item for item in seeded["staged_items"] if item["verification"] == "supported"
@@ -133,8 +127,9 @@ def test_model_unavailable_exhaustion_finishes_partial_with_supported_items(env,
         "SELECT * FROM analysis_module WHERE id=:id", {"id": runtime.run["module_id"]}
     )[0]
     assert module["status"] == "partial"
-    assert [item["record_id"] for item in module["items"]] == ["keep"]
-    assert [record["id"] for record in module["business_data"]["records"]] == ["keep"]
+    assert module["items"] == []
+    assert not module["business_data"].get("records")
+    assert row[0]["state"]["staged_items"][0]["id"] == "keep"
 
 
 def test_model_unavailable_does_not_create_new_attempt_or_reset_budget(env, monkeypatch):
@@ -156,8 +151,8 @@ def test_model_unavailable_does_not_create_new_attempt_or_reset_budget(env, monk
     )
     # 恢复沿用同一次运行账，不创建新 attempt，也不清空已消耗预算（7 次工具 + Skill 与四个工具）。
     assert len(rows) == 1
-    assert rows[0]["model_calls"] == 12  # 旧预算五次加本轮七次，合包不重置恢复账。
-    assert rows[0]["tool_calls"] == 12
+    assert rows[0]["model_calls"] == 11  # 旧预算五次加本轮六次。
+    assert rows[0]["tool_calls"] == 11
     assert rows[0]["prompt_tokens"] >= 100
     assert rows[0]["completion_tokens"] >= 50
 
@@ -189,11 +184,11 @@ def test_worker_restart_keeps_persisted_model_recovery_limit(env, monkeypatch, u
     assert [event["detail"]["attempt"] for event in events] == list(range(used + 1, 3))
 
 
-@pytest.mark.parametrize("boundary", ["research_update", "draft", "review"])
+@pytest.mark.parametrize("boundary", ["research_update", "draft", "review", "edit", "final"])
 def test_saved_business_update_resumes_graph_without_reapplying_or_resettling(
     env, monkeypatch, boundary,
 ):
-    """业务保存与图回执之间断连：重放工具及审查时复用已持久化成果。"""
+    """真实工具事务成功但图未收到回执；恢复复用回执并保持版本及账本。"""
     from langchain_core.messages import AIMessage, message_to_dict
 
     from tender.ports.llm.chat import Completion
@@ -201,28 +196,15 @@ def test_saved_business_update_resumes_graph_without_reapplying_or_resettling(
     runtime = compact_runtime(env)
     run = module_run(env, runtime)
     original_save = AgentRuntime.save
-    original_update = ResearchLedger.update_batch
-    interrupted, applications, reviews, deadlines = [], [], [], []
-
-    def update(book, values):
-        applications.append(values)
-        return original_update(book, values)
+    interrupted, deadlines = [], []
+    target = {"research_update": 3, "draft": 4, "review": 5, "edit": 6, "final": 8}[boundary]
 
     def save(active, state):
         original_save(active, state)
         deadlines.append(active.run["deadline_at"])
-        if interrupted:
-            return
-        results = state.get("tool_results", {})
-        ready = {
-            "research_update": bool(state.get("research_update_receipts"))
-            and "call3" not in results,
-            "draft": bool(state.get("staged_items")) and "call4" not in results,
-            "review": bool(state.get("topic_flow", {}).get("audit", {}).get("results")),
-        }[boundary]
-        if ready:
+        if not interrupted and f"call{target}" in state.get("tool_results", {}):
             interrupted.append(True)
-            raise ConnectionError("故障注入：保存后回执前断连")
+            raise ConnectionError("故障注入：工具事务提交后响应中断")
 
     class DraftRouter(NativeRouter):
         async def chat(self, messages, tools):
@@ -233,44 +215,57 @@ def test_saved_business_update_resumes_graph_without_reapplying_or_resettling(
             bid = next(block["id"] for m in messages if m["type"] == "tool"
                        and m["data"].get("name") == "search_document"
                        for block in json.loads(m["data"]["content"])["blocks"])
+            row = {"kind": "fact", "group": "项目基本信息",
+                   "content": {"字段": "质保", "内容": "三年"},
+                   "scope": {"kind": "common"}, "block_ids": [bid]}
+            if self.calls == 4:
+                name, args = "submit_analysis", {"records": [row]}
+            else:
+                receipt = next(json.loads(m["data"]["content"])["accepted"][0]
+                    for m in reversed(messages) if m["type"] == "tool"
+                    and m["data"].get("name") == "submit_analysis")
+                if self.calls == 6:
+                    name, args = "submit_analysis", {"records": [row | {
+                        "id": receipt["id"], "version": receipt["version"],
+                        "content": {"字段": "质保期限", "内容": "三年"},
+                    }]}
+                elif self.calls in {5, 7}:
+                    name, args = "record_review", {"records": [{
+                        "record_id": receipt["id"], "version": receipt["version"],
+                        "status": "passed", "reason": "对照原文核对期限", "block_ids": [bid],
+                    }]}
+                else:
+                    name, args = "submit_analysis", {"final": True,
+                        "record_ids": [receipt["id"]], "summary": "已完成质保核对"}
             return self.respond(Completion(content="", model="fixture",
                 agent_message=message_to_dict(AIMessage(content="", tool_calls=[{
-                    "name": "submit_analysis", "id": f"call{self.calls}", "args": {
-                        "records": [{"kind": "fact", "group": "项目基本信息",
-                            "content": {"字段": "质保", "内容": "三年"},
-                            "scope": {"kind": "common"}, "work_ids": ["w1"],
-                            "block_ids": [bid]}], "final": True},
+                    "name": name, "id": f"call{self.calls}", "args": args,
                 }]))))
 
         async def complete(self, prompt):
-            await self.reserve()
-            payload = json.loads(prompt.rsplit("\n", 1)[-1])
-            reviews.append(payload)
-            return Completion(content=json.dumps({"reviews": {
-                row["record_id"]: {"supported": True, "issues": [],
-                                   "block_ids": row["block_ids"]}
-                for row in payload["records"]}, "issues": [],
-                "check_results": check_results(payload)}), model="fixture")
+            raise AssertionError("不得调用独立审查模型")
 
-    monkeypatch.setattr(ResearchLedger, "update_batch", update)
     monkeypatch.setattr(AgentRuntime, "save", save)
     monkeypatch.setattr(env.executor, "model_factory",
                         lambda feature, purpose, **kw: DraftRouter(purpose=purpose, **kw))
     run_async(env.executor.execute_module(runtime.report, run, runtime.sources))
     row = module_run(env, runtime)
     assert row["status"] == "completed", row["error_message"]
-    assert interrupted and len(applications) == 1
-    checked_topics = [topic for packet in reviews
-                      for topic in packet.get("topics", [packet["topic"]])]
-    assert len(checked_topics) == len(set(checked_topics))
-    assert set(checked_topics) == {t["key"] for t in DraftRouter(
-        before_call=None, on_call=None).topics}
+    assert interrupted
     assert row["attempt"] == 1 and row["thread_id"] == run["thread_id"]
     assert len(set(deadlines)) == 1
     assert len(row["state"]["staged_items"]) == 1
+    assert row["state"]["staged_items"][0]["draft_version"] == 2
+    assert [e["event"] for e in row["state"]["agent_workspace"]["history"]] == [
+        "draft", "review", "draft", "review",
+    ]
     assert row["state"]["subagent_retries"] == 1
     attempts = env.db.rows("SELECT * FROM agent_call_attempt WHERE run_id=:id",
                            {"id": run["id"]})
     assert not any(r["status"] == "pending" for r in attempts)
+    assert row["successful_tool_calls"] == 8
     assert row["successful_tool_calls"] == sum(
         r["kind"] == "tool" and r["status"] == "ok" for r in attempts)
+    module = env.db.rows("SELECT items FROM analysis_module WHERE id=:id",
+                         {"id": run["module_id"]})[0]
+    assert module["items"][0]["output"]["content"] == {"字段": "质保期限", "内容": "三年"}

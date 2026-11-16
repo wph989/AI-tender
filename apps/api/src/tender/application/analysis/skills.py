@@ -61,7 +61,7 @@ def attribution_claims(value: Mapping[str, Any]) -> bool:
 
 
 def skill_snapshot() -> dict[str, str]:
-    # 快照只存 Skill 正文：运行时契约由 deep_analysis 的提示词常量提供，不再混入协议键。
+    # 公共工作方法和专题资源一起冻结；执行协议键由创建报告的用例另行写入。
     return {
         str(p.relative_to(RESOURCE_ROOT)).replace("\\", "/"): p.read_text(encoding="utf-8")
         for p in sorted(RESOURCE_ROOT.rglob("*")) if p.suffix in {".md", ".json"}

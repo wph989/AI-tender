@@ -74,8 +74,8 @@ def test_semantic_completion_does_not_bypass_independent_omission_review():
         assert len(state["draft"]["fields"]) == 1
         assert len(state["business_gaps"]) == len(state["quality_issues"]) == 1
         assert state["business_gaps"][0]["issue_id"] == state["quality_issues"][0]["issue_id"]
-        # 空提交没有改变内容或依据，沿用原问题直接结束，不再发送复核。
-        assert len(calls) == 1
+        # 待补读请求完成一次定向复核后仍有具体遗漏，正常结束并保留缺口，不重复否决已审事实。
+        assert len(calls) == 2
 
     asyncio.run(run())
 
@@ -382,7 +382,7 @@ def test_mixed_supported_fact_and_independent_gap_reaches_review_without_being_d
 
         async def review(payload):
             calls.append(payload)
-            assert len(payload["records"]) == 1
+            assert len(payload["records"] if len(calls) == 1 else payload["context_records"]) == 1
             return approve(payload) | {"issues": [{
                 "topic": "a", "detail": "起算日期需定向补读转引公告", "target": "公告/起算日期",
                 "evidence_ids": ["s1r1c0"], "record_ids": [], "kind": "omission", "action": "read",
@@ -392,7 +392,7 @@ def test_mixed_supported_fact_and_independent_gap_reaches_review_without_being_d
             tail=[finish("repair-ready"), call("submit_analysis", {
                 "records": [], "final": True,
             }, "repair-final")])
-        assert len(calls) == 1 and len(state["staged_items"]) == 1
+        assert len(calls) == 2 and len(state["staged_items"]) == 1
         assert len(module_data(state)["records"]) == 1
         assert len(state["quality_issues"]) == len(state["business_gaps"]) == 1
         assert state["quality_issues"][0]["target"] == "公告/起算日期"

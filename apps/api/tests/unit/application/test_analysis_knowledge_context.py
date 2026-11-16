@@ -35,7 +35,8 @@ def test_search_delivers_each_original_id_and_clause_condition_in_one_tool_call(
         result = await agent.search("开标时刻", "project")
         assert {b["id"] for b in result["blocks"]} == {r["block_id"] for r in rows}
         assert result["blocks"][0]["text"] == rows[0]["content"]
-        assert set(result["blocks"][0]) == {"id", "text"}
+        assert set(result["blocks"][0]) == {"id", "text", "source_id", "chapter"}
+        assert result["blocks"][0]["chapter"] == rows[0]["chapter"]
         assert agent.tool_calls == 1
         assert result["page"]["limit"] == agent.limits.max_search_results
         assert all(agent.seen[r["block_id"]]["element_id"] == r["element_id"] for r in rows)
@@ -56,6 +57,45 @@ def test_context_budget_preserves_anchor_and_reports_omitted_evidence():
         assert result["blocks"][0]["id"] == rows[0]["block_id"]
         assert len(agent.seen) == 2
         assert result["budget_exhausted"] and result["omitted_blocks"] == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid", [None, "content", "identity", "missing"])
+def test_review_large_chunk_revalidates_it_without_reading_unrelated_neighbours(invalid):
+    async def run():
+        rows = [block() | {"block_id": f"s1r1g2c{i}", "offset": i,
+                           "element_id": i + 1, "chunk_version": "2"}
+                for i in range(3)]
+        agent = research(rows)
+        anchor = rows[1]["block_id"]
+        agent.seen = {anchor: dict(rows[1])}
+        # 已合并的条款本身就是完整选证单位，邻章不能因自动补读变成每项必带依据。
+        agent.limits = replace(agent.limits, max_evidence_blocks=1)
+        original, calls = agent.read, []
+
+        async def read(source, offset, limit):
+            calls.append((offset, limit))
+            window = await original(source, offset, limit)
+            if invalid == "content":
+                window = replace(window, rows=[row | {"content": "变化后的条件"}
+                                               for row in window.rows])
+            elif invalid == "identity":
+                window = replace(window, rows=[row | {"version_id": 99} for row in window.rows])
+            elif invalid == "missing":
+                window = replace(window, rows=[])
+            return window
+
+        agent.read = read
+        if invalid:
+            with pytest.raises(PermissionError):
+                await agent.review_context({anchor})
+            assert set(agent.seen) == {anchor}
+        else:
+            result = await agent.review_context({anchor})
+            assert result["dependencies"] == {anchor: [anchor]}
+            assert set(agent.seen) == {anchor}
+        assert calls == [(1, 1)]
 
     asyncio.run(run())
 

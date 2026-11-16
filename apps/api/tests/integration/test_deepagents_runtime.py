@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from analysis_review_fixture import review_payload
 from data_schema import install_data_schema
 from langchain_core.messages import AIMessage, ToolMessage, message_to_dict
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -259,6 +260,85 @@ def test_hard_quota_across_reports_and_no_lease_theft(env):
             runtime.release()
 
 
+@pytest.mark.parametrize("operation", ["claim", "reap", "requeue", "cancel"])
+def test_other_database_advisory_lock_cannot_occupy_or_protect_local_run(env, operation):
+    runtime = prepared_runtime(env)
+    target = env.engine.url.set(database="postgres")
+    if target.database == env.engine.url.database:
+        pytest.skip("跨库锁回归需要当前测试库与postgres不同")
+    foreign = create_engine(target)
+    params = {"ns": run_store.QUOTA_NAMESPACE, "id": runtime.run["id"]}
+    try:
+        with foreign.connect() as holder:
+            holder.execute(text("SELECT pg_advisory_lock(:ns,:id)"), params)
+            try:
+                # pg_locks可见整个实例；另一数据库的同号锁不能占本库配额或保护本库的僵尸运行。
+                if operation == "claim":
+                    with env.engine.connect() as connection:
+                        assert connection.execute(text(run_store._OCCUPIED_SQL), {
+                            "ns": params["ns"], "company": 1,
+                        }).scalar_one() == 0
+                    assert runtime.claim()
+                else:
+                    env.db.execute("UPDATE agent_module_run SET status='running',"
+                                   "lease_until=now()-interval '1 minute' WHERE id=:id", params)
+                    with env.engine.begin() as connection:
+                        if operation == "reap":
+                            connection.execute(text(run_store._REAP_SQL), {
+                                "ns": params["ns"], "report": runtime.report["id"],
+                            })
+                        elif operation == "requeue":
+                            run_store.requeue_unlocked_runs(connection, runtime.report["id"])
+                        else:
+                            run_store.cancel_unlocked_runs(connection, runtime.report["id"])
+                    status = env.db.rows("SELECT status FROM agent_module_run WHERE id=:id",
+                                         params)[0]["status"]
+                    assert status == ("canceled" if operation == "cancel" else "pending")
+            finally:
+                holder.execute(text("SELECT pg_advisory_unlock(:ns,:id)"), params)
+    finally:
+        runtime.release()
+        foreign.dispose()
+
+
+@pytest.mark.parametrize("operation", ["guard", "reserve", "settle", "finish"])
+def test_other_database_lock_cannot_authorize_stale_owner(env, operation):
+    runtime = prepared_runtime(env)
+    target = env.engine.url.set(database="postgres")
+    if target.database == env.engine.url.database:
+        pytest.skip("跨库锁回归需要当前测试库与postgres不同")
+    foreign = create_engine(target)
+    params = {"ns": run_store.QUOTA_NAMESPACE, "id": runtime.run["id"]}
+    try:
+        assert runtime.claim()
+        runtime.reserve("model", "pending-result")
+        runtime.release()
+        # 本库执行者已失去锁，即使租约尚有效、另一数据库仍持有同号锁，也不能继续写入。
+        before = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", params)
+        attempts = env.db.rows("SELECT * FROM agent_call_attempt WHERE run_id=:id", params)
+        with foreign.connect() as holder:
+            holder.execute(text("SELECT pg_advisory_lock(:ns,:id)"), params)
+            try:
+                with pytest.raises(InterruptedError, match="配额锁"):
+                    if operation == "guard":
+                        runtime.store.guard_settlement()
+                    elif operation == "reserve":
+                        runtime.store.reserve("tool", "stale-tool")
+                    elif operation == "settle":
+                        runtime.store.record_call({"status": "ok", "prompt_tokens": 10})
+                    else:
+                        runtime.store.finish("failed", state={"stale": True})
+                assert env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", params) == before
+                assert env.db.rows(
+                    "SELECT * FROM agent_call_attempt WHERE run_id=:id", params,
+                ) == attempts
+            finally:
+                holder.execute(text("SELECT pg_advisory_unlock(:ns,:id)"), params)
+    finally:
+        runtime.release()
+        foreign.dispose()
+
+
 def test_claim_backoff_does_not_starve_later_modules(env, monkeypatch):
     """配额占满时等待模块退避轮询，仍能依次领取，权限复核不随轮询次数增长。"""
 
@@ -501,6 +581,50 @@ def test_unknown_tool_reexecution_uses_a_new_attempt_and_settles_saved_result_on
         resumed.release()
 
 
+def test_expired_recovery_settles_saved_results_and_closes_orphan_attempts(env):
+    first = prepared_runtime(env)
+    assert first.claim()
+    first.reserve("model", "expired:1")
+    first.reserve("model", "expired:2")
+    first.reserve("tool", "expired-tool")
+    first.store.save_invocation("expired-packet", {
+        "success_record": {"invocation_id": "expired", "request_ordinal": 2,
+                           "status": "ok", "prompt_tokens": 8, "completion_tokens": 2},
+    })
+    purpose = f"analysis:{first.report['id']}:{first.run['module_key']}:{first.run['attempt']}"
+    with env.db.engine.begin() as conn:
+        conn.execute(text("INSERT INTO llm_call_log(provider_id,model_id,feature_key,purpose,"
+                          "status,latency_ms) VALUES (1,1,'analysis',:purpose,'running',0)"),
+                     {"purpose": purpose})
+        conn.execute(text("UPDATE agent_module_run SET deadline_at=now()-interval '1 second' "
+                          "WHERE id=:id"), {"id": first.run["id"]})
+    first.release()
+    worker.prepare_report(env.db, analysis_api.report_row(env.request, first.report["id"]))
+    run = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", {"id": first.run["id"]})[0]
+    resumed = agent_runtime.AgentRuntime(env.db, first.report, run, first.sources)
+    try:
+        # 到期检查发生在claim之前；异常收尾也必须结算回执，不能留下永久运行中的请求。
+        with pytest.raises(TimeoutError, match="恢复不会重置"):
+            asyncio.run(worker.wait_for_claim(resumed))
+        resumed.abandon("failed", "模块总时长预算已耗尽")
+        resumed.abandon("failed", "重复收尾不得改变调用账")
+        attempts = env.db.rows("SELECT call_key,status FROM agent_call_attempt WHERE run_id=:id",
+                               {"id": first.run["id"]})
+        assert {r["call_key"]: r["status"] for r in attempts} == {
+            "expired:1": "unknown", "expired:2": "ok", "expired-tool": "unknown",
+        }
+        saved = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id",
+                            {"id": first.run["id"]})[0]
+        assert saved["status"] == "failed"
+        assert saved["deadline_at"] == run["deadline_at"]
+        assert (saved["successful_model_calls"], saved["prompt_tokens"],
+                saved["completion_tokens"]) == (1, 8, 2)
+        assert env.db.rows("SELECT status FROM llm_call_log WHERE purpose=:purpose",
+                           {"purpose": purpose}) == [{"status": "unknown"}]
+    finally:
+        resumed.release()
+
+
 class NativeRouter:
     def __init__(self, *, purpose="", **kwargs):
         self.before_call, self.on_call = kwargs["before_call"], kwargs["on_call"]
@@ -525,40 +649,19 @@ class NativeRouter:
     async def chat(self, messages, tools):
         await self.reserve()
         self.calls += 1
-        all_works = [
-            f"w{i}"
-            for i in range(1, 1 + sum(len(t.get("checks") or [t["title"]]) for t in self.topics))
-        ]
         if self.calls == 1:
             name, args = "list_documents", {}
         elif self.calls == 2:
-            name, args = (
-                "search_document",
-                {"query": "质保", "work_ids": all_works},
-            )
+            name, args = "search_document", {"query": "质保"}
         elif self.calls == 3:
-            name, args = (
-                "update_research",
-                {
-                    "updates": [
-                        {
-                            "work_ids": all_works,
-                            "status": "not_found",
-                            "detail": "已核对测试资料，当前专题未找到更多事项",
-                            "scope": {"kind": "common", "lot_refs": []},
-                            "examined_ids": [
-                                block["id"]
-                                for m in messages
-                                if m["type"] == "tool"
-                                and m["data"].get("name") == "search_document"
-                                for block in json.loads(m["data"]["content"])["blocks"]
-                            ],
-                        }
-                    ]
-                },
-            )
+            name, args = "update_research", {"updates": [{
+                "topic": "覆盖核对", "detail": "已核对测试资料，未找到当前专题适用事项",
+                "status": "checked",
+            }]}
         else:
-            name, args = "submit_analysis", {"records": [], "final": True}
+            name, args = "submit_analysis", {
+                "final": True, "record_ids": [], "summary": "测试资料未规定当前专题事项",
+            }
         return self.respond(Completion(
             content="",
             model="fixture",
@@ -571,7 +674,7 @@ class NativeRouter:
 
     async def complete(self, prompt):
         await self.reserve()
-        payload = json.loads(prompt.rsplit("\n", 1)[-1])
+        payload = review_payload(prompt)
         blocks = [s["id"] for s in payload["evidence"] + payload["context_evidence"]]
         return Completion(
             content=json.dumps({"reviews": {}, "issues": [], "check_results": {
@@ -628,48 +731,37 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
                 return await super().chat(messages, tools)
             await self.reserve()
             self.calls += 1
-            result = next(
-                json.loads(m["data"]["content"])
-                for m in messages
-                if m["type"] == "tool" and m["data"].get("name") == "search_document"
-            )
-            assert "retrieval" not in result
-            assert all(set(b) == {"id", "text"} for b in result["blocks"])
+            result = next(json.loads(m["data"]["content"]) for m in messages
+                if m["type"] == "tool" and m["data"].get("name") == "search_document")
+            assert all(set(b) == {"id", "text", "source_id", "chapter"}
+                       for b in result["blocks"])
+            bid = max(b["id"] for b in result["blocks"])
             if self.calls == 3:
-                name, args = "update_research", {"updates": [{
-                    "work_ids": ["w1"], "detail": "已核对质保期限",
-                    "scope": {"kind": "common", "lot_refs": []},
-                    "evidence_ids": [b["id"] for b in result["blocks"]],
-                }]}
-            else:
+                selected.append(bid)
                 name, args = "submit_analysis", {"records": [{
-                    "kind": "requirement",
-                    "work_ids": ["w1"], "group": "项目基本信息",
+                    "kind": "requirement", "group": "项目基本信息",
                     "content": {"字段": "质保期限", "内容": "质保期限为三年"},
-                    "scope": {"kind": "common", "lot_refs": []},
-                    "block_ids": [b["id"] for b in result["blocks"]],
-                }], "final": True}
+                    "scope": {"kind": "common", "lot_refs": []}, "block_ids": [bid],
+                }], "final": False}
+            else:
+                receipt = next(json.loads(m["data"]["content"])["accepted"][0]
+                    for m in messages if m["type"] == "tool"
+                    and m["data"].get("name") == "submit_analysis")
+                if self.calls == 4:
+                    name, args = "record_review", {"records": [{
+                        "record_id": receipt["id"], "version": receipt["version"],
+                        "status": "passed", "reason": "已核对质保期限及范围", "block_ids": [bid],
+                    }]}
+                else:
+                    name, args = "submit_analysis", {"final": True,
+                        "record_ids": [receipt["id"]], "summary": "已复核质保期限"}
             return self.respond(Completion(content="", model="fixture",
-                                           agent_message=message_to_dict(
-                AIMessage(content="", tool_calls=[{"name": name, "args": args,
-                                                   "id": f"evidence-{self.calls}"}])
-            )))
+                agent_message=message_to_dict(AIMessage(content="", tool_calls=[{
+                    "name": name, "args": args, "id": f"evidence-{self.calls}",
+                }]))))
 
         async def complete(self, prompt):
-            await self.reserve()
-            payload = json.loads(prompt.rsplit("\n", 1)[-1])
-            spans = payload["evidence"] + payload["context_evidence"]
-            assert len(spans) == 2 and not any("bbox" in span for span in spans)
-            row = payload["records"][0]
-            assert row["business"]["scope"] == {"kind": "common", "lot_refs": []}
-            bid = max(span["id"] for span in spans)
-            selected.append(bid)
-            return Completion(content=json.dumps({"reviews": {row["record_id"]: {
-                "supported": True, "issues": [], "block_ids": [bid],
-            }}, "issues": [], "check_results": {check["check_id"]: {
-                "status": "covered", "summary": "已核对三年质保及适用范围",
-                "record_ids": [row["record_id"]], "block_ids": [bid], "issue_indexes": [],
-            } for check in payload["check_items"]}}), model="fixture")
+            raise AssertionError("最终发布不得另起审查模型调用")
 
     async def retrieve(db, selected_sources, query, *args, **kwargs):
         return db.readable_chunks(selected_sources[0]), {"mode": "keyword"}
@@ -744,18 +836,12 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     runs = env.db.rows("SELECT * FROM agent_module_run")
     assert len({r["thread_id"] for r in runs}) == 13
     assert all(r["status"] == "completed" for r in runs)
-    for module in result["modules"]:
-        path = module["module_key"] + "/references/coverage.json"
-        checks = json.loads(row["skill_snapshot"][path])
-        current = next(r for r in runs if r["module_id"] == module["id"])
-        # 小主题共享一次独立审查，但每个主题仍须留下可恢复的完成凭据。
-        assert current["model_calls"] == 5
-        audit = current["state"]["topic_flow"]["audit"]
-        assert audit["done"]
-        assert set(audit["completed_topics"]) == {"0:" + topic["key"] for topic in checks}
+    for current in runs:
+        assert current["model_calls"] == 4
+        assert current["state"]["agent_workspace"]["finalized"]
+        assert "topic_flow" not in current["state"]
     assert all(r["state"]["research"]["seen"] for r in runs)
-    assert all(r["state"]["loaded_skill"]["sha256"] for r in runs)
-    assert len(env.db.rows("SELECT id FROM agent_run_event WHERE kind='skill_loaded'")) == 13
+    assert all(r["state"]["agent_skill_hash"] for r in runs)
     assert result["coverage"]["mode"] == "agent_research"
     assert "scanned_blocks" not in result["coverage"]
     assert len(env.db.rows("SELECT id FROM agent_run_event WHERE kind='client_close_failed'")) == 13
@@ -764,7 +850,7 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     assert len(snapshots) == 1 and snapshots[0]["schema_version"] == "1"
     # 模型只提交空结果时，13 个模块执行完成也不能伪装成业务覆盖完整。
     assert snapshots[0]["data"]["readiness"] == "unavailable"
-    assert snapshots[0]["data"]["coverage"]
+    assert not snapshots[0]["data"]["coverage"]
     assert not env.db.rows(
         "SELECT objid FROM pg_locks WHERE locktype='advisory' AND classid=:ns"
         " AND objsubid=2 AND granted",
@@ -815,58 +901,27 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     assert runtime.claim()
     runtime.reserve("model")
     runtime.reserve("tool")
-    carried_field = {
-        "id": "part1",
-        "field": "质保",
-        "group": "",
-        "sort_order": 0,
-        "values": [
-            {
-                "value": "质保三年",
-                "citations": [
-                    {
-                        "source_id": runtime.sources[0]["source_id"],
-                        "project_id": runtime.report["project_id"],
-                        "quote": "质保三年",
-                    }
-                ],
-            }
-        ],
-        "note": "",
-        "verification": "supported",
-    }
-    saved_state = {
-        "draft": {
-            "fields": [carried_field],
-            "relations": [],
-            "research_summary": "已经检索",
-        },
-        "invalid_submissions": 3,
-        "consecutive_invalid_submissions": 3,
-        "consecutive_unsubmitted_responses": 2,
-        "last_unsubmitted_message_id": "old-response",
-    }
-    if staged:
-        saved_state = {
-            "staged_items": [carried_field],
-            "pending_final": {"research_summary": "旧的最终提交尚未完成校验"},
-            "invalid_submissions": 3,
-            "consecutive_invalid_submissions": 3,
-            "staged_items_verified": True,
-            "consecutive_unsubmitted_responses": 2,
-            "last_unsubmitted_message_id": "old-response",
-        }
+    from tender.application.analysis.drafts import DraftWorkspace
+    from tender.application.analysis.output import output_schema
+
+    seen = {r["block_id"]: r for r in env.db.read_chunk_window(runtime.sources[0], 0, 1).rows}
+    saved_state = {"output_schema": output_schema(runtime.report["skill_snapshot"],
+                                                  "project_basic_info_parsing")}
+    book = DraftWorkspace(saved_state, seen, "project_basic_info_parsing")
+    receipt = book.save_records([{"kind": "fact", "group": "项目基本信息",
+        "content": {"字段": "质保", "内容": "三年"}, "scope": {"kind": "common"},
+        "block_ids": list(seen)}], "first")["accepted"][0]
+    book.record_review([{"record_id": receipt["id"], "version": 1, "status": "passed",
+        "reason": "核对质保三年", "block_ids": list(seen)}], [], "review")
+    if not staged:
+        book.finalize([receipt["id"]], "已核对")
     saved_state["research"] = {
-        "seen": {}, "events": [{"action": "search_result", "scope": "project"}],
+        "seen": seen, "events": [{"action": "search_result", "scope": "project"}],
         "tool_calls": 1,
     }
     runtime.save(saved_state)
-    if staged:
-        # 逐字段落库：已核实成果写进模块结果，模块失败后前端仍能展示。
-        items = env.db.rows(
-            "SELECT items FROM analysis_module WHERE id=:id", {"id": runtime.run["module_id"]}
-        )[0]["items"]
-        assert [item["id"] for item in items] == ["part1"]
+    assert not env.db.rows("SELECT items FROM analysis_module WHERE id=:id",
+                          {"id": runtime.run["module_id"]})[0]["items"]
     runtime.finish("failed", "故障注入")
     runtime.release()
     env.db.execute(
@@ -897,22 +952,10 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     assert rows[0]["limits"]["timeout_seconds"] == 1800
     assert rows[1]["limits"]["timeout_seconds"] == 1200
     assert rows[0]["thread_id"] != rows[1]["thread_id"]
-    if staged:
-        # 已核实字段连同验证标记恢复，补跑不需要再调用校验模型。
-        assert rows[1]["state"]["staged_items"] == rows[0]["state"]["staged_items"]
-        assert rows[1]["state"]["staged_items_verified"] is True
-    else:
-        # draft 会让新图直接结束，补跑必须转成暂存后继续补齐未完成内容。
-        assert "draft" not in rows[1]["state"]
-        assert rows[1]["state"]["staged_items"] == rows[0]["state"]["draft"]["fields"]
-        assert rows[1]["state"]["staged_items_verified"] is True
-    assert "invalid_submissions" not in rows[1]["state"]
-    assert "consecutive_invalid_submissions" not in rows[1]["state"]
-    assert "field_failures" not in rows[1]["state"]
-    assert "unavailable_submissions" not in rows[1]["state"]
-    assert "pending_final" not in rows[1]["state"]
-    assert "consecutive_unsubmitted_responses" not in rows[1]["state"]
-    assert "last_unsubmitted_message_id" not in rows[1]["state"]
+    assert rows[1]["state"]["staged_items"] == rows[0]["state"]["staged_items"]
+    assert rows[1]["state"]["agent_workspace"]["reviews"] == book.book["reviews"]
+    assert "draft" not in rows[1]["state"]
+    assert not rows[1]["state"]["agent_workspace"]["finalized"]
     with pytest.raises(ApiProblem):
         analysis_api.retry_report(
             runtime.report["id"], analysis_api.RetryInput(module_keys=[key]), env.request

@@ -64,7 +64,7 @@ ITEMS: tuple[ConfigItem, ...] = (
     _item("analysis.max_evidence_blocks", L1, "int", 160, "每模块保留的原文证据块上限"),
     _item(
         "analysis.similarity_threshold", L1, "number", 0.6,
-        "专题检索最低相关度（0到1），有向量时用余弦相似度，否则用检索词命中比例",
+        "专题语义检索的最低余弦相似度（0到1）；关键词独立召回，按命中数参与融合排序",
     ),
     _item("analysis.max_search_results", L1, "int", 6, "每次专题检索通过阈值后返回的证据块上限"),
     _item("analysis.max_tool_failures", L1, "int", 3, "工具连续失败上限，按工具及全局分别计数"),
@@ -150,6 +150,9 @@ ITEMS_BY_KEY: dict[str, ConfigItem] = {entry.key: entry for entry in ITEMS}
 
 # 未接入的能力不能伪装成生效开关；保留登记项以便查看历史版本和后续接入。
 READONLY_REASONS: dict[str, str] = {
+    **dict.fromkeys(("analysis.max_review_repairs", "analysis.review_max_input_tokens",
+                    "analysis.max_no_progress_rounds", "analysis.max_finish_corrections"),
+                   "当前由单个Agent按Skill自主核对，不再使用程序阶段或固定修复轮数"),
     "queue.priority.batch": "当前队列未接入动态批次优先级",
     "mineru.output_formats": "当前解析协议固定使用 middle_json 和 zip",
     "mineru.page_range": "当前章节与坐标契约要求解析全部页码 all",

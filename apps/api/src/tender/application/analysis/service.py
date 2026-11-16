@@ -7,8 +7,8 @@ from collections.abc import Callable
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
-from tender.application.analysis.agent import CONTRACT, validate_project_claims
-from tender.application.analysis.contract import RUNTIME_VERSION
+from tender.application.analysis.contract import FLOW_VERSION as PROTOCOL_VERSION
+from tender.application.analysis.contract import READABLE_RUNTIMES, RUNTIME_VERSION
 from tender.application.analysis.data import (
     DATA_VERSION,
     ContextError,
@@ -23,7 +23,6 @@ from tender.application.analysis.data_store import (
     snapshot_matches_report,
 )
 from tender.application.analysis.output import output_schema
-from tender.application.analysis.protocol import PROTOCOL_VERSION
 from tender.application.analysis.quality import (
     aggregate_quality,
     input_changed,
@@ -127,17 +126,8 @@ class AnalysisService:
                     if exc.code not in {"process_in_flight", "parse_in_flight"}:
                         raise
         rules = skill_snapshot()
-        rules["__deep_contract__"] = CONTRACT
         rules["__analysis_data_version__"] = DATA_VERSION
-        from tender.application.analysis.protocol import PROTOCOL_VERSION
-        from tender.application.analysis.topic_flow import (
-            FLOW_KEY,
-            OUTPUT_MODE,
-            OUTPUT_MODE_KEY,
-        )
-
-        rules[FLOW_KEY] = PROTOCOL_VERSION
-        rules[OUTPUT_MODE_KEY] = OUTPUT_MODE
+        rules["__analysis_flow_version__"] = PROTOCOL_VERSION
         references = [
             source
             for source in self.store.sources(self.store.collections_for_project(project_id))
@@ -195,6 +185,8 @@ class AnalysisService:
         for module in modules:
             module["runs"] = [run for run in runs if run["module_id"] == module["id"]]
             latest = module["runs"][-1] if module["runs"] else {}
+            if latest.get("agent_progress"):
+                module["progress"] = latest["agent_progress"]
             merged = {item["id"]: item for item in module["items"]}
             if module["status"] != "completed":
                 merged.update(
@@ -240,7 +232,7 @@ class AnalysisService:
                 module["research_summary"] = ""
                 module["research_gaps"] = []
                 module["quality_issues"] = []
-        retired = report["runtime_version"] != RUNTIME_VERSION
+        retired = report["runtime_version"] not in READABLE_RUNTIMES
         stale = (
             source_signature(current["sources"]) != source_signature(report["source_snapshot"])
             or current["analysis_category"] != report["category"]
@@ -270,7 +262,7 @@ class AnalysisService:
             "quality_status": aggregate_quality([m["quality_status"] for m in modules]),
             "stale": stale,
             "runtime_retired": retired,
-            "execution_compatible": not retired and rules.get(
+            "execution_compatible": report["runtime_version"] == RUNTIME_VERSION and rules.get(
                 "__analysis_flow_version__",
             ) == PROTOCOL_VERSION,
             "data_schema_version": None if retired else DATA_VERSION,
@@ -278,7 +270,7 @@ class AnalysisService:
 
     def data_snapshot(self, report_id: int, snapshot_id: int | None = None) -> dict:
         report = self.report_row(report_id)
-        if report["runtime_version"] != RUNTIME_VERSION:
+        if report["runtime_version"] not in READABLE_RUNTIMES:
             raise Conflict(
                 "此报告没有业务数据，请重新发起分析",
                 code="data_reanalysis_required",
@@ -590,15 +582,7 @@ class AnalysisService:
                     code="nothing_to_retry",
                 )
             restarted = {row["id"] for row in rows} if mode == "restart" else set()
-            tx.reset_modules(sorted(restarted))
-            if restarted:
-                summary = []
-                for item in report.get("summary", []):
-                    owners = [key for key in item.get("module_keys", []) if key not in keys]
-                    if owners:
-                        summary.append({**item, "module_keys": owners})
-                # 报告汇总也是当前成果投影，不能在清空专题后继续展示它的旧结论。
-                tx.update_report(report_id, {"summary": summary})
+            # 重跑期间保留上一轮正式投影；只有新Agent显式final并原子发布后才替换。
             retried = [row["id"] for row in rows]
             tx.mark_modules_pending(retried)
             limits = limits_snapshot(self.store)
@@ -613,134 +597,12 @@ class AnalysisService:
                 # 冷启动连旧检查点都不读取，避免经草稿、待办或缓存旁路继承旧内容。
                 previous_state = (tx.previous_run_state(module_id)
                                   if module_id not in restarted else {})
-                # 轻量研究可能只有examined笔记和待办；尚无完整发现也须保留身份及已读证据。
-                carry = (
-                    previous_state
-                    if module_id not in restarted
-                    and (previous_state.get("draft") or previous_state.get("staged_items")
-                         or previous_state.get("topic_flow"))
-                    else {}
-                )
-                if carry:
-                    if "research" in carry:
-                        # 新 attempt 已获得独立预算；保留证据与检索过程，但不继承旧调用次数。
-                        # 同一 attempt 的中断恢复不经过补跑入口，仍累计原计数。
-                        carry["research"] = {**carry["research"], "tool_calls": 0}
-                    draft = carry.pop("draft", None)
-                    if draft and not carry.get("staged_items"):
-                        carry["staged_items"] = draft["fields"]
-                        carry["staged_relations"] = draft.get("relations", [])
-                        carry["staged_items_verified"] = all(
-                            item.get("verification") == "supported" for item in draft["fields"]
-                        )
-                    carry.pop("tool_results", None)
-                    carry.pop("tool_outcomes", None)
-                    carry.pop("tool_call_keys", None)
-                    carry.pop("stop_reason", None)
-                    carry.pop("quality_status", None)
-                    carry.pop("quality_issues", None)
-                    carry.pop("invalid_submissions", None)
-                    carry.pop("consecutive_invalid_submissions", None)
-                    carry.pop("prevalidation_failures", None)
-                    carry.pop("prevalidation_invalid_ids", None)
-                    carry.pop("consecutive_unsubmitted_responses", None)
-                    carry.pop("last_unsubmitted_message_id", None)
-                    carry.pop("field_failures", None)
-                    carry.pop("unavailable_submissions", None)
-                    for key in (
-                        "loaded_skill",
-                        "correction_failures",
-                        "tool_failures",
-                        "consecutive_tool_failures",
-                        "research_failure_patterns",
-                        "argument_failures",
-                        "argument_failure_rounds",
-                        "tool_issue_ledger",
-                        "research_update_receipts",
-                        "recovery_finish_requested",
-                        "review_started_recorded",
-                        "evidence_budget_failures",
-                        "failure_policy_version",
-                        "verification_degraded",
-                        "model_unavailable_retries",
-                        "identical_tool_calls",
-                        "read_tool_cache",
-                        "progress_message_id",
-                        "progress_signature",
-                        "no_progress_rounds",
-                        "finish_only",
-                        "subagent_retries",
-                        # 新 attempt 重新注入完整 Skill 与成果摘要，不继承旧提示状态。
-                        "skill_prompt_phase",
-                        "skill_prompt_mode",
-                        "skill_full_summary_id",
-                        "handoff_reference_signature",
-                        "staged_prompt_ids",
-                        "topic_skill_prompted",
-                        "topic_summary_id",
-                        "topic_final_requested",
-                        "topic_budget_exhausted",
-                        "topic_research_round",
-                    ):
-                        carry.pop(key, None)
-                    carry.pop("pending_final", None)
-                    if carry.get("topic_flow"):
-                        flow = carry["topic_flow"]
-                        audit = flow.get("audit", {})
-                        if audit.get("version") == "combined-v3":
-                            # 新attempt只更新执行额度；语义一致的包与主题判定跨补跑保留。
-                            completed = {}
-                            for key, value in audit.get("completed_topics", {}).items():
-                                completed["0:" + key.split(":", 1)[-1]] = value
-                            audit.update(round=0, done=False, completed_topics=completed)
-                            audit.pop("progress", None)
-                            if flow.get("synthesis_finished") or completed:
-                                flow.update(phase="review", synthesis_finished=True)
-                        else:
-                            flow["audit"] = {"round": 0, "results": {}}
-                            flow["phase"] = "research"
-                        if flow.get("output_mode") == "after-research":
-                            flow["release_results"] = False
-                        # 仅显式补跑开启新研究额度；同attempt恢复仍保留耗尽状态及统计。
-                        for key in ("search_work", "efficiency", "active_work", "active_topics"):
-                            carry["topic_flow"].pop(key, None)
-                        carry["business_gaps"] = [g for g in carry.get("business_gaps", [])
-                                                  if g["key"] != "execution:incomplete"]
-                        for entry in carry["topic_flow"]["entries"].values():
-                            entry["blocked_checks"] = []
-                            if entry["status"] == "blocked":
-                                entry.update(status="researching", requested_status="researching")
-                            for task in entry["tasks"].values():
-                                if task["status"] == "blocked":
-                                    task["status"] = "pending"
-                            for trace in entry.get("references", []):
-                                if trace["status"] == "budget_exhausted":
-                                    trace["status"] = "missing"
-                        unresolved = [issue for issue in audit.get("remaining", [])
-                                      if issue.get("action") != "provide_input"]
-                        if unresolved:
-                            # 显式补跑要处理旧待办；直接进审查只会复用旧否决并原样结束。
-                            flow.update(phase="research", synthesis_finished=False)
-                            for issue in unresolved:
-                                for entry in flow["entries"].values():
-                                    if entry["topic"] in issue.get("topics", [issue["topic"]]):
-                                        entry["tasks"][issue["issue_id"]] = {
-                                            **issue, "task_id": issue["issue_id"],
-                                            "status": "pending", "review_issue": True,
-                                        }
-                                        entry.update(status="researching",
-                                                     requested_status="researching")
-                    try:
-                        validate_project_claims(
-                            carry.get("draft", {}).get("fields", carry.get("staged_items", [])),
-                            report["project_id"],
-                            defer_semantics=carry.get("topic_flow", {}).get("protocol")
-                            in {"research-v2", "research-v3"},
-                        )
-                    except ValueError:
-                        carry = {}
-                    if module_id in changed_modules and carry:
-                        refresh_input(carry, current_sources + current_references)
+                # 仅显式补跑新attempt重置调用额度；草稿、自查与问题身份继续保留。
+                from tender.application.analysis.drafts import resume_workspace
+
+                carry = resume_workspace(previous_state)
+                if module_id in changed_modules and carry:
+                    refresh_input(carry, current_sources + current_references)
                 carry["execution_mode"] = mode
                 tx.insert_module_run(
                     module_id=module_id,

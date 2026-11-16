@@ -249,7 +249,7 @@ def test_running_and_changed_report_cannot_supply_context(basis):
 
 
 @pytest.mark.parametrize("run_status", ["pending", "running"])
-def test_canceled_retry_cannot_reactivate_the_previous_snapshot(basis, run_status):
+def test_canceled_retry_preserves_previous_formal_snapshot(basis, run_status):
     first = publish_data_snapshot(basis.db, basis.report_id)
     retried = basis.client.post(basis.path + "/retry", json={
         "module_keys": ["project_basic_info_parsing"],
@@ -266,18 +266,18 @@ def test_canceled_retry_cannot_reactivate_the_previous_snapshot(basis, run_statu
     assert basis.client.get(basis.path + "/data").json()["stale"] is True
     assert basis.client.post(basis.path + "/context", json=request).status_code == 409
 
-    # 即使运行行已结束，在新 manifest 发布前也不能短暂恢复旧依据。
+    # 最新运行已终止且正式投影未变，上一轮提交仍是当前版本。
     basis.db.execute("UPDATE agent_module_run SET status='canceled' WHERE module_id=:id",
                      {"id": basis.module_id})
     basis.db.execute("UPDATE analysis_module SET status='canceled' WHERE id=:id",
                      {"id": basis.module_id})
-    assert basis.client.get(basis.path + "/data").json()["stale"] is True
-    assert basis.client.post(basis.path + "/context", json=request).status_code == 409
-    second = publish_data_snapshot(basis.db, basis.report_id)
-    assert second["revision"] == first["revision"] + 1
-    assert second["data"]["readiness"] == "unavailable"
     assert basis.client.get(basis.path + "/data").json()["stale"] is False
-    assert basis.client.post(basis.path + "/context", json=request).status_code == 409
+    assert basis.client.post(basis.path + "/context", json=request).status_code == 200
+    second = publish_data_snapshot(basis.db, basis.report_id)
+    assert second["revision"] == first["revision"]
+    assert second["data"] == first["data"]
+    assert basis.client.get(basis.path + "/data").json()["stale"] is False
+    assert basis.client.post(basis.path + "/context", json=request).status_code == 200
 
 
 def test_superseded_pending_attempt_does_not_block_the_new_terminal_snapshot(basis):
@@ -298,12 +298,12 @@ def test_superseded_pending_attempt_does_not_block_the_new_terminal_snapshot(bas
     basis.db.execute("UPDATE analysis_module SET status='canceled' WHERE id=:id",
                      {"id": basis.module_id})
     second = publish_data_snapshot(basis.db, basis.report_id)
-    assert second["revision"] == first["revision"] + 1
+    assert second["revision"] == first["revision"]
     assert basis.client.get(basis.path + "/data").json()["stale"] is False
 
 
 @pytest.mark.parametrize("run_status", ["pending", "running"])
-def test_cancel_orphaned_retry_publishes_new_snapshot_without_reusing_old_data(basis, run_status):
+def test_cancel_orphaned_retry_keeps_previous_snapshot_without_drafts(basis, run_status):
     first = publish_data_snapshot(basis.db, basis.report_id)
     assert basis.client.post(basis.path + "/retry", json={
         "module_keys": ["project_basic_info_parsing"],
@@ -313,12 +313,12 @@ def test_cancel_orphaned_retry_publishes_new_snapshot_without_reusing_old_data(b
     result = basis.client.post(basis.path + "/cancel")
     assert result.json() == {"status": "canceled", "canceling": False}
     current = basis.client.get(basis.path + "/data").json()
-    assert current["revision"] == first["revision"] + 1
-    assert current["data"]["readiness"] == "unavailable"
+    assert current["revision"] == first["revision"]
+    assert current["data"] == first["data"]
     assert basis.client.post(basis.path + "/context", json={
         "snapshot_id": first["id"], "purpose": "outline",
         "lot_id": first["data"]["lots"][0]["lot_id"],
-    }).status_code == 409
+    }).status_code == 200
 
 
 def test_known_project_lots_missing_from_analysis_require_explicit_selection(basis):

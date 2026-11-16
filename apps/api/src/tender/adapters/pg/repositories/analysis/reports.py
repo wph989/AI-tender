@@ -198,6 +198,7 @@ class ReportQueries:
                     AgentModuleRun.state["stop_reason"].label("stop_reason"),
                     AgentModuleRun.state["quality_status"].astext.label("quality_status"),
                     AgentModuleRun.state["execution_mode"].astext.label("mode"),
+                    AgentModuleRun.state["agent_progress"].label("agent_progress"),
                     saved,
                 )
                 .select_from(AgentModuleRun)

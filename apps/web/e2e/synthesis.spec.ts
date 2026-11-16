@@ -67,6 +67,28 @@ function report(id: number, overrides: Partial<AnalysisReport> = {}): AnalysisRe
 }
 
 let errors: string[];
+
+test("单Agent进度展示草稿与自查，保留上一轮正文", async ({ page }) => {
+  const selected = { ...modules[0], status: "partial" as const, progress: {
+    protocol: "skill-agent-v1", activity: "record_review", topics: [], audit_round: 0,
+    draft_count: 4, reviewed_count: 3, unresolved_issues: 1,
+  } };
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
+    status: "partial", modules: [{ ...selected, items: [] }],
+  }) }));
+  // records接口仍是上一轮正式数据，不能覆盖报告携带的最新工作进度。
+  await page.route("**/api/v1/analysis/reports/1/modules/*/records", (route) => route.fulfill({
+    json: { ...records(selected), progress: { topics: [], audit_round: 2, phase: "review" } },
+  }));
+  await page.goto("/projects/1");
+  await selectModule(page, 1);
+  await expect(page.getByText(/已保存 4 条草稿.*当前版本已自查 3 条/)).toBeVisible();
+  await expect(page.getByText(/未决问题 1 项/)).toBeVisible();
+  await expect(page.getByText(/草稿和自查记录已保存/)).toBeVisible();
+  await expect(page.getByText("完成现有平台升级与迁移。", { exact: true })).toBeVisible();
+  await expect(page.getByText(/已用修复.*次/)).toHaveCount(0);
+});
+
 function records(module: AnalysisModule): ModuleRecords {
   return {
     schema_version: "1", module_key: module.module_key, status: module.status,

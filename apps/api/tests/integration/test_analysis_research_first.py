@@ -11,6 +11,7 @@ import pytest
 import test_deepagents_runtime
 from test_deepagents_runtime import prepared_runtime, publishable_state, report
 
+from tender.application.analysis.drafts import AGENT_PROTOCOL, DraftWorkspace
 from tender.application.analysis.topic_flow import OUTPUT_MODE, OUTPUT_MODE_KEY
 from tender.config.registry import ConfigRegistry
 from tender.core.di import create_analysis_service
@@ -37,9 +38,19 @@ def state_with_notes():
     return state
 
 
+def agent_state_with_notes():
+    state = {}
+    book = DraftWorkspace(state, {}, "project_basic_info_parsing")
+    book.book["notes"] = {"note-1": {"id": "note-1", "topic": "身份", "status": "open",
+        "detail": "已读公告，继续核对补充附件范围", "block_ids": []}}
+    return state
+
+
 def test_new_report_freezes_research_before_output(env):
     current = report(env, topic_flow=True)
-    assert current["skill_snapshot"][OUTPUT_MODE_KEY] == OUTPUT_MODE
+    assert current["skill_snapshot"]["__analysis_flow_version__"] == AGENT_PROTOCOL
+    assert "analysis_workflow/SKILL.md" in current["skill_snapshot"]
+    assert OUTPUT_MODE_KEY not in current["skill_snapshot"]
 
 
 def test_research_notes_are_saved_while_business_records_remain_hidden(env):
@@ -109,10 +120,8 @@ def test_expired_old_owner_cannot_release_staged_results(env):
 def test_explicit_retry_keeps_research_notes_even_without_business_records(env):
     runtime = prepared_runtime(env, topic_flow=True)
     assert runtime.claim()
-    state = state_with_notes()
+    state = agent_state_with_notes()
     state["staged_items"] = []
-    state["topic_flow"]["search_work"] = {"attempted": {"exhausted": True}}
-    state["topic_flow"]["entries"]["identity"]["record_keys"] = []
     try:
         runtime.finish("failed", "研究后模型不可用", state=state)
     finally:
@@ -127,9 +136,8 @@ def test_explicit_retry_keeps_research_notes_even_without_business_records(env):
                       "WHERE module_id=:id ORDER BY attempt DESC LIMIT 1",
                       {"id": runtime.run["module_id"]})[0]
     assert row["attempt"] == 2 and row["model_calls"] == row["tool_calls"] == 0
-    assert row["state"]["topic_flow"]["entries"] == state["topic_flow"]["entries"]
-    assert row["state"]["topic_flow"]["phase"] == "research"
-    assert not row["state"]["topic_flow"].get("search_work")
+    assert row["state"]["agent_workspace"]["notes"] == state["agent_workspace"]["notes"]
+    assert "topic_flow" not in row["state"]
 
 
 def test_work_evidence_and_context_cursor_survive_database_checkpoint_without_resetting_budget(env):
@@ -176,60 +184,33 @@ def test_work_evidence_and_context_cursor_survive_database_checkpoint_without_re
 
 
 def test_retry_restores_examined_notes_and_todos_before_any_check_is_completed(env):
-    from tender.application.analysis.protocol import ResearchDelta, ResearchLedger
-    from tender.application.analysis.research import ResearchSession
-    from tender.application.analysis.topic_flow import TopicFlow
-
-    async def unused(*args):
-        raise AssertionError("补跑恢复已有笔记不应再次检索或调用模型")
-
     runtime = prepared_runtime(env, topic_flow=True)
     assert runtime.claim()
-    state = {"business_topics": [{"key": "identity", "checks": ["名称", "范围"]}]}
-    research = ResearchSession(
-        runtime.sources, runtime.report["project_id"], unused, unused, unused,
-    )
-    research.seen = {"s1r1c0": runtime.sources[0] | {
-        "block_id": "s1r1c0", "content": "项目名称见公告，适用范围详见补充附件。", "offset": 0,
-    }}
-    flow = TopicFlow(state, research)
-    flow.data.update(protocol="research-v2", output_mode=OUTPUT_MODE, phase="research")
-    book = ResearchLedger(flow)
-    work_id = book.works()[0]["id"]
-    book.update([ResearchDelta(
-        work_ids=[work_id], status="examined", detail="已读公告，还需核对补充附件的范围",
-        examined_ids=["s1r1c0"], followups=[{
-            "detail": "补读补充附件", "from_block_id": "s1r1c0", "target": "补充附件范围条款",
-        }],
-    )])
-    state["research"] = research.checkpoint() | {"tool_calls": 2}
-    expected = book.context([work_id])
+    state = agent_state_with_notes()
+    blocks = env.db.read_chunk_window(runtime.sources[0], 0, 1).rows
+    state["research"] = {"seen": {r["block_id"]: r for r in blocks}, "events": [], "tool_calls": 2}
     try:
         runtime.save(state)
         runtime.reserve("model")
         runtime.reserve("tool")
-        runtime.finish("failed", "研究尚未完成时预算耗尽", state=state)
+        runtime.finish("partial", "草稿尚未形成时预算耗尽", state=state)
     finally:
         runtime.release()
-    env.db.execute("UPDATE analysis_report SET status='failed' WHERE id=:id",
+    env.db.execute("UPDATE analysis_report SET status='partial' WHERE id=:id",
                    {"id": runtime.report["id"]})
     create_analysis_service(env.engine, 1, ConfigRegistry(env.engine)).retry_report(
-        runtime.report["id"], module_keys=["project_basic_info_parsing"],
-        max_output_tokens=None, timeout_seconds=None, mode="resume",
+        runtime.report["id"], module_keys=["project_basic_info_parsing"], mode="resume",
+        max_output_tokens=None, timeout_seconds=None,
     )
-    row = env.db.rows("SELECT state,model_calls,tool_calls,attempt FROM agent_module_run "
-                      "WHERE module_id=:id ORDER BY attempt DESC LIMIT 1",
-                      {"id": runtime.run["module_id"]})[0]
-    restored = ResearchLedger(TopicFlow(row["state"], research))
+    row = env.db.rows("SELECT * FROM agent_module_run WHERE module_id=:id "
+                     "ORDER BY attempt DESC LIMIT 1", {"id": runtime.run["module_id"]})[0]
     assert row["attempt"] == 2 and row["model_calls"] == row["tool_calls"] == 0
     assert row["state"]["research"]["tool_calls"] == 0
     assert row["state"]["research"]["seen"] == state["research"]["seen"]
-    assert restored.context([work_id]) == expected
-    assert restored.flow.entries[0]["tasks"] == flow.entries[0]["tasks"]
-    assert not restored.flow.entries[0].get("findings")
+    assert row["state"]["agent_workspace"]["notes"] == state["agent_workspace"]["notes"]
     module = env.db.rows("SELECT items,business_data FROM analysis_module WHERE id=:id",
                          {"id": runtime.run["module_id"]})[0]
-    assert module["items"] == [] and module["business_data"]["records"] == []
+    assert module["items"] == [] and not module["business_data"].get("records")
 
 
 def test_semantic_completion_survives_checkpoint_without_per_check_notes_or_budget_reset(env):

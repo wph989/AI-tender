@@ -31,7 +31,10 @@ export function AnnotationLayer({ pageNo, items, activeEvidence, viewport, onLoc
   if (viewport === null || !activeEvidence || activeEvidence.pageNo !== pageNo) return null;
 
   // 同页可能有多个出处，角标与粗框只显示当前选中的原文块。
-  const activeItems = items.filter((item) => item.anchor === activeEvidence.anchor && item.pageNo === pageNo);
+  // 多条摘录可以共享同一原文块；只保留当前选中证据的一个角标，避免重叠按钮。
+  const activeItem = items.find((item) => item.evidenceId === activeEvidence.evidenceId
+    && item.anchor === activeEvidence.anchor && item.pageNo === pageNo);
+  const activeItems = activeItem ? [activeItem] : [];
 
   return (
     <div className="pointer-events-none absolute inset-0">

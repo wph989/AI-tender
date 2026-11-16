@@ -16,19 +16,35 @@ def rows(count, *, element=None):
                        "content": f"条件{i}"} for i in range(count)]
 
 
-def test_compact_wide_read_applies_one_neighbor_and_returns_continuation():
+def test_compact_read_honors_requested_window_without_repeated_model_roundtrips():
     async def run():
         source_rows = rows(20)
         research = session(source_rows)
         research.compact_results = True
         research.seen = {"s1r1c10": source_rows[10]}
         result = await research.read_evidence("s1r1c10", 5, 6)
-        assert [b["id"] for b in result["blocks"]] == ["s1r1c9", "s1r1c10", "s1r1c11"]
-        assert result["applied"] == {"before": 1, "after": 1}
-        assert result["truncated"]
-        assert result["continue_from"] == ["s1r1c9", "s1r1c11"]
-        more = await research.read_evidence("s1r1c11", 0, 1)
-        assert [b["id"] for b in more["blocks"]] == ["s1r1c11", "s1r1c12"]
+        assert [b["id"] for b in result["blocks"]] == [f"s1r1c{i}" for i in range(5, 17)]
+        assert result["applied"] == {"before": 5, "after": 6}
+        assert not result["truncated"] and not result["read_limited"]
+        assert result["continue_from"] == []
+        assert research.tool_calls == 1
+
+    asyncio.run(run())
+
+
+def test_compact_forward_read_keeps_evidence_budget_atomic():
+    async def run():
+        source_rows = rows(20)
+        research = session(source_rows, limits=AgentLimits(max_evidence_blocks=10))
+        research.compact_results = True
+        research.seen = {"s1r1c0": source_rows[0]}
+        with pytest.raises(EvidenceBudgetError):
+            await research.read_evidence("s1r1c0", 0, 10)
+        # 不把被总额度拒绝的窗口冒充已读；Agent可据反馈缩小同一窗口。
+        assert set(research.seen) == {"s1r1c0"}
+        result = await research.read_evidence("s1r1c0", 0, 9)
+        assert [b["id"] for b in result["blocks"]] == [f"s1r1c{i}" for i in range(10)]
+        assert len(research.seen) == 10
 
     asyncio.run(run())
 

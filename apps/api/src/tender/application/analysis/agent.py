@@ -84,9 +84,10 @@ from tender.application.analysis.protocol import (
     ResearchDelta,
     ResearchLedger,
     ResearchRecord,
+    ResearchUpdateInput,
     SearchQuery,
+    SubmissionInput,
     SubmissionRecord,
-    batch_field,
     submission_records,
     tool_arguments,
 )
@@ -257,6 +258,14 @@ register_harness_profile(
         excluded_middleware={"SummarizationMiddleware"},
     ),
 )
+
+
+class BatchTool(StructuredTool):
+    @property
+    def tool_call_schema(self):
+        # LangChain重建子模型时会丢弃items扩展；这两个批次工具没有注入参数，
+        # 直接公开显式输入模型，保留逐项协议及执行时隔离坏条目的能力。
+        return self.get_input_schema()
 
 
 class RoutedAgentModel(BaseChatModel):
@@ -2030,6 +2039,14 @@ class ResearchMiddleware(AgentMiddleware):
                         result = await handler(request)
                         if self.topic_flow and self.topic_flow.simplified:
                             result = stamp_evidence(result, self.research.seen)
+                        path = request.tool_call["args"].get("file_path")
+                        if (self.topic_flow and name == "read_file" and result.status != "error"
+                                and path in (self.skill or {}).get("line_counts", {})):
+                            read_paths = self.state.setdefault("read_skill_paths", [])
+                            if path not in read_paths:
+                                # 首次读取冻结规则是必要准备；同文件重复读取不能续命。
+                                read_paths.append(path)
+                                self.state["topic_research_round"] = self._round_id(request)
                     if (control and result.status != "error"
                             and not str(result.content).startswith(TOOL_ARGUMENT_PREFIX)):
                         payload = json.loads(result.content)
@@ -2550,8 +2567,7 @@ def build_module_agent(
             raise ToolException(str(exc)) from exc
 
     async def update_compact_research(
-        updates: Annotated[list[Any], batch_field(ResearchDelta, min_length=1, max_length=50,
-            description="研究增量数组；每条work_ids/detail/status及实际已读evidence_ids，范围与待办按需填写")],
+        updates: list[Any],
     ) -> dict:
         """保存必要事实线索和具体问题，程序自动维护覆盖及阶段。"""
         book = ResearchLedger(flow)
@@ -2930,11 +2946,7 @@ def build_module_agent(
         )
 
     async def submit_v3(
-        records: Annotated[list[Any], batch_field(SubmissionRecord, description=(
-            "完整事项数组；每项kind/group/content/block_ids/work_ids，修改带回执id；"
-            "标段与格式节点提供title，范围未知或混合须显式scope；"
-            "父子或关系引用使用parent_key/subject_key/object_key/requirement_keys"
-        ))], final: bool = False,
+        records: list[Any], final: bool = False,
     ) -> dict:
         """暂存完整业务事项；新增省略id，修改沿用回执id，最后一批final=true。"""
         from tender.application.analysis.data import record_identity
@@ -3065,9 +3077,10 @@ def build_module_agent(
             handle_validation_error=partial(validation_feedback, tool_name="complete_research"),
         ))
     elif flow.research_first:
-        tools.append(StructuredTool.from_function(
+        tools.append((BatchTool if flow.simplified else StructuredTool).from_function(
             name="update_research",
             coroutine=update_compact_research if flow.simplified else update_research,
+            args_schema=ResearchUpdateInput if flow.simplified else None,
             handle_tool_error=True,
             handle_validation_error=partial(validation_feedback, tool_name="update_research"),
         ))
@@ -3085,10 +3098,11 @@ def build_module_agent(
             ))
     # 完成意图在全部汇总条目校验通过后才结束子图。
     tools.append(
-        StructuredTool.from_function(
+        (BatchTool if v3 else StructuredTool).from_function(
             name="submit_analysis",
             coroutine=(submit_v3 if flow and flow.data.get("protocol") == "research-v3" else
                        submit_compact if flow and flow.simplified else submit_business),
+            args_schema=SubmissionInput if v3 else None,
             handle_tool_error=True,
             handle_validation_error=validation_feedback,
         )

@@ -51,7 +51,7 @@ def build(router, research, state, **kwargs):
     )
 
 
-def test_compact_evidence_hides_metadata_and_rereads_by_registered_id():
+def test_compact_evidence_keeps_chapter_and_rereads_by_registered_id():
     async def run():
         rows = [
             block() | {"score": 0.99, "bbox": [1, 2, 3, 4], "page_no": 8},
@@ -63,7 +63,9 @@ def test_compact_evidence_hides_metadata_and_rereads_by_registered_id():
         with pytest.raises(ToolArgumentError):
             await research.read_evidence("s1r1c0")
         result = await research.search("质保", "project")
-        assert result["blocks"] == [{"id": r["block_id"], "text": r["content"]} for r in rows]
+        assert result["blocks"] == [{"id": r["block_id"], "text": r["content"],
+                                    "source_id": r["source_id"], "chapter": r["chapter"]}
+                                   for r in rows]
         assert "retrieval" not in result and "relations" not in result
         assert research.seen["s1r1c0"]["page_no"] == 8
         reread = await research.read_evidence("s1r1c0", 0, 1)

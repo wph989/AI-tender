@@ -111,7 +111,7 @@ def test_keyword_and_vector_qualify_independently_before_fusion():
     assert result[0]["score"] < 0.6
 
 
-def test_keyword_fallback_uses_hit_ratio_and_filters_before_limit():
+def test_keyword_fallback_ranks_hits_and_keeps_independent_clauses_before_limit():
     result = rank_chunks(
         [
             {"content": "alpha"},
@@ -124,7 +124,7 @@ def test_keyword_fallback_uses_hit_ratio_and_filters_before_limit():
         min_similarity=0.6,
     )
     assert len(result) == 1 and result[0]["content"] == "alpha beta gamma"
-    assert rank_chunks([{"content": "alpha"}], "alpha beta gamma", min_similarity=0.6) == []
+    assert rank_chunks([{"content": "alpha"}], "alpha beta gamma", min_similarity=0.6)
 
 
 @pytest.mark.parametrize(
@@ -244,7 +244,8 @@ def test_failed_embedding_or_rerank_does_not_drop_threshold_or_backfill():
             min_similarity=0.6,
             max_results=6,
         )
-        assert hits == [] and info["mode"] == "keyword" and info["warning"]
+        assert len(hits) == 1 and info["mode"] == "keyword" and info["warning"]
+        assert hits[0]["content"] == "alpha" and info["similarity_threshold"] == 0.6
         hits, info = await retrieve_chunks(
             Store(rows(20), rerank=True),
             [SOURCE],
@@ -315,7 +316,7 @@ def test_cancellation_during_client_cleanup_is_propagated():
         ))
 
 
-def test_compact_tool_only_delivers_qualified_id_and_text_under_limit():
+def test_compact_tool_delivers_qualified_text_with_chapter_under_limit():
     async def run():
         research = session(rows(20), limits=AgentLimits(max_search_results=3))
         research.compact_results = True
@@ -334,7 +335,7 @@ def test_compact_tool_only_delivers_qualified_id_and_text_under_limit():
         research.retrieve = retrieve
         result = await research.search("投标保证金", "project")
         assert len(result["blocks"]) == len(research.seen) == 3
-        assert all(set(row) == {"id", "text"} for row in result["blocks"])
+        assert all(set(row) == {"id", "text", "source_id", "chapter"} for row in result["blocks"])
         assert "retrieval" not in result
         assert result["search_limited"] is True
         assert "限定 source_id" in result["search_hint"]
@@ -417,7 +418,7 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
         await executor.execute_module(
             {"id": 1, "project_id": 10,
              "source_snapshot": snapshot, "reference_snapshot": references,
-             "skill_snapshot": {"__analysis_flow_version__": "research-v3"}, "category": "goods",
+             "skill_snapshot": {"__analysis_flow_version__": "skill-agent-v1"}, "category": "goods",
              "topics": [], "lot_settings": []},
             {"id": 2, "module_key": "deposit_requirement_parsing", "attempt": 1}, [SOURCE],
         )
@@ -475,12 +476,12 @@ def test_keyword_empty_search_guides_narrower_query_without_weakening_threshold(
             )
 
         research.retrieve = retrieve
-        # 真实标书验收中，堆叠多个主题会把只包含目标名称的转引块过滤掉。
-        empty = await research.search("报价表 增值税税金 一次性报价", "project")
+        # 真正无关键词命中才提示改写；并列关键词中的附件名称必须独立召回。
+        empty = await research.search("履约保证金", "project")
         assert empty["blocks"] == [] and research.seen == {}
         assert "关键词" in empty["search_hint"] and "单一" in empty["search_hint"]
         assert research.events[-1]["similarity_threshold"] == 0.6
-        found = await research.search("报价表", "project")
+        found = await research.search("报价表 增值税税金 一次性报价", "project")
         assert len(found["blocks"]) == 1 and "search_hint" not in found
         repeated = await research.search("报价表", "project")
         assert repeated["already_read"] and "search_hint" not in repeated

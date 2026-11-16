@@ -424,6 +424,8 @@ def module_data(state: dict) -> dict:
         records.append(record)
     return {
         "schema_version": DATA_VERSION, "records": records, "evidence": evidence,
+        **({"protocol": state["agent_workspace"]["protocol"]}
+           if state.get("agent_workspace") else {}),
         "quality_status": quality_status(state),
         "quality_issues": copy.deepcopy(state.get("quality_issues", [])),
         "quality_input_signature": state.get("quality_input_signature"),
@@ -612,7 +614,8 @@ def assemble_dataset(
                     record_id=record["id"], module_key=key,
                 ))
         coverage = data.get("coverage", [])
-        for topic in data.get("topics", []):
+        # 新协议由Agent按Skill核对覆盖，旧阶段缺少回执不再自动生成整专题未完成结论。
+        for topic in ([] if data.get("protocol") == "skill-agent-v1" else data.get("topics", [])):
             entries = [c for c in coverage if c["topic"] == topic["key"]]
             if not entries:
                 entries = [{"topic": topic["key"], "status": "unchecked",

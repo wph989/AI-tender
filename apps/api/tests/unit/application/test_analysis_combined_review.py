@@ -24,6 +24,9 @@ def approve(payload):
                 "supported": True,
                 "issues": [],
                 "block_ids": row["block_ids"],
+                **({"applicability": {"status": "applicable",
+                    "reason": "已核对当前项目与本条款适用条件", "block_ids": row["block_ids"]}}
+                   if payload.get("require_applicability") else {}),
             }
             for row in reversed(payload["records"])
         },

@@ -111,6 +111,11 @@ export interface AnalysisModule {
 }
 
 export interface TopicProgress {
+  protocol?: "skill-agent-v1";
+  activity?: string;
+  draft_count?: number;
+  reviewed_count?: number;
+  unresolved_issues?: number;
   phase?: "research" | "synthesis" | "review" | "completed" | "partial";
   audit_round: number;
   review?: {

@@ -66,6 +66,7 @@ def test_malformed_missing_input_returns_protocol_feedback_instead_of_crashing(m
     ({"status": "needs_action", "record_ids": [], "issue_indexes": []}, "具体业务issues"),
     ({"status": "deferred", "record_ids": [], "block_ids": []}, "真实导航"),
     ({"status": "covered", "record_ids": ["other"]}, "实际交付"),
+    ({"status": "covered_here"}, "partition"),
 ])
 def test_receipts_cannot_claim_unexamined_or_unpublished_content_is_complete(response, reason):
     payload = packet()
@@ -73,6 +74,69 @@ def test_receipts_cannot_claim_unexamined_or_unpublished_content_is_complete(res
     result["check_results"]["a-warranty"].update(response)
     with pytest.raises(InvalidModelOutput, match=reason):
         validate(result, payload)
+
+
+@pytest.mark.parametrize("failure", ["deferred", "no_evidence"])
+def test_partition_receipt_requires_actual_reviewed_content(failure):
+    payload = packet()
+    payload["check_items"][0]["coverage_mode"] = "partition"
+    payload["checks"][0]["navigation_record_ids"] = ["another-packet"]
+    result = approve(payload)
+    receipt = result["check_results"]["a-warranty"]
+    receipt["status"] = "covered_here"
+    if failure == "deferred":
+        receipt.update(status="deferred", record_ids=[], block_ids=[], issue_indexes=[])
+    elif failure == "no_evidence":
+        receipt["block_ids"] = []
+    with pytest.raises(InvalidModelOutput):
+        validate(result, payload)
+
+
+@pytest.mark.parametrize("partition", [False, True])
+def test_coverage_receipt_preserves_rejection_without_repeating_model_call(partition):
+    payload = packet()
+    if partition:
+        payload["check_items"][0]["coverage_mode"] = "partition"
+    result = approve(payload)
+    receipt = result["check_results"]["a-warranty"]
+    receipt["status"] = "covered_here" if partition else "covered"
+    result["reviews"]["a"].update(supported=False, issues=["原文没有支持期限"])
+    validate(result, payload)
+    assert receipt["status"] == "needs_action"
+    assert receipt["issue_indexes"] == [0]
+    assert result["issues"][0]["detail"] == "原文没有支持期限"
+    assert result["issues"][0]["record_ids"] == ["a"]
+    assert not result["reviews"]["a"]["supported"]
+    # 路由校验、返回解析及冻结回执会多次经过校验，不能重复生成同一业务问题。
+    validate(result, payload)
+    assert len(result["issues"]) == 1
+
+
+@pytest.mark.parametrize("partition", [False, True])
+def test_rejected_coverage_never_publishes_or_becomes_verified(partition):
+    async def run():
+        async def review(payload):
+            result = approve(payload)
+            for verdict in result["reviews"].values():
+                verdict.update(supported=False, issues=["原文要求三年，草稿误写两年"])
+            if partition:
+                for check in payload["check_items"]:
+                    check["coverage_mode"] = "partition"
+                for receipt in result["check_results"].values():
+                    receipt["status"] = "covered_here"
+            return result
+
+        state, _, _, calls = await execute([summary_record()], review=review,
+                                           limits=AgentLimits(max_review_repairs=0))
+        assert len(calls) == 1
+        assert not module_data(state)["records"]
+        assert state["quality_status"] == "needs_review"
+        assert len(state["quality_issues"]) == 1
+        assert "误写两年" in state["quality_issues"][0]["detail"]
+        assert all(receipt[0]["status"] == "needs_action" for receipt in
+                   state["topic_flow"]["audit"]["check_results"]["a"].values())
+
+    asyncio.run(run())
 
 
 def test_omitted_independent_condition_keeps_supported_fact_and_concrete_gap():
@@ -110,3 +174,12 @@ def test_shared_original_does_not_merge_distinct_check_identity_or_issue_owner()
     wrong["check_results"]["a-warranty"].update(status="needs_action", issue_indexes=[0])
     with pytest.raises(InvalidModelOutput, match="主题与范围"):
         validate(wrong, payload)
+
+
+@pytest.mark.parametrize("verdict", [None, False, [], {"block_ids": None}])
+def test_bad_verdict_cannot_crash_or_support_a_covered_receipt(verdict):
+    payload = packet()
+    result = approve(payload)
+    result["reviews"]["a"] = verdict
+    with pytest.raises(InvalidModelOutput):
+        validate(result, payload)

@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from tender.application.analysis.contract import RUNTIME_VERSION
-from tender.application.analysis.protocol import PROTOCOL_VERSION
+from tender.application.analysis.contract import FLOW_VERSION as PROTOCOL_VERSION
+from tender.application.analysis.contract import READABLE_RUNTIMES, RUNTIME_VERSION
 from tender.application.analysis.service import AnalysisService
 from tender.ports.repository.analysis.reports import ReportRepository
 
@@ -18,6 +18,7 @@ from tender.ports.repository.analysis.reports import ReportRepository
     (RUNTIME_VERSION, "research-v2", "canceled", False),
     (RUNTIME_VERSION, None, "canceled", False),
     ("legacy", PROTOCOL_VERSION, "canceled", False),
+    ("deepagents-0.7.22-v5-records", "research-v3", "completed", False),
 ])
 def test_report_compatibility_uses_snapshot_without_exposing_it(
     monkeypatch, runtime, protocol, status, compatible,
@@ -44,7 +45,7 @@ def test_report_compatibility_uses_snapshot_without_exposing_it(
     for _ in range(2):
         result = service.get_report(42)
         assert result["execution_compatible"] is compatible
-        assert result["runtime_retired"] is (runtime != RUNTIME_VERSION)
+        assert result["runtime_retired"] is (runtime not in READABLE_RUNTIMES)
         assert result["status"] == status
         assert not result["canceling"]
         assert "skill_snapshot" not in result

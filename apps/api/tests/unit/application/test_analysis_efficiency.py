@@ -88,14 +88,14 @@ def test_batch_reads_merge_overlapping_windows_and_preserve_clause_order():
 
         research.read = tracked
         result = await research.read_evidence(["s1r1c5", "s1r1c2", "s1r1c20"], 2, 3)
-        assert reads == [(1, 6), (19, 3)]
+        assert reads == [(0, 9), (18, 6)]
         assert [r["id"] for r in result["blocks"]] == [
-            f"s1r1c{i}" for i in [*range(1, 7), *range(19, 22)]
+            f"s1r1c{i}" for i in [*range(0, 9), *range(18, 24)]
         ]
         assert research.tool_calls == 1
         assert result["windows"] == [
-            {"first_id": "s1r1c1", "last_id": "s1r1c6"},
-            {"first_id": "s1r1c19", "last_id": "s1r1c21"},
+            {"first_id": "s1r1c0", "last_id": "s1r1c8"},
+            {"first_id": "s1r1c18", "last_id": "s1r1c23"},
         ]
 
     asyncio.run(run())

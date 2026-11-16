@@ -16,7 +16,6 @@ from typing import Any
 from tender.application.analysis.agent import (
     RoutedAgentModel,
     VerificationUnavailable,
-    build_module_agent,
     invoke_module,
     validate_project_claims,
 )
@@ -24,6 +23,7 @@ from tender.application.analysis.data_store import publish_data_snapshot
 from tender.application.analysis.research import AgentLimits, ResearchSession
 from tender.application.analysis.runtime import AgentRuntime, check_report_access
 from tender.application.analysis.search_control import TopicSearch
+from tender.application.analysis.skill_agent import build_skill_agent as build_module_agent
 from tender.application.analysis.skills import MODULES
 from tender.application.analysis.topic_flow import TopicIncomplete, enabled
 from tender.application.knowledge.content import encode, normalized, source_signature, source_state
@@ -274,9 +274,14 @@ class AnalysisExecutor:
         task = None
         state = {}
         started = time.monotonic()
+        queue_ms = 0
+        claimed = False
         try:
             await wait_for_claim(runtime)
             queue_ms = int((time.monotonic() - started) * 1000)
+            # 配额排队不是模型执行耗时；分开计量才能定位实际慢在哪个专题。
+            started = time.monotonic()
+            claimed = True
 
             async def authorize():
                 await asyncio.to_thread(runtime.guard)
@@ -311,6 +316,11 @@ class AnalysisExecutor:
             async def read_window(source, offset, limit):
                 return await asyncio.to_thread(db.read_chunk_window, source, offset, limit)
 
+            async def resolve_citation(ref):
+                # 最终提交前检查定位仍可解析；复用仓储权限与版本校验，不靠模型填页码。
+                await authorize()
+                return await asyncio.to_thread(db.resolve, ref)
+
             state = runtime.run["state"]
             state.setdefault("execution_mode", "restart" if runtime.run.get("attempt", 1) == 1
                              else "resume")
@@ -318,7 +328,7 @@ class AnalysisExecutor:
             state["quality_input_signature"] = source_signature(
                 report["source_snapshot"] + report["reference_snapshot"],
             )
-            from tender.application.analysis.protocol import PROTOCOL_VERSION
+            from tender.application.analysis.contract import FLOW_VERSION as PROTOCOL_VERSION
 
             if report["skill_snapshot"].get("__analysis_flow_version__") != PROTOCOL_VERSION:
                 raise ValueError("解析协议已升级，旧检查点不能恢复；请重新创建报告")
@@ -358,22 +368,6 @@ class AnalysisExecutor:
             )
 
             async def work():
-                async def review_all(payload):
-                    from tender.application.analysis.review import review_combined
-                    from tender.application.knowledge.content import citation
-
-                    result = await review_combined(model, payload, limits=limits)
-                    await authorize()
-                    selected = {bid for verdict in result["reviews"].values()
-                                if verdict["supported"] for bid in verdict["block_ids"]}
-                    locations = {}
-                    for cid in selected:
-                        raw = research.seen[cid]
-                        ref = citation(raw, raw["content"])
-                        locations[cid] = await asyncio.to_thread(db.resolve, ref)
-                    result["locations"] = locations
-                    return result
-
                 async with self.checkpoints() as saver:
                     graph, files = build_module_agent(
                         key=module["module_key"],
@@ -384,6 +378,7 @@ class AnalysisExecutor:
                         checkpointer=saver,
                         reserve_tool=reserve_tool,
                         begin_tool=begin_tool,
+                        resolve_citation=resolve_citation,
                         save=save,
                         budget_status=lambda: {
                             "seconds_remaining": max(
@@ -392,13 +387,11 @@ class AnalysisExecutor:
                                     (runtime.run["deadline_at"] - datetime.now(UTC)).total_seconds()
                                 ),
                             ),
-                            "finish_reserve_seconds": min(300, int(limits.timeout_seconds * 0.25)),
                             "model_calls_remaining": limits.max_model_calls
                             - (runtime.run.get("successful_model_calls") or 0),
                             "tool_calls_remaining": limits.max_tool_calls
                             - (runtime.run.get("successful_tool_calls") or 0),
                         },
-                        review_combined=review_all,
                         lots=report["lot_settings"],
                         event=runtime.event,
                         # 项目和标段品类可能不同，首次推理前加载全部已明确品类的细则。
@@ -480,8 +473,9 @@ class AnalysisExecutor:
                 if "draft" not in state:
                     raise ValueError("子 Agent 结束但没有提交通过校验的分析")
                 draft = state["draft"]
-                # 字段与关系的支持性校验都在子 Agent 的提交工具内完成，此处只做最终权限复核。
-                validate_project_claims(draft["fields"], report["project_id"])
+                # 最终正文由同一Agent确认；发布只复核引用权限，不另起语义审查。
+                validate_project_claims(draft["fields"], report["project_id"],
+                                        defer_semantics=True)
                 await asyncio.to_thread(runtime.finish, "completed", draft=draft, state=state)
                 logger.info(
                     "module.result",
@@ -512,12 +506,12 @@ class AnalysisExecutor:
             await task
         except (VerificationUnavailable, ModelUnavailable, TopicIncomplete) as exc:
             # 校验网关或模型恢复不可用不等于分析无成果：只发布已核实条目。
-            await self._settle_incomplete(runtime, state, task, started, exc)
+            await self._settle_incomplete(runtime, state, task, started, exc, queue_ms=queue_ms)
         except (Exception, asyncio.CancelledError) as exc:
-            if isinstance(exc, (TimeoutError, ModelBudgetExhausted, BudgetExhausted)) and enabled(
-                report.get("skill_snapshot", {})
+            if isinstance(exc, (TimeoutError, ModelBudgetExhausted, BudgetExhausted)) and (
+                state.get("agent_workspace") or enabled(report.get("skill_snapshot", {}))
             ):
-                await self._settle_incomplete(runtime, state, task, started, exc)
+                await self._settle_incomplete(runtime, state, task, started, exc, queue_ms=queue_ms)
                 return
             if task and not task.done():
                 task.cancel()
@@ -528,7 +522,8 @@ class AnalysisExecutor:
             log = logger.info if canceled else logger.error
             log(
                 "module.cancel" if canceled else "module.fail",
-                duration_ms=int((time.monotonic() - started) * 1000),
+                duration_ms=int((time.monotonic() - started) * 1000) if claimed else 0,
+                queue_ms=queue_ms if claimed else int((time.monotonic() - started) * 1000),
                 reason=error_detail(str(exc)) if canceled else None,
                 saved_item_count=sum(
                     i.get("verification") == "supported" for i in state.get("staged_items", [])
@@ -565,6 +560,8 @@ class AnalysisExecutor:
         task: asyncio.Task | None,
         started: float,
         exc: Exception,
+        *,
+        queue_ms: int = 0,
     ) -> None:
         """模型或校验不可用时收尾：有已核实成果才是 partial，否则明确失败。"""
         reason = str(exc)
@@ -573,6 +570,11 @@ class AnalysisExecutor:
             task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await task
+        if state.get("agent_workspace"):
+            # 未明确提交的草稿只留在检查点；硬预算或上游失败不能代替Agent选择最终结果。
+            state["stop_reason"] = {"code": "agent_interrupted", "message": reason[:2000]}
+            await asyncio.to_thread(runtime.finish, "partial", reason[:1000], state=state)
+            return
         from tender.application.analysis.state import published_items
 
         supported = len(published_items(state, final=bool(state.get("topic_flow"))))
@@ -592,6 +594,7 @@ class AnalysisExecutor:
             logger.warning(
                 "module.partial",
                 duration_ms=int((time.monotonic() - started) * 1000),
+                queue_ms=queue_ms,
                 saved_item_count=supported,
                 pending_count=state.get("verification_degraded", {}).get("pending_count"),
                 gap_count=len(state.get("business_gaps", [])),
@@ -606,6 +609,7 @@ class AnalysisExecutor:
             logger.error(
                 "module.fail",
                 duration_ms=int((time.monotonic() - started) * 1000),
+                queue_ms=queue_ms,
                 saved_item_count=0,
                 # 显式保留脱敏原因，避免仅依赖500字符异常摘要丢失后备模型的错误。
                 error=error_detail(reason),

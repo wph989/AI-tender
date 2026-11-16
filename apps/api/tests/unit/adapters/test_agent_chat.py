@@ -47,6 +47,33 @@ def agent(client):
     )
 
 
+@pytest.mark.parametrize("arguments", [{}, {"query": 12}])
+def test_tool_owned_validation_returns_bad_arguments_to_same_agent(arguments):
+    async def run():
+        tool = json.loads(json.dumps(TOOL))
+        tool["function"]["parameters"]["x-tender-tool-validation"] = True
+
+        def handle(request):
+            # 内部校验分工不泄露给供应商，但供应商仍看到完整输入契约。
+            parameters = json.loads(request.content)["tools"][0]["function"]["parameters"]
+            assert "x-tender-tool-validation" not in parameters
+            assert parameters["required"] == ["query"]
+            return stream_response(response({"role": "assistant", "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                    "name": "search_document", "arguments": json.dumps(arguments),
+                }}]}))
+
+        model = agent(httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+        try:
+            reply = await model.chat([message_to_dict(HumanMessage(content="检索"))], [tool])
+            assert reply.agent_message["data"]["tool_calls"][0]["args"] == arguments
+            assert reply.completion_tokens == 7
+        finally:
+            await model.aclose()
+
+    asyncio.run(run())
+
+
 def test_incomplete_tool_json_is_rejected_even_with_normal_finish():
     async def run():
         body = response({"role": "assistant", "content": None, "tool_calls": [{
