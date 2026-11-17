@@ -235,6 +235,33 @@ export async function loadProject(projectId: number): Promise<WireProjectDetail>
   return getJson<WireProjectDetail>("/api/v1/projects/" + projectId);
 }
 
+export function updateProject(projectId: number, input: {
+  name: string; project_no: string | null; owner: string | null;
+}): Promise<WireProject> {
+  return patchJson("/api/v1/projects/" + projectId, input);
+}
+
+export async function deleteProject(projectId: number): Promise<void> {
+  const response = await fetch("/api/v1/projects/" + projectId, { method: "DELETE" });
+  // 删除返回204，不解析不存在的JSON正文。
+  if (!response.ok) throw await readError(response, "删除项目失败");
+}
+
+export async function replaceProjectFile(projectId: number, fileId: number, file: File,
+  options: { autoParse: boolean; tier: ParseTier; ocrMode: "auto" | "txt" | "ocr" },
+): Promise<{ added: UploadResult["added"][number]; jobs: string[] }> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("auto_parse", String(options.autoParse));
+  form.append("tier", options.tier);
+  form.append("ocr_mode", options.ocrMode);
+  const response = await fetch(`/api/v1/projects/${projectId}/files/${fileId}/replace`, {
+    method: "POST", body: form,
+  });
+  if (!response.ok) throw await readError(response, "文件换版失败");
+  return response.json();
+}
+
 export interface UploadOptions {
   tier: ParseTier | "";
   ocrMode: "auto" | "txt" | "ocr" | "";

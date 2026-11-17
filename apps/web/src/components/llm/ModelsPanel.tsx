@@ -5,16 +5,16 @@ import {
   Alert,
   App,
   Button,
-  Card,
+  Tag,
   Form,
   Input,
   InputNumber,
   Modal,
-  Pagination,
   Select,
   Space,
   Switch,
 } from "antd";
+import { DataTable } from "@/components/DataTable";
 import { useFeedback } from "@/hooks/useFeedback";
 import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
 import {
@@ -298,156 +298,50 @@ export function ModelsPanel({ providers, models, profiles, fields = {}, onChange
           />
         )}
       </Modal>
-      <div className="mt-4 space-y-3">
-        {visible
-          .slice(
-            (Math.min(page, Math.max(1, Math.ceil(visible.length / 8))) - 1) *
-              8,
-            Math.min(page, Math.max(1, Math.ceil(visible.length / 8))) * 8,
-          )
-          .map((m) => (
-            <Card key={m.id} className="rounded-xl border border-slate-200 p-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <h3 className="break-all font-semibold">{m.display_name}</h3>
-                  <p className="break-all text-xs text-slate-500">
-                    {m.provider_name} · {m.model_id}
-                  </p>
-                </div>
-                <span className="rounded-full bg-violet-50 px-3 py-1 text-xs text-violet-700">
-                  {kindLabel[m.kind]}
-                  {m.embedding_input_type === "multimodal"
-                    ? " · 文本＋图片"
-                    : m.embedding_input_type === "text"
-                      ? " · 纯文本"
-                      : m.capabilities.includes("image_input")
-                        ? " · 视觉"
-                        : ""}
-                </span>
-              </div>
+      <DataTable<LlmModel>
+        rowKey="id"
+        className="mt-4"
+        dataSource={visible}
+        scroll={{ x: 1100 }}
+        pagination={{
+          current: Math.min(page, Math.max(1, Math.ceil(visible.length / 10))),
+          pageSize: 10,
+          onChange: setPage,
+        }}
+        locale={{
+          emptyText: "暂无符合条件的模型，可手动添加或从供应商目录导入。",
+        }}
+        expandable={{
+          columnTitle: "详情",
+          columnWidth: 56,
+          expandedRowRender: (model) => (
+            <div className="model-details">
               <p className="mt-3 text-sm text-slate-600">
-                {m.api_mode} · {m.kind === "language" ? "响应间隔" : "超时"} {m.timeout_seconds}s
-                {m.kind === "language" && ` · 单次总时限 ${m.total_timeout_seconds == null ? "不限制" : `${m.total_timeout_seconds}s`}`} · 失败后额外重试{" "}
-                {m.extra_retries} 次
+                {model.api_mode} ·{" "}
+                {model.kind === "language" ? "响应间隔" : "超时"}{" "}
+                {model.timeout_seconds}s
+                {model.kind === "language" &&
+                  ` · 单次总时限 ${
+                    model.total_timeout_seconds == null
+                      ? "不限制"
+                      : `${model.total_timeout_seconds}s`
+                  }`}
+                {" · 失败后额外重试 "}
+                {model.extra_retries} 次
               </p>
-              {m.kind === "language" && (
+              {model.kind === "language" && (
                 <p className="mt-1 text-xs text-slate-500">
-                  温度 {m.temperature ?? "服务默认"} · 输出上限{" "}
-                  {m.max_tokens ?? "服务默认"}
+                  温度 {model.temperature ?? "服务默认"} · 输出上限{" "}
+                  {model.max_tokens ?? "服务默认"}
                 </p>
               )}
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-                <div className="text-xs text-slate-500">
-                  <span
-                    className={
-                      m.enabled && m.provider_enabled ? "text-emerald-700" : ""
-                    }
-                  >
-                    {!m.provider_enabled
-                      ? "供应商停用"
-                      : m.enabled
-                        ? "已启用"
-                        : "已停用"}
-                  </span>{" "}
-                  ·{" "}
-                  {m.capabilities
-                    .map((c) => capabilityLabel[c] ?? c)
-                    .join(" / ")}
-                  <p className="mt-1">{formatTime(m.last_test_at)}</p>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <Switch
-                    aria-label={`${m.display_name}启用状态`}
-                    checked={m.enabled}
-                    checkedChildren="启用"
-                    unCheckedChildren="停用"
-                    disabled={busy || editing !== null}
-                    onChange={(enabled) =>
-                      void run(async () => {
-                        await updateModel(m.id, { enabled, revision: m.revision });
-                        void toast.success(`模型已${enabled ? "启用" : "停用"}`);
-                      })
-                    }
-                  />
-                  <Select
-                    aria-label={`${m.display_name} 测试能力`}
-                    value={
-                      selectedTests[m.id] ??
-                      (m.embedding_input_type === "multimodal"
-                        ? "multimodal_embedding"
-                        : m.test_capabilities[0])
-                    }
-                    onChange={(value) =>
-                      setSelectedTests((old) => ({ ...old, [m.id]: value }))
-                    }
-                    disabled={busy}
-                    options={m.test_capabilities.map((value) => ({
-                      value,
-                      label: capabilityLabel[value],
-                    }))}
-                  />
-                  <Button
-                    htmlType="submit"
-
-                    disabled={
-                      busy ||
-                      Object.values(m.capability_tests).some(
-                        (t) => t.status === "running",
-                      )
-                    }
-                    onClick={() => void test(m)}
-                  >
-                    {Object.values(m.capability_tests).some(
-                      (t) => t.status === "running",
-                    )
-                      ? "测试中…"
-                      : "测试"}
-                  </Button>
-                  <Button
-                    htmlType="submit"
-
-                    disabled={busy || editing !== null}
-                    onClick={() => edit(m.id)}
-                  >
-                    编辑
-                  </Button>
-                  <Button
-                    danger
-                    htmlType="submit"
-
-                    disabled={busy}
-                    onClick={() =>
-                      modal.confirm({
-                        title: `删除模型「${m.display_name}」？`,
-                        content: "有效绑定或索引引用会阻止删除。",
-                        okText: "删除",
-                        okButtonProps: { danger: true },
-                        onOk: async () => {
-                          try {
-                            await deleteModel(m.id);
-                            void toast.success("模型已删除");
-                            await onChanged().catch(() =>
-                              setError("模型已删除，刷新失败。"),
-                            );
-                          } catch (e) {
-                            setError(message(e, "删除模型失败"));
-                            throw e;
-                          }
-                        },
-                      })
-                    }
-                  >
-                    删除
-                  </Button>
-                </div>
-              </div>
               <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
-                {m.test_capabilities.map((cap) => {
-                  const check = m.capability_tests[cap];
+                {model.test_capabilities.map((capability) => {
+                  const check = model.capability_tests[capability];
                   return (
-                    <div key={cap} className="text-xs text-slate-600">
+                    <div key={capability} className="text-xs text-slate-600">
                       <span className="font-medium">
-                        {capabilityLabel[cap]}
+                        {capabilityLabel[capability]}
                       </span>{" "}
                       · {validityLabel(check?.validity ?? "untested")}
                       {check?.latency_ms != null &&
@@ -479,30 +373,168 @@ export function ModelsPanel({ providers, models, profiles, fields = {}, onChange
                   );
                 })}
               </div>
-              {m.last_test_error &&
-                Object.keys(m.capability_tests).length === 0 && (
+              {model.last_test_error &&
+                Object.keys(model.capability_tests).length === 0 && (
                   <p className="mt-2 text-sm text-rose-700">
-                    {m.last_test_error}
+                    {model.last_test_error}
                   </p>
                 )}
-            </Card>
-          ))}
-      </div>
-      <Pagination
-        className="mt-4"
-        current={Math.min(page, Math.max(1, Math.ceil(visible.length / 8)))}
-        pageSize={8}
-        total={visible.length}
-        onChange={setPage}
-        showSizeChanger={false}
-        hideOnSinglePage
-        showTotal={(total) => `共 ${total} 个模型`}
+            </div>
+          ),
+        }}
+        columns={[
+          {
+            title: "模型 / 供应商",
+            key: "model",
+            width: 260,
+            render: (_, model) => (
+              <div>
+                <strong className="table-title">{model.display_name}</strong>
+                <div className="table-meta">
+                  {model.provider_name} · {model.model_id}
+                </div>
+              </div>
+            ),
+          },
+          {
+            title: "类型",
+            key: "kind",
+            width: 130,
+            render: (_, model) => (
+              <Tag>
+                {kindLabel[model.kind]}
+                {model.embedding_input_type === "multimodal"
+                  ? " · 图文"
+                  : model.capabilities.includes("image_input")
+                    ? " · 视觉"
+                    : ""}
+              </Tag>
+            ),
+          },
+          {
+            title: "状态 / 最近测试",
+            key: "status",
+            width: 180,
+            render: (_, model) => (
+              <div>
+                <Tag
+                  color={
+                    !model.provider_enabled || !model.enabled
+                      ? "default"
+                      : "success"
+                  }
+                >
+                  {!model.provider_enabled
+                    ? "供应商停用"
+                    : model.enabled
+                      ? "已启用"
+                      : "已停用"}
+                </Tag>
+                {Object.values(model.capability_tests).some(
+                  (check) => check.status === "running",
+                ) && <Tag color="processing">测试中</Tag>}
+                {(model.last_test_error ||
+                  Object.values(model.capability_tests).some(
+                    (check) => check.error_message,
+                  )) && <Tag color="error">测试异常 · 展开详情</Tag>}
+                <div className="table-meta">
+                  {formatTime(model.last_test_at)}
+                </div>
+              </div>
+            ),
+          },
+          {
+            title: "操作",
+            key: "actions",
+            fixed: "right",
+            width: 420,
+            render: (_, model) => (
+              <div className="model-row-actions">
+                <Switch
+                  aria-label={`${model.display_name}启用状态`}
+                  checked={model.enabled}
+                  checkedChildren="启用"
+                  unCheckedChildren="停用"
+                  disabled={busy || editing !== null}
+                  onChange={(enabled) =>
+                    void run(async () => {
+                      await updateModel(model.id, {
+                        enabled,
+                        revision: model.revision,
+                      });
+                      void toast.success(`模型已${enabled ? "启用" : "停用"}`);
+                    })
+                  }
+                />
+                <Select
+                  aria-label={`${model.display_name} 测试能力`}
+                  value={
+                    selectedTests[model.id] ??
+                    (model.embedding_input_type === "multimodal"
+                      ? "multimodal_embedding"
+                      : model.test_capabilities[0])
+                  }
+                  onChange={(value) =>
+                    setSelectedTests((old) => ({ ...old, [model.id]: value }))
+                  }
+                  disabled={busy}
+                  options={model.test_capabilities.map((value) => ({
+                    value,
+                    label: capabilityLabel[value],
+                  }))}
+                />
+                <Button
+                  disabled={
+                    busy ||
+                    Object.values(model.capability_tests).some(
+                      (check) => check.status === "running",
+                    )
+                  }
+                  onClick={() => void test(model)}
+                >
+                  {Object.values(model.capability_tests).some(
+                    (check) => check.status === "running",
+                  )
+                    ? "测试中…"
+                    : "测试"}
+                </Button>
+                <Button
+                  disabled={busy || editing !== null}
+                  onClick={() => edit(model.id)}
+                >
+                  编辑
+                </Button>
+                <Button
+                  danger
+                  disabled={busy}
+                  onClick={() =>
+                    modal.confirm({
+                      title: `删除模型「${model.display_name}」？`,
+                      content: "有效绑定或索引引用会阻止删除。",
+                      okText: "删除",
+                      okButtonProps: { danger: true },
+                      onOk: async () => {
+                        try {
+                          await deleteModel(model.id);
+                          void toast.success("模型已删除");
+                          await onChanged().catch(() =>
+                            setError("模型已删除，刷新失败。"),
+                          );
+                        } catch (caught) {
+                          setError(message(caught, "删除模型失败"));
+                          throw caught;
+                        }
+                      },
+                    })
+                  }
+                >
+                  删除
+                </Button>
+              </div>
+            ),
+          },
+        ]}
       />
-      {!visible.length && (
-        <p className="mt-6 text-sm text-slate-500">
-          暂无符合条件的模型，可手动添加或从供应商目录导入。
-        </p>
-      )}
     </section>
   );
 }

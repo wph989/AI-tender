@@ -12,11 +12,11 @@ export function AntdProvider({ children }: { children: ReactNode }) {
       button={{ autoInsertSpace: false }}
       theme={{
         token: {
-          colorPrimary: "#7156ce",
+          colorPrimary: "#2563eb",
           colorSuccess: "#2d866f",
           colorError: "#bf4764",
-          colorText: "#27283f",
-          colorBgLayout: "#f7f8fc",
+          colorText: "#1e293b",
+          colorBgLayout: "#f8fafc",
           borderRadius: 8,
           controlHeight: 36,
           fontFamily: '"Segoe UI", "Microsoft YaHei", sans-serif',

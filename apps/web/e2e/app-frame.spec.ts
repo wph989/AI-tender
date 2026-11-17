@@ -1,5 +1,11 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { collections, mockApi, project } from "./fixtures";
+
+async function openMainNavigation(page: Page) {
+  if ((page.viewportSize()?.width ?? 1440) <= 767)
+    await page.getByRole("button", { name: "打开导航菜单" }).click();
+  return page.getByRole("navigation", { name: "主导航", exact: true });
+}
 
 let pageErrors: string[];
 test.beforeEach(async ({ page }) => {
@@ -34,10 +40,11 @@ test.beforeEach(async ({ page }) => {
 });
 test.afterEach(() => expect(pageErrors).toEqual([]));
 
-test("顶部导航常驻，长页面独立滚动且切换页面保留同一框架", async ({ page }, info) => {
+test("全局导航常驻，长页面独立滚动且切换页面保留同一框架", async ({ page }, info) => {
   await page.goto("/projects");
-  const navigation = page.getByRole("navigation", { name: "主导航", exact: true });
+  const navigation = await openMainNavigation(page);
   await expect(navigation).toHaveCount(1);
+  if ((page.viewportSize()?.width ?? 1440) <= 767) await page.keyboard.press("Escape");
   const header = page.locator(".app-header");
   const originalHeader = await header.elementHandle();
   const viewport = page.locator(".app-viewport");
@@ -47,9 +54,10 @@ test("顶部导航常驻，长页面独立滚动且切换页面保留同一框�
   await expect.poll(() => viewport.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
   await expect.poll(() => header.evaluate((element) => element.getBoundingClientRect().top)).toBe(0);
   expect(await page.evaluate(() => window.scrollY)).toBe(0);
-  await navigation.getByRole("link", { name: "知识库", exact: true }).click();
+  await (await openMainNavigation(page)).getByRole("link", { name: "知识库", exact: true }).click();
   await expect(page).toHaveURL(/\/knowledge$/, { timeout: 15_000 });
-  await expect(navigation.getByRole("link", { name: "知识库", exact: true }))
+  const currentNavigation = await openMainNavigation(page);
+  await expect(currentNavigation.getByRole("link", { name: "知识库", exact: true }))
     .toHaveAttribute("aria-current", "page");
   // 客户端切换应保留原导航节点，并把新页面内容带回顶部。
   expect(await originalHeader!.evaluate((element) => element.isConnected)).toBe(true);
@@ -89,12 +97,11 @@ test("长页面切换回顶部，前进后退按历史条目恢复各自滚动�
   }));
   await page.goto("/projects");
   const viewport = page.locator(".app-viewport");
-  const navigation = page.getByRole("navigation", { name: "主导航", exact: true });
   const scrollTop = () => viewport.evaluate((element) => element.scrollTop);
   await expect(page.getByText("界面验收项目 1", { exact: true })).toBeVisible();
   await viewport.evaluate((element) => { element.scrollTop = 450; });
   await expect.poll(scrollTop).toBe(450);
-  await navigation.getByRole("link", { name: "知识库", exact: true }).click();
+  await (await openMainNavigation(page)).getByRole("link", { name: "知识库", exact: true }).click();
   await expect(page.getByText("滚动验收资料库 1", { exact: true })).toBeVisible();
   await expect.poll(scrollTop).toBe(0);
   // 桌面知识库只略超一屏，使用两端都可到达且与项目页不同的位置。
@@ -107,7 +114,7 @@ test("长页面切换回顶部，前进后退按历史条目恢复各自滚动�
   await expect(page).toHaveURL(/\/knowledge$/);
   await expect.poll(scrollTop).toBe(80);
   // 再次点击相同入口创建新历史条目，不能套用该 URL 上次留下的位置。
-  await navigation.getByRole("link", { name: "项目空间", exact: true }).click();
+  await (await openMainNavigation(page)).getByRole("link", { name: "项目空间", exact: true }).click();
   await expect(page).toHaveURL(/\/projects$/);
   await expect.poll(scrollTop).toBe(0);
   await viewport.evaluate((element) => { element.scrollTop = 250; });
@@ -142,7 +149,7 @@ test("返回长列表等待异步数据撑开后恢复，并保持正文锚点�
   await expect(page.getByText("界面验收项目 1", { exact: true })).toBeVisible();
   await viewport.evaluate((element) => { element.scrollTop = 450; });
   await expect.poll(scrollTop).toBe(450);
-  await page.getByRole("navigation", { name: "主导航", exact: true })
+  await (await openMainNavigation(page))
     .getByRole("link", { name: "知识库", exact: true }).click();
   await expect(page).toHaveURL(/\/knowledge$/);
   waitForProjects = new Promise<void>((resolve) => { releaseProjects = resolve; });
@@ -166,15 +173,15 @@ test("返回长列表等待异步数据撑开后恢复，并保持正文锚点�
 test("分析与文档工作台使用导航下方剩余高度，原文滚动不带动外框", async ({ page }, info) => {
   for (const path of ["/projects/1", "/projects/1?view=document"]) {
     await page.goto(path);
-    await expect(page.getByRole("navigation", { name: "主导航", exact: true })).toHaveCount(1);
+    await expect(await openMainNavigation(page)).toHaveCount(1);
+    if ((page.viewportSize()?.width ?? 1440) <= 767) await page.keyboard.press("Escape");
     const workspace = page.locator(".workspace");
     await expect(workspace).toBeVisible();
     await expect.poll(() => page.evaluate(() => {
       const frameViewport = document.querySelector(".app-viewport")!;
-      const header = document.querySelector(".app-header")!;
       const workspace = document.querySelector(".workspace")!;
       return Math.abs(workspace.getBoundingClientRect().height -
-        (innerHeight - header.getBoundingClientRect().height)) < 1 &&
+        frameViewport.clientHeight) < 1 &&
         frameViewport.scrollHeight <= frameViewport.clientHeight + 1 &&
         document.documentElement.scrollHeight <= innerHeight + 1;
     })).toBe(true);

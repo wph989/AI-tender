@@ -274,7 +274,9 @@ test("执行中取消持续刷新，退出后只补跑选中的已取消模块",
   phase = "stopped";
   await expect(retry).toBeEnabled({ timeout: 10000 });
   await retry.click();
-  await expect.poll(() => retried).toEqual({ module_keys: ["deposit_requirement_parsing"] });
+  await expect.poll(() => retried).toEqual({
+    module_keys: ["deposit_requirement_parsing"], mode: "restart",
+  });
 });
 
 test("上传默认省略解析参数，让配置中心决定任务默认值", async ({ page }) => {
@@ -310,7 +312,7 @@ test("长列表底部编辑模型，弹窗和保存按钮可见，关闭后返�
     dialog.getByRole("button", { name: "保存", exact: true }),
   ).toBeInViewport();
   await expect(dialog.getByLabel("名称", { exact: true })).toHaveValue(
-    "测试模型 8",
+    "测试模型 10",
   );
   await page.keyboard.press("Escape");
   await expect(dialog).not.toBeVisible();
@@ -343,7 +345,9 @@ test("保存失败保留模型草稿；重试成功只发送一次保存", async
   );
   expect(writes).toBe(1);
   fail = false;
-  await dialog.getByRole("button", { name: "保存", exact: true }).click();
+  const save = dialog.getByRole("button", { name: /保存/ });
+  await expect(save).toBeEnabled();
+  await save.click();
   await expect(dialog).not.toBeVisible();
   expect(writes).toBe(2);
 });
@@ -410,7 +414,7 @@ test("知识库首次加载失败可重试，新建在弹窗中完成", async ({
   await expect(page.getByText("服务暂时不可用")).toBeVisible();
   await expect(page.getByText("正在加载知识库")).not.toBeVisible();
   await page.getByRole("button", { name: "重试", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "测试知识库" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "测试知识库" })).toBeVisible();
   await page.getByRole("button", { name: "新建知识库", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "新建知识库", exact: true });
   await dialog.getByLabel("知识库名称").fill("新资料库");
@@ -474,7 +478,7 @@ test("失败请求在记录详情和调用链中展示完整上游响应", async
   } }));
   await page.goto("/settings/models");
   await page.getByRole("tab", { name: "调用记录" }).click();
-  await page.locator(".ant-table-row-expand-icon").first().click();
+  await page.getByRole("button", { name: "展开行" }).first().click();
   const detail = page.locator(".ant-table-expanded-row article");
   await expect(detail).toContainText("HTTP 429");
   await expect(detail.getByText(errorMessage, { exact: true })).toBeVisible();
@@ -550,7 +554,6 @@ test("导入模型的选择和提交位于弹窗，保留选中的模型 ID", as
 
 test("知识库重命名预填当前名称，删除取消后仍可操作", async ({ page }) => {
   await page.goto("/knowledge/1");
-  await page.getByText("上传与管理资料", { exact: true }).click();
   await page.getByRole("button", { name: "重命名", exact: true }).click();
   const dialog = page.getByRole("dialog", {
     name: "重命名知识库",
@@ -558,7 +561,7 @@ test("知识库重命名预填当前名称，删除取消后仍可操作", async
   });
   await expect(dialog.getByLabel("知识库名称")).toHaveValue("测试知识库");
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
-  await page.getByRole("button", { name: "移除知识库", exact: true }).click();
+  await page.getByRole("button", { name: "删除知识库", exact: true }).click();
   await page
     .getByRole("dialog")
     .getByRole("button", { name: "取消", exact: true })

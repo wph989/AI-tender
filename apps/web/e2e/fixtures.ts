@@ -183,11 +183,13 @@ export async function mockApi(page: Page) {
       body =
         method === "GET"
           ? {
+              limit: Number(url.searchParams.get("limit") || 100),
+              offset: Number(url.searchParams.get("offset") || 0),
               items: Array.from({ length: 18 }, (_, i) => ({
                 ...project,
                 id: i + 1,
                 name: `${project.name} ${i + 1}`,
-              })),
+              })).slice(Number(url.searchParams.get("offset") || 0)),
             }
           : { ...project, ...route.request().postDataJSON() };
     else if (path === "/projects/1") body = project;

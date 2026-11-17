@@ -212,6 +212,7 @@ export function ConfigWorkspace({ scope }: { scope: "system" | "models" }) {
 
       {state === "ready" && (
         <Tabs
+          className={scope === "models" ? "nested-page-tabs" : "page-tabs"}
           activeKey={section === "releases" || items.some((item) => item.layer === section)
             ? section : items[0]?.layer ?? "releases"}
           onChange={setSection}

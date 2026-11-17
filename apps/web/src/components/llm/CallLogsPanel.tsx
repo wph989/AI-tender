@@ -1,5 +1,6 @@
 "use client";
-import { Alert, Button, Drawer, Select, Spin, Table, Tag } from "antd";
+import { DataTable } from "@/components/DataTable";
+import { Alert, Button, Drawer, Select, Spin, Tag } from "antd";
 
 import { useEffect, useRef, useState } from "react";
 import { listCalls } from "@/lib/api/llm";
@@ -174,7 +175,7 @@ export function CallLogsPanel({
           }
         />
       )}
-      <Table<LlmCall>
+      <DataTable<LlmCall>
         className="mt-4"
         rowKey="id"
         dataSource={data?.items ?? []}

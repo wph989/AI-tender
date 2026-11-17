@@ -1,5 +1,6 @@
 "use client";
-import { Alert, App, Button, Drawer, Input, Spin, Table } from "antd";
+import { DataTable } from "@/components/DataTable";
+import { Alert, App, Button, Drawer, Input, Spin } from "antd";
 
 /**
  * 配置版本面板：版本列表 + 详情（diff / 影响清单逐条确认 / 门禁 / 审计）。
@@ -82,7 +83,7 @@ export function ReleasePanel({
         <p className="mt-1 text-[13px] leading-5 text-slate-500">
           查看每次配置变更，或恢复某个历史版本的设置。
         </p>
-        <Table<ConfigRelease>
+        <DataTable<ConfigRelease>
           className="mt-4"
           rowKey="id"
           dataSource={releases}

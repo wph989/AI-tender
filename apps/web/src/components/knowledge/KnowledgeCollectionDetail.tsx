@@ -1,10 +1,11 @@
 "use client";
-import { Alert, App, Button, Form, Input, Modal, Space } from "antd";
+import { Alert, App, Button, Form, Input, Modal, Space, Tag } from "antd";
 import { useFeedback } from "@/hooks/useFeedback";
 import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { DataTable } from "@/components/DataTable";
 import { PageShell } from "@/components/PageShell";
 import { UploadPanel } from "@/components/projects/UploadPanel";
 import { BUTTON_CLASS } from "@/components/ui";
@@ -15,6 +16,7 @@ import {
   STATE_LABELS,
   type Citation,
   type KnowledgeCollection,
+  type KnowledgeSource,
 } from "@/types/knowledge";
 import { CitationViewer } from "./CitationViewer";
 import { QuestionPanel } from "./QuestionPanel";
@@ -129,12 +131,58 @@ export function KnowledgeCollectionDetail({
       }
       actions={
         collection && (
-          <Link
-            className={BUTTON_CLASS}
-            href={"/projects/" + collection.upload_project_id + "/files"}
-          >
-            文件管理
-          </Link>
+          <Space wrap>
+            <Link
+              className={BUTTON_CLASS}
+              href={`/projects/${collection.upload_project_id}/files`}
+            >
+              文件管理
+            </Link>
+            {!collection.is_project && (
+              <Space wrap>
+                <Button
+                  disabled={busy}
+                  onClick={() => {
+                    renameForm.setFieldsValue({ name: collection.name });
+                    setRenameDirty(false);
+                    setError(null);
+                    setRenaming(true);
+                  }}
+                >
+                  重命名
+                </Button>
+                <Button
+                  danger
+                  disabled={busy}
+                  onClick={() =>
+                    modal.confirm({
+                      title: "删除这个知识库？",
+                      content: "关联项目将无法继续检索其中的资料。",
+                      okText: "删除知识库",
+                      okButtonProps: { danger: true },
+                      onOk: async () => {
+                        try {
+                          await knowledgeRequest(
+                            "/knowledge/collections/" + collectionId,
+                            "DELETE",
+                          );
+                          void toast.success("知识库已删除");
+                          router.push("/knowledge");
+                        } catch (e) {
+                          setError(
+                            e instanceof Error ? e.message : "移除失败",
+                          );
+                          throw e;
+                        }
+                      },
+                    })
+                  }
+                >
+                  删除知识库
+                </Button>
+              </Space>
+            )}
+          </Space>
         )
       }
     >
@@ -186,50 +234,6 @@ export function KnowledgeCollectionDetail({
                   }
                 }}
               />
-              {!collection.is_project && (
-                <Space className="mt-4" wrap>
-                  <Button
-                    disabled={busy}
-                    onClick={() => {
-                      renameForm.setFieldsValue({ name: collection.name });
-                      setRenameDirty(false);
-                      setError(null);
-                      setRenaming(true);
-                    }}
-                  >
-                    重命名
-                  </Button>
-                  <Button
-                    danger
-                    disabled={busy}
-                    onClick={() =>
-                      modal.confirm({
-                        title: "移除这个知识库？",
-                        content: "关联项目将无法继续检索其中的资料。",
-                        okText: "移除",
-                        okButtonProps: { danger: true },
-                        onOk: async () => {
-                          try {
-                            await knowledgeRequest(
-                              "/knowledge/collections/" + collectionId,
-                              "DELETE",
-                            );
-                            void toast.success("知识库已移除");
-                            router.push("/knowledge");
-                          } catch (e) {
-                            setError(
-                              e instanceof Error ? e.message : "移除失败",
-                            );
-                            throw e;
-                          }
-                        },
-                      })
-                    }
-                  >
-                    移除知识库
-                  </Button>
-                </Space>
-              )}
               <Modal
                 open={renaming}
                 title="重命名知识库"
@@ -305,7 +309,7 @@ export function KnowledgeCollectionDetail({
                 ? "语义检索模型：" + collection.embedding_model
                 : "语义检索未配置 · 全文检索可用"}
             </span>
-            <Link href="/settings/models" className="text-violet-700">
+            <Link href="/settings/models" className="text-sky-700">
               配置模型
             </Link>
             {collection.embedding_configured && (
@@ -345,90 +349,46 @@ export function KnowledgeCollectionDetail({
               重建索引
             </Button>
           </div>
-          <details className="analysis-options mb-4">
-            <summary>
-              资料处理状态 <span>{collection.sources?.length ?? 0} 份</span>
-            </summary>
-            <div className="knowledge-source-list">
-              {collection.sources?.map((source) => (
-                <div key={source.source_id}>
-                  <span className="min-w-0 flex-1">
-                    <strong>{source.file_name}</strong>
-                    <small>
-                      {STATE_LABELS[source.state] ?? source.state} ·{" "}
-                      {source.index_status === "completed"
-                        ? source.semantic_ready
-                          ? "全文与向量索引就绪"
-                          : source.needs_reindex
-                            ? "全文可用 · 请重建当前模型的向量索引"
-                            : "全文索引就绪"
-                        : (source.index_error ??
-                          (source.index_status === "running"
-                            ? "正在构建索引"
-                            : "等待建立索引"))}
-                    </small>
-                    {source.error_message && (
-                      <small className="text-rose-700">
-                        {source.error_message}
-                      </small>
-                    )}
-                  </span>
-                  {["pending", "failed", "unsupported"].includes(
-                    source.state,
-                  ) && (
-                    <Button
-                      htmlType="submit"
-                      disabled={busy}
-                      onClick={() =>
-                        void perform(() =>
-                          knowledgeRequest(
-                            "/knowledge/sources/" +
-                              source.source_id +
-                              "/process",
-                            "POST",
-                            {},
-                          ),
-                        )
-                      }
-                    >
-                      重新处理
-                    </Button>
-                  )}
-                  <Button
-                    htmlType="submit"
-                    disabled={busy}
-                    onClick={() =>
-                      modal.confirm({
-                        title: "移除这份资料？",
-                        content: "对应引用将变为不可用。",
-                        okText: "移除",
-                        okButtonProps: { danger: true },
-                        onOk: async () => {
-                          try {
-                            await deleteProjectFile(
-                              collection.upload_project_id,
-                              source.project_file_id,
-                            );
-                            void toast.success("资料已移除");
-                            await reload().catch(() =>
-                              setError("资料已移除，刷新失败。"),
-                            );
-                          } catch (e) {
-                            setError(
-                              e instanceof Error ? e.message : "移除失败",
-                            );
-                            throw e;
-                          }
-                        },
-                      })
-                    }
-                  >
-                    移除
-                  </Button>
-                </div>
-              ))}
-            </div>
-          </details>
+          <section aria-label="资料处理状态" className="mb-4">
+            <div className="list-toolbar"><h2>资料处理状态 <span className="table-meta">{collection.sources?.length ?? 0} 份</span></h2></div>
+            <DataTable<KnowledgeSource> rowKey="source_id" dataSource={collection.sources ?? []}
+              pagination={{ defaultPageSize: 10 }} scroll={{ x: 820 }}
+              columns={[
+                { title: "文件名称", dataIndex: "file_name", width: 280, render: (name) => <strong className="table-title">{name}</strong> },
+                { title: "处理状态", key: "state", width: 150, render: (_, source) => <Tag
+                  color={source.state === "failed" ? "error" : source.state === "ready" ? "success" : "default"}>
+                  {STATE_LABELS[source.state] ?? source.state}</Tag> },
+                { title: "索引", key: "index", width: 240, render: (_, source) => <div className="text-sm">
+                  {source.index_status === "completed" ? source.semantic_ready ? "全文与向量索引就绪"
+                    : source.needs_reindex ? "全文可用 · 请重建当前模型的向量索引" : "全文索引就绪"
+                    : source.index_error ?? (source.index_status === "running" ? "正在构建索引" : "等待建立索引")}
+                  {source.error_message && <p className="text-rose-700">{source.error_message}</p>}
+                </div> },
+                { title: "操作", key: "actions", fixed: "right", width: 220, render: (_, source) => <Space size={4} wrap>
+                  <Button type="link" href={`/api/v1/projects/${collection.upload_project_id}/files/${source.project_file_id}/original`} download>下载原件</Button>
+                  {["pending", "failed", "unsupported"].includes(source.state) && <Button disabled={busy}
+                    onClick={() => void perform(() => knowledgeRequest(`/knowledge/sources/${source.source_id}/process`, "POST", {}))}>重新处理</Button>}
+                  <Button danger type="text" disabled={busy} onClick={() => modal.confirm({
+                    title: `删除资料「${source.file_name}」？`, content: "对应引用将变为不可用。",
+                    okText: "删除资料", cancelText: "取消", okButtonProps: { danger: true },
+                    onOk: async () => {
+                      setBusy(true);
+                      try {
+                        await deleteProjectFile(collection.upload_project_id, source.project_file_id);
+                        // 同时撤下本页的旧检索和问答引用，避免继续定位已删除原文。
+                        setCollection((current) => current ? { ...current,
+                          sources: current.sources?.filter((row) => row.source_id !== source.source_id) } : current);
+                        setHits(null); setAnswerRefs([]); setSelected(null);
+                        void toast.success("资料已删除");
+                        await reload().catch(() => setError("资料已删除，刷新失败，请重试刷新。"));
+                      } catch (caught) {
+                        setError(caught instanceof Error ? caught.message : "删除失败"); throw caught;
+                      } finally { setBusy(false); }
+                    },
+                  })}>删除</Button>
+                </Space> },
+              ]} />
+          </section>
           <div className="analysis-mobile-switch">
             <button
               aria-pressed={!mobileDocument}

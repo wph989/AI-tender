@@ -138,6 +138,7 @@ export function ModelSettings() {
 
       {state === "ready" && settings && (
         <Tabs
+          className="page-tabs"
           activeKey={section}
           onChange={setSection}
           destroyOnHidden={false}

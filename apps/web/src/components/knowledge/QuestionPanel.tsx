@@ -156,7 +156,7 @@ export function QuestionPanel({
                   {r.citations.map((ref, j) => (
                     <button
                       key={j}
-                      className="mr-3 mt-2 text-violet-700"
+                      className="mr-3 mt-2 text-sky-700"
                       onClick={() => onLocate(ref)}
                     >
                       {ref.file_name} · 第 {ref.page_no} 页 ↗

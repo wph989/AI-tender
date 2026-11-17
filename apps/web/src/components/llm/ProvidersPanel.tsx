@@ -1,4 +1,5 @@
 "use client";
+import { DataTable } from "@/components/DataTable";
 
 import { useState } from "react";
 import {
@@ -14,7 +15,6 @@ import {
   Space,
   Spin,
   Switch,
-  Table,
   Tag,
 } from "antd";
 import {
@@ -174,7 +174,7 @@ export function ProvidersPanel({
       {error && !editing && !importing && (
         <Alert className="mb-4" type="error" showIcon title={error} />
       )}
-      <Table<LlmProvider>
+      <DataTable<LlmProvider>
         rowKey="id"
         dataSource={providers}
         size="middle"
@@ -465,7 +465,7 @@ export function ProvidersPanel({
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
-            <Table<{ id: string }>
+            <DataTable<{ id: string }>
               size="small"
               rowKey="id"
               dataSource={remote

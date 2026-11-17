@@ -3,10 +3,12 @@ import {
   Alert,
   App,
   Button,
+  Card,
   Form,
   Input,
   Modal,
-  Pagination,
+  Empty,
+  Tag,
   Segmented,
   Space,
   type InputRef,
@@ -15,9 +17,11 @@ import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DataPagination } from "@/components/DataPagination";
+import { DataTable } from "@/components/DataTable";
 import { PageShell } from "@/components/PageShell";
 import { Icon, type IconName } from "@/components/Icon";
-import { createProject, listProjects } from "@/lib/api/client";
+import { createProject, deleteProject, listProjects, updateProject } from "@/lib/api/client";
 import { formatTime } from "@/lib/format";
 import type { WireProject } from "@/types/projects";
 
@@ -36,7 +40,7 @@ function projectStatus(project: WireProject) {
 }
 
 export function ProjectList() {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const [form] = Form.useForm();
   const [dirty, setDirty] = useState(false);
   const [page, setPage] = useState(1);
@@ -45,6 +49,7 @@ export function ProjectList() {
   const [appliedKeyword, setAppliedKeyword] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [view, setView] = useState<"grid" | "list">("grid");
+  const [editing, setEditing] = useState<WireProject | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -158,15 +163,18 @@ export function ProjectList() {
     setBusy(true);
     setCreateError(null);
     try {
-      await createProject({
+      const input = {
         name: draft.name.trim(),
         project_no: draft.project_no?.trim() || null,
         owner: draft.owner?.trim() || null,
-      });
+      };
+      if (editing) await updateProject(editing.id, input);
+      else await createProject(input);
       form.resetFields();
       setDirty(false);
-      void message.success("项目已创建");
+      void message.success(editing ? "项目信息已更新" : "项目已创建");
       setCreating(false);
+      setEditing(null);
       setKeyword("");
       setFilter("all");
       await reload("");
@@ -179,6 +187,68 @@ export function ProjectList() {
     }
   };
 
+  // 删除末页最后一条时，卡片切片与分页组件使用同一个有效页码。
+  const currentPage = Math.min(
+    page,
+    Math.max(1, Math.ceil(visible.length / 12)),
+  );
+  const projectActions = (project: WireProject) => (
+    <Space size={4} wrap>
+      <Button type="link" href={`/projects/${project.id}`}>
+        打开
+      </Button>
+      <Button
+        type="text"
+        disabled={busy}
+        onClick={() => {
+          setEditing(project);
+          form.setFieldsValue(project);
+          setDirty(false);
+          setCreateError(null);
+          setCreating(true);
+        }}
+      >
+        编辑
+      </Button>
+      <Button
+        type="text"
+        danger
+        disabled={busy}
+        onClick={() =>
+          modal.confirm({
+            title: `删除项目「${project.name}」？`,
+            content:
+              "项目及其资料将无法继续访问，相关报告引用会受影响。此操作无法在页面中撤销。",
+            okText: "删除项目",
+            cancelText: "取消",
+            okButtonProps: { danger: true },
+            onOk: async () => {
+              setBusy(true);
+              try {
+                await deleteProject(project.id);
+                // 先移除已删除行，刷新失败也不能让它继续显示为可操作。
+                setProjects(
+                  (rows) => rows?.filter((row) => row.id !== project.id) ?? null,
+                );
+                void message.success("项目已删除");
+                await reload(appliedKeyword);
+              } catch (caught) {
+                void message.error(
+                  caught instanceof Error ? caught.message : "删除项目失败",
+                );
+                throw caught;
+              } finally {
+                setBusy(false);
+              }
+            },
+          })
+        }
+      >
+        删除
+      </Button>
+    </Space>
+  );
+
   return (
     <PageShell
       eyebrow="项目空间"
@@ -190,6 +260,8 @@ export function ProjectList() {
           htmlType="button"
           onClick={() => {
             setCreateError(null);
+            setEditing(null);
+            form.resetFields();
             setCreating(true);
           }}
         >
@@ -274,24 +346,23 @@ export function ProjectList() {
           >
             <Icon name="refresh" size={16} />
           </Button>
-          <div className="view-switch" aria-label="项目显示方式">
-            <button
-              type="button"
-              aria-label="卡片视图"
-              aria-pressed={view === "grid"}
-              onClick={() => setView("grid")}
-            >
-              <Icon name="grid" size={15} />
-            </button>
-            <button
-              type="button"
-              aria-label="列表视图"
-              aria-pressed={view === "list"}
-              onClick={() => setView("list")}
-            >
-              <Icon name="list" size={15} />
-            </button>
-          </div>
+          <Segmented
+            aria-label="项目显示方式"
+            value={view}
+            options={[
+              {
+                value: "grid",
+                label: "卡片视图",
+                icon: <Icon name="grid" size={15} />,
+              },
+              {
+                value: "list",
+                label: "列表视图",
+                icon: <Icon name="list" size={15} />,
+              },
+            ]}
+            onChange={setView}
+          />
         </div>
         {error && (
           <div className="notice mb-5" role="alert">
@@ -305,126 +376,167 @@ export function ProjectList() {
             </Button>
           </div>
         )}
-        {projects === null && loading ? (
-          <div className="project-grid" role="status" aria-label="正在加载项目">
-            {[0, 1, 2].map((i) => (
-              <div className="project-card h-[230px]" key={i}>
-                <div className="skeleton h-10 w-10" />
-                <div className="skeleton mt-6 h-4 w-3/4" />
-                <div className="skeleton mt-3 h-3 w-1/2" />
-                <div className="skeleton mt-auto h-5 w-full" />
-              </div>
-            ))}
-          </div>
-        ) : projects !== null && visible.length === 0 ? (
-          <div className="empty-state">
-            <span className="empty-icon">
-              <Icon name={appliedKeyword ? "search" : "folder"} size={30} />
-            </span>
-            <h3>
-              {appliedKeyword
-                ? "没有找到匹配的项目"
-                : filter !== "all"
-                  ? "当前没有需要处理的项目"
-                  : "把第一份标书交给 AI-Tender"}
-            </h3>
-            <p>
-              {appliedKeyword
-                ? "试试更短的名称或项目编号。"
-                : filter !== "all"
-                  ? "你可以切换到全部项目，查看文件与解析结果。"
-                  : "新建项目，上传主文件、补遗或澄清材料，即可开始分析。"}
-            </p>
-            {appliedKeyword || filter !== "all" ? (
-              <Button
-                htmlType="button"
-                onClick={() => {
-                  setKeyword("");
-                  setFilter("all");
-                  void reload("");
-                }}
-              >
-                查看全部项目
-              </Button>
-            ) : (
-              <Button
-                type="primary"
-                htmlType="button"
-                onClick={() => setCreating(true)}
-              >
-                <Icon name="plus" size={15} />
-                新建项目
-              </Button>
+        {view === "grid" ? (
+          <>
+            <div className="project-grid" aria-label="项目卡片">
+              {loading && projects === null
+                ? [0, 1, 2].map((id) => <Card key={id} loading />)
+                : visible
+                    .slice((currentPage - 1) * 12, currentPage * 12)
+                    .map((project) => (
+                      <Card
+                        key={project.id}
+                        className="project-summary-card"
+                        title={
+                          <Link href={`/projects/${project.id}`}>
+                            {project.name}
+                          </Link>
+                        }
+                        extra={
+                          <Tag
+                            color={
+                              projectStatus(project).tone === "failed"
+                                ? "error"
+                                : "default"
+                            }
+                          >
+                            {projectStatus(project).label}
+                          </Tag>
+                        }
+                      >
+                        <p className="table-meta">
+                          {project.project_no || "未填写项目编号"}
+                        </p>
+                        <div className="project-summary-meta">
+                          <span>负责人 · {project.owner || "未指定"}</span>
+                          <Link href={`/projects/${project.id}/files`}>
+                            {project.file_count ?? 0} 份文件
+                          </Link>
+                        </div>
+                        <p className="table-meta">
+                          最近活动 ·{" "}
+                          {formatTime(
+                            project.last_activity_at ?? project.created_at,
+                          )}
+                        </p>
+                        <div className="project-summary-actions">
+                          {projectActions(project)}
+                        </div>
+                      </Card>
+                    ))}
+            </div>
+            {!loading && !visible.length && (
+              <Empty
+                description={
+                  appliedKeyword || filter !== "all"
+                    ? "没有匹配的项目"
+                    : "暂无项目，点击新建项目"
+                }
+              />
             )}
-          </div>
+            <DataPagination
+              current={currentPage}
+              pageSize={12}
+              total={visible.length}
+              onChange={setPage}
+            />
+          </>
         ) : (
-          <div className={"project-grid " + (view === "list" ? "is-list" : "")}>
-            {visible.slice((page - 1) * 12, page * 12).map((project) => {
-              const status = projectStatus(project);
-              return (
-                <Link
-                  href={"/projects/" + project.id}
-                  key={project.id}
-                  className="project-card"
-                >
-                  <div className="project-card-top">
-                    <span className="folder-badge">
-                      <Icon name="folder" size={22} />
-                    </span>
-                    <span className={"status-badge " + status.tone}>
-                      {status.label}
-                    </span>
-                  </div>
-                  <h3 title={project.name}>{project.name}</h3>
-                  <p className="project-number">
-                    {project.project_no || "尚未填写项目编号"}
-                  </p>
-                  <div className="project-card-data">
-                    <span>
-                      <Icon name="file" size={13} />
-                      {project.file_count ?? 0} 个文件
-                    </span>
-                    <span>
-                      <Icon name="clock" size={13} />
-                      {project.file_count ?? 0} 份资料
-                    </span>
-                  </div>
-                  <div className="project-card-footer">
-                    <span className="owner-avatar">
-                      {project.owner?.slice(0, 1) || (
-                        <Icon name="user" size={12} />
-                      )}
-                    </span>
-                    <small>{project.owner || "未指定负责人"}</small>
-                    <time
-                      dateTime={project.last_activity_at ?? project.created_at}
+          <DataTable<WireProject>
+            rowKey="id"
+            dataSource={visible}
+            loading={loading}
+            pagination={{
+              current: currentPage,
+              pageSize: 12,
+              onChange: setPage,
+            }}
+            locale={{
+              emptyText: (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description={
+                    appliedKeyword
+                      ? "没有找到匹配的项目"
+                      : filter !== "all"
+                        ? "当前筛选下没有项目"
+                        : "暂无项目，点击右上方新建项目"
+                  }
+                />
+              ),
+            }}
+            columns={[
+              {
+                title: "项目名称 / 编号",
+                key: "name",
+                width: 300,
+                render: (_, project) => (
+                  <div>
+                    <Link
+                      className="table-title"
+                      href={`/projects/${project.id}`}
                     >
-                      {formatTime(
-                        project.last_activity_at ?? project.created_at,
-                      )}
-                    </time>
-                    <Icon name="arrow" size={15} />
+                      {project.name}
+                    </Link>
+                    <div className="table-meta">
+                      {project.project_no || "未填写编号"}
+                    </div>
                   </div>
-                </Link>
-              );
-            })}
-          </div>
+                ),
+              },
+              {
+                title: "负责人",
+                dataIndex: "owner",
+                width: 140,
+                render: (value) => value || "未指定",
+              },
+              {
+                title: "文件",
+                key: "files",
+                width: 100,
+                render: (_, project) => (
+                  <Link href={`/projects/${project.id}/files`}>
+                    {project.file_count ?? 0} 份
+                  </Link>
+                ),
+              },
+              {
+                title: "状态",
+                key: "status",
+                width: 130,
+                render: (_, project) => {
+                  const status = projectStatus(project);
+                  const color =
+                    status.tone === "failed"
+                      ? "error"
+                      : status.tone === "ready"
+                        ? "success"
+                        : "default";
+                  return <Tag color={color}>{status.label}</Tag>;
+                },
+              },
+              {
+                title: "最近活动",
+                key: "activity",
+                width: 180,
+                render: (_, project) =>
+                  formatTime(project.last_activity_at ?? project.created_at),
+              },
+              {
+                title: "操作",
+                key: "actions",
+                width: 180,
+                fixed: "right",
+                render: (_, project) => projectActions(project),
+              },
+            ]}
+          />
         )}
-        <Pagination
-          className="mt-5"
-          current={page}
-          pageSize={12}
-          total={visible.length}
-          onChange={setPage}
-          hideOnSinglePage
-          showSizeChanger={false}
-          showTotal={(total) => `共 ${total} 个项目`}
-        />
       </section>
 
       <Modal
         open={creating}
-        title="新建项目"
+        title={editing ? "编辑项目" : "新建项目"}
         centered
         width={520}
         destroyOnHidden
@@ -459,7 +571,7 @@ export function ProjectList() {
               form="create-project"
               loading={busy}
             >
-              创建项目
+              {editing ? "保存修改" : "创建项目"}
             </Button>
           </Space>
         }
