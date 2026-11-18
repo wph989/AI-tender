@@ -33,8 +33,9 @@ COPY alembic.ini ./
 RUN uv sync --frozen --no-dev
 
 # 非 root 运行；只 chown 应用目录，不动系统路径
+# 预建挂载目录，首次挂载空的命名卷时 Docker 会沿用镜像内目录的属主。
 RUN useradd --create-home --uid 10001 appuser \
-    && mkdir -p /app/logs \
+    && mkdir -p /app/logs /app/storage \
     && chown -R appuser:appuser /app
 USER appuser
 

@@ -34,6 +34,10 @@ class BlobStoreError(Exception):
 
 
 class BlobStore(Protocol):
+    def close(self) -> None:
+        """释放适配器持有的客户端资源。"""
+        ...
+
     def put(self, key: str, content: bytes, *, content_type: str) -> None:
         """按内容寻址写入对象；重复写入同一 key 必须幂等。"""
         ...

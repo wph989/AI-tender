@@ -1,0 +1,5 @@
+# 本地模式将 MinIO 移到独立 profile，便于按需启动以迁出旧数据。
+services:
+  minio-service:
+    profiles: ["minio"]
+  app-service: {}

@@ -32,6 +32,8 @@ _DEPLOYMENT_ENV_KEYS = (
     "LLM_API_KEY",
     "LLM_TIMEOUT_SECONDS",
     "LLM_SECRET_KEYS",
+    "BLOB_STORE_BACKEND",
+    "LOCAL_STORAGE_ROOT",
 )
 
 
@@ -218,3 +220,32 @@ def test_gotenberg_credentials_half_configured_is_an_error(
 
     with pytest.raises(ValueError):
         settings.gotenberg_credentials()
+
+
+def test_blob_store_backend_defaults_to_s3_and_accepts_local(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+    assert settings.blob_store_backend() == "s3"
+
+    monkeypatch.setenv("BLOB_STORE_BACKEND", "LOCAL")
+    assert settings.blob_store_backend() == "local"
+
+
+def test_blob_store_backend_rejects_unknown_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _point_at(monkeypatch, tmp_path / "does-not-exist.env")
+    monkeypatch.setenv("BLOB_STORE_BACKEND", "filesystem")
+
+    with pytest.raises(ValueError, match="BLOB_STORE_BACKEND"):
+        settings.blob_store_backend()
+
+
+def test_local_storage_root_resolves_relative_to_app_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _point_at(monkeypatch, tmp_path / "apps" / "api" / ".env")
+    monkeypatch.setenv("LOCAL_STORAGE_ROOT", ".objects")
+
+    assert settings.local_storage_root() == (tmp_path / "apps" / "api" / ".objects").resolve()

@@ -6,7 +6,7 @@ import os
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any
 
 from sqlalchemy import Engine
@@ -34,6 +34,7 @@ from tender.adapters.pg.repositories.llm.runtime import ModelRuntimeRepository
 from tender.adapters.pg.repositories.projects.files import ProjectFileRepository
 from tender.adapters.pg.repositories.projects.projects import ProjectRepository
 from tender.adapters.pg.session import create_pg_engine
+from tender.adapters.storage.local import LocalBlobStore
 from tender.adapters.storage.s3 import S3BlobStore
 from tender.application.analysis.execution import AnalysisExecutor
 from tender.application.analysis.service import AnalysisService
@@ -148,6 +149,20 @@ def create_rerank_gateway(config: dict) -> RerankModel:
     )
 
 
+def create_blob_store_factory() -> Callable[[], BlobStore]:
+    """启动时固定存储配置，Worker 可在每项任务中创建独立客户端。"""
+    if settings.blob_store_backend() == "local":
+        return partial(LocalBlobStore, settings.local_storage_root())
+    return partial(
+        S3BlobStore,
+        endpoint_url=settings.s3_endpoint_url(),
+        bucket=settings.s3_bucket(),
+        access_key=settings.s3_access_key(),
+        secret_key=settings.s3_secret_key(),
+        region=settings.s3_region(),
+    )
+
+
 @dataclass(slots=True)
 class ApiComponents:
     engine: Engine
@@ -156,31 +171,29 @@ class ApiComponents:
     # 任务投递本身走 beat（worker/dispatch.py）；这里保留队列装配点，
     # 给 P3 的回归回放/抽检这类"从 API 主动排队"的入口用。
     queue: TaskQueue
-    blob_client: Any
     model_gateway: ModelGateway
     configs: ConfigRegistry
 
     async def aclose(self) -> None:
         await self.converter.aclose()
-        self.blob_client.close()
+        self.blobs.close()
         self.configs.close()
         self.engine.dispose()
 
 
 def create_api_components() -> ApiComponents:
     credentials = settings.gotenberg_credentials()
-    blobs = S3BlobStore()
+    blob_store_factory = create_blob_store_factory()
     engine = create_pg_engine()
     return ApiComponents(
         engine=engine,
-        blobs=blobs,
+        blobs=blob_store_factory(),
         converter=GotenbergConverter(
             settings.gotenberg_url(),
             username=credentials[0] if credentials else None,
             password=credentials[1] if credentials else None,
         ),
         queue=CeleryTaskQueue(),
-        blob_client=blobs,
         model_gateway=create_model_gateway,
         configs=ConfigRegistry(engine, RedisConfigCache()),
     )

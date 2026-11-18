@@ -11,6 +11,7 @@
 #
 #   B) 全栈：api / worker / beat / migrate / web 也进容器：
 #        docker compose --profile app up -d --build
+#      根目录 .env 设置 BLOB_STORE_BACKEND=local 时跳过内置 MinIO，API 与 Worker 共用文件卷。
 #
 #   没有 NVIDIA GPU 的机器：docker compose up -d --scale mineru=0（跳过 MinerU，其余依赖照常）
 #
@@ -32,10 +33,16 @@
 
 name: ai-tender
 
+# 存储模式同时决定容器依赖与应用读写目标，避免本地模式仍等待 MinIO。
+x-storage-config: &storage-config docker/storage/${BLOB_STORE_BACKEND:-s3}.yml
+
 # api / migrate / worker / beat 共用同一份部署参数（同名变量见 apps/api/.env.example）
 x-api-env: &api-env
   DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://tender:tender@postgres:5432/tender}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  BLOB_STORE_BACKEND: ${BLOB_STORE_BACKEND:-s3}
+  # 路径与共享卷挂载点保持一致，避免各进程把文件写到容器层。
+  LOCAL_STORAGE_ROOT: /app/storage
   S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
   S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
   S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -87,6 +94,7 @@ x-api-base: &api-base
       max-file: "5"
   volumes:
     - backendlogs:/app/logs
+    - blobdata:/app/storage
 
 services:
   postgres:
@@ -125,6 +133,9 @@ services:
       retries: 10
 
   minio:
+    extends:
+      file: *storage-config
+      service: minio-service
     # 钉版本、不用 latest：这是浮动标签，镜像一漂移连控制台都会跟着换——2025-05-24 的社区版把内置 Web
     # 控制台标记为弃用并迁到单独的 object-browser 项目（LDAP / OIDC 登录也一并移出社区版），9001 会白发布。
     # 默认值取那之前最后一个版本；不需要控制台就换更新的版本，并删掉下面 9001 那行端口。
@@ -154,6 +165,9 @@ services:
   # 在对方那边建好桶并开版本化即可（两条命令见 .env.example 的 MinIO 段）。
   # mc 不必与 server 同版本，这里只用到 mb / version 两个标准 S3 接口，但仍钉住避免漂移。
   minio-init:
+    extends:
+      file: *storage-config
+      service: minio-service
     image: ${MINIO_MC_IMAGE:-minio/mc:RELEASE.2025-08-13T08-35-41Z}
     depends_on:
       minio:
@@ -229,6 +243,9 @@ services:
   api:
     profiles: ["app"]
     <<: *api-base
+    extends:
+      file: *storage-config
+      service: app-service
     restart: unless-stopped
     command:
       - uvicorn
@@ -247,10 +264,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
-        condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
     healthcheck:
@@ -264,6 +277,9 @@ services:
   worker:
     profiles: ["app"]
     <<: *api-base
+    extends:
+      file: *storage-config
+      service: app-service
     restart: unless-stopped
     command:
       - celery
@@ -287,8 +303,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
 
@@ -337,6 +351,7 @@ services:
 
 volumes:
   backendlogs:
+  blobdata:
   pgdata:
   redisdata:
   miniodata:

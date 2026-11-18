@@ -9,7 +9,6 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from tender.core import settings
 from tender.ports.storage.blob_store import BlobMetadata, BlobNotFound, BlobObject, BlobStoreError
 
 
@@ -19,20 +18,20 @@ class S3BlobStore:
     def __init__(
         self,
         *,
-        endpoint_url: str | None = None,
-        bucket: str | None = None,
-        access_key: str | None = None,
-        secret_key: str | None = None,
-        region: str | None = None,
+        endpoint_url: str,
+        bucket: str,
+        access_key: str | None,
+        secret_key: str | None,
+        region: str,
         client: Any | None = None,
     ) -> None:
-        self._bucket = bucket or settings.s3_bucket()
+        self._bucket = bucket
         self._client: Any = client or boto3.client(
             "s3",
-            endpoint_url=endpoint_url or settings.s3_endpoint_url(),
-            aws_access_key_id=access_key or settings.s3_access_key(),
-            aws_secret_access_key=secret_key or settings.s3_secret_key(),
-            region_name=region or settings.s3_region(),
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region,
             # 招标文件只能走配置的内网对象存储，不能继承开发机代理转发到外网。
             config=Config(
                 proxies={},

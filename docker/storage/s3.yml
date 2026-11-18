@@ -1,0 +1,8 @@
+# 默认模式让 MinIO 随依赖启动，应用等待存储桶可用后再处理请求。
+services:
+  minio-service:
+    profiles: []
+  app-service:
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully

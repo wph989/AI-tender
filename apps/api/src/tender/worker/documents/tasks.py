@@ -15,10 +15,10 @@ from typing import Any
 
 from tender.adapters.documents.gotenberg import GotenbergConverter
 from tender.adapters.documents.pdfium import InvalidPdfError, inspect_pdf
-from tender.adapters.storage.s3 import S3BlobStore
 from tender.application.documents.middle_json import normalize_middle_json
 from tender.core import settings
 from tender.core.di import (
+    create_blob_store_factory,
     create_document_parser,
     create_document_pipeline_repository,
     create_task_locks,
@@ -34,7 +34,7 @@ from tender.domain.shared.errors import (
     ServiceRestarted,
 )
 from tender.ports.documents.parser import DocumentParser
-from tender.ports.storage.blob_store import BlobNotFound, BlobStoreError
+from tender.ports.storage.blob_store import BlobNotFound, BlobStore, BlobStoreError
 from tender.worker.celery_app import celery_app
 
 _repository = create_document_pipeline_repository()
@@ -42,11 +42,11 @@ _locks = create_task_locks()
 logger = get_logger(__name__)
 
 
-def _store() -> S3BlobStore:
-    return S3BlobStore()
+# 任务模块在 Worker 启动时加载，避免运行中的 Worker 提前读取修改过的 .env。
+_store = create_blob_store_factory()
 
 
-def _parser(store: S3BlobStore) -> DocumentParser:
+def _parser(store: BlobStore) -> DocumentParser:
     async def load_pdf(key: str) -> bytes:
         return await asyncio.to_thread(store.read, key)
 
@@ -150,7 +150,7 @@ def _poll_delay(values: Mapping[str, Any], attempts: int) -> float:
     return min(maximum, initial * 2**exponent) / 1000
 
 
-async def _process_office_file(row: Mapping[str, Any], store: S3BlobStore) -> tuple[int, int, bool]:
+async def _process_office_file(row: Mapping[str, Any], store: BlobStore) -> tuple[int, int, bool]:
     values = _runtime_values(row)
     started_at = _repository.execution_start(str(row["id"]), "convert")
     remaining = _remaining(started_at, int(values["job.timeout.convert_minutes"]))
@@ -162,7 +162,7 @@ async def _process_office_file(row: Mapping[str, Any], store: S3BlobStore) -> tu
 
 
 async def _convert_office_file(
-    row: Mapping[str, Any], store: S3BlobStore, remaining: float, extra_retries: int
+    row: Mapping[str, Any], store: BlobStore, remaining: float, extra_retries: int
 ) -> tuple[int, int, bool]:
     source_sha256 = str(row["source_sha256"]).strip().lower()
     converter_adapter = _converter(remaining_seconds=remaining, extra_retries=extra_retries)
@@ -222,7 +222,7 @@ async def _convert_office_file(
         await converter_adapter.aclose()
 
 
-def _process_pdf_file(row: Mapping[str, Any], store: S3BlobStore) -> tuple[int, int, bool]:
+def _process_pdf_file(row: Mapping[str, Any], store: BlobStore) -> tuple[int, int, bool]:
     source_sha256 = str(row["source_sha256"]).strip().lower()
     lock_key = f"version:{row['project_company_id']}:{source_sha256}:pdf"
     with _locks.lock(lock_key, wait=True):
@@ -327,7 +327,7 @@ def _mark_submission_unknown(job_id: str, message: str) -> None:
     _repository.set_job_failure(job_id, "parse_submission_unknown", message)
 
 
-async def _submit(row: Mapping[str, Any], store: S3BlobStore) -> Any:
+async def _submit(row: Mapping[str, Any], store: BlobStore) -> Any:
     parser = _parser(store)
     try:
         return await parser.submit(
@@ -415,7 +415,7 @@ def submit_parse(self: Any, job_id: str) -> None:
     _repository.schedule_attempt(job_id, _poll_delay(values, 0))
 
 
-async def _poll(row: Mapping[str, Any], store: S3BlobStore) -> tuple[Any, Any | None]:
+async def _poll(row: Mapping[str, Any], store: BlobStore) -> tuple[Any, Any | None]:
     parser = _parser(store)
     try:
         status = await parser.poll(str(row["provider_job_id"]))
@@ -430,7 +430,7 @@ async def _poll(row: Mapping[str, Any], store: S3BlobStore) -> tuple[Any, Any | 
         await parser.aclose()
 
 
-async def _drain_parse(row: Mapping[str, Any], store: S3BlobStore) -> Any:
+async def _drain_parse(row: Mapping[str, Any], store: BlobStore) -> Any:
     parser = _parser(store)
     try:
         # 取消和失败排空仅需确认远端释放资源，不下载或归一化即将丢弃的成果。

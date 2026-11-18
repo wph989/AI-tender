@@ -39,6 +39,7 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 DEFAULT_S3_ENDPOINT_URL = "http://localhost:9000"
 DEFAULT_S3_BUCKET = "ai-tender"
 DEFAULT_S3_REGION = "us-east-1"
+DEFAULT_BLOB_STORE_BACKEND = "s3"
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -167,6 +168,23 @@ def s3_bucket() -> str:
 
 def s3_region() -> str:
     return _setting("S3_REGION") or DEFAULT_S3_REGION
+
+
+def blob_store_backend() -> str:
+    """返回文件存储后端；不合法的值在进程启动装配时明确报错。"""
+    backend = (_setting("BLOB_STORE_BACKEND") or DEFAULT_BLOB_STORE_BACKEND).lower()
+    if backend not in {"s3", "local"}:
+        raise ValueError("BLOB_STORE_BACKEND 必须是 s3 或 local")
+    return backend
+
+
+def local_storage_root() -> Path:
+    """本地文件根目录；相对路径固定相对于 apps/api，避免受启动目录影响。"""
+    raw = _setting("LOCAL_STORAGE_ROOT") or ".storage"
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = _ENV_FILE.parent / path
+    return path.resolve()
 
 
 def llm_secret_keys() -> tuple[str, ...]:
