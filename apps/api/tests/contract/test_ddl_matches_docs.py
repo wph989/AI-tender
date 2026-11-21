@@ -60,7 +60,7 @@ class _MigrationSpec:
 _MIGRATIONS: tuple[_MigrationSpec, ...] = (
     _MigrationSpec(
         "0021_knowledge_context.py",
-        (("设计/14-知识库与综合分析实现.md", 2),),
+        (("设计/14-知识库与综合分析实现.md", 3),),
         require_tables=False,
         require_indexes=False,
     ),
@@ -88,6 +88,7 @@ _MIGRATIONS: tuple[_MigrationSpec, ...] = (
         require_indexes=False,
     ),
     _MigrationSpec("0011_analysis_data.py", (("设计/14-知识库与综合分析实现.md", 1),)),
+    _MigrationSpec("0023_reviewed_analysis.py", (("设计/14-知识库与综合分析实现.md", 2),)),
     _MigrationSpec(
         "0009_provider_cooldown.py",
         (("设计/16-DeepAgents标书分析运行时.md", 1),),

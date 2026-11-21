@@ -2,6 +2,7 @@
 
 import copy
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -22,8 +23,8 @@ from tender.application.analysis.data import (
     module_data,
     prepare_records,
 )
-from tender.application.analysis.data_store import publish_data_snapshot
-from tender.application.knowledge.content import encode
+from tender.application.analysis.data_store import publish_data_snapshot, snapshot_manifest
+from tender.application.knowledge.content import encode, source_signature
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TENDER_RUN_DB_TESTS") != "1", reason="需要数据库集成验证"
@@ -56,6 +57,10 @@ def basis(environment):
         )
 
     state = {}
+    report = db.report(created["id"])
+    state["quality_input_signature"] = source_signature(
+        report["source_snapshot"] + report["reference_snapshot"]
+    )
     items = prepare_records([
         record("lot-a", "A标段", "A标段", kind="lot", code="A"),
         record("lot-b", "B标段", "B标段", kind="lot", code="B"),
@@ -90,8 +95,24 @@ def basis(environment):
         )
 
 
+def confirm_snapshot_records(basis, snapshot):
+    loaded = basis.client.get(basis.path + f"/data?snapshot_id={snapshot['id']}").json()
+    for bucket in ("lots", "facts", "requirements", "format_nodes", "relations"):
+        for record in loaded["data"][bucket]:
+            response = basis.client.post(basis.path + "/reviews", json={
+                "snapshot_id": snapshot["id"], "record_id": record["id"],
+                "previous_review_id": None, "decision": "confirmed", "note": "",
+                "corrected_text": None,
+            })
+            assert response.status_code == 200, response.text
+
+
 def test_lot_without_original_code_publishes_and_resolves_by_verified_name(basis):
     state = {}
+    report = basis.db.report(basis.report_id)
+    state["quality_input_signature"] = source_signature(
+        report["source_snapshot"] + report["reference_snapshot"]
+    )
     records = [
         BusinessRecord(
             key="named-lot", title="A标段", text="A标段", kind="lot", scope=COMMON,
@@ -113,6 +134,7 @@ def test_lot_without_original_code_publishes_and_resolves_by_verified_name(basis
         {"data": encode(module_data(state)), "id": basis.module_id},
     )
     snapshot = publish_data_snapshot(basis.db, basis.report_id)
+    confirm_snapshot_records(basis, snapshot)
     assert publish_data_snapshot(basis.db, basis.report_id)["id"] == snapshot["id"]
     lot = snapshot["data"]["lots"][0]
     assert lot["title"] == "A标段" and lot["code"] is None
@@ -157,6 +179,7 @@ def test_terminal_snapshot_is_idempotent_and_context_is_single_lot(basis):
                      {"id": basis.report_id})
     snapshot = publish_data_snapshot(basis.db, basis.report_id)
     assert publish_data_snapshot(basis.db, basis.report_id)["id"] == snapshot["id"]
+    confirm_snapshot_records(basis, snapshot)
     loaded = basis.client.get(basis.path + "/data").json()
     assert loaded["stale"] is False
     assert loaded["snapshot_id"] == snapshot["id"]
@@ -251,32 +274,22 @@ def test_running_and_changed_report_cannot_supply_context(basis):
 @pytest.mark.parametrize("run_status", ["pending", "running"])
 def test_canceled_retry_preserves_previous_formal_snapshot(basis, run_status):
     first = publish_data_snapshot(basis.db, basis.report_id)
+    confirm_snapshot_records(basis, first)
     retried = basis.client.post(basis.path + "/retry", json={
         "module_keys": ["project_basic_info_parsing"],
     })
     assert retried.status_code == 202
     basis.db.execute("UPDATE agent_module_run SET status=:status WHERE module_id=:id",
                      {"status": run_status, "id": basis.module_id})
-    # 模拟取消已落库、执行者仍在退出的窗口；无执行者的 HTTP 取消现会直接结束运行账。
+    # 该用例没有持有执行锁，收尾会回收孤儿运行并继续使用上一版正式成果。
     basis.db.execute("UPDATE analysis_report SET status='canceled' WHERE id=:id",
                      {"id": basis.report_id})
-    assert publish_data_snapshot(basis.db, basis.report_id) is None
+    second = publish_data_snapshot(basis.db, basis.report_id)
+    assert second["id"] == first["id"]
+    assert second["revision"] == first["revision"]
+    assert basis.client.get(basis.path + "/data").json()["stale"] is False
     request = {"snapshot_id": first["id"], "purpose": "outline",
                "lot_id": first["data"]["lots"][0]["lot_id"]}
-    assert basis.client.get(basis.path + "/data").json()["stale"] is True
-    assert basis.client.post(basis.path + "/context", json=request).status_code == 409
-
-    # 最新运行已终止且正式投影未变，上一轮提交仍是当前版本。
-    basis.db.execute("UPDATE agent_module_run SET status='canceled' WHERE module_id=:id",
-                     {"id": basis.module_id})
-    basis.db.execute("UPDATE analysis_module SET status='canceled' WHERE id=:id",
-                     {"id": basis.module_id})
-    assert basis.client.get(basis.path + "/data").json()["stale"] is False
-    assert basis.client.post(basis.path + "/context", json=request).status_code == 200
-    second = publish_data_snapshot(basis.db, basis.report_id)
-    assert second["revision"] == first["revision"]
-    assert second["data"] == first["data"]
-    assert basis.client.get(basis.path + "/data").json()["stale"] is False
     assert basis.client.post(basis.path + "/context", json=request).status_code == 200
 
 
@@ -305,6 +318,7 @@ def test_superseded_pending_attempt_does_not_block_the_new_terminal_snapshot(bas
 @pytest.mark.parametrize("run_status", ["pending", "running"])
 def test_cancel_orphaned_retry_keeps_previous_snapshot_without_drafts(basis, run_status):
     first = publish_data_snapshot(basis.db, basis.report_id)
+    confirm_snapshot_records(basis, first)
     assert basis.client.post(basis.path + "/retry", json={
         "module_keys": ["project_basic_info_parsing"],
     }).status_code == 202
@@ -314,7 +328,15 @@ def test_cancel_orphaned_retry_keeps_previous_snapshot_without_drafts(basis, run
     assert result.json() == {"status": "canceled", "canceling": False}
     current = basis.client.get(basis.path + "/data").json()
     assert current["revision"] == first["revision"]
-    assert current["data"] == first["data"]
+    assert {record["human_review_status"] for key in (
+        "lots", "facts", "requirements", "format_nodes", "relations",
+    ) for record in current["data"][key]} == {"confirmed"}
+    assert {key: len(current["data"][key]) for key in first["data"]
+            if key in {"lots", "facts", "requirements", "format_nodes", "relations"}} == {
+        key: len(first["data"][key])
+        for key in first["data"]
+        if key in {"lots", "facts", "requirements", "format_nodes", "relations"}
+    }
     assert basis.client.post(basis.path + "/context", json={
         "snapshot_id": first["id"], "purpose": "outline",
         "lot_id": first["data"]["lots"][0]["lot_id"],
@@ -371,6 +393,69 @@ def test_revoked_source_used_only_in_gaps_is_redacted_without_rewriting_snapshot
     assert secret in encode(persisted)
 
 
+def test_legacy_snapshot_reuses_matching_module_signature_and_review_stays_in_transaction(basis):
+    report = basis.db.report(basis.report_id)
+    signature = source_signature(report["source_snapshot"] + report["reference_snapshot"])
+    business = copy.deepcopy(basis.business)
+    business["quality_input_signature"] = signature
+    basis.db.execute("UPDATE analysis_module SET business_data=CAST(:data AS JSONB) WHERE id=:id",
+                     {"data": encode(business), "id": basis.module_id})
+    snapshot = publish_data_snapshot(basis.db, basis.report_id)
+
+    # 模拟0023前的快照：移除输入签名映射，并恢复旧版成果指纹。
+    inputs = {k: v for k, v in snapshot["input_snapshot"].items()
+              if k not in {"publication_version", "module_input_signatures"}}
+    report_runs = basis.db.report_runs(basis.report_id)
+    modules = basis.db.report_modules(basis.report_id)
+    legacy_hash = snapshot_manifest(
+        report["status"], report_runs, modules, runtime_version=report["runtime_version"],
+    )
+    basis.db.execute("""UPDATE analysis_data_snapshot
+        SET input_snapshot=CAST(:inputs AS JSONB), manifest_hash=:manifest WHERE id=:id""", {
+        "inputs": encode(inputs), "manifest": legacy_hash, "id": snapshot["id"],
+    })
+
+    loaded = basis.client.get(basis.path + "/data").json()
+    assert loaded["stale"] is False
+    requirement = loaded["data"]["requirements"][0]
+    assert requirement["human_review_status"] == "pending"
+
+    service = analysis_api.analysis_service(basis.request)
+    repository = service.store
+    original_transaction = repository.transaction
+    original_resolve = repository.resolve
+    active = {"transaction": None}
+
+    @contextmanager
+    def tracked_transaction():
+        with original_transaction() as tx:
+            active["transaction"] = tx
+            try:
+                yield tx
+            finally:
+                active["transaction"] = None
+
+    def tracked_resolve(ref, **kwargs):
+        if active["transaction"] is not None:
+            assert kwargs.get("bound") is active["transaction"]._connection()
+        return original_resolve(ref, **kwargs)
+
+    repository.transaction = tracked_transaction
+    repository.resolve = tracked_resolve
+    result = service.record_human_review(
+        basis.report_id,
+        analysis.RecordReviewInput(
+            snapshot_id=snapshot["id"], record_id=requirement["id"],
+            previous_review_id=None, decision="confirmed",
+        ),
+        actor="reviewer",
+    )
+    assert result["decision"] == "confirmed"
+    updated = basis.client.get(basis.path + "/data").json()
+    reviewed = next(r for r in updated["data"]["requirements"] if r["id"] == requirement["id"])
+    assert reviewed["human_review_status"] == "confirmed"
+
+
 def test_content_references_and_revocation_during_retrieval(basis, monkeypatch):
     company = basis.client.post("/api/v1/knowledge/collections", json={
         "name": "企业证明", "purpose": "company",
@@ -385,7 +470,14 @@ def test_content_references_and_revocation_during_retrieval(basis, monkeypatch):
         "UPDATE analysis_report SET reference_snapshot=CAST(:sources AS JSONB) WHERE id=:id",
         {"sources": encode(sources), "id": basis.report_id},
     )
+    business = copy.deepcopy(basis.business)
+    business["quality_input_signature"] = source_signature(
+        basis.db.report(basis.report_id)["source_snapshot"] + sources
+    )
+    basis.db.execute("UPDATE analysis_module SET business_data=CAST(:data AS JSONB) WHERE id=:id",
+                     {"data": encode(business), "id": basis.module_id})
     snapshot = publish_data_snapshot(basis.db, basis.report_id)
+    confirm_snapshot_records(basis, snapshot)
     reference = basis.db.readable_chunks(sources[0])[0]
     requirement = next(r for r in snapshot["data"]["requirements"] if r["key"] == "a")
     revoke = False

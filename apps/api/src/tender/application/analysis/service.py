@@ -19,8 +19,17 @@ from tender.application.analysis.data import (
 )
 from tender.application.analysis.data_store import (
     accessible_data,
+    citations_accessible,
+    matching_snapshot_state,
     publish_data_snapshot,
-    snapshot_matches_report,
+    snapshot_input_signatures,
+)
+from tender.application.analysis.human_review import (
+    CORRECTABLE_KINDS,
+    RecordReviewInput,
+    review_projection,
+    review_record,
+    reviewed_compilation,
 )
 from tender.application.analysis.output import output_schema
 from tender.application.analysis.quality import (
@@ -50,6 +59,23 @@ from tender.application.shared.errors import (
 from tender.ports.configuration.registry import ConfigReader
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.repository.analysis.reports import ReportRepository
+
+
+def report_inputs_changed(
+    report: dict, settings: dict, lots: list[dict], sources: list[dict], references: list[dict],
+) -> bool:
+    # 发布自动派生的标段不算用户改动，除非它随后有了自己的分析设置。
+    frozen_lot_ids = {lot["id"] for lot in report["lot_settings"]}
+    derived = set(report.get("derived_lot_ids", [])) - frozen_lot_ids
+    return (
+        source_signature(sources) != source_signature(report["source_snapshot"])
+        or settings["analysis_category"] != report["category"]
+        or settings["analysis_topics"] != report["topics"]
+        or [lot for lot in lots if not (lot["id"] in derived and lot["category"] is None
+                                        and lot["topics"] is None)] != report["lot_settings"]
+        or (report["runtime_version"] in READABLE_RUNTIMES
+            and source_signature(references) != source_signature(report["reference_snapshot"]))
+    )
 
 
 class AnalysisService:
@@ -215,7 +241,8 @@ class AnalysisService:
                               if source["project_id"] != report["project_id"]]
         for module in modules:
             # 页面入口与补跑事务共用专题输入判断，报告快照已更新也不能禁用其他专题。
-            module["input_changed"] = input_changed(
+            signature = module_inputs[module["id"]]["quality_input_signature"]
+            module["input_changed"] = not signature or input_changed(
                 module_inputs[module["id"]], current["sources"] + current_references,
                 report["source_snapshot"] + report["reference_snapshot"],
             )
@@ -233,26 +260,8 @@ class AnalysisService:
                 module["research_gaps"] = []
                 module["quality_issues"] = []
         retired = report["runtime_version"] not in READABLE_RUNTIMES
-        stale = (
-            source_signature(current["sources"]) != source_signature(report["source_snapshot"])
-            or current["analysis_category"] != report["category"]
-            or current["analysis_topics"] != report["topics"]
-            or [
-                lot
-                for lot in current["lots"]
-                if not (
-                    lot["id"] in report.get("derived_lot_ids", [])
-                    and lot["id"] not in {old["id"] for old in report["lot_settings"]}
-                    and lot["category"] is None
-                    and lot["topics"] is None
-                )
-            ]
-            != report["lot_settings"]
-            or (
-                not retired
-                and source_signature(current_references)
-                != source_signature(report["reference_snapshot"])
-            )
+        stale = report_inputs_changed(
+            report, current, current["lots"], current["sources"], current_references,
         )
         canceling = report["status"] == "canceled" and self.store.execution_active(report_id)
         return {
@@ -356,25 +365,39 @@ class AnalysisService:
     ) -> dict[str, Any]:
         snapshot = self.data_snapshot(report_id, snapshot_id)
         report = self.get_report(report_id)
+        state = self._current_snapshot_state(report, snapshot)
+        data = self._review_data(report, snapshot, state)
         return {
             "report_id": report_id,
             "snapshot_id": snapshot["id"],
             "revision": snapshot["revision"],
             "schema_version": snapshot["schema_version"],
-            "stale": (
-                report["stale"]
-                or report["status"] in {"waiting", "pending", "running"}
-                or self.data_snapshot(report_id)["id"] != snapshot["id"]
-                or not snapshot_matches_report(self.store, snapshot)
-            ),
-            "data": accessible_data(
-                self.store,
-                snapshot["data"],
-                self.store.collections_for_project(report["project_id"]),
-                sources=snapshot["input_snapshot"]["source_snapshot"]
-                + snapshot["input_snapshot"]["reference_snapshot"],
-            ),
+            "stale": state is None,
+            "data": data,
         }
+
+    def _current_snapshot_state(self, report: dict, snapshot: dict) -> dict | None:
+        if (report["stale"] or report["status"] in {"waiting", "pending", "running"}
+                or self.data_snapshot(report["id"])["id"] != snapshot["id"]):
+            return None
+        return matching_snapshot_state(self.store.snapshot_state, snapshot)
+
+    def _review_data(self, report: dict, snapshot: dict, state: dict | None) -> dict:
+        inputs = snapshot["input_snapshot"]
+        sources = inputs["source_snapshot"] + inputs["reference_snapshot"]
+        signature = source_signature(sources)
+        signatures = snapshot_input_signatures(snapshot, state)
+        data = accessible_data(
+            self.store, snapshot["data"], self.store.collections_for_project(report["project_id"]),
+            sources=sources,
+        )
+        # 来源撤销后不回显可能含原文的人工备注或修正结果。
+        if any(gap["code"] == "source_unavailable" for gap in data["gaps"]):
+            return review_projection(data, signatures, signature, {}, current=False)
+        return review_projection(
+            data, signatures, signature, self.store.record_reviews(snapshot["id"]),
+            current=state is not None,
+        )
 
     def context_data(self, report_id: int, snapshot: dict) -> tuple[dict, dict]:
         report = self.get_report(report_id)
@@ -383,26 +406,54 @@ class AnalysisService:
                 "报告正在更新，请在本轮分析结束后获取编制依据",
                 code="report_running",
             )
-        allowed = self.store.collections_for_project(report["project_id"])
-        data = accessible_data(
-            self.store,
-            snapshot["data"],
-            allowed,
-            sources=snapshot["input_snapshot"]["source_snapshot"]
-            + snapshot["input_snapshot"]["reference_snapshot"],
-        )
+        state = self._current_snapshot_state(report, snapshot)
+        data = self._review_data(report, snapshot, state)
         if any(gap["code"] == "source_unavailable" for gap in data["gaps"]):
             raise Conflict(
                 "部分来源已删除或撤销访问，请更新分析",
                 code="source_unavailable",
             )
-        if (
-            report["stale"]
-            or self.data_snapshot(report_id)["id"] != snapshot["id"]
-            or not snapshot_matches_report(self.store, snapshot)
-        ):
+        if state is None:
             raise Conflict("依据已更新，请使用当前有效分析快照", code="data_stale")
         return report, data
+
+    def record_human_review(
+        self, report_id: int, payload: RecordReviewInput, *, actor: str,
+    ) -> dict[str, Any]:
+        snapshot = self.data_snapshot(report_id, payload.snapshot_id)
+        report, data = self.context_data(report_id, snapshot)
+        record = review_record(data, payload.record_id)
+        if record is None:
+            raise NotFound("事项不存在或原文已不可访问")
+        if record["human_review_status"] == "outdated":
+            raise Conflict("该专题尚未核对当前资料，请重新解析后复核", code="record_outdated")
+        if record.get("review_status") == "needs_review" or not record.get("citations"):
+            raise Conflict("该事项的原文依据尚未齐备", code="record_unready")
+        if payload.decision == "corrected" and record["kind"] not in CORRECTABLE_KINDS:
+            raise InvalidArgument("只有项目事实和招标要求支持人工修正正文")
+        with self.store.transaction() as tx:
+            tx.lock_project(report["project_id"])
+            row = tx.lock_report(report_id)
+            if (tx.latest_snapshot_id(report_id) != snapshot["id"]
+                    or matching_snapshot_state(tx.snapshot_state, snapshot) is None):
+                raise Conflict("报告已更新，请刷新后再复核", code="data_stale")
+            # 等锁期间资料可能变化；落笔前只查当前输入和本事项的证据。
+            project_id = row["project_id"]
+            settings, lots, allowed, live = tx.review_inputs(project_id)
+            if settings is None or report_inputs_changed(
+                row, settings, lots,
+                [s for s in live if s["project_id"] == project_id],
+                [s for s in live if s["project_id"] != project_id],
+            ):
+                raise Conflict("报告已更新，请刷新后再复核", code="data_stale")
+            if not citations_accessible(tx.resolve, record["citations"], allowed, {}):
+                raise Conflict("部分来源已删除或撤销访问，请更新分析", code="source_unavailable")
+            last = tx.record_review(snapshot["id"], payload.record_id)
+            if (last["id"] if last else None) != payload.previous_review_id:
+                raise Conflict("该事项已被其他人复核，请刷新后再提交", code="review_conflict")
+            return tx.insert_record_review(
+                payload.model_dump(exclude={"previous_review_id"}) | {"actor": actor},
+            )
 
     async def get_analysis_context(
         self,
@@ -412,7 +463,7 @@ class AnalysisService:
         snapshot = await asyncio.to_thread(self.data_snapshot, report_id, payload.snapshot_id)
         report, data = await asyncio.to_thread(self.context_data, report_id, snapshot)
         try:
-            context = build_context(data, payload)
+            context = build_context(reviewed_compilation(data), payload)
         except ContextError as exc:
             raise Unprocessable(str(exc), code=exc.code) from exc
         if payload.purpose == "content":
@@ -431,7 +482,9 @@ class AnalysisService:
                     embedding_timeout=15,
                 )
                 # 不只重查参考片段；招标依据也可能在等待参考检索时被撤销或重跑。
-                await asyncio.to_thread(self.context_data, report_id, snapshot)
+                _, refreshed = await asyncio.to_thread(self.context_data, report_id, snapshot)
+                if refreshed != data:
+                    raise Conflict("事项复核已变更，请重新获取编制依据", code="review_conflict")
                 live = await asyncio.to_thread(
                     self.store.collections_for_project, report["project_id"],
                 )
@@ -544,6 +597,7 @@ class AnalysisService:
                 tx.cancel_unlocked_runs(report_id)
             if tx.other_active_report(report["project_id"], report_id) is not None:
                 raise Conflict("项目已有其它分析任务", code="analysis_in_flight")
+            # 完成状态不能证明已处理当前资料；统一取回后按专题输入和质量筛选。
             rows = tx.modules_for_retry(report_id, keys, explicit=explicit)
             changed = False
             previous_sources = (report.get("source_snapshot", [])
@@ -562,15 +616,19 @@ class AnalysisService:
                 if changed:
                     tx.update_report(report_id, {"source_snapshot": current_sources,
                                                  "reference_snapshot": current_references})
-            changed_modules = {row["id"] for row in rows if input_changed(
-                row.get("business_data") or {}, current_sources + current_references,
-                previous_sources,
+            changed_modules = {row["id"] for row in rows if "source_snapshot" in report and (
+                not (row.get("business_data") or {}).get("quality_input_signature")
+                or input_changed(
+                    row.get("business_data") or {}, current_sources + current_references,
+                    previous_sources,
+                )
             )}
             if mode == "resume":
                 pending_input = [row for row in rows
                                  if quality_status(row.get("business_data") or {}) == "needs_input"]
                 rows = [row for row in rows if (
-                    quality_status(row.get("business_data") or {}) == "needs_review"
+                    row["id"] in changed_modules
+                    or quality_status(row.get("business_data") or {}) == "needs_review"
                     or row["status"] in {"failed", "canceled", "partial"}
                     and quality_status(row.get("business_data") or {}) != "needs_input"
                     or row in pending_input and row["id"] in changed_modules
@@ -620,6 +678,7 @@ class AnalysisService:
                 report_id,
                 {
                     "status": status,
+                    "snapshot_pending": False,
                     "lease_until": None,
                     "error_message": None,
                     "finished_at": None,

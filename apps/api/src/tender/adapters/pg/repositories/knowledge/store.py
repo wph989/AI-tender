@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 from sqlalchemy import (
@@ -57,6 +57,7 @@ from tender.adapters.pg.models import (
     ProjectFile,
     ProjectKnowledgeCollection,
 )
+from tender.adapters.pg.models.analysis import AnalysisRecordReview
 from tender.adapters.pg.repositories.analysis.reports import ReportQueries
 from tender.adapters.pg.repositories.analysis.runtime import (
     AgentRunStore,
@@ -211,7 +212,9 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                 .limit(1)
             ).scalar_one_or_none()
 
-    def collections_for_project(self, project_id: int) -> list[int]:
+    def collections_for_project(
+        self, project_id: int, *, bound: Connection | None = None,
+    ) -> list[int]:
         """项目自己的资料库 + 显式关联的独立知识库，二者都可读。"""
         own = (
             select(KnowledgeCollection.id)
@@ -239,7 +242,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                 KnowledgeCollection.deleted_at.is_(None),
             )
         )
-        with self.engine.connect() as connection:
+        with (nullcontext(bound) if bound is not None else self.engine.connect()) as connection:
             return list(connection.execute(own.union(linked).order_by("id")).scalars())
 
     def collection_overview(self) -> list[dict[str, Any]]:
@@ -293,7 +296,9 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
             )
 
     # —— 资料来源 ——
-    def sources(self, collection_ids: Sequence[int]) -> list[dict[str, Any]]:
+    def sources(
+        self, collection_ids: Sequence[int], *, bound: Connection | None = None,
+    ) -> list[dict[str, Any]]:
         """这批知识库里当前可用的资料及其解析/索引状态（见模块文档）。"""
         run = aliased(ParseRun)
         running = aliased(Job)
@@ -413,7 +418,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
             )
             .order_by(ProjectFile.sort_no, ProjectFile.id)
         )
-        with self.engine.connect() as connection:
+        with (nullcontext(bound) if bound is not None else self.engine.connect()) as connection:
             return [dict(row) for row in connection.execute(statement).mappings()]
 
     def _blocks_query(self, source: dict[str, Any]):
@@ -504,7 +509,9 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
     def read_chunk_window(self, source: dict[str, Any], offset: int, limit: int) -> ChunkWindow:
         return read_chunk_window(self, source, offset, limit)
 
-    def resolve(self, ref: dict[str, Any], *, with_content: bool = False) -> dict[str, Any]:
+    def resolve(
+        self, ref: dict[str, Any], *, with_content: bool = False, bound: Connection | None = None,
+    ) -> dict[str, Any]:
         """校验一条引文的身份并补全定位；整条身份在一次带权限的查询里匹配。"""
         statement = (
             select(
@@ -545,7 +552,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                 Project.deleted_at.is_(None),
             )
         )
-        with self.engine.connect() as connection:
+        with (nullcontext(bound) if bound is not None else self.engine.connect()) as connection:
             row = connection.execute(statement).mappings().first()
         if row is None:
             raise LookupError("引用原文已删除、撤销访问或与解析批次不符")
@@ -562,7 +569,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
         if group:
             if (int(group[1]), int(group[2])) != (ref["source_id"], ref["parse_run_id"]):
                 raise LookupError("大块与引用来源身份不一致")
-            with self.engine.connect() as connection:
+            with (nullcontext(bound) if bound is not None else self.engine.connect()) as connection:
                 saved = connection.execute(select(KnowledgeChunk.locations, KnowledgeChunk.content)
                     .join(KnowledgeIndex, KnowledgeIndex.id == KnowledgeChunk.index_id)
                     .where(KnowledgeIndex.source_id == ref["source_id"],
@@ -757,6 +764,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                     error_message=error,
                     finished_at=func.now(),
                     lease_until=None,
+                    snapshot_pending=True,
                 )
             )
 
@@ -896,12 +904,16 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
         小批次派发限制消息积压；长任务会定期续约，重复消息由会话锁拒绝。
         """
         model = _TASK_MODELS[kind]
+        due = model.status.in_(("pending", "waiting", "running"))
+        if kind == "report":
+            # 复用报告消息补发快照；不为发布再运行 Agent 或占用模型槽。
+            due = or_(due, AnalysisReport.snapshot_pending.is_(True))
         with self.engine.begin() as connection:
             ids = list(
                 connection.execute(
                     select(model.id)
                     .where(
-                        model.status.in_(("pending", "waiting", "running")),
+                        due,
                         _scoped(model, self.company_id),
                         or_(model.lease_until.is_(None), model.lease_until < func.now()),
                     )
@@ -938,6 +950,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
     def finish_task(self, kind: str, record_id: int, status: str, error: str | None = None) -> None:
         """任务收口；已取消的记录不再改写。``kind`` 同上。"""
         model = _TASK_MODELS[kind]
+        extra: dict[str, Any] = {"snapshot_pending": True} if kind == "report" else {}
         with self.engine.begin() as connection:
             connection.execute(
                 update(model)
@@ -947,6 +960,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
                     error_message=error,
                     finished_at=func.now(),
                     lease_until=None,
+                    **extra,
                 )
             )
 
@@ -964,7 +978,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
 
     # —— 事务 ——
     def transaction(self) -> KnowledgeSession:
-        return KnowledgeSession(self.engine, self.company_id, self.configs)
+        return KnowledgeSession(self)
 
     def create_collection(self, *, name: str, purpose: str) -> dict[str, Any]:
         with self.engine.begin() as connection:
@@ -1099,12 +1113,11 @@ class KnowledgeSession:
     负责 flush，事务边界由本会话或外层所有者掌握。
     """
 
-    def __init__(
-        self, engine: Engine, company_id: int, configs: ConfigRegistry | None = None
-    ) -> None:
-        self.company_id = company_id
-        self.configs = configs
-        self._engine = engine
+    def __init__(self, store: KnowledgeStore) -> None:
+        self._store = store
+        self.company_id = store.company_id
+        self.configs = store.configs
+        self._engine = store.engine
         self._connection_cm: Any = None
         self._raw_connection: Any = None
         self._transaction: Any = None
@@ -1145,6 +1158,24 @@ class KnowledgeSession:
     def lock_project(self, project_id: int) -> None:
         """事务级 advisory 锁串行化同项目的发布与补跑；跨进程也需要，因此不用行锁。"""
         lock_project(self._connection(), project_id)
+
+    def snapshot_state(self, report_id: int) -> dict[str, Any] | None:
+        return self._store.snapshot_state(report_id, bound=self._connection())
+
+    def review_inputs(
+        self, project_id: int,
+    ) -> tuple[dict | None, list[dict], list[int], list[dict]]:
+        # 保存复核已经持有事务锁，复用同一连接，避免连接池满时互相等待。
+        connection = self._connection()
+        settings = self._store.analysis_settings(project_id, bound=connection)
+        if settings is None:
+            return None, [], [], []
+        lots = self._store.project_lots(project_id, bound=connection)
+        allowed = self._store.collections_for_project(project_id, bound=connection)
+        return settings, lots, allowed, self._store.sources(allowed, bound=connection)
+
+    def resolve(self, ref: dict[str, Any]) -> dict[str, Any]:
+        return self._store.resolve(ref, bound=self._connection())
 
     def lock_report(self, report_id: int) -> dict[str, Any]:
         row = (
@@ -1257,7 +1288,7 @@ class KnowledgeSession:
                 select(*_entity_columns(AnalysisDataSnapshot)).where(
                     AnalysisDataSnapshot.report_id == report_id,
                     AnalysisDataSnapshot.manifest_hash == manifest_hash,
-                )
+                ).order_by(AnalysisDataSnapshot.id.desc()).limit(1)
             )
             .mappings()
             .first()
@@ -1300,6 +1331,28 @@ class KnowledgeSession:
                 )
             ).scalar_one()
         )
+
+    def latest_snapshot_id(self, report_id: int) -> int | None:
+        return self._connection().execute(
+            select(AnalysisDataSnapshot.id)
+            .where(AnalysisDataSnapshot.report_id == report_id)
+            .order_by(AnalysisDataSnapshot.id.desc()).limit(1)
+        ).scalar_one_or_none()
+
+    def record_review(self, snapshot_id: int, record_id: str) -> dict[str, Any] | None:
+        row = self._connection().execute(
+            select(AnalysisRecordReview)
+            .where(AnalysisRecordReview.snapshot_id == snapshot_id,
+                   AnalysisRecordReview.record_id == record_id)
+            .order_by(AnalysisRecordReview.id.desc()).limit(1)
+        ).mappings().first()
+        return dict(row) if row is not None else None
+
+    def insert_record_review(self, values: dict[str, Any]) -> dict[str, Any]:
+        row = self._connection().execute(
+            insert(AnalysisRecordReview).values(**values).returning(*AnalysisRecordReview.__table__.c)
+        ).mappings().one()
+        return dict(row)
 
     def insert_snapshot(
         self,
@@ -1437,6 +1490,7 @@ class KnowledgeSession:
                 status="canceled",
                 finished_at=func.coalesce(AnalysisReport.finished_at, func.now()),
                 lease_until=None,
+                snapshot_pending=True,
             )
         )
         cancel_unlocked_runs(self._connection(), report_id)
@@ -1458,13 +1512,7 @@ class KnowledgeSession:
             .where(AnalysisModule.report_id == report_id, AnalysisModule.module_key.in_(keys))
             .with_for_update()
         )
-        if not explicit:
-            # 部分完成的模块仍有未核实主题，补跑时与失败模块一样需要重跑。
-            statement = statement.where(
-                or_(AnalysisModule.status.in_(("failed", "canceled", "partial")),
-                    AnalysisModule.business_data["quality_status"].astext.in_(
-                        ("needs_review", "needs_input")))
-            )
+        # 完成专题也可能用了旧资料，故候选取回后由用例统一比较专题输入签名。
         return [dict(row) for row in self._connection().execute(statement).mappings().all()]
 
     def report_has_modules(self, report_id: int) -> bool:

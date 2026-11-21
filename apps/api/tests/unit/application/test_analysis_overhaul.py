@@ -29,7 +29,8 @@ def test_restart_discards_all_analysis_state_for_every_terminal_status(status, m
 
 def test_confirmed_missing_input_does_not_restart_on_the_same_materials():
     tx = _RetryTx([{"id": 9, "status": "completed", "business_data": {
-        "quality_status": "needs_input"}}], {})
+        "quality_status": "needs_input", "quality_input_signature": source_signature([]),
+    }}], {})
     service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
     original = service.report_row(3) | {"source_snapshot": []}
     service.report_row = Mock(return_value=original)

@@ -379,6 +379,7 @@ data: {"status":"completed","version_id":2048}
 | `POST` | `/api/v1/analysis/reports/{report_id}/context` | 按单个标段获取大纲、正文或检查的编制依据 |
 | `POST` | `/api/v1/analysis/reports/{report_id}/cancel` | 知识库与项目综合分析，见设计/14 |
 | `POST` | `/api/v1/analysis/reports/{report_id}/retry` | 知识库与项目综合分析，见设计/14 |
+| `POST` | `/api/v1/analysis/reports/{report_id}/reviews` | 对当前分析快照中的单条事项确认、修正或驳回 |
 | `POST` | `/api/v1/knowledge/collections/{collection_id}/ask` | 知识库与项目综合分析，见设计/14 |
 | `POST` | `/api/v1/projects/{project_id}/knowledge/ask` | 知识库与项目综合分析，见设计/14 |
 | `GET` | `/api/v1/knowledge/answers/{answer_id}` | 知识库与项目综合分析，见设计/14 |
@@ -419,6 +420,12 @@ DeepAgents 报告补跑可选 `max_output_tokens`（整数，最小值 1，无�
 `data` 的业务结构、引用和 DDL 见
 [14-知识库与综合分析实现](14-知识库与综合分析实现.md) 的“单标段编制的业务数据”。
 读取会按实时权限过滤，不直接把数据库中的历史 JSON 原样返回。
+历史快照只有在当前报告终态、冻结资料与专题成果指纹一致时才可复核；旧版快照由此读取的专题成果恢复输入签名，
+资料或专题成果不匹配时继续标记过期。
+
+`POST /analysis/reports/{report_id}/reviews` 按当前快照 ID 和事项 ID 追加确认、修正或驳回记录；
+保存前会在同一报告事务中复核报告快照、项目资料设置及原文权限。有证据的“不适用”结论沿用其
+`review_id` 提交相同的裁定；只有人工确认的不适用结论进入编制覆盖信息。
 
 `POST /analysis/reports/{report_id}/context` 只读取依据，不创建生成任务或调用正文生成模型：
 

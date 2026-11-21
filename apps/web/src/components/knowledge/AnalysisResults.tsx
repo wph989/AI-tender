@@ -234,7 +234,10 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
         <ul>{data.coverage.filter((entry) => !current || entry.module_key === current.module_key).map((entry, index) => <li key={index}>
           <strong>{modules.find((module) => module.module_key === entry.module_key)?.title} · {entry.title}</strong>
           <p>{({ extracted: "已汇总", searched_not_found: "本次检索未找到", pending: "尚未核对完整",
-            not_applicable: "已确认不适用", unchecked: "未检查" } as Record<string, string>)[entry.status] ?? entry.status}
+            not_applicable: entry.human_review_status === "confirmed" ? "已确认不适用"
+              : entry.human_review_status === "rejected" ? "不适用结论已驳回"
+              : entry.human_review_status === "outdated" ? "不适用结论待更新" : "不适用结论待复核",
+            unchecked: "未检查" } as Record<string, string>)[entry.status] ?? entry.status}
             {" · "}{scopeLabel(entry.scope)}</p><p>{entry.detail}</p>
         </li>)}</ul>
       </details>}
@@ -354,6 +357,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           ? "专题尚未生成，可点击上方补跑未完成模块。" : "这份报告没有保存专题结果。"}</p>}
     </>}
     </div>
-    <AnalysisDataPanel report={report} snapshot={snapshot} open={previewOpen} onClose={() => setPreviewOpen(false)} onLocate={onLocate} />
+    <AnalysisDataPanel report={report} snapshot={snapshot} open={previewOpen} onClose={() => setPreviewOpen(false)}
+      onLocate={onLocate} onReviewChanged={reload} />
   </div>;
 }

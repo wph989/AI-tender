@@ -692,7 +692,12 @@ class AnalysisExecutor:
 
     async def execute(self, report_id: int) -> None:
         db = self.db
-        if db.accessible_report_status(report_id) not in {"waiting", "pending", "running"}:
+        status = db.accessible_report_status(report_id)
+        if status is None:
+            return
+        if status not in {"waiting", "pending", "running"}:
+            if db.snapshot_pending(report_id):
+                await asyncio.to_thread(publish_data_snapshot, db, report_id)
             return
         from tender.application.analysis.contract import RUNTIME_VERSION
         from tender.application.shared.schema_guard import missing_schema

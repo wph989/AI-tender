@@ -108,7 +108,7 @@ test("多标段必须显式单选，分页完整加载，原文入口先校验�
   await expect(dialog.getByRole("cell", { name: /B标段专用要求/ })).toHaveCount(0);
   await dialog.getByRole("button", { name: "加载更多要求", exact: true }).click();
   await expect(dialog.getByRole("button", { name: "加载更多要求", exact: true })).toHaveCount(0);
-  await dialog.locator('.ant-pagination-item[title="11"]').click();
+  await dialog.locator('.analysis-context-requirements .ant-pagination-item[title="11"]').click();
   await expect(dialog.getByRole("cell", { name: /A标段要求100/ })).toBeVisible();
   expect(requests.map((r) => [r.snapshot_id, r.lot_id, r.offset])).toEqual([[10, 1, 0], [10, 1, 100]]);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
@@ -192,4 +192,108 @@ test("依据不足的报告保留正文入口，但禁止进入标段编制预�
   await page.goto("/projects/1");
   await expect(page.getByRole("button", { name: "按标段查看要求", exact: true })).toBeDisabled();
   await expect(page.getByRole("tab", { name: "解析正文", exact: true })).toBeVisible();
+});
+
+test("人工确认绑定当前快照和事项版本", async ({ page }) => {
+  let submitted: Record<string, unknown> | undefined;
+  await page.route("**/api/v1/analysis/reports/1/reviews", async (route) => {
+    submitted = route.request().postDataJSON();
+    await route.fulfill({ json: { id: 77, decision: "confirmed" } });
+  });
+  const dialog = await openPreview(page);
+  await dialog.getByText("项目事实（1）", { exact: true }).click();
+  await dialog.getByRole("button", { name: "确认", exact: true }).click();
+  await expect.poll(() => submitted).toMatchObject({
+    snapshot_id: 10, record_id: "project", previous_review_id: null,
+    decision: "confirmed", corrected_text: null,
+  });
+});
+
+test("机器自查未通过的事项不能提交人工复核", async ({ page }) => {
+  const data = snapshot();
+  data.data.facts[0]!.review_status = "needs_review";
+  await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({ json: data }));
+  let submitted = false;
+  await page.route("**/api/v1/analysis/reports/1/reviews", async (route) => {
+    submitted = true;
+    await route.fulfill({ json: { id: 77 } });
+  });
+  const dialog = await openPreview(page);
+  await dialog.getByText("项目事实（1）", { exact: true }).click();
+  const row = dialog.getByRole("row").filter({ hasText: "采购交换机项目" });
+  await expect(row.getByRole("button", { name: "确认", exact: true })).toBeDisabled();
+  await expect(row.getByText("机器自查未通过，须重跑分析后再复核", { exact: true })).toBeVisible();
+  expect(submitted).toBe(false);
+});
+
+test("重新打开复核可对照人工修正和机器原文，预览只展示修正正文", async ({ page }, info) => {
+  const data = snapshot();
+  const fact = data.data.facts[0]!;
+  const corrected = "采购核心交换机项目";
+  await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({ json: data }));
+  await page.route("**/api/v1/analysis/reports/1/reviews", (route) => {
+    const input = route.request().postDataJSON();
+    expect(input).toMatchObject({ record_id: fact.id, decision: "corrected", corrected_text: corrected });
+    fact.human_review_status = "corrected";
+    fact.human_review = { ...input, id: 78, actor: "operator", created_at: "2026-11-21T00:00:00Z" };
+    return route.fulfill({ json: fact.human_review });
+  });
+  await page.route("**/api/v1/analysis/reports/1/context", (route) =>
+    route.fulfill({ json: { ...context(1), facts: [{ ...fact, text: corrected }] } }));
+  let dialog = await openPreview(page);
+  await dialog.getByText("项目事实（1）", { exact: true }).click();
+  await dialog.getByRole("textbox", { name: "project 修正或驳回理由" }).fill("与招标公告核对");
+  await dialog.getByRole("textbox", { name: "project 修正内容" }).fill(corrected);
+  const refetched = page.waitForResponse((response) => response.url().endsWith("/1/data"));
+  await dialog.getByRole("button", { name: "保存修正", exact: true }).click();
+  await refetched;
+  dialog = await openPreview(page);
+  await dialog.getByText("项目事实（1）", { exact: true }).click();
+  const row = dialog.getByRole("row").filter({ hasText: "机器原文：" });
+  await expect(row).toContainText("人工修正：" + corrected);
+  await expect(row).toContainText("机器原文：" + fact.text);
+  await expect(row.getByRole("button", { name: "定位：编制依据样本.pdf · 第 1 页" })).toBeVisible();
+  await page.screenshot({ path: info.outputPath("analysis-correction.png") });
+  await dialog.getByText("项目事实（1）", { exact: true }).click();
+  await selectLot(page, "A标段");
+  await dialog.getByRole("button", { name: "查看要求", exact: true }).click();
+  await expect(dialog.getByRole("cell", { name: corrected, exact: false })).toBeVisible();
+  await expect(dialog.getByText("机器原文：")).toBeHidden();
+});
+
+test("有原文的不适用结论可确认并按当前裁定版本驳回", async ({ page }, info) => {
+  const data = snapshot();
+  const coverage = { topic: "deposit", title: "投标保证金", status: "not_applicable",
+    detail: "A标段不收取投标保证金。", scope: record("a", "", 1).scope, citations: [citation],
+    module_key: "project_basic_info_parsing", review_id: "proof-a" } satisfies AnalysisDataSnapshot["data"]["coverage"][number];
+  data.data.coverage = [coverage];
+  const requests: Record<string, unknown>[] = [];
+  await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({ json: data }));
+  await page.route("**/api/v1/analysis/reports/1/reviews", (route) => {
+    const input = route.request().postDataJSON();
+    requests.push(input);
+    const decision = { ...input, id: requests.length + 80, actor: "operator", created_at: "2026-11-21T00:00:00Z" };
+    data.data.coverage = [{ ...coverage, human_review_status: input.decision, human_review: decision }];
+    return route.fulfill({ json: decision });
+  });
+  const dialog = await openPreview(page);
+  const section = dialog.getByText("不适用结论（1）", { exact: true });
+  await section.click();
+  const row = dialog.getByRole("row").filter({ hasText: "A标段不收取投标保证金。" });
+  await expect(row.getByRole("button", { name: /定位：/ })).toBeVisible();
+  await expect(row.getByRole("button", { name: "保存修正" })).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath("analysis-coverage.png") });
+  const refetched = page.waitForResponse((response) => response.url().endsWith("/1/data"));
+  await row.getByRole("button", { name: "确认", exact: true }).click();
+  await refetched;
+  // 刷新快照会重建复核分组。
+  await expect(section).toBeVisible();
+  await section.click();
+  await expect(row.getByText("人工确认", { exact: true })).toBeVisible();
+  await row.getByRole("textbox", { name: "投标保证金 驳回理由" }).fill("补遗要求重新核对");
+  await row.getByRole("button", { name: "驳回", exact: true }).click();
+  await expect.poll(() => requests).toMatchObject([
+    { record_id: "proof-a", previous_review_id: null, decision: "confirmed" },
+    { record_id: "proof-a", previous_review_id: 81, decision: "rejected" },
+  ]);
 });

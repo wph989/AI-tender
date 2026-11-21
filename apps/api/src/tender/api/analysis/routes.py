@@ -7,11 +7,12 @@ from typing import Literal
 from fastapi import APIRouter, Query, Request
 from pydantic import Field
 
-from tender.api.shared.common import configs, engine
+from tender.api.shared.common import actor, configs, engine
 from tender.api.shared.dto import StrictModel
 from tender.api.shared.errors import as_api_problem
 from tender.api.shared.logging import throttle_access_log
 from tender.application.analysis.data import ContextInput
+from tender.application.analysis.human_review import RecordReviewInput
 from tender.application.analysis.service import AnalysisService
 from tender.application.knowledge.service import visible_items as _visible_items
 from tender.application.shared.errors import ServiceError
@@ -192,6 +193,16 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
             max_output_tokens=payload.max_output_tokens,
             timeout_seconds=payload.timeout_seconds,
             mode=payload.mode,
+        )
+    except ServiceError as exc:
+        raise as_api_problem(exc) from exc
+
+
+@router.post("/analysis/reports/{report_id}/reviews")
+def review_record(report_id: int, payload: RecordReviewInput, request: Request) -> dict:
+    try:
+        return analysis_service(request).record_human_review(
+            report_id, payload, actor=actor(request),
         )
     except ServiceError as exc:
         raise as_api_problem(exc) from exc

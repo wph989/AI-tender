@@ -123,6 +123,7 @@ def test_schema_guard_runs_before_loading_full_report(monkeypatch, missing):
 def test_schema_guard_does_not_touch_inaccessible_or_terminal_reports(monkeypatch, status):
     db = Mock(spec=KnowledgeStore)
     db.accessible_report_status.return_value = status
+    db.snapshot_pending.return_value = False
     monkeypatch.setattr(knowledge, "_store", lambda: db)
 
     asyncio.run(knowledge._analyze_project(16))

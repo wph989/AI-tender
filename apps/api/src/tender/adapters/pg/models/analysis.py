@@ -42,6 +42,7 @@ class AnalysisReport(Base):
     reference_snapshot: Mapped[list[Any]] = mapped_column(JSONB)
     summary: Mapped[list[Any]] = mapped_column(JSONB)
     derived_lot_ids: Mapped[list[int]] = mapped_column(ARRAY(BigInteger))
+    snapshot_pending: Mapped[bool] = mapped_column(Boolean)
 
 
 class AnalysisModule(Base):
@@ -125,4 +126,19 @@ class AnalysisDataSnapshot(Base):
     manifest_hash: Mapped[str] = mapped_column(Text)
     input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB)
     data: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AnalysisRecordReview(Base):
+    """人工裁定按快照和事项追加，机器再次提交不会改写历史裁定。"""
+
+    __tablename__ = "analysis_record_review"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(BigInteger)
+    record_id: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(Text)
+    decision: Mapped[str] = mapped_column(Text)
+    note: Mapped[str] = mapped_column(Text)
+    corrected_text: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -187,8 +187,20 @@ export interface AnalysisScope {
   lot_refs: string[];
 }
 
+export interface AnalysisReviewState {
+  human_review_status?: "pending" | "confirmed" | "corrected" | "rejected" | "outdated";
+  human_review?: {
+    id: number;
+    actor: string;
+    decision: "confirmed" | "corrected" | "rejected";
+    note: string;
+    corrected_text: string | null;
+    created_at: string;
+  } | null;
+}
+
 /** 正式业务记录与展示字段分离，编制任务固定快照和记录身份。 */
-export interface BusinessRecord {
+export interface BusinessRecord extends AnalysisReviewState {
   review_status?: "current" | "needs_review";
   id: string;
   key: string;
@@ -275,13 +287,15 @@ export interface AnalysisGap {
   module_key?: string;
 }
 
-export interface AnalysisCoverage {
+export interface AnalysisCoverage extends AnalysisReviewState {
   topic: string;
   title: string;
   status: string;
   scope: AnalysisScope;
   detail: string;
   module_key?: string;
+  review_id?: string;
+  citations?: Citation[];
 }
 
 export interface AnalysisDataset {

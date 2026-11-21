@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
-from sqlalchemy import Engine, case, exists, func, literal, or_, select
+from sqlalchemy import Connection, Engine, case, exists, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import aliased
 
@@ -17,6 +18,7 @@ from tender.adapters.pg.models import (
     Lot,
     Project,
 )
+from tender.adapters.pg.models.analysis import AnalysisRecordReview
 
 
 class ReportQueries:
@@ -61,9 +63,11 @@ class ReportQueries:
             )
         return dict(row) if row is not None else None
 
-    def analysis_settings(self, project_id: int) -> dict[str, Any] | None:
+    def analysis_settings(
+        self, project_id: int, *, bound: Connection | None = None,
+    ) -> dict[str, Any] | None:
         """项目的分析类别与专题设置。"""
-        with self.engine.connect() as connection:
+        with (nullcontext(bound) if bound is not None else self.engine.connect()) as connection:
             row = (
                 connection.execute(
                     select(Project.analysis_category, Project.analysis_topics).where(
@@ -77,9 +81,11 @@ class ReportQueries:
             )
         return dict(row) if row is not None else None
 
-    def project_lots(self, project_id: int) -> list[dict[str, Any]]:
+    def project_lots(
+        self, project_id: int, *, bound: Connection | None = None,
+    ) -> list[dict[str, Any]]:
         """项目的全部标段及各自的分析设置，按序号排序。"""
-        with self.engine.connect() as connection:
+        with (nullcontext(bound) if bound is not None else self.engine.connect()) as connection:
             rows = connection.execute(
                 select(
                     Lot.id,
@@ -285,7 +291,29 @@ class ReportQueries:
             )
         return dict(row) if row is not None else None
 
-    def snapshot_state(self, report_id: int) -> dict[str, Any] | None:
+    def snapshot_pending(self, report_id: int) -> bool:
+        with self.engine.connect() as connection:
+            return bool(connection.execute(
+                select(AnalysisReport.snapshot_pending).where(
+                    AnalysisReport.id == report_id,
+                    AnalysisReport.company_id == self.company_id,
+                )
+            ).scalar_one_or_none())
+
+    def record_reviews(self, snapshot_id: int) -> dict[str, dict[str, Any]]:
+        # DISTINCT ON 只读取每条事项的最后一次裁定；历史事件继续留存。
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(AnalysisRecordReview)
+                .where(AnalysisRecordReview.snapshot_id == snapshot_id)
+                .distinct(AnalysisRecordReview.record_id)
+                .order_by(AnalysisRecordReview.record_id, AnalysisRecordReview.id.desc())
+            ).mappings()
+            return {row["record_id"]: dict(row) for row in rows}
+
+    def snapshot_state(
+        self, report_id: int, *, bound: Connection | None = None,
+    ) -> dict[str, Any] | None:
         """报告状态 + 运行账 + 模块成果，**一条语句**读出以免拼出混合版本。"""
         runs = (
             select(
@@ -334,11 +362,19 @@ class ReportQueries:
             .correlate(AnalysisReport)
             .scalar_subquery()
         )
-        with self.engine.connect() as connection:
+        with (nullcontext(bound) if bound is not None else self.engine.connect()) as connection:
             row = (
                 connection.execute(
                     select(
                         AnalysisReport.status,
+                        AnalysisReport.snapshot_pending,
+                        AnalysisReport.source_snapshot,
+                        AnalysisReport.reference_snapshot,
+                        AnalysisReport.category,
+                        AnalysisReport.topics,
+                        AnalysisReport.lot_settings,
+                        AnalysisReport.skill_version,
+                        AnalysisReport.runtime_version,
                         runs.label("runs"),
                         modules.label("modules"),
                     ).where(
