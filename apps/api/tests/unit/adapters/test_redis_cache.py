@@ -17,6 +17,11 @@ class _FakeClient:
         self.closed = False
         self.fail = False
 
+    def ping(self) -> bool:
+        if self.fail:
+            raise ConnectionError("redis down")
+        return True
+
     def get(self, key: str) -> object:
         if self.fail:
             raise ConnectionError("redis down")
@@ -74,6 +79,14 @@ def test_broken_cache_degrades_instead_of_raising() -> None:
     cache.publish_invalidate(1)
     cache.close()
     assert client.closed is True
+
+
+def test_health_reports_redis_availability() -> None:
+    client = _FakeClient()
+    cache = RedisConfigCache("redis://unused", client=client)
+    assert cache.health() is True
+    client.fail = True
+    assert cache.health() is False
 
 
 def test_invalid_json_is_treated_as_miss() -> None:

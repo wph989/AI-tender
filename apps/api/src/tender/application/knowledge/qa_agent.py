@@ -10,18 +10,23 @@ from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from deepagents.middleware.summarization import SummarizationMiddleware
+from langchain.agents.middleware import AgentMiddleware, hook_config
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool, ToolException
 from langsmith import tracing_context
 from typing_extensions import TypedDict
 
-from tender.application.analysis.agent import (
-    ResearchMiddleware,
-    RoutedAgentModel,
-    _relation_unit,
-    context_size,
+from tender.application.knowledge.answer_evidence import validate_answer, verify_items
+from tender.application.shared.agent_model import RoutedAgentModel, context_size
+from tender.application.shared.research import (
+    AgentLimits,
+    EvidenceBudgetError,
+    Expand,
+    Read,
+    ResearchSession,
+    SourceNotAllowed,
+    ToolArgumentError,
 )
-from tender.application.analysis.research import AgentLimits, Expand, Read, ResearchSession
-from tender.application.analysis.skills import _module_result, verify_items
 
 
 class AnswerCitation(TypedDict):
@@ -74,6 +79,74 @@ class QABudgetExceeded(RuntimeError):
     """预算耗尽必须终止问答，不能被当成可纠正的工具参数错误继续重试。"""
 
 
+class _QuestionTools(AgentMiddleware):
+    def __init__(self, research, state, reserve_tool):
+        self.research = research
+        self.state = state
+        self.reserve_tool = reserve_tool
+        self.lock = asyncio.Lock()
+        self.unsubmitted = 0
+        self.invalid_submissions = 0
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state, runtime):
+        await self.research.authorize()
+        if "draft" in self.state:
+            return {"jump_to": "end"}
+        return None
+
+    @hook_config(can_jump_to=["model"])
+    async def aafter_model(self, state, runtime):
+        await self.research.authorize()
+        message = state["messages"][-1]
+        if not isinstance(message, AIMessage) or message.tool_calls or "draft" in self.state:
+            self.unsubmitted = 0
+            return None
+        self.unsubmitted += 1
+        if self.unsubmitted >= 3:
+            raise ValueError("模型连续三次未提交结构化问答结果")
+        return {
+            "messages": [HumanMessage(content="请用 submit_analysis 提交带原文引文的最终回答。")],
+            "jump_to": "model",
+        }
+
+    async def awrap_tool_call(self, request, handler):
+        # 并行工具调用串行写入证据与暂存答案，提交也计入问答的工具预算。
+        async with self.lock:
+            await self.research.authorize()
+            await self.reserve_tool()
+            name = request.tool_call["name"]
+            if name == "submit_analysis":
+                self.state.pop("draft", None)
+            try:
+                result = await handler(request)
+            except (SourceNotAllowed, ToolArgumentError, EvidenceBudgetError) as exc:
+                result = ToolMessage(
+                    content=str(exc), name=name, tool_call_id=request.tool_call["id"],
+                    status="error",
+                )
+            await self.research.authorize()
+            if name == "submit_analysis":
+                self.invalid_submissions = (
+                    self.invalid_submissions + 1 if result.status == "error" else 0
+                )
+                if self.invalid_submissions >= 3:
+                    raise ValueError("模型连续三次提交无效结果：" + str(result.content)[:700])
+            return result
+
+
+def _relation_unit(link: dict) -> dict:
+    # 关系的条件和范围也是断言，和主谓宾一起核对引用。
+    return {
+        "kind": "relation",
+        "field": link["subject"],
+        "values": [{
+            "value": link["predicate"] + link["object"] + link["scope"] + link["condition"],
+            "citations": link["citations"],
+        }],
+    }
+
+
 async def answer_with_agent(
     *,
     model_factory: Callable[..., Any],
@@ -122,9 +195,6 @@ async def answer_with_agent(
         # 研究会话只统计检索和补读；这里还须计入提交、读历史及无效工具调用。
         tool_calls += 1
 
-    async def save(_state: dict) -> None:
-        return None
-
     async def list_documents() -> list[dict]:
         """列出可检索的资料，不读取全文。"""
         return await research.documents()
@@ -143,7 +213,7 @@ async def answer_with_agent(
 
     async def validate_support(items: list[dict]) -> None:
         # 问答允许保留未获支持的结论并由前端提示，不因单条推断终止整轮作答。
-        await verify_items(model, items, explain=True, evidence=research.seen)
+        await verify_items(model, items, evidence=research.seen)
 
     async def submit_answer(
         fields: list[AnswerItem],
@@ -157,8 +227,8 @@ async def answer_with_agent(
                 raise ValueError("需要4000字以内的检索总结与未决问题")
             if not any(e["action"].startswith("search_") for e in research.events):
                 raise ValueError("请先检索相关证据再作答")
-            checked, links = _module_result(
-                {"fields": fields, "relations": relations}, research.seen
+            checked, links = validate_answer(
+                {"fields": fields, "relations": relations}, research.seen,
             )
             await validate_support(checked)
             units = [_relation_unit(link) for link in links]
@@ -175,7 +245,7 @@ async def answer_with_agent(
                 link for link in links if link not in state.get("staged_relations", [])
             ]
             if not final:
-                # draft 是共享中间件的结束信号，非最终批只暂存，留出后续检索和提交机会。
+                # 只有最终批生成答案，留出后续检索和提交机会。
                 state["staged_items"], state["staged_relations"] = checked, links
                 return {"accepted": True, "final": False, "staged_items": len(checked)}
             state["draft"] = {
@@ -244,16 +314,7 @@ async def answer_with_agent(
                         token_counter=context_size,
                         trim_tokens_to_summarize=limits.context_tokens,
                     ),
-                    ResearchMiddleware(
-                        research,
-                        state,
-                        reserve_tool,
-                        save,
-                        lambda: {
-                            "model_calls_remaining": limits.max_model_calls - model_calls,
-                            "tool_calls_remaining": limits.max_tool_calls - tool_calls,
-                        },
-                    ),
+                    _QuestionTools(research, state, reserve_tool),
                 ],
             )
             task = (

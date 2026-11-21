@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import APIRouter, FastAPI
+from pydantic import BaseModel, ConfigDict
+from starlette.responses import JSONResponse
 
 from tender.api.analysis import routes as analysis_api
 from tender.api.configuration import routes as config
@@ -19,6 +22,17 @@ from tender.api.shared.errors import install_error_handlers
 from tender.api.shared.logging import RequestLoggingMiddleware
 from tender.core.di import ApiComponents, create_api_components
 from tender.core.logging import configure_logging, get_logger
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+
+
+class ReadinessResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ready", "not_ready"]
+    checks: dict[str, bool]
 
 
 def create_app(components: ApiComponents | None = None) -> FastAPI:
@@ -36,9 +50,29 @@ def create_app(components: ApiComponents | None = None) -> FastAPI:
     install_error_handlers(app)
     router = APIRouter(prefix="/api/v1")
 
-    @router.get("/healthz")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    @router.get("/healthz", response_model=HealthResponse)
+    def health() -> HealthResponse:
+        return HealthResponse(status="ok")
+
+    @router.get(
+        "/readyz",
+        response_model=ReadinessResponse,
+        responses={503: {"model": ReadinessResponse}},
+    )
+    def readiness() -> JSONResponse:
+        checks: dict[str, bool] = {}
+        for name, probe in (
+            ("postgresql", runtime.postgres_healthy),
+            ("redis", runtime.configs.health),
+            ("storage", runtime.blobs.health),
+        ):
+            try:
+                checks[name] = bool(probe())
+            except Exception:
+                checks[name] = False
+        status = "ready" if all(checks.values()) else "not_ready"
+        body = ReadinessResponse(status=status, checks=checks).model_dump()
+        return JSONResponse(status_code=200 if status == "ready" else 503, content=body)
 
     app.include_router(router)
     app.include_router(projects.router)

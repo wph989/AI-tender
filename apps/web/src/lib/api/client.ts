@@ -12,6 +12,8 @@ import type {
   WirePageMeta,
   WireVersionDetail,
 } from "@/types/workbench";
+import type { ApiSchemas } from "@/types/api.generated";
+import { apiErrorFromBody, requestJson, requestNoContent } from "@/lib/api/request";
 
 export interface WorkbenchData {
   pdfUrl: string;
@@ -38,32 +40,9 @@ interface ElementsResponse {
   elements: WireBlock[];
 }
 
-export interface JobResponse {
-  id: string;
-  status: string;
-  /** 流水线阶段：converting / submitting / parsing 等（见 worker/dispatch.py 的 STREAMS）。 */
-  stage?: string | null;
-  progress?: Record<string, unknown> | null;
-  error_code?: string | null;
-  error_message?: string | null;
-}
+export type JobResponse = ApiSchemas["JobResponse"];
 
 /** 后端的问题响应统一是 {error: {code, message, …}}；代理或网关则可能回一整页 HTML。 */
-function problemFromBody(body: unknown, status: number, fallback: string): Error {
-  if (typeof body === "object" && body !== null && "error" in body) {
-    const problem = body.error;
-    if (
-      typeof problem === "object" &&
-      problem !== null &&
-      "message" in problem &&
-      typeof problem.message === "string"
-    ) {
-      return new Error(problem.message);
-    }
-  }
-  return new Error(fallback + " 返回 " + status);
-}
-
 /**
  * 上传失败（整批一个都没入库）时，后端仍会把逐文件原因放进 error.detail.skipped。
  *
@@ -99,40 +78,24 @@ function skippedFromBody(body: unknown): { name: string; reason: string }[] {
   return skipped;
 }
 
-async function readError(response: Response, fallback: string): Promise<Error> {
-  let payload: unknown = null;
-  try {
-    payload = await response.json();
-  } catch {
-    // 非 JSON 错误页也保留 HTTP 状态：那是唯一能拿到的诊断信息。
-  }
-  return problemFromBody(payload, response.status, fallback);
-}
-
 async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
-  if (!response.ok) throw await readError(response, "取数失败：" + url);
-  return (await response.json()) as T;
+  return requestJson(url, undefined, "取数失败：" + url);
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const response = await fetch(url, {
+  return requestJson(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
-  if (!response.ok) throw await readError(response, "操作失败：" + url);
-  return (await response.json()) as T;
+  }, "操作失败：" + url);
 }
 
 async function patchJson<T>(url: string, body: unknown): Promise<T> {
-  const response = await fetch(url, {
+  return requestJson(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
-  if (!response.ok) throw await readError(response, "操作失败：" + url);
-  return (await response.json()) as T;
+  }, "操作失败：" + url);
 }
 
 export async function loadWorkbench(versionId: number): Promise<WorkbenchData> {
@@ -242,9 +205,8 @@ export function updateProject(projectId: number, input: {
 }
 
 export async function deleteProject(projectId: number): Promise<void> {
-  const response = await fetch("/api/v1/projects/" + projectId, { method: "DELETE" });
   // 删除返回204，不解析不存在的JSON正文。
-  if (!response.ok) throw await readError(response, "删除项目失败");
+  await requestNoContent("/api/v1/projects/" + projectId, { method: "DELETE" }, "删除项目失败");
 }
 
 export async function replaceProjectFile(projectId: number, fileId: number, file: File,
@@ -258,8 +220,14 @@ export async function replaceProjectFile(projectId: number, fileId: number, file
   const response = await fetch(`/api/v1/projects/${projectId}/files/${fileId}/replace`, {
     method: "POST", body: form,
   });
-  if (!response.ok) throw await readError(response, "文件换版失败");
-  return response.json();
+  if (!response.ok) {
+    const body: unknown = await response.json().catch(() => null);
+    const error = apiErrorFromBody(body, response.status, "文件换版失败");
+    const skipped = skippedFromBody(body);
+    if (skipped.length) throw new UploadRejectedError(error.message, skipped);
+    throw error;
+  }
+  return (await response.json()) as { added: UploadResult["added"][number]; jobs: string[] };
 }
 
 export interface UploadOptions {
@@ -314,7 +282,7 @@ export async function uploadProjectFiles(
         resolve(request.response as UploadResult);
         return;
       }
-      const problem = problemFromBody(request.response, request.status, "上传失败");
+      const problem = apiErrorFromBody(request.response, request.status, "上传失败");
       const skipped = skippedFromBody(request.response);
       reject(skipped.length > 0 ? new UploadRejectedError(problem.message, skipped) : problem);
     });
@@ -338,10 +306,11 @@ export async function patchProjectFile(
 }
 
 export async function deleteProjectFile(projectId: number, fileId: number): Promise<void> {
-  const response = await fetch("/api/v1/projects/" + projectId + "/files/" + fileId, {
-    method: "DELETE",
-  });
-  if (!response.ok) throw await readError(response, "删除文件失败");
+  await requestNoContent(
+    "/api/v1/projects/" + projectId + "/files/" + fileId,
+    { method: "DELETE" },
+    "删除文件失败",
+  );
 }
 
 /** 对已有版本重跑解析。force=true 表示即使已有解析结果也重跑。 */

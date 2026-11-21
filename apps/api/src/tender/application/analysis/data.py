@@ -11,7 +11,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tender.application.analysis.output import canonical_topic, record_output
 from tender.application.analysis.quality import aggregate_quality, quality_status
-from tender.application.analysis.state import published_items
 from tender.application.knowledge.content import (
     dedupe_citations,
     fingerprint,
@@ -36,14 +35,6 @@ class DataCitation(DataInput):
     """模型只选择已读块，文件、页码、坐标和原文由服务端补齐。"""
 
     block_id: str = Field(min_length=1, description="检索或补读实际返回的原文块ID")
-
-    @model_validator(mode="before")
-    @classmethod
-    def discard_legacy_quote(cls, value):
-        # 冻结样例和旧检查点可能仍带quote；它不是定位输入，不能再因改写或缺失而拒绝总结。
-        if isinstance(value, dict):
-            return {key: item for key, item in value.items() if key != "quote"}
-        return value
 
 
 class DataScope(DataInput):
@@ -392,6 +383,15 @@ def module_records(data: dict) -> list[dict]:
     return result
 
 
+def published_items(snapshot: dict) -> list[dict]:
+    """只发布 Agent 明确最终提交的草稿。"""
+    workspace = snapshot.get("agent_workspace", {})
+    if not workspace.get("finalized"):
+        return []
+    items = {item["id"]: item for item in snapshot.get("staged_items", [])}
+    return [items[rid] for rid in workspace.get("final_ids", []) if rid in items]
+
+
 def module_data(state: dict) -> dict:
     records = []
     evidence = {}
@@ -400,8 +400,6 @@ def module_data(state: dict) -> dict:
             continue
         record = copy.deepcopy(item["business"])
         record["verification"] = "supported"
-        if state.get("topic_flow"):
-            record["review_status"] = item.get("review_status", "current")
         refs = dedupe_citations([
             ref for value in item["values"] for ref in value["citations"]
         ])
@@ -424,26 +422,13 @@ def module_data(state: dict) -> dict:
         records.append(record)
     return {
         "schema_version": DATA_VERSION, "records": records, "evidence": evidence,
-        **({"protocol": state["agent_workspace"]["protocol"]}
-           if state.get("agent_workspace") else {}),
         "quality_status": quality_status(state),
         "quality_issues": copy.deepcopy(state.get("quality_issues", [])),
         "quality_input_signature": state.get("quality_input_signature"),
         "coverage": copy.deepcopy(state.get("business_coverage", [])),
         "gaps": copy.deepcopy(state.get("business_gaps", [])),
         "topics": copy.deepcopy(state.get("business_topics", [])),
-        "research_summary": state.get("draft", {}).get(
-            "research_summary", state.get("research_completed", {}).get("research_summary", "")
-        ),
-        "research": copy.deepcopy(state.get("research_completed", {})),
-        **({"progress": {"topics": [{**{k: v for k, v in e.items()
-                                         if k not in {"placeholder", "requested_status"}},
-                                      "tasks": list(e["tasks"].values())}
-                                     for e in state["topic_flow"]["entries"].values()],
-                         "audit_round": state["topic_flow"]["audit"]["round"],
-                         **({"phase": state["topic_flow"].get("phase", "research")}
-                            if state["topic_flow"].get("output_mode") == "after-research" else {})}}
-           if state.get("topic_flow") else {}),
+        "research_summary": state.get("draft", {}).get("research_summary", ""),
     }
 
 
@@ -572,12 +557,6 @@ def assemble_dataset(
         key = module["module_key"]
         available = []
         for record in (hydrated or {}).get(key) or module_records(data):
-            if record.get("review_status") == "needs_review":
-                result["gaps"].append(data_gap(
-                    "record_needs_review", "新增证据影响该事项，尚待复核", record_id=record["id"],
-                    module_key=key,
-                ))
-                continue
             # 必要证据缺失的记录整条不可用，只登记缺口，不能让剩余引用冒充完整依据。
             if record.get("verification") == "unavailable":
                 result["gaps"].append(data_gap(

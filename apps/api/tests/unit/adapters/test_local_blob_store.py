@@ -51,6 +51,14 @@ def test_local_blob_store_reports_missing_objects(tmp_path: Path) -> None:
         store.head("missing/object")
 
 
+def test_local_blob_store_health_requires_an_accessible_root(tmp_path: Path) -> None:
+    root = tmp_path / "objects"
+    store = LocalBlobStore(root)
+    assert store.health() is False
+    root.mkdir()
+    assert store.health() is True
+
+
 @pytest.mark.parametrize("key", ["../outside", "a/../../outside", r"a\..\outside", "/absolute"])
 def test_local_blob_store_rejects_paths_outside_its_root(tmp_path: Path, key: str) -> None:
     store = LocalBlobStore(tmp_path / "objects")

@@ -8,7 +8,7 @@ import { message as errorMessage } from "@/lib/errors";
 import { Icon } from "@/components/Icon";
 import { BUTTON_CLASS } from "@/components/ui";
 import {
-  knowledgeRequest, loadReportRecords, resolveCitation, supportsModuleRecords,
+  knowledgeRequest, loadReportRecords, resolveCitation,
 } from "@/lib/api/knowledge";
 import { loadProject } from "@/lib/api/client";
 import { citationLocationKey, findCitationResult } from "@/lib/analysis/citations";
@@ -85,11 +85,11 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
         // 同一报告的轮询结果不重置为加载态，否则每三秒都会清空已显示正文。
         setReport((previous) => {
           if (previous?.id === loaded.id) return previous;
-          return supportsModuleRecords(loaded) ? {
+          return {
             ...loaded, modules: loaded.modules.map((module) => ({
               ...module, items: [], records_loading: true,
             })),
-          } : loaded;
+          };
         });
         const complete = await loadReportRecords(loaded, controller.signal);
         if (!controller.signal.aborted) setReport(complete);

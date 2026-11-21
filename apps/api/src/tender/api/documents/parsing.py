@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from tender.api.shared.common import actor, configs, engine
 from tender.api.shared.errors import as_api_problem
+from tender.api.shared.responses import ParseJobCreatedResponse
 from tender.application.documents.parsing import ParseService
 from tender.application.shared.errors import ServiceError
 from tender.core import settings
@@ -60,7 +61,7 @@ def _create_parse_job(
         raise as_api_problem(exc) from exc
 
 
-@router.post("/{version_id}/parse", status_code=202)
+@router.post("/{version_id}/parse", status_code=202, response_model=ParseJobCreatedResponse)
 def parse_version(
     version_id: int,
     request: Request,
@@ -70,7 +71,7 @@ def parse_version(
     return _create_parse_job(version_id, payload, request, force=payload.force)
 
 
-@router.post("/{version_id}/reparse", status_code=202)
+@router.post("/{version_id}/reparse", status_code=202, response_model=ParseJobCreatedResponse)
 def reparse_version(
     version_id: int,
     request: Request,

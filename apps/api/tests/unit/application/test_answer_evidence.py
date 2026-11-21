@@ -1,63 +1,17 @@
-"""用真实 DeepAgents 图验证权限、工具执行、纠正与 checkpoint 恢复。"""
+"""问答的逐项证据与原文邻域核对。"""
 
 import asyncio
 import json
 
 import pytest
-from langchain_core.messages import AIMessage, message_to_dict
+from agent_fixtures import submitted_field
 from test_analysis_research import block
 
-from tender.application.analysis.agent import split_absence_claims, validate_project_claims
-from tender.application.analysis.skills import verify_items
+from tender.application.analysis.quality import validate_project_claims
+from tender.application.knowledge.answer_evidence import verify_items
 from tender.application.knowledge.content import validate_items
 from tender.domain.shared.errors import InvalidModelOutput
 from tender.ports.llm.chat import Completion
-
-KEY = "project_basic_info_parsing"
-SKILL = {
-    KEY
-    + "/SKILL.md": (
-        "---\nname: project-basic-info-parsing\ndescription: 分析概况\n---\n检索项目概况"
-    ),
-    KEY + "/references/output_format.md": (
-        "```markdown\n## 项目基本信息\n| 字段 | 内容 |\n|---|---|\n```"
-    ),
-    KEY + "/references/coverage.json": "[]",
-}
-
-
-class ScriptedRouter:
-    def __init__(self, calls):
-        self.calls = list(calls)
-        self.requests = []
-
-    async def chat(self, messages, tools):
-        self.requests.append((messages, tools))
-        call = self.calls.pop(0)
-        return Completion(
-            content="",
-            model="fixture",
-            agent_message=message_to_dict(
-                call if isinstance(call, AIMessage) else AIMessage(content="", tool_calls=[call])
-            ),
-        )
-
-
-def call(name, args, number):
-    if name == "submit_analysis":
-        args = {"final": True, **args}
-    return {"name": name, "args": args, "id": "call_" + str(number), "type": "tool_call"}
-
-
-def submitted_field(field, value, quote="质保三年", block_id="s1r1c0"):
-    """构造一条字段-值条目：field 是字段名，证据逐值绑定在 values 上。"""
-    return {
-        "field": field,
-        "group": "",
-        "sort_order": 0,
-        "values": [{"value": value, "citations": [{"block_id": block_id, "quote": quote}]}],
-        "note": "",
-    }
 
 
 @pytest.mark.parametrize(
@@ -144,41 +98,6 @@ def test_revision_keeps_original_and_amendment_citations_after_alignment():
     ]
 
 
-def test_split_absence_claims_routes_gaps_and_keeps_scope_errors_strict():
-    gap = {
-        "field": "条款未约定",
-        "values": [
-            {
-                "value": "文件未约定违约金",
-                "citations": [{"project_id": 10, "source_id": 1, "quote": "质保三年"}],
-            }
-        ],
-    }
-    valid = {
-        "field": "质保",
-        "values": [
-            {
-                "value": "质保三年",
-                "citations": [{"project_id": 10, "source_id": 1, "quote": "质保三年"}],
-            }
-        ],
-    }
-    reference_only = {
-        "field": "历史",
-        "values": [
-            {
-                "value": "历史五年",
-                "citations": [{"project_id": 20, "source_id": 2, "quote": "历史五年"}],
-            }
-        ],
-    }
-    kept, gaps = split_absence_claims([gap, valid, reference_only], 10)
-    assert gaps == [gap] and kept == [valid, reference_only]
-    # 缺项目引用的条目不能借“缺口”之名绕开严格校验
-    with pytest.raises(ValueError):
-        validate_project_claims(kept, 10)
-
-
 def test_support_review_rejects_unsupported_claim_even_when_model_flag_is_true():
     class Reviewer:
         async def complete(self, prompt):
@@ -207,7 +126,7 @@ def test_support_review_rejects_unsupported_claim_even_when_model_flag_is_true()
         ],
         "verification": "supported",
     }
-    asyncio.run(verify_items(Reviewer(), [item], explain=True))
+    asyncio.run(verify_items(Reviewer(), [item]))
     assert item["verification"] == "unsupported"
     assert "全部标段" in item["verification_issues"][0]
 
@@ -241,7 +160,7 @@ def test_support_review_checks_claims_in_notes(note):
             )
 
     item = submitted_field("质保", "质保三年") | {"note": note}
-    asyncio.run(verify_items(Reviewer(), [item], explain=True))
+    asyncio.run(verify_items(Reviewer(), [item]))
     assert item["verification"] == "unsupported"
 
 
@@ -259,7 +178,7 @@ def test_support_review_fails_closed_when_claim_review_is_missing(result):
             return Completion(content=json.dumps(result), model="fixture")
 
     with pytest.raises(InvalidModelOutput, match="逐项断言"):
-        asyncio.run(verify_items(Reviewer(), [{"field": "限价", "values": []}], explain=True))
+        asyncio.run(verify_items(Reviewer(), [{"field": "限价", "values": []}]))
 
 
 def test_support_review_batches_fields_without_mixing_their_verdicts():
@@ -305,7 +224,7 @@ def test_support_review_batches_fields_without_mixing_their_verdicts():
         }
         for title in ("有据", "范围无据", "有据", "有据")
     ]
-    asyncio.run(verify_items(reviewer, items, explain=True))
+    asyncio.run(verify_items(reviewer, items))
     # 4 条字段只发 2 次请求（3+1），逐条结论仍各自独立。
     assert reviewer.batches == [3, 1]
     assert reviewer.fields == ["有据", "范围无据", "有据", "有据"]
@@ -385,7 +304,7 @@ def test_support_review_receives_block_text_and_neighbours_for_section_attributi
         },
     ]
     reviewer = Reviewer()
-    asyncio.run(verify_items(reviewer, items[:1], explain=True, evidence=evidence))
+    asyncio.run(verify_items(reviewer, items[:1], evidence=evidence))
     assert items[0]["verification"] == "supported"
     citation = reviewer.batch[0]["values"][0]["citations"][0]
     assert "bbox" not in citation
@@ -396,7 +315,7 @@ def test_support_review_receives_block_text_and_neighbours_for_section_attributi
     assert [row["offset"] for row in context["before"]][-1] == 132
     assert [row["offset"] for row in context["after"]] == [134]
     legacy = Reviewer()
-    asyncio.run(verify_items(legacy, items[1:], explain=True, evidence=evidence))
+    asyncio.run(verify_items(legacy, items[1:], evidence=evidence))
     legacy_citation = legacy.batch[0]["values"][0]["citations"][0]
     legacy_context = legacy_citation["block_context"]
     assert legacy_context["offset"] == 134
@@ -405,7 +324,7 @@ def test_support_review_receives_block_text_and_neighbours_for_section_attributi
     assert "before" not in legacy_context and "after" not in legacy_context
     # 未传证据的调用（例如项目问答）保持原载荷，不能凭空出现上下文。
     plain = Reviewer()
-    asyncio.run(verify_items(plain, items[:1], explain=True))
+    asyncio.run(verify_items(plain, items[:1]))
     assert "block_context" not in plain.batch[0]["values"][0]["citations"][0]
 
 
@@ -427,7 +346,7 @@ def _window_evidence(rows):
 
 def test_support_review_receives_distant_chapter_heading_without_crossing_source_or_gaps():
     """真实人员条款距离章标题20块；扩大语义上下文仍须隔离资料、版本和缺块区间。"""
-    from tender.application.analysis.skills import EvidenceWindows
+    from tender.application.knowledge.answer_evidence import EvidenceWindows
 
     class Reviewer:
         async def complete(self, prompt):
@@ -465,7 +384,7 @@ def test_support_review_receives_distant_chapter_heading_without_crossing_source
         }
     ]
     reviewer = Reviewer()
-    asyncio.run(verify_items(reviewer, items, explain=True, evidence=evidence))
+    asyncio.run(verify_items(reviewer, items, evidence=evidence))
     context = reviewer.batch[0]["values"][0]["citations"][0]["block_context"]
     assert context["chapter_heading"] == {
         "offset": 15,
@@ -483,7 +402,7 @@ def test_support_review_receives_distant_chapter_heading_without_crossing_source
 
 def test_contract_section_heading_does_not_leak_into_next_chapter():
     """通用与专用合同条款的标题离条款很远，必须保留节归属并在新章边界清除。"""
-    from tender.application.analysis.skills import EvidenceWindows
+    from tender.application.knowledge.answer_evidence import EvidenceWindows
 
     evidence = _window_evidence([(n, 5, "合同正文。") for n in range(40)])
     for offset, content in (
@@ -553,7 +472,7 @@ def test_support_review_merges_only_physically_adjacent_blocks_for_continuation(
         }
     ]
     reviewer = Reviewer()
-    asyncio.run(verify_items(reviewer, items, explain=True, evidence=evidence))
+    asyncio.run(verify_items(reviewer, items, evidence=evidence))
     assert items[0]["verification"] == "supported"
     context = reviewer.batch[0]["values"][0]["citations"][0]["block_context"]
     assert context["continuous"].startswith("〔块275〕")
@@ -589,7 +508,7 @@ def test_support_review_merges_only_physically_adjacent_blocks_for_continuation(
         }
     ]
     gap_reviewer = Reviewer()
-    asyncio.run(verify_items(gap_reviewer, gap_items, explain=True, evidence=gap_evidence))
+    asyncio.run(verify_items(gap_reviewer, gap_items, evidence=gap_evidence))
     gap_context = gap_reviewer.batch[0]["values"][0]["citations"][0]["block_context"]
     assert "continuous" not in gap_context
     # 归属仍可由邻近标题块核对，标题块必须随载荷发出。
@@ -618,6 +537,6 @@ def test_support_review_merges_only_physically_adjacent_blocks_for_continuation(
         }
     ]
     closed_reviewer = Reviewer()
-    asyncio.run(verify_items(closed_reviewer, closed_items, explain=True, evidence=closed_evidence))
+    asyncio.run(verify_items(closed_reviewer, closed_items, evidence=closed_evidence))
     closed_context = closed_reviewer.batch[0]["values"][0]["citations"][0]["block_context"]
     assert "continuous" not in closed_context

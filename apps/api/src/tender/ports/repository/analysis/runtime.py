@@ -4,7 +4,7 @@
 fencing、未知请求标记这些都属于持久化细节。用例层只表达「现在想领取一个执行槽」
 「把这一版状态存下来」「按这个终态收尾」，不铺开 ``UPDATE ... WHERE owner=...``。
 
-实现见 ``adapters/pg/repositories/agent_runtime.py``；``None`` 一律表示「调用方不需要
+实现见 ``adapters/pg/repositories/analysis/runtime.py``；``None`` 一律表示「调用方不需要
 这次写回」，例如状态未变化时不必发布成果。
 """
 
@@ -51,8 +51,8 @@ class AgentRunStore(Protocol):
         """累计一次模型调用的 token 用量并记一条审计事件（``record`` 已序列化为字典）。"""
         ...
 
-    def save(self, state: dict[str, Any], *, publish: dict[str, Any] | None = None) -> None:
-        """把这一版运行状态写回；``publish`` 非空时同步发布已核实成果。"""
+    def save(self, state: dict[str, Any]) -> None:
+        """把这一版Agent工作区状态写回检查点。"""
         ...
 
     def finish(

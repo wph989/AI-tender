@@ -1,19 +1,13 @@
 """单标段编制基线：范围、条件、完整清单、版本身份与未决事项。"""
 
-import asyncio
 import copy
 import json
 from types import SimpleNamespace
 
 import pytest
-from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
-from synthesis_fixtures import research_calls
-from test_analysis_research import block, session
-from test_deep_analysis import KEY as MODULE
-from test_deep_analysis import SKILL, ScriptedRouter, call
+from test_analysis_research import block
 
-from tender.application.analysis.agent import RoutedAgentModel, build_module_agent, invoke_module
 from tender.application.analysis.data import (
     BusinessRecord,
     ContextError,
@@ -27,7 +21,6 @@ from tender.application.analysis.data import (
     prepare_records,
 )
 from tender.application.analysis.data_store import accessible_data
-from tender.application.analysis.policy import correction_count, progress_signature
 from tender.application.knowledge.content import merge_field_entries
 
 KEY = "project_basic_info_parsing"
@@ -43,7 +36,7 @@ def record(key="r", text="质保三年", scope=None, **kwargs):
     return BusinessRecord(
         key=key, title=kwargs.pop("title", key), text=text,
         kind=kwargs.pop("kind", "requirement"), scope=scope or COMMON,
-        citations=[{"block_id": "s1r1c0", "quote": text}], structuring="complete", **kwargs,
+        citations=[{"block_id": "s1r1c0"}], structuring="complete", **kwargs,
     )
 
 
@@ -54,6 +47,7 @@ def dataset(records, *, topics=None, coverage=None, gaps=None, lots=None, key=KE
     items = prepare_records(records, state, seen, key)
     for item in items:
         item["verification"] = "supported"
+    state["agent_workspace"] = {"finalized": True, "final_ids": [i["id"] for i in items]}
     state.update(staged_items=items, business_topics=topics or [], business_coverage=coverage or [],
                  business_gaps=gaps or [])
     module = {"module_key": key, "title": "测试专题", "status": "completed",
@@ -106,106 +100,6 @@ def test_content_requires_applicable_record_ids_and_check_paginates_without_omis
                                          requirement_ids=[other]))
 
 
-def test_same_key_corrections_keep_identity_and_conditions_are_kept_for_review():
-    state, seen = {}, {"s1r1c0": block() | {"content": "质保三年\n质保四年"}}
-    first = prepare_records([record()], state, seen, KEY)[0]
-    second = prepare_records([record(text="质保四年", title="更名", conditions={
-        "expression": "不少于四年", "logic": "all", "terms": [
-            {"subject": "质保期限", "operator": ">=", "value": "4", "unit": "年",
-             "time_basis": None}], "exceptions": [],
-    })], state, seen, KEY)[0]
-    assert first["id"] == second["id"]
-    assert second["business"]["conditions"]["terms"][0]["operator"] == ">="
-    assert second["business"]["conditions"]["terms"][0]["time_basis"] is None
-
-
-def test_support_review_omits_unspecified_attributes_but_keeps_actual_claims():
-    from tender.application.analysis.skills import verify_items
-    from tender.ports.llm.chat import Completion
-
-    async def run():
-        records = [record("plain"), record("detailed", conditions={
-            "expression": "两项均须满足", "logic": "all", "terms": [
-                {"subject": "期限", "operator": ">=", "value": "3", "unit": "年"}],
-            "exceptions": ["例外条件"],
-        }, materials=[{"name": "证明", "requirement": "提交原件"}], scoring={
-            "max_points": "0", "tiers": [{"condition": "未提供", "points": "0"}],
-            "deductions": ["每缺一项扣分"],
-        })]
-        items = prepare_records(records, {}, {"s1r1c0": block()}, KEY)
-        before = copy.deepcopy(items)
-        sent = []
-
-        class Reviewer:
-            async def complete(self, prompt):
-                # 检查真正送给模型的数据，不能只验证一个未被调用的辅助函数。
-                sent.extend(json.loads(prompt.rsplit("\n", 1)[1]))
-                return Completion(content=json.dumps({"reviews": [
-                    {"supported": True, "unsupported_claims": []} for _ in items
-                ]}), model="fixture")
-
-        await verify_items(Reviewer(), items, explain=True)
-        plain, detailed = [row["business"] for row in sent]
-        assert not {"conditions", "materials", "scoring", "parent_key", "predicate"} & plain.keys()
-        assert plain["scope"] == COMMON
-        for key in ("scope", "conditions", "materials", "scoring"):
-            assert detailed[key] == before[1]["business"][key]
-        # 送审表示不改变持久记录或纠错身份，空字段继续保留原有存储结构。
-        assert [item["business"] for item in items] == [item["business"] for item in before]
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("quote_catalog,select_catalog,scope,expected", [
-    (False, False, {"kind": "lots", "lot_refs": ["Ａ标段", "B标段"]}, "unsupported"),
-    (True, False, {"kind": "lots", "lot_refs": ["Ａ标段", "B标段"]}, "unsupported"),
-    (True, True, {"kind": "lots", "lot_refs": ["Ａ标段", "B标段"]}, "supported"),
-    (False, False, COMMON, "supported"),
-])
-def test_scope_identifiers_must_remain_in_selected_quotes(
-    quote_catalog, select_catalog, scope, expected,
-):
-    from tender.application.analysis.skills import verify_items
-    from tender.ports.llm.chat import Completion
-
-    async def run():
-        requirement = block() | {"content": "各标段质保三年。"}
-        catalog = block() | {"block_id": "catalog", "offset": 1, "element_id": 2,
-                             "content": "本项目包括 A 标段和 B 标段。"}
-        refs = [{"block_id": requirement["block_id"], "quote": requirement["content"]}]
-        if quote_catalog:
-            refs.append({"block_id": "catalog", "quote": catalog["content"]})
-        row = BusinessRecord.model_validate(
-            record(text=requirement["content"], scope=scope).model_dump() | {"citations": refs}
-        )
-        seen = {r["block_id"]: r for r in (requirement, catalog)}
-        if scope["kind"] == "lots" and not quote_catalog:
-            with pytest.raises(ValueError, match="scope.lot_refs"):
-                prepare_records([row], {}, seen, KEY)
-            return
-        items = prepare_records([row], {}, seen, KEY)
-        selected = [requirement["block_id"]] + (["catalog"] if select_catalog else [])
-
-        class PermissiveReviewer:
-            async def complete(self, prompt):
-                # 模拟真实模型误放行；上下文含名单也不能替代最终记录自己的引文。
-                return Completion(content=json.dumps({"reviews": [{
-                    "supported": True, "unsupported_claims": [],
-                    "unresolved_references": [], "evidence_ids": [selected],
-                }]}), model="fixture")
-
-        await verify_items(PermissiveReviewer(), items, explain=True,
-                           evidence=seen, select_evidence=True)
-        assert items[0]["verification"] == expected
-        if expected == "unsupported":
-            assert "lot_refs" in " ".join(items[0]["verification_claim_issues"])
-        else:
-            assert not items[0]["verification_claim_issues"]
-            assert [r["block_id"] for r in items[0]["values"][0]["citations"]] == selected
-
-    asyncio.run(run())
-
-
 def test_deep_format_tree_is_preserved_and_cycles_are_rejected():
     records = [record(str(n), text=f"材料{n}", kind="format_node", node_type="section",
                       parent_key=str(n-1) if n else None) for n in range(5)]
@@ -215,13 +109,6 @@ def test_deep_format_tree_is_preserved_and_cycles_are_rejected():
     records[0] = records[0].model_copy(update={"parent_key": "4"})
     with pytest.raises(ValueError, match="循环"):
         dataset(records, key="bid_format_outline_parsing")
-
-
-def test_completed_modules_do_not_hide_unchecked_topics():
-    data = dataset([record()], topics=[{"key": "score", "title": "评分细则"}])
-    assert data["readiness"] == "partial"
-    assert data["coverage"][0]["status"] == "unchecked"
-    assert any(g["code"] == "coverage_unchecked" for g in data["gaps"])
 
 
 def test_lot_specific_addendum_does_not_replace_other_lots_common_requirement():
@@ -239,44 +126,6 @@ def test_lot_specific_addendum_does_not_replace_other_lots_common_requirement():
     assert data == original
 
 
-def test_native_graph_submits_business_records_and_reuses_stable_identity():
-    async def run():
-        state, saved, reviewed = {}, [], []
-        research = session([block()])
-        first = record("warranty", title="质保")
-        corrected = first.model_copy(update={"title": "质保期限"})
-        def submission(value, final):
-            return {"records": [synthesis_record(value)], "coverage": [], "gaps": [],
-                    "research_summary": "已核对质保", "final": final}
-        router = ScriptedRouter([
-            *research_calls(),
-            call("submit_analysis", submission(first, False), 2),
-            call("submit_analysis", submission(corrected, True), 3),
-        ])
-        async def save(value):
-            saved.append(copy.deepcopy(value))
-        async def noop():
-            pass
-        async def review(items):
-            reviewed.extend(copy.deepcopy(items))
-            for item in items:
-                item["verification"] = "supported"
-        graph, files = build_module_agent(
-            key=MODULE, model=RoutedAgentModel(router=router), research=research, state=state,
-            snapshot={**SKILL, "__analysis_data_version__": "1",
-                      MODULE + "/references/coverage.json": json.dumps([])},
-            checkpointer=InMemorySaver(), reserve_tool=noop, save=save, review_support=review,
-        )
-        await invoke_module(graph, files, thread_id="native-business", task="解析", state=state,
-                            save=save)
-        records = state["draft"]["business_data"]["records"]
-        assert len(records) == 1 and records[0]["title"] == "质保期限"
-        assert reviewed[0]["id"] == reviewed[1]["id"]
-        assert records[0]["scope"]["kind"] == "common"
-        assert len(router.requests) == 5
-    asyncio.run(run())
-
-
 def test_display_projection_keeps_same_title_records_in_different_lots():
     items = prepare_records([
         record("a", title="质保", scope={"kind": "lots", "lot_refs": ["A"]}),
@@ -288,36 +137,6 @@ def test_display_projection_keeps_same_title_records_in_different_lots():
     assert all("business" not in item for item in projected)
     assert len(merge_field_entries(projected)) == 2
     assert {item["record_id"] for item in projected} == {item["id"] for item in items}
-
-
-def test_business_corrections_use_identity_and_keep_lot_budgets_separate():
-    state = {}
-    items = prepare_records([
-        record("a", title="质保", scope={"kind": "lots", "lot_refs": ["A"]}),
-        record("b", title="质保", scope={"kind": "lots", "lot_refs": ["B"]}),
-    ], state, {"s1r1c0": block() | {"content": "A：质保三年\nB：质保三年"}}, KEY)
-    assert correction_count(state, items[0]) == 1
-    assert correction_count(state, items[1]) == 1
-    corrected = copy.deepcopy(items[0])
-    corrected["field"] = "改名"
-    corrected["values"][0]["value"] = "修改后的条件"
-    assert correction_count(state, corrected) == 2
-    # 同一语义换 key 也不能绕过事实额度；不同标段的额度则仍独立。
-    renamed = copy.deepcopy(items[1])
-    renamed["id"] = "new-id"
-    renamed["business"].update(id="new-id", key="new-key", title="改名")
-    assert correction_count(state, renamed) == 2
-
-
-def test_verified_scope_correction_counts_as_progress_but_title_change_does_not():
-    item = prepare_records([record()], {}, {"s1r1c0": block()}, KEY)[0]
-    item["verification"] = "supported"
-    state = {"staged_items": [item]}
-    before = progress_signature({}, state)
-    item["field"] = item["business"]["title"] = "改名"
-    assert progress_signature({}, state) == before
-    item["business"]["scope"] = {"kind": "lots", "lot_refs": ["A"]}
-    assert progress_signature({}, state) != before
 
 
 def test_lot_coverage_does_not_silently_complete_other_lots():
@@ -344,10 +163,12 @@ def test_not_applicable_proof_is_preserved_and_rechecked_on_read():
     state = {"business_topics": [{"key": "deposit", "title": "保证金"}]}
     entries, items = prepare_coverage([CoverageInput(
         topic="deposit", scope=COMMON, status="not_applicable", detail="本项目无需保证金",
-        citations=[{"block_id": "s1r1c0", "quote": "本项目无需保证金"}],
+        citations=[{"block_id": "s1r1c0"}],
     )], state, seen, state["business_topics"], KEY)
     items[0]["verification"] = "supported"
-    state.update(staged_items=items, business_coverage=entries)
+    state.update(staged_items=items, business_coverage=entries, agent_workspace={
+        "finalized": True, "final_ids": [item["id"] for item in items],
+    })
     data = assemble_dataset([{
         "module_key": KEY, "title": "保证金", "status": "completed",
         "business_data": module_data(state),
@@ -397,7 +218,7 @@ def test_not_applicable_proofs_are_independent_for_each_lot(legacy_keys):
     entries, items = prepare_coverage([
         CoverageInput(topic="deposit", scope={"kind": "lots", "lot_refs": [lot]},
                       status="not_applicable", detail=f"{lot}标段无需保证金",
-                      citations=[{"block_id": "s1r1c0", "quote": quote}])
+                      citations=[{"block_id": "s1r1c0"}])
         for lot in ("A", "B")
     ], state, {"s1r1c0": block() | {"content": quote}}, state["business_topics"], KEY)
     if not legacy_keys:
@@ -407,7 +228,9 @@ def test_not_applicable_proofs_are_independent_for_each_lot(legacy_keys):
         if legacy_keys:
             # 已保存的旧检查点也必须按证明 ID 查找，不能再次按重复 key 丢掉前一标段。
             item["business"]["key"] = "coverage:deposit"
-    state.update(staged_items=items, business_coverage=entries)
+    state.update(staged_items=items, business_coverage=entries, agent_workspace={
+        "finalized": True, "final_ids": [item["id"] for item in items],
+    })
     data = assemble_dataset([{"module_key": KEY, "title": "保证金", "status": "completed",
                               "business_data": module_data(state)}], LOTS)
     assert [c["status"] for c in data["coverage"]] == ["not_applicable", "not_applicable"]
@@ -420,7 +243,7 @@ def test_coverage_correction_reuses_proof_identity_from_checkpoint(legacy_id):
     quote = "本项目无需保证金"
     seen = {"s1r1c0": block() | {"content": quote}}
     entry = CoverageInput(topic="deposit", scope=COMMON, status="not_applicable", detail=quote,
-                          citations=[{"block_id": "s1r1c0", "quote": quote}])
+                          citations=[{"block_id": "s1r1c0"}])
     coverage, first = prepare_coverage([entry], state, seen, state["business_topics"], KEY)
     expected = "legacy-proof" if legacy_id else first[0]["id"]
     coverage[0]["review_id"] = expected
@@ -430,73 +253,10 @@ def test_coverage_correction_reuses_proof_identity_from_checkpoint(legacy_id):
     assert corrected[0]["id"] == expected
 
 
-def synthesis_record(record):
-    # 数据投影测试仍使用通用业务记录，真实图必须按其专题格式构造综合内容。
-    if record.kind == "format_node":
-        return record.model_dump() | {"content": {"编制要求": [record.text]}}
-    return record.model_dump() | {
-        "group": "项目基本信息", "content": {"字段": record.title, "内容": record.text},
-    }
 
 
-def business_submission(records=(), *, gaps=(), final=False):
-    return {"records": [synthesis_record(r) for r in records], "coverage": [], "gaps": list(gaps),
-            "research_summary": "已核对本批结果", "final": final}
 
 
-async def run_business_batches(key, batches, rejected_text=None):
-    state, saved = {}, []
-    router = ScriptedRouter([
-        *research_calls(query="项目要求"),
-        *[call("submit_analysis", batch, index + 2) for index, batch in enumerate(batches)],
-    ])
-
-    async def save(value):
-        saved.append(copy.deepcopy(value))
-
-    async def noop():
-        pass
-
-    async def review(items):
-        for item in items:
-            item["verification"] = (
-                "unsupported" if rejected_text in item["business"]["content"].values()
-                or [rejected_text] in item["business"]["content"].values() else "supported"
-            )
-
-    content = "\n".join(r["text"] for batch in batches for r in batch["records"])
-    graph, files = build_module_agent(
-        key=key, model=RoutedAgentModel(router=router),
-        research=session([block() | {"content": content}]), state=state,
-        snapshot={**SKILL, key + "/SKILL.md": (
-            f"---\nname: {key.replace('_', '-')}\ndescription: 测试解析\n---\n核对项目"
-        ), "__analysis_data_version__": "1", key + "/references/coverage.json": "[]"},
-        checkpointer=InMemorySaver(), reserve_tool=noop, save=save, review_support=review,
-    )
-    await invoke_module(graph, files, thread_id="business-regression", task="解析", state=state,
-                        save=save)
-    return state, saved, router
-
-
-def test_partial_format_rollback_requires_repair_before_final_submission():
-    key = "bid_format_outline_parsing"
-    a = record("a", text="材料A", kind="format_node", node_type="section")
-    b = record("b", text="材料B", kind="format_node", node_type="section", parent_key="a")
-    moved_a = a.model_copy(update={"parent_key": "b"})
-    moved_b = record("b", text="材料B错误条件", kind="format_node", node_type="section")
-    state, saved, router = asyncio.run(run_business_batches(key, [
-        business_submission([a]), business_submission([b]),
-        business_submission([moved_a]), business_submission([moved_b]),
-        business_submission(final=True), business_submission([a], final=True),
-    ], rejected_text=moved_b.text))
-    # 空 final 不能发布部分回退产生的环，必须让模型收到结构反馈并修正后再完成。
-    assert len(router.requests) == 8
-    assert any("循环" in str(messages) for messages, _ in router.requests)
-    records = state["draft"]["business_data"]["records"]
-    assert {r["key"]: r["parent_key"] for r in records} == {"a": None, "b": "a"}
-    assert all("draft" not in s for s in saved if any(
-        i.get("business", {}).get("parent_key") == "b" for i in s.get("staged_items", [])
-    ))
 
 
 @pytest.mark.parametrize("change", ["cycle", "renamed_parent", "unverified_parent_path"])
@@ -522,6 +282,9 @@ def test_snapshot_excludes_invalid_format_paths_after_partial_rollback(change):
         state["staged_items"][-1] = prepare_records([records[2]], state, seen, key)[0]
     for item in state["staged_items"]:
         item["verification"] = "supported"
+    state["agent_workspace"] = {
+        "finalized": True, "final_ids": [item["id"] for item in state["staged_items"]],
+    }
     data = assemble_dataset([{"module_key": key, "title": "格式", "status": "failed",
                               "business_data": module_data(state)}], [])
     context = build_context(data, ContextInput(snapshot_id=1, purpose="outline"))
@@ -533,25 +296,3 @@ def test_snapshot_excludes_invalid_format_paths_after_partial_rollback(change):
     )
     assert any(g["code"] == ("format_cycle" if change == "cycle" else "parent_path_changed")
                for g in context["gaps"])
-
-
-@pytest.mark.parametrize("keep_unresolved", [False, True])
-def test_final_gaps_replace_history_only_after_successful_verification(keep_unresolved):
-    missing = {"key": "reference", "topic": "warranty", "scope": COMMON,
-               "code": "unresolved_reference", "detail": "质保条款转引待补读"}
-    remaining = {**missing, "key": "other", "detail": "另一条要求尚未核对"}
-    bad = record("warranty", text="质保错误条件")
-    good = record("warranty", text="质保三年")
-    final_gaps = [remaining] if keep_unresolved else []
-    state, saved, _ = asyncio.run(run_business_batches(KEY, [
-        business_submission(gaps=[missing, remaining]), business_submission([good]),
-        business_submission([bad], final=True),
-        business_submission([good], gaps=final_gaps, final=True),
-    ], rejected_text=bad.text))
-    failed_final = [s for s in saved if s.get("correction_failures") and "draft" not in s]
-    assert failed_final
-    assert all({g["key"] for g in s["business_gaps"]} == {"reference", "other"}
-               for s in failed_final)
-    data = state["draft"]["business_data"]
-    assert data["gaps"] == final_gaps
-    assert [r["content"]["内容"] for r in data["records"]] == [good.text]

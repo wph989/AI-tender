@@ -86,6 +86,10 @@ class ConfigRegistry:
         if self._cache is not None:
             self._cache.close()
 
+    def health(self) -> bool:
+        """配置缓存是运行就绪依赖；未装配缓存时不报告 Redis 就绪。"""
+        return self._cache is not None and self._cache.health()
+
     def _load(self, company_id: int) -> dict[str, Any] | None:
         with self._engine.connect() as connection:
             row = (

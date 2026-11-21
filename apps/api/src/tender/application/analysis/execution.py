@@ -8,29 +8,27 @@ import json
 import random
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from datetime import UTC, datetime
 from typing import Any
 
-from tender.application.analysis.agent import (
-    RoutedAgentModel,
-    VerificationUnavailable,
-    invoke_module,
-    validate_project_claims,
-)
+from langsmith import tracing_context
+from psycopg import OperationalError
+
 from tender.application.analysis.data_store import publish_data_snapshot
-from tender.application.analysis.research import AgentLimits, ResearchSession
+from tender.application.analysis.quality import validate_project_claims
 from tender.application.analysis.runtime import AgentRuntime, check_report_access
-from tender.application.analysis.search_control import TopicSearch
-from tender.application.analysis.skill_agent import build_skill_agent as build_module_agent
+from tender.application.analysis.skill_agent import build_skill_agent
 from tender.application.analysis.skills import MODULES
-from tender.application.analysis.topic_flow import TopicIncomplete, enabled
 from tender.application.knowledge.content import encode, normalized, source_signature, source_state
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
+from tender.application.shared.agent_model import RoutedAgentModel
+from tender.application.shared.research import AgentLimits, ResearchSession
 from tender.core.error_details import error_detail
 from tender.core.logging import bind_context, get_logger
+from tender.domain.analysis.contract import is_current_report
 from tender.domain.shared.errors import BudgetExhausted, ModelBudgetExhausted, ModelUnavailable
 from tender.ports.analysis.archive import AnalysisArchive
 from tender.ports.llm.embedding import EmbeddingModel
@@ -45,6 +43,59 @@ FULL_ACCESS_HEARTBEATS = 2
 # 等待配额时权限检查与等待事件都按约 30 秒节流，避免 13 个模块逐秒打满权限查询。
 CLAIM_ACCESS_CHECK_SECONDS = 30.0
 CLAIM_WAIT_EVENT_SECONDS = 30.0
+
+
+async def invoke_module(
+    graph,
+    files: dict,
+    *,
+    thread_id: str,
+    task: str,
+    state: dict | None = None,
+    save: Callable[[dict], Awaitable[None]] | None = None,
+    max_retries: int = 2,
+    recursion_limit: int = 256,
+) -> dict:
+    """恢复已有图检查点；仅连接故障按已持久化次数重试。"""
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
+    with tracing_context(enabled=False):
+        while True:
+            try:
+                checkpoint = await graph.aget_state(config)
+                if checkpoint.values:
+                    if not checkpoint.next:
+                        logger.debug("checkpoint.done", thread_id=thread_id)
+                        return dict(checkpoint.values)
+                    logger.info("checkpoint.resume", thread_id=thread_id)
+                    return await graph.ainvoke(None, config=config, durability="sync")
+                return await graph.ainvoke(
+                    {"messages": [("user", task)], "files": files},
+                    config=config,
+                    durability="sync",
+                )
+            except (ConnectionError, OperationalError) as exc:
+                sqlstate = getattr(exc, "sqlstate", None)
+                recoverable = (
+                    not sqlstate
+                    or sqlstate.startswith("08")
+                    or sqlstate in {"40001", "40P01", "57P01"}
+                )
+                if state is None or save is None or not recoverable:
+                    raise
+                attempts = state.get("subagent_retries", 0)
+                if attempts >= max_retries:
+                    raise RuntimeError("Agent检查点恢复次数已耗尽") from exc
+                state["subagent_retries"] = attempts + 1
+                await save(state)
+                logger.warning(
+                    "checkpoint.retry",
+                    thread_id=thread_id,
+                    retry_ordinal=attempts + 1,
+                    max_retries=max_retries,
+                    error_type=type(exc).__name__,
+                    error=error_detail(str(exc)),
+                )
+                await asyncio.sleep(min(0.5 * (attempts + 1), 2))
 
 
 def next_claim_delay(attempt: int, random_value: float) -> float:
@@ -328,9 +379,7 @@ class AnalysisExecutor:
             state["quality_input_signature"] = source_signature(
                 report["source_snapshot"] + report["reference_snapshot"],
             )
-            from tender.application.analysis.contract import FLOW_VERSION as PROTOCOL_VERSION
-
-            if report["skill_snapshot"].get("__analysis_flow_version__") != PROTOCOL_VERSION:
+            if not is_current_report(report):
                 raise ValueError("解析协议已升级，旧检查点不能恢复；请重新创建报告")
             limits = AgentLimits(**runtime.run["limits"])
             prior = state.get("research", {})
@@ -369,7 +418,7 @@ class AnalysisExecutor:
 
             async def work():
                 async with self.checkpoints() as saver:
-                    graph, files = build_module_agent(
+                    graph, files = build_skill_agent(
                         key=module["module_key"],
                         model=RoutedAgentModel(router=model),
                         research=research,
@@ -490,7 +539,6 @@ class AnalysisExecutor:
                     gap_count=len(state.get("business_gaps", [])),
                     model_calls=runtime.run["model_calls"],
                     tool_calls=runtime.run["tool_calls"],
-                    **TopicSearch.summary(state),
                 )
 
             task = asyncio.create_task(work())
@@ -504,13 +552,12 @@ class AnalysisExecutor:
                         runtime.heartbeat, heartbeats % FULL_ACCESS_HEARTBEATS == 0
                     )
             await task
-        except (VerificationUnavailable, ModelUnavailable, TopicIncomplete) as exc:
-            # 校验网关或模型恢复不可用不等于分析无成果：只发布已核实条目。
+        except ModelUnavailable as exc:
+            # 保留中断状态供补跑，未最终提交的草稿不进入正式结果。
             await self._settle_incomplete(runtime, state, task, started, exc, queue_ms=queue_ms)
         except (Exception, asyncio.CancelledError) as exc:
-            if isinstance(exc, (TimeoutError, ModelBudgetExhausted, BudgetExhausted)) and (
-                state.get("agent_workspace") or enabled(report.get("skill_snapshot", {}))
-            ):
+            if (isinstance(exc, (TimeoutError, ModelBudgetExhausted, BudgetExhausted))
+                    and state.get("agent_workspace")):
                 await self._settle_incomplete(runtime, state, task, started, exc, queue_ms=queue_ms)
                 return
             if task and not task.done():
@@ -528,7 +575,6 @@ class AnalysisExecutor:
                 saved_item_count=sum(
                     i.get("verification") == "supported" for i in state.get("staged_items", [])
                 ),
-                **TopicSearch.summary(state),
                 # 适配器已对业务异常脱敏；不串联原始 SDK 异常，以免回显其请求或凭证。
                 exception=None
                 if canceled
@@ -563,7 +609,7 @@ class AnalysisExecutor:
         *,
         queue_ms: int = 0,
     ) -> None:
-        """模型或校验不可用时收尾：有已核实成果才是 partial，否则明确失败。"""
+        """模型不可用时保留工作区并标记 partial，等待同一 Agent 后续补跑。"""
         reason = str(exc)
         state["quality_status"] = "needs_review"
         if task and not task.done():
@@ -575,48 +621,15 @@ class AnalysisExecutor:
             state["stop_reason"] = {"code": "agent_interrupted", "message": reason[:2000]}
             await asyncio.to_thread(runtime.finish, "partial", reason[:1000], state=state)
             return
-        from tender.application.analysis.state import published_items
-
-        supported = len(published_items(state, final=bool(state.get("topic_flow"))))
-        if state.get("topic_flow"):
-            state["business_gaps"] = [*state.get("business_gaps", []), {
-                "key": "execution:incomplete", "topic": "运行收尾",
-                "scope": {"kind": "unknown", "lot_refs": []},
-                "code": "search_exhausted", "detail": reason[:2000],
-            }]
-        if supported:
-            await asyncio.to_thread(runtime.finish, "partial", reason[:1000], state=state)
-            await asyncio.to_thread(
-                runtime.event,
-                "partial_publish",
-                {"item_count": supported, "reason_type": type(exc).__name__},
-            )
-            logger.warning(
-                "module.partial",
-                duration_ms=int((time.monotonic() - started) * 1000),
-                queue_ms=queue_ms,
-                saved_item_count=supported,
-                pending_count=state.get("verification_degraded", {}).get("pending_count"),
-                gap_count=len(state.get("business_gaps", [])),
-                reason=error_detail(reason),
-                **TopicSearch.summary(state),
-            )
-        else:
-            if state.get("topic_flow"):
-                await asyncio.to_thread(runtime.finish, "failed", reason[:1000], state=state)
-            else:
-                await asyncio.to_thread(runtime.abandon, "failed", reason[:1000])
-            logger.error(
-                "module.fail",
-                duration_ms=int((time.monotonic() - started) * 1000),
-                queue_ms=queue_ms,
-                saved_item_count=0,
-                # 显式保留脱敏原因，避免仅依赖500字符异常摘要丢失后备模型的错误。
-                error=error_detail(reason),
-                **TopicSearch.summary(state),
-                # 业务异常已脱敏；不串联原始 SDK 原因，避免回显请求或凭证。
-                exception="".join(traceback.format_exception(exc, chain=False)),
-            )
+        await asyncio.to_thread(runtime.abandon, "failed", reason[:1000])
+        logger.error(
+            "module.fail",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            queue_ms=queue_ms,
+            saved_item_count=0,
+            error=error_detail(reason),
+            exception="".join(traceback.format_exception(exc, chain=False)),
+        )
 
     async def analyze_report(self, report: dict) -> None:
         with bind_context(project_id=report.get("project_id"), report_id=report["id"]):
@@ -699,7 +712,6 @@ class AnalysisExecutor:
             if db.snapshot_pending(report_id):
                 await asyncio.to_thread(publish_data_snapshot, db, report_id)
             return
-        from tender.application.analysis.contract import RUNTIME_VERSION
         from tender.application.shared.schema_guard import missing_schema
 
         # ORM 全列读取也会访问新列，所以先只读旧版已有的状态列，再核对结构；
@@ -716,10 +728,7 @@ class AnalysisExecutor:
         report = db.report_for_analysis(report_id)
         if report is None or report["status"] not in {"waiting", "pending", "running"}:
             return
-        # 旧的固定字段解析流程已下线：历史报告只读展示，不能继续执行；版本不一致同样拒绝。
-        if report["runtime_version"] != RUNTIME_VERSION:
-            db.finish_task(
-                "report", report_id, "failed", "报告使用已下线的解析流程，请重新发起分析"
-            )
+        # 队列可能在升级期间仍含旧协议消息，执行前按报告快照统一拒绝。
+        if not is_current_report(report):
             return
         await self.analyze_report(report)

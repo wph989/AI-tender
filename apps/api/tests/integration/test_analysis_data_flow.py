@@ -53,7 +53,7 @@ def basis(environment):
             key=key, title=title, text=content, kind=kind, code=code,
             scope={"kind": "lots", "lot_refs": [lot]} if lot else COMMON,
             structuring="complete",
-            citations=[{"block_id": block["block_id"], "quote": content}],
+            citations=[{"block_id": block["block_id"]}],
         )
 
     state = {}
@@ -70,7 +70,9 @@ def basis(environment):
     ], state, {block["block_id"]: block}, "project_basic_info_parsing")
     for item in items:
         item["verification"] = "supported"
-    state.update(staged_items=items, staged_items_verified=True)
+    state.update(staged_items=items, agent_workspace={
+        "finalized": True, "final_ids": [item["id"] for item in items],
+    })
     business = module_data(state)
     module_id = conn.execute(text("""INSERT INTO analysis_module
         (report_id,module_key,title,status,items,business_data)
@@ -116,18 +118,19 @@ def test_lot_without_original_code_publishes_and_resolves_by_verified_name(basis
     records = [
         BusinessRecord(
             key="named-lot", title="A标段", text="A标段", kind="lot", scope=COMMON,
-            citations=[{"block_id": basis.block["block_id"], "quote": "A标段"}],
+            citations=[{"block_id": basis.block["block_id"]}],
         ),
         BusinessRecord(
             key="warranty", title="质保要求", text="A标段质保三年", kind="requirement",
             scope={"kind": "lots", "lot_refs": ["A标段"]}, structuring="complete",
-            citations=[{"block_id": basis.block["block_id"], "quote": "A标段质保三年"}],
+            citations=[{"block_id": basis.block["block_id"]}],
         ),
     ]
     items = prepare_records(records, state, {basis.block["block_id"]: basis.block},
                             "project_basic_info_parsing")
     for item in items:
         item["verification"] = "supported"
+    state["agent_workspace"] = {"finalized": True, "final_ids": [i["id"] for i in items]}
     state["staged_items"] = items
     basis.db.execute(
         "UPDATE analysis_module SET business_data=CAST(:data AS JSONB) WHERE id=:id",

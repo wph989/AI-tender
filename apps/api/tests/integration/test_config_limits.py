@@ -20,9 +20,9 @@ from tender.api.llm import routes as llm
 from tender.api.projects import files as project_files
 from tender.api.projects import routes as projects
 from tender.api.shared.errors import ApiProblem
-from tender.application.analysis.research import AgentLimits, ResearchSession
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.profiles import FEATURE_FIELDS, MODEL_FIELDS
+from tender.application.shared.research import AgentLimits, ResearchSession
 from tender.config.registry import ConfigRegistry
 from tender.core.di import create_document_pipeline_repository
 from tender.domain.shared.errors import ParseUnavailable

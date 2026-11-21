@@ -34,6 +34,10 @@ class BlobStoreError(Exception):
 
 
 class BlobStore(Protocol):
+    def health(self) -> bool:
+        """检查当前对象存储后端是否可访问。"""
+        ...
+
     def close(self) -> None:
         """释放适配器持有的客户端资源。"""
         ...

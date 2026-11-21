@@ -237,46 +237,31 @@ def attach_completed_module(connection, report_id, blocks):
     return module_id, items
 
 
-def test_report_items_survive_reparse_and_show_unavailable_when_deleted(environment):
-    """报告的读取路径统一：重解析后旧引文仍可溯源，资料删除后降级为不可用而不是消失。"""
+def test_retired_report_is_hidden_from_application_but_history_is_preserved(environment):
+    """退役协议不再进入应用展示，数据库中的原报告与记录仍保留。"""
     request, conn, pid = environment
     version, run = add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
     report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
-    # 历史报告（runtime_version=legacy）与新报告共用展示路径，但会被标记为不可再执行。
     conn.execute(
         text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
         {"id": report["id"]},
     )
-    store = KnowledgeStore(request.app.state.components.engine, 1)
-    collection = knowledge.project_knowledge(pid, request)["collection_id"]
-    block = store.readable_chunks(store.sources([collection])[0])[0]
-    attach_completed_module(conn, report["id"], [block])
-    loaded = analysis_api.get_report(report["id"], request)
-    assert loaded["runtime_retired"] is True
-    reference = loaded["modules"][0]["items"][0]["values"][0]["citations"][0]
-    assert reference["version_id"] == version
-    assert store.resolve(reference)["parse_run_id"] == run
-    conn.execute(
-        text("""INSERT INTO parse_run(version_id,provider_version,tier,schema_version,status)
-        VALUES (:version,'test','standard','1','completed')"""),
-        {"version": version},
-    )
-    assert analysis_api.get_report(report["id"], request)["stale"] is True
-    conn.execute(
-        text("UPDATE project_file SET deleted_at=now() WHERE id=:id"),
-        {"id": reference["project_file_id"]},
-    )
-    with pytest.raises(LookupError):
-        store.resolve(reference)
-    assert (
-        analysis_api.get_report(report["id"], request)["modules"][0]["items"][0]["verification"]
-        == "unavailable"
-    )
+    assert version and run
+    status = analysis_api.analysis_status(pid, request)
+    assert all(item["id"] != report["id"] for item in status["reports"])
+    with pytest.raises(ApiProblem) as exc:
+        analysis_api.get_report(report["id"], request)
+    assert exc.value.status_code == 409 and exc.value.code == "runtime_retired"
+    stored = conn.execute(
+        text("SELECT id, runtime_version FROM analysis_report WHERE id=:id"),
+        {"id": report["id"]},
+    ).mappings().one()
+    assert stored["runtime_version"] == "legacy"
 
 
-def test_unfinished_module_shows_verified_items_saved_in_run_state(environment):
-    """未完成模块也展示已核实成果：运行状态里暂存的合格字段合并进结果，失败不白跑。"""
+def test_unfinished_module_does_not_show_saved_drafts(environment):
+    """暂存结果只在工作区，报告详情只展示正式结果。"""
     request, conn, pid = environment
     add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
@@ -316,7 +301,8 @@ def test_unfinished_module_shows_verified_items_saved_in_run_state(environment):
             "module": module_id,
             "thread": f"analysis:{report['id']}:{module_id}:1",
             "state": json.dumps(
-                {"staged_items": [item], "staged_items_verified": True}, ensure_ascii=False
+                {"agent_workspace": {"finalized": False, "final_ids": []},
+                 "staged_items": [item]}, ensure_ascii=False
             ),
         },
     )
@@ -326,8 +312,7 @@ def test_unfinished_module_shows_verified_items_saved_in_run_state(environment):
         if entry["id"] == module_id
     )
     assert module["status"] == "running"
-    assert [entry["field"] for entry in module["items"]] == ["资质"]
-    assert module["items"][0]["verification"] == "supported"
+    assert module["items"] == []
 
 
 def test_report_merges_same_field_versions_and_dedupes_locations(environment):
@@ -437,7 +422,7 @@ def test_report_preserves_outline_nodes_with_different_parent_paths(environment,
 
 
 def test_retired_runtime_report_cannot_run_or_retry(environment):
-    """旧流程报告只读：worker 拒绝执行，补跑接口报错而不是静默改写历史数据。"""
+    """Worker 拒绝运行退役报告，读取与补跑接口均返回明确错误。"""
     request, conn, pid = environment
     add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
@@ -447,15 +432,20 @@ def test_retired_runtime_report_cannot_run_or_retry(environment):
         {"id": report["id"]},
     )
     asyncio.run(worker._analyze_project(report["id"]))
-    retired = analysis_api.get_report(report["id"], request)
-    assert retired["status"] == "failed" and "已下线" in retired["error_message"]
+    stored = conn.execute(
+        text("SELECT status FROM analysis_report WHERE id=:id"), {"id": report["id"]}
+    ).scalar_one()
+    assert stored == "failed"
+    with pytest.raises(ApiProblem) as read_error:
+        analysis_api.get_report(report["id"], request)
+    assert read_error.value.status_code == 409 and read_error.value.code == "runtime_retired"
     with pytest.raises(ApiProblem) as exc:
         analysis_api.retry_report(report["id"], analysis_api.RetryInput(), request)
     assert exc.value.status_code == 409 and exc.value.code == "runtime_retired"
 
 
-def test_reference_snapshot_change_marks_only_current_runtime_reports_stale(environment):
-    """参考来源快照只有当前运行时会记录：旧报告不能因库里存在参考来源就被误判为已变化。"""
+def test_reference_snapshot_change_marks_current_runtime_reports_stale(environment):
+    """当前运行时记录参考来源快照，变化后报告标为过期。"""
     request, conn, pid = environment
     add_source(conn, pid, "要求甲级资质。")
     configure(request, pid)
@@ -473,13 +463,13 @@ def test_reference_snapshot_change_marks_only_current_runtime_reports_stale(envi
         {"pid": pid, "cid": collection},
     )
     assert analysis_api.get_report(report["id"], request)["stale"] is True
-    # 同一份报告标记为旧运行时后，同样的参考来源不能触发 stale：旧流程从不记录参考快照。
     conn.execute(
         text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
         {"id": report["id"]},
     )
-    retired = analysis_api.get_report(report["id"], request)
-    assert retired["runtime_retired"] is True and retired["stale"] is False
+    with pytest.raises(ApiProblem) as exc:
+        analysis_api.get_report(report["id"], request)
+    assert exc.value.code == "runtime_retired"
 
 
 def test_wait_for_missing_sources_or_explicit_partial_analysis(environment):

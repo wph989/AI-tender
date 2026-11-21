@@ -5,7 +5,7 @@ import asyncio
 import pytest
 from test_analysis_research import block, session
 
-from tender.application.analysis.research import AgentLimits
+from tender.application.shared.research import AgentLimits
 
 
 @pytest.mark.parametrize("queries", [("投标 保证金", "投标保证金"), ("A&amp;B", "A&B")])

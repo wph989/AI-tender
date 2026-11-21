@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import Any
 
-from sqlalchemy import Connection, Engine, case, exists, func, literal, or_, select
+from sqlalchemy import Connection, Engine, exists, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import aliased
 
@@ -19,6 +19,15 @@ from tender.adapters.pg.models import (
     Project,
 )
 from tender.adapters.pg.models.analysis import AnalysisRecordReview
+from tender.domain.analysis.contract import FLOW_VERSION, FLOW_VERSION_KEY, RUNTIME_VERSION
+
+
+def current_protocol():
+    # 先筛掉退役报告，避免它们占用列表名额或被再次派发。
+    return (
+        (AnalysisReport.runtime_version == RUNTIME_VERSION)
+        & (AnalysisReport.skill_snapshot[FLOW_VERSION_KEY].astext == FLOW_VERSION)
+    )
 
 
 class ReportQueries:
@@ -119,6 +128,7 @@ class ReportQueries:
                 .where(
                     AnalysisReport.project_id == project_id,
                     AnalysisReport.company_id == self.company_id,
+                    current_protocol(),
                 )
                 .order_by(AnalysisReport.id.desc())
                 .limit(30)
@@ -136,17 +146,7 @@ class ReportQueries:
             return [dict(row) for row in rows]
 
     def report_runs(self, report_id: int) -> list[dict[str, Any]]:
-        """报告的全部模块运行账（含尚未核实的暂存成果），按 attempt 升序。
-
-        ``saved_items`` 与旧裸 SQL 的口径一致：只有暂存已验证时才回显暂存成果。
-        """
-        saved = case(
-            (
-                AgentModuleRun.state["staged_items_verified"].astext == "true",
-                AgentModuleRun.state["staged_items"],
-            ),
-            else_=literal([], type_=JSONB),
-        ).label("saved_items")
+        """报告的全部模块运行账与进度，按 attempt 升序。"""
         # 成功数来自已落定的结果事件，不能用预占次数推算；聚合只扫描本报告的运行账。
         successes = (
             select(
@@ -205,7 +205,6 @@ class ReportQueries:
                     AgentModuleRun.state["quality_status"].astext.label("quality_status"),
                     AgentModuleRun.state["execution_mode"].astext.label("mode"),
                     AgentModuleRun.state["agent_progress"].label("agent_progress"),
-                    saved,
                 )
                 .select_from(AgentModuleRun)
                 .join(AnalysisModule, AnalysisModule.id == AgentModuleRun.module_id)

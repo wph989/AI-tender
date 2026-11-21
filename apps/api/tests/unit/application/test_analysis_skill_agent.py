@@ -5,20 +5,19 @@ import copy
 import json
 
 import pytest
+from agent_fixtures import KEY, ScriptedRouter, call, noop, raw, schema
 from langgraph.checkpoint.memory import InMemorySaver
-from synthesis_fixtures import noop
 from test_analysis_research import block, session
-from test_analysis_v3 import KEY, raw, schema
-from test_deep_analysis import ScriptedRouter, call
 
-from tender.application.analysis.agent import RoutedAgentModel, invoke_module
 from tender.application.analysis.drafts import AGENT_PROTOCOL
+from tender.application.analysis.execution import invoke_module
 from tender.application.analysis.skill_agent import (
     DraftSubmission,
     build_skill_agent,
     workspace_feedback,
 )
 from tender.application.analysis.skills import skill_snapshot
+from tender.application.shared.agent_model import RoutedAgentModel
 
 
 def test_encoded_array_error_explains_invalid_inner_json_without_echoing_body():
@@ -157,7 +156,6 @@ def test_one_agent_can_research_after_review_and_publish_only_explicit_final():
             names = {tool["function"]["name"] for tool in tools}
             assert {"search_document", "submit_analysis", "record_review", "read_document"} <= names
             assert "complete_research" not in names and "task" not in names
-        assert "topic_flow" not in state
 
     asyncio.run(run())
 

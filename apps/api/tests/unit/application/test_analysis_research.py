@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from tender.application.analysis.research import (
+from tender.application.shared.research import (
     AgentLimits,
     EvidenceBudgetError,
     ResearchSession,

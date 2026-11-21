@@ -54,7 +54,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       ...(data?.format_nodes ?? []), ...(data?.relations ?? []), ...(data?.lots ?? [])]
       .map((record) => [record.id, record]));
     return report.modules.map((module) => ({ ...module, items: module.items.map((item) => ({
-      ...item, record: item.record?.review_status === "needs_review" ? item.record : byId.get(item.id) ?? item.record,
+      ...item, record: byId.get(item.id) ?? item.record,
     })) }));
   }, [report.modules, data]);
   const allItems = useMemo(() => modules.flatMap((module) => module.items), [modules]);
@@ -68,9 +68,6 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
     && (!modules.length || modules.some((module) => module.quality_status === "needs_review"
       || module.quality_status === "needs_input" && (module.input_changed ?? report.stale)
       || module.status !== "completed" && module.quality_status !== "needs_input"));
-  // 协议升级影响可执行性，保留原有入口并说明原因，避免用户误以为重解析功能被删除。
-  const retryBlockedReason = report.execution_compatible === false
-    ? "解析协议已升级，当前报告无法继续解析，请生成新报告。" : undefined;
   const gaps = useMemo<DisplayGap[]>(() => {
     const existing: DisplayGap[] = data ? data.gaps.map((gap, index) => {
       // 记录级缺口未必重复写 module_key，仍应归到对应事项，避免混入每一个专题。
@@ -162,16 +159,14 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       </p>
       <div className="report-actions" role="group" aria-label="报告操作">
         <Button onClick={onRefresh}>刷新结果</Button>
-        {!report.runtime_retired && <Button disabled={busy || running || Boolean(retryBlockedReason) || !current || isActive(current?.status)}
-          title={retryBlockedReason ?? (current ? `重新解析：${current.title}` : "请先选择一个专题")}
-          onClick={() => { if (current) onAction("retry", [current.module_key], "restart"); }}>重新解析本模块</Button>}
+        <Button disabled={busy || running || !current || isActive(current?.status)}
+          title={current ? `重新解析：${current.title}` : "请先选择一个专题"}
+          onClick={() => { if (current) onAction("retry", [current.module_key], "restart"); }}>重新解析本模块</Button>
         {isActive(report.status) && <Button disabled={busy || report.canceling} onClick={() => onAction("cancel")}>取消任务</Button>}
-        {!report.runtime_retired && <Button disabled={busy || running || Boolean(retryBlockedReason) || !canResume} title={retryBlockedReason}
-          onClick={() => onAction("retry", undefined, "resume")}>补跑未完成模块</Button>}
-        {!report.runtime_retired && modules.length > 0 && <Button disabled={busy || running || Boolean(retryBlockedReason) || !terminal} title={retryBlockedReason}
+        <Button disabled={busy || running || !canResume}
+          onClick={() => onAction("retry", undefined, "resume")}>补跑未完成模块</Button>
+        {modules.length > 0 && <Button disabled={busy || running || !terminal}
           onClick={() => onAction("retry", modules.map((module) => module.module_key), "restart")}>全部重新解析</Button>}
-        {report.runtime_retired ? <p>旧流程报告仅供查看，需要最新结果请生成新报告。</p>
-          : retryBlockedReason && <p>{retryBlockedReason}</p>}
       </div>
     </div>
     <div className="results-sticky">
@@ -204,7 +199,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       <div className="results-mode" role="tablist" aria-label="结果阅读方式">
         <button type="button" role="tab" aria-selected={view === "results"} onClick={() => setView("results")}>解析正文</button>
         <button type="button" role="tab" aria-selected={view === "gaps"} onClick={() => setView("gaps")}>待核对 · {groupGaps(visibleGaps).length} 组</button>
-        {report.data_schema_version && !report.runtime_retired && <Button size="small"
+        {report.data_schema_version && <Button size="small"
           title={data?.readiness === "unavailable" ? "依据不足，请先查看待核对事项" : undefined}
           disabled={!snapshot || report.stale || snapshot.stale || data?.readiness === "unavailable"}
           onClick={() => setPreviewOpen(true)}>按标段查看要求</Button>}
@@ -263,37 +258,13 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           {module.quality_status === "needs_input" && "；补充所列资料后可重新核对。"}
         </p>}
         {module.status === "partial" && <p className="notice" role="status">
-          {module.progress?.protocol === "skill-agent-v1"
-            ? "本次执行已中断，草稿和自查记录已保存，可补跑继续处理。正式结果在最终提交后更新。"
-            : `本次执行已结束，已展示 ${module.items.length} 条结果；仍有待核对事项，处理后可补跑。`}
+          本次执行已中断，可补跑继续处理。正式结果在最终提交后更新。
         </p>}
-        {module.progress?.protocol === "skill-agent-v1" && <div className="module-progress-summary" role="status" aria-label="解析进展">
+        {module.progress && <div className="module-progress-summary" role="status" aria-label="解析进展">
           <p>{isActive(module.status) ? "正在分析" : "本次执行已结束"}
             {module.progress.activity && ` · 最近活动：${AGENT_ACTIVITIES[module.progress.activity] ?? "处理分析任务"}`}</p>
           <p>已保存 {module.progress.draft_count ?? 0} 条草稿 · 当前版本已自查 {module.progress.reviewed_count ?? 0} 条
             {" · "}未决问题 {module.progress.unresolved_issues ?? 0} 项</p>
-        </div>}
-        {module.progress && module.progress.protocol !== "skill-agent-v1" && <div className="module-progress-summary" role="status" aria-label="解析进展">
-          {/* 终态可能保留最后阶段的进度，不能据此把已结束的执行显示成正在审查。 */}
-          <p>{isActive(module.status) ? module.progress.phase === "research" ? "正在研究原文"
-            : module.progress.phase === "synthesis" ? "正在综合结果"
-              : module.progress.phase === "review" ? "正在独立审查" : `已展示 ${module.items.length} 条结果`
-            : `已展示 ${module.items.length} 条结果`} · 已核对 {module.progress.topics.filter((topic) => module.progress?.phase
-            ? topic.checks.every((check) => topic.checked.includes(check)) && topic.scope.kind !== "unknown"
-            : topic.status === "ready").length}/{module.progress.topics.length} 个子主题</p>
-          {isActive(module.status) && module.progress.topics.some((topic) => ["researching", "needs_review"].includes(topic.status)) && <p>
-            正在处理：{module.progress.topics.filter((topic) => ["researching", "needs_review"].includes(topic.status)).map((topic) => topic.title).join("、")}
-          </p>}
-          {module.progress.phase === "review" && module.progress.review && <p>
-            {module.progress.review.stage === "initial" ? "完整审查" : "定向复核"} · 已完成 {module.progress.review.completed_packets}/{module.progress.review.total_packets} 包
-            {" · "}已用修复 {module.progress.review.repairs_used}/{module.progress.review.repairs_limit} 次
-              {module.progress.review.unresolved_issues !== undefined && <>
-                {" · "}剩余问题 {module.progress.review.unresolved_issues} 项
-              </>}
-          </p>}
-          {module.progress.topics.filter((topic) => topic.status === "blocked").slice(0, 2).map((topic, index) => <p key={index}>
-            研究受阻 · {topic.title}：{topic.tasks.find((task) => task.status === "blocked")?.detail || topic.detail}
-          </p>)}
         </div>}
         <details className="module-operations"><summary>{module.status === "completed" ? "分析记录" : `${STATE_LABELS[module.status] ?? module.status} · 查看原因与运行记录`}</summary>
           {["failed", "canceled"].includes(module.status) && <AnalysisFailureNotice message={module.error_message}
@@ -322,38 +293,18 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
           </ol>}
           {module.research_summary && <details className="research-process"><summary>查看分析过程</summary><p>{module.research_summary}</p></details>}
         </details>
-        {module.items.some((item) => item.record?.review_status === "needs_review") && <Alert type="warning"
-          title="新增依据影响部分结果，以下事项待复核"
-          description={module.items.filter((item) => item.record?.review_status === "needs_review")
-            .map((item) => item.field).join("、")} />}
         {module.records_loading ? <p role="status">正在加载专题结果…</p> : module.records_error ? <Alert type="error" title="专题结果读取失败"
           description={module.records_error} action={<Button onClick={onRefresh}>重新加载</Button>} /> : module.items.length ? <ModuleMarkdown
           items={module.items} relatedItems={allItems} resolvedRelations={data?.relations}
           filtered={Boolean(query.trim() || scope || group || attention)} activeId={activeItem}
           locationRevision={locationRevision} onLocate={onLocate} onRevealItem={reveal} />
           : <p className="result-empty">{query || scope || group || attention ? "当前筛选没有匹配结果。" : module.status === "completed"
-            ? "本次未形成已核实结果，请结合待核对事项了解检索范围。" : isActive(module.status)
-              ? module.progress?.phase === "review" ? "正在独立核对结论依据、引用与内容完整性，完成后统一展示。"
-                : module.progress?.phase === "synthesis" ? "研究已结束，正在统一整理结果。"
-                : module.progress?.phase === "research" ? "正在根据核对清单研究原文，完成后统一展示结果。"
-                  : "正在检索与核对原文，已有可靠结果会持续保存。"
+            ? "本次未形成公开结果，请查看待核对事项。" : isActive(module.status)
+              ? "正在检索与核对原文，最终提交后展示结果。"
               : "本次还没有可用的分析结果，可展开上方记录查看原因。"}</p>}
-        {/* 详细工作账供需要时展开；轮询不自动打开，避免打断正文阅读。 */}
-        {module.progress && module.progress.protocol !== "skill-agent-v1" && <details className="coverage-details">
-          <summary>查看核对详情</summary>
-          <ul>{module.progress.topics.map((topic, index) => <li key={`${topic.topic}:${index}`}>
-            <strong>{topic.title}</strong>{" · "}
-            {({ pending: "待处理", researching: "分析中", ready: "已处理", blocked: "研究受阻", needs_review: "待复核" })[topic.status]}
-            {" · "}{scopeLabel(topic.scope)}
-            <p>{topic.detail}（核对项 {topic.checked.length}/{topic.checks.length}）</p>
-            {topic.tasks.filter((task) => task.status !== "resolved").map((task, taskIndex) => <p key={taskIndex}>
-              {task.status === "blocked" ? "未完成：" : "待核对："}{task.detail}
-            </p>)}
-          </li>)}</ul>
-        </details>}
       </section>)}
       {!modules.length && <p className="result-empty">{isActive(report.status) ? "专题尚未生成，请等待任务就绪。"
-        : ["failed", "partial", "canceled"].includes(report.status) && !report.runtime_retired && report.execution_compatible !== false
+        : ["failed", "partial", "canceled"].includes(report.status)
           ? "专题尚未生成，可点击上方补跑未完成模块。" : "这份报告没有保存专题结果。"}</p>}
     </>}
     </div>

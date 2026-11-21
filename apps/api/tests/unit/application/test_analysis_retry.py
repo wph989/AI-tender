@@ -42,9 +42,9 @@ def test_retry_preserves_notes_and_evidence_without_any_draft():
     assert carried["research"]["seen"] == book.seen
     assert carried["research"]["tool_calls"] == 0
     assert carried["agent_workspace"]["notes"] == book.book["notes"]
-    assert "topic_flow" not in carried
+    assert "agent_progress" not in carried
 
 
-def test_old_phase_checkpoint_cannot_gain_new_self_review_qualification():
+def test_checkpoint_without_current_workspace_cannot_be_resumed():
     with pytest.raises(InputError, match="旧阶段"):
-        resume_workspace({"topic_flow": {"audit": {"done": True}}})
+        resume_workspace({"staged_items": [{"id": "legacy"}]})

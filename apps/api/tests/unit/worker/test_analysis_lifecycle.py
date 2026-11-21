@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from tender.application.analysis import execution as deep_analysis
-from tender.application.analysis.contract import RUNTIME_VERSION
+from tender.domain.analysis.contract import RUNTIME_VERSION
 from tender.ports.repository.knowledge.store import KnowledgeStore
 from tender.worker.knowledge import tasks as knowledge
 
@@ -140,7 +140,10 @@ def test_ready_schema_allows_analysis(monkeypatch):
     db.accessible_report_status.return_value = "running"
     db.schema_columns.return_value = set(REQUIRED_COLUMNS)
     db.schema_tables.return_value = set(REQUIRED_TABLES)
-    report = {"id": 16, "status": "running", "runtime_version": RUNTIME_VERSION}
+    from tender.domain.analysis.contract import FLOW_VERSION, FLOW_VERSION_KEY
+
+    report = {"id": 16, "status": "running", "runtime_version": RUNTIME_VERSION,
+              "skill_snapshot": {FLOW_VERSION_KEY: FLOW_VERSION}}
     db.report_for_analysis.return_value = report
     analyze = AsyncMock()
     monkeypatch.setattr(knowledge, "_store", lambda: db)

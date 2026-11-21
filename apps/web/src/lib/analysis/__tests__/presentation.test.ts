@@ -88,9 +88,9 @@ it("稳定问题ID跨主题只统计一次，独立标段缺口及待补材料�
 });
 
 
-it("新增证据影响的旧核实事项保留正文并进入待核对筛选", () => {
-  const old = item("old", { review_status: "needs_review" });
-  const current = item("current", { review_status: "current" });
+it("机器自查未通过的事项进入待核对筛选", () => {
+  const old: AnalysisField = { ...item("old"), verification: "unsupported" };
+  const current = item("current");
   expect(needsAttention(old)).toBe(true);
   expect(needsAttention(current)).toBe(false);
   expect(filterResults([old, current], { query: "", scope: "", attention: true })

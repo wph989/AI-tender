@@ -7,8 +7,8 @@ import pytest
 import test_deepagents_runtime
 from test_deepagents_runtime import (
     NativeRouter,
+    draft_state,
     prepared_runtime,
-    publishable_state,
 )
 
 from tender.adapters.pg.analysis.checkpoints import run_async
@@ -22,13 +22,13 @@ env = test_deepagents_runtime.env
 
 def compact_runtime(env):
     """恢复专项使用当前协议，避免以旧工具替身掩盖真实装配变化。"""
-    return prepared_runtime(env, topic_flow=True)
+    return prepared_runtime(env)
 
 
 def verified_state(key):
     from tender.application.analysis.drafts import AGENT_PROTOCOL
 
-    state = publishable_state(key)
+    state = draft_state(key)
     state["agent_workspace"] = {"protocol": AGENT_PROTOCOL, "reviews": {}, "issues": {},
         "notes": {}, "history": [], "finalized": False, "final_ids": []}
     for item in state["staged_items"]:

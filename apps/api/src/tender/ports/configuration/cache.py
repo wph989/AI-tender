@@ -11,6 +11,10 @@ from typing import Any, Protocol
 
 
 class ConfigCache(Protocol):
+    def health(self) -> bool:
+        """检查缓存服务当前是否可用，不改变缓存内容。"""
+        ...
+
     def get_active(self, company_id: int) -> Mapping[str, Any] | None:
         """取缓存的活动 release（未命中或缓存不可用时返回 None）。"""
         ...

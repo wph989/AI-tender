@@ -14,10 +14,10 @@ from test_analysis_research import block, session, source
 
 from tender.adapters.llm.rerank_http import HttpRerankModel
 from tender.application.analysis import execution
-from tender.application.analysis.research import AgentLimits
 from tender.application.analysis.runtime import limits_snapshot
 from tender.application.knowledge.content import rank_chunks
 from tender.application.knowledge.retrieval import retrieve_chunks
+from tender.application.shared.research import AgentLimits
 from tender.config.schema import resolve_values
 from tender.ports.repository.knowledge.retrieval import SearchCandidates
 
@@ -371,6 +371,8 @@ def test_limited_candidate_window_guides_cached_pages_before_new_queries():
 
 @pytest.mark.parametrize("page_size", [2, 6, 20])
 def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
+    from tender.domain.analysis.contract import FLOW_VERSION, FLOW_VERSION_KEY, RUNTIME_VERSION
+
     async def run():
         limits = AgentLimits(max_search_results=page_size)
         runtime = Mock()
@@ -404,7 +406,7 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
         async def saver():
             yield None
 
-        monkeypatch.setattr(execution, "build_module_agent", build)
+        monkeypatch.setattr(execution, "build_skill_agent", build)
         monkeypatch.setattr(execution, "invoke_module", invoke)
         store = Store(rows(101))
         store.search_candidates = Mock(wraps=store.search_candidates)
@@ -418,7 +420,8 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
         await executor.execute_module(
             {"id": 1, "project_id": 10,
              "source_snapshot": snapshot, "reference_snapshot": references,
-             "skill_snapshot": {"__analysis_flow_version__": "skill-agent-v1"}, "category": "goods",
+             "runtime_version": RUNTIME_VERSION, "category": "goods",
+             "skill_snapshot": {FLOW_VERSION_KEY: FLOW_VERSION},
              "topics": [], "lot_settings": []},
             {"id": 2, "module_key": "deposit_requirement_parsing", "attempt": 1}, [SOURCE],
         )

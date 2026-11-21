@@ -1,51 +1,49 @@
 """执行是否结束与业务结论是否完备分别表达，问题身份不随描述改写变化。"""
 
-import copy
+import re
 
-from tender.application.knowledge.content import fingerprint, normalized, source_signature
+from tender.application.knowledge.content import source_signature
 
-QUALITY_STATUSES = {"verified", "needs_review", "needs_input", "unknown"}
-ISSUE_ACTIONS = {"read", "repair", "provide_input"}
-
-
-def issue_identity(issue: dict) -> str:
-    # 主题只是责任归属；同一事项、范围及目标的缺口跨主题只修一次。
-    scope = issue.get("scope", {"kind": "unknown", "lot_refs": []})
-    scope = {**scope, "lot_refs": sorted(set(scope.get("lot_refs", [])))}
-    return fingerprint([
-        issue.get("kind", "unsupported"), scope,
-        sorted(issue.get("record_keys", [])), normalized(str(issue.get("target", ""))),
-    ])
+QUALITY_STATUSES = {"self_check_passed", "needs_review", "needs_input", "unknown"}
+LEGACY_QUALITY_STATUSES = {"verified"}
+ABSENCE_TERMS = (
+    "未载明", "未约定", "未见", "未检索到", "未找到", "无法认定", "条款缺失",
+    "未明示", "未列示", "未单独列示", "未给出", "未规定", "未明确", "未划分", "缺失细节",
+)
 
 
-def merge_issues(issues: list[dict]) -> list[dict]:
-    result: dict[str, dict] = {}
-    for raw in issues:
-        issue = copy.deepcopy(raw)
-        issue.setdefault("kind", "unsupported")
-        issue.setdefault("action", "repair")
-        key = issue.get("issue_id") or issue_identity(issue)
-        issue["issue_id"] = key
-        issue["topics"] = sorted(set(issue.get("topics", [])) | {issue["topic"]})
-        if key in result:
-            previous = result[key]
-            previous["topics"] = sorted(set(previous["topics"]) | set(issue["topics"]))
-            previous["evidence_ids"] = sorted(set(previous.get("evidence_ids", []))
-                                               | set(issue.get("evidence_ids", [])))
-            # 新证据确认缺件后需要用户输入；历史“补读”指令不能继续驱动空转。
-            if issue["action"] == "provide_input":
-                previous["action"] = "provide_input"
-                # 缺件确认必须连同依据和说明替换旧补读指令，否则等待资料却没有可操作的补件信息。
-                previous["detail"] = issue["detail"]
-                if issue.get("missing_input"):
-                    previous["missing_input"] = issue["missing_input"]
-        else:
-            result[key] = issue
-    return list(result.values())
+def is_absence_claim(field: dict) -> bool:
+    """单段引文不能证明整份文件未约定；缺口应单独登记。"""
+    body = field["field"] + "".join(value["value"] for value in field["values"])
+    quotes = "\n".join(ref["quote"] for value in field["values"] for ref in value["citations"])
+    return any(term in body and term not in quotes for term in ABSENCE_TERMS)
+
+
+def validate_project_claims(
+    fields: list[dict], project_id: int, *, defer_semantics: bool = False,
+) -> None:
+    """检查项目结论的来源边界和可确定的缺口、修订约束。"""
+    for field in fields:
+        refs = [ref for value in field["values"] for ref in value["citations"]]
+        own = {ref["source_id"] for ref in refs if ref["project_id"] == project_id}
+        if not own:
+            raise ValueError("项目结论及参考建议都须引用本项目相关要求；参考建议还须保留参考来源")
+        if defer_semantics and field.get("business"):
+            continue
+        body = field["field"] + field.get("note", "") + "".join(
+            value["value"] for value in field["values"]
+        )
+        if is_absence_claim(field):
+            raise ValueError("检索缺口只能写入 research_summary，单段引文不能证明整份文件未约定")
+        if "补充" in body and re.search("调整|更正|修订|修改", body) and len(own) < 2:
+            raise ValueError("跨文件修订结论须在同一字段同时引用原条款与补充文件")
 
 
 def quality_status(data: dict) -> str:
     explicit = data.get("quality_status")
+    # 历史 JSON 中的 verified 仅指机器自查完成，读取时改用不混淆人工裁定的名称。
+    if explicit in LEGACY_QUALITY_STATUSES:
+        return "self_check_passed"
     if explicit in QUALITY_STATUSES:
         return explicit
     # 历史结果无独立质量结算记录，不能根据 completed 猜测所有问题均已核清。
@@ -60,7 +58,7 @@ def aggregate_quality(values: list[str]) -> str:
     for value in ("needs_review", "needs_input", "unknown"):
         if value in values:
             return value
-    return "verified" if values else "unknown"
+    return "self_check_passed" if values else "unknown"
 
 
 def input_changed(data: dict, sources: list[dict], previous_sources: list[dict]) -> bool:
@@ -80,69 +78,14 @@ def refresh_input(state: dict, sources: list[dict]) -> None:
     items = [item for item in state.get("staged_items", [])
              if all(ref.get("block_id") in seen
                     for ref in item.get("business", {}).get("citations", []))]
-    for item in items:
-        item["review_status"] = "needs_review"
     state["staged_items"] = items
-    # 输入已变化时旧版回退也必须重新核对，不能从旁路恢复已撤销的依据。
-    state["business_previous"] = {}
-    state.pop("rejected_records", None)
-    state.pop("review_context_key", None)
     state["business_gaps"] = []
-    state.pop("research_completed", None)
-    if state.get("agent_workspace"):
-        # 新资料使旧自查失效，但工作方法仍由Agent安排，不创建旧阶段状态。
-        workspace = state["agent_workspace"]
-        workspace.update(reviews={}, finalized=False, final_ids=[], draft_receipts={})
-        for issue in workspace["issues"].values():
-            if issue.get("action") == "provide_input":
-                issue.update(action="read", status="open",
-                             detail="资料已更新，重新核对：" + issue["detail"])
-                issue.pop("missing_input", None)
-        return
-    flow = state.get("topic_flow", {})
-    flow.update(phase="research", audit={"round": 0, "results": {}})
-    flow.pop("synthesis_finished", None)
-    flow["evidence_topics"] = {key: value for key, value in flow.get("evidence_topics", {}).items()
-                               if key in seen}
-    keys = {item["business"]["key"] for item in items}
-    for entry in flow.get("entries", {}).values():
-        entry.update(status="researching", requested_status="researching",
-                     detail="资料已更新，重新核对")
-        entry["evidence_ids"] = [key for key in entry["evidence_ids"] if key in seen]
-        entry["record_keys"] = [key for key in entry["record_keys"] if key in keys]
-        # 旧“缺件已确认”及查漏缓存不再成立，新的资料必须参与核对。
-        for field in ("findings", "dispositions", "tasks"):
-            entry[field] = {}
-        entry["references"] = []
-        entry["unreviewed_evidence"] = list(entry["evidence_ids"])
-    flow.pop("research_searches", None)
-
-
-def settle_quality(
-    state: dict, issues: list[dict], *, audited_topics: set[str] | None = None,
-) -> list[dict]:
-    issues = merge_issues(issues)
-    state["quality_issues"] = issues
-    state["quality_status"] = (
-        "needs_input" if issues and all(i["action"] == "provide_input" for i in issues)
-        else "needs_review" if issues else "verified"
-    )
-    # 同一身份供前端缺口、进度及停止说明共用，避免一处合并而另一处重复统计。
-    # 已审主题的历史程序缺口由本轮真实问题取代；未审主题的原有缺口继续保留。
-    audited = audited_topics or set()
-    gaps = [g for g in state.get("business_gaps", []) if not g.get("issue_id")
-            and not (g.get("topic") in audited and g["key"].startswith(
-                ("topic:", "finding:", "coverage:", "record:", "research:")))]
-    for issue in issues:
-        gaps.append({"key": "issue:" + issue["issue_id"], "issue_id": issue["issue_id"],
-                     "topic": issue["topic"], "topics": issue["topics"],
-                     "scope": issue.get("scope", {"kind": "unknown", "lot_refs": []}),
-                     "code": issue["kind"], "kind": issue["kind"], "action": issue["action"],
-                     "detail": issue["detail"], "target": issue.get("target", ""),
-                     "record_keys": issue.get("record_keys", []),
-                     "record_id": next((item["id"] for item in state.get("staged_items", [])
-                                        if item.get("business", {}).get("key")
-                                        in issue.get("record_keys", [])), None),
-                     "evidence_ids": issue.get("evidence_ids", [])})
-    state["business_gaps"] = gaps
-    return issues
+    workspace = state.get("agent_workspace")
+    if not workspace:
+        raise ValueError("补跑状态缺少当前Agent工作区")
+    workspace.update(reviews={}, finalized=False, final_ids=[], draft_receipts={})
+    for issue in workspace["issues"].values():
+        if issue.get("action") == "provide_input":
+            issue.update(action="read", status="open",
+                         detail="资料已更新，重新核对：" + issue["detail"])
+            issue.pop("missing_input", None)

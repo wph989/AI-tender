@@ -18,30 +18,26 @@ from langchain_core.messages import (
     message_to_dict,
     messages_from_dict,
 )
+from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, ValidationError
 
-from tender.application.analysis.agent import (
-    AnalysisSummarizationMiddleware,
-    BatchTool,
-    context_size,
-)
 from tender.application.analysis.data import DataInput
 from tender.application.analysis.drafts import (
-    AGENT_PROTOCOL,
     DraftRecord,
     DraftWorkspace,
     ReviewIssue,
     ReviewRecord,
+    batch_field,
 )
 from tender.application.analysis.output import output_schema
 from tender.application.analysis.policy import load_module_skill
-from tender.application.analysis.protocol import batch_field
-from tender.application.analysis.research import (
+from tender.application.knowledge.content import fingerprint
+from tender.application.shared.agent_model import BudgetedSummarization, context_size
+from tender.application.shared.research import (
     EvidenceBudgetError,
     SourceNotAllowed,
     ToolArgumentError,
 )
-from tender.application.knowledge.content import fingerprint
 from tender.application.shared.validation import InputError, schema_feedback
 
 WORKFLOW_PATH = "analysis_workflow/SKILL.md"
@@ -78,7 +74,7 @@ class SearchQuery(DataInput):
     offset: int = Field(default=0, ge=0)
 
 
-class WorkspaceTool(BatchTool):
+class WorkspaceTool(StructuredTool):
     @property
     def tool_call_schema(self):
         # 类型/必填错误由工具返回同一Agent；供应商适配器仍拦截坏JSON与非法调用身份。
@@ -226,8 +222,6 @@ class WorkspaceMiddleware(AgentMiddleware):
                 self.book.seen = self.research.seen
                 self.book.book["activity"] = name
                 state["agent_progress"] = self.book.progress()
-                if "draft" in state:
-                    state["draft"]["business_data"]["progress"] = state["agent_progress"]
                 # 状态与回执通过既有仓储一起结算，恢复不会重新执行已保存的修改。
                 await self.save(state)
                 if self.event:
@@ -252,10 +246,6 @@ def build_skill_agent(
     lots=(),
     resolve_citation=None,
 ):
-    if snapshot.get("__analysis_flow_version__") != AGENT_PROTOCOL:
-        raise ValueError("旧阶段检查点不能使用新Agent流程，请新建报告")
-    if state.get("topic_flow") or state.get("staged_items") and not state.get("agent_workspace"):
-        raise ValueError("旧草稿和阶段检查点不能继承新协议的自查资格，请新建报告")
     workflow = snapshot.get(WORKFLOW_PATH)
     if not isinstance(workflow, str) or not workflow.strip():
         raise ValueError("报告缺少公共工作流程Skill")
@@ -496,7 +486,7 @@ def build_skill_agent(
         book, research, save, begin_tool, reserve_tool, budget_status, instructions, event
     )
     limits = research.limits
-    summary = AnalysisSummarizationMiddleware(
+    summary = BudgetedSummarization(
         model,
         backend=backend,
         trigger=("tokens", max(1, limits.context_tokens * 3 // 5)),

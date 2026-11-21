@@ -230,9 +230,10 @@ def test_executor_settles_restored_unavailable_window_without_losing_verified_re
     from test_analysis_agent_workspace import approve, saved, workspace
 
     from tender.application.analysis import execution
-    from tender.application.analysis.research import AgentLimits
+    from tender.application.analysis.data import published_items
     from tender.application.analysis.skills import skill_snapshot
-    from tender.application.analysis.state import published_items
+    from tender.application.shared.research import AgentLimits
+    from tender.domain.analysis.contract import FLOW_VERSION, FLOW_VERSION_KEY, RUNTIME_VERSION
 
     async def run():
         book = workspace()
@@ -263,7 +264,7 @@ def test_executor_settles_restored_unavailable_window_without_losing_verified_re
 
         monkeypatch.setattr(execution, "AgentRuntime", lambda *args: runtime)
         monkeypatch.setattr(execution, "wait_for_claim", claimed)
-        monkeypatch.setattr(execution, "build_module_agent", lambda **kwargs: (None, None))
+        monkeypatch.setattr(execution, "build_skill_agent", lambda **kwargs: (None, None))
         monkeypatch.setattr(execution, "invoke_module", invoke)
         monkeypatch.setattr(execution, "model_recovery_delay", lambda *args: 0)
         executor = execution.AnalysisExecutor(
@@ -271,16 +272,17 @@ def test_executor_settles_restored_unavailable_window_without_losing_verified_re
             embedding_gateway=Mock(), rerank_gateway=Mock(), checkpoints=checkpoints,
         )
         report = {"id": 1, "project_id": 1, "category": "engineering", "topics": [],
+                  "runtime_version": RUNTIME_VERSION,
                   "source_snapshot": [], "reference_snapshot": [],
                   "lot_settings": [], "skill_snapshot": skill_snapshot()
-                  | {"__analysis_flow_version__": "skill-agent-v1"}}
+                  | {FLOW_VERSION_KEY: FLOW_VERSION}}
         await executor.execute_module(report, {"module_key": "project_basic_info_parsing",
                                                "attempt": 1}, [])
         runtime.abandon.assert_not_called()
         runtime.finish.assert_called_once_with(
             "partial", "上游504", state=state,
         )
-        assert not published_items(state, final=True)
+        assert not published_items(state)
         assert len(state["staged_items"]) == int(has_results)
         assert len(records) == 1 and store.rows == original
         assert not any(call.args[0] == "model_unavailable_recovery"

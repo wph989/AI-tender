@@ -9,6 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from tender.api.shared.common import actor, configs, engine, role
 from tender.api.shared.errors import translate_service_errors
+from tender.api.shared.responses import (
+    ConfigAcknowledgeResponse,
+    ConfigAuditResponse,
+    ConfigItemsResponse,
+    ConfigReleaseListResponse,
+    ConfigReleaseResponse,
+)
 from tender.application.configuration.service import ConfigService
 from tender.core import settings
 from tender.core.di import create_config_service
@@ -55,13 +62,13 @@ def _service(request: Request) -> ConfigService:
     return create_config_service(engine(request), settings.company_id(), configs(request))
 
 
-@router.get("/items")
+@router.get("/items", response_model=ConfigItemsResponse, response_model_exclude_unset=True)
 @translate_service_errors
 def list_items(request: Request) -> dict[str, Any]:
     return _service(request).list_items(role(request))
 
 
-@router.get("/releases")
+@router.get("/releases", response_model=ConfigReleaseListResponse)
 @translate_service_errors
 def list_releases(
     request: Request,
@@ -71,7 +78,8 @@ def list_releases(
     return _service(request).list_releases(status, limit)
 
 
-@router.post("/releases", status_code=201)
+@router.post("/releases", status_code=201, response_model=ConfigReleaseResponse,
+             response_model_exclude_unset=True)
 @translate_service_errors
 def create_release(payload: ReleaseCreate, request: Request) -> dict[str, Any]:
     return _service(request).create_release(
@@ -83,13 +91,14 @@ def create_release(payload: ReleaseCreate, request: Request) -> dict[str, Any]:
     )
 
 
-@router.get("/releases/{release_id}")
+@router.get("/releases/{release_id}", response_model=ConfigReleaseResponse,
+            response_model_exclude_unset=True)
 @translate_service_errors
 def get_release(release_id: int, request: Request) -> dict[str, Any]:
     return _service(request).get_release(release_id)
 
 
-@router.post("/releases/{release_id}/acknowledge")
+@router.post("/releases/{release_id}/acknowledge", response_model=ConfigAcknowledgeResponse)
 @translate_service_errors
 def acknowledge_release(
     release_id: int,
@@ -105,7 +114,8 @@ def acknowledge_release(
     )
 
 
-@router.post("/releases/{release_id}/activate")
+@router.post("/releases/{release_id}/activate", response_model=ConfigReleaseResponse,
+             response_model_exclude_unset=True)
 @translate_service_errors
 def activate_release(
     release_id: int,
@@ -121,7 +131,8 @@ def activate_release(
     )
 
 
-@router.post("/releases/{release_id}/rollback")
+@router.post("/releases/{release_id}/rollback", response_model=ConfigReleaseResponse,
+             response_model_exclude_unset=True)
 @translate_service_errors
 def rollback_release(
     release_id: int,
@@ -136,7 +147,7 @@ def rollback_release(
     )
 
 
-@router.get("/audit")
+@router.get("/audit", response_model=ConfigAuditResponse)
 @translate_service_errors
 def list_audit(
     request: Request,

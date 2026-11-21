@@ -79,7 +79,7 @@ def test_large_block_location_rechecks_permissions(environment, indexed):
 
 
 def test_model_receives_only_large_block_id_and_full_clause(environment):
-    from tender.application.analysis.research import ResearchSession
+    from tender.application.shared.research import ResearchSession
 
     db, source, chunks = grouped_source(environment)
 

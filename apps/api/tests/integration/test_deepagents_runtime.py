@@ -25,12 +25,13 @@ from tender.api.projects import routes as projects
 from tender.api.shared.errors import ApiProblem
 from tender.application.analysis import execution as worker
 from tender.application.analysis import runtime as agent_runtime
-from tender.application.analysis.agent import VerificationUnavailable
 from tender.application.analysis.skills import MODULES, skill_snapshot
 from tender.application.llm.routing import CallRecord
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
 from tender.core.di import create_analysis_executor
+from tender.domain.analysis.contract import FLOW_VERSION
+from tender.domain.shared.errors import ModelUnavailable
 from tender.ports.llm.chat import Completion
 
 pytestmark = pytest.mark.skipif(
@@ -143,7 +144,7 @@ def env(monkeypatch):
         base.dispose()
 
 
-def report(env, *, topic_flow=False):
+def report(env):
     project = projects.create_project(projects.ProjectCreate(name="DeepAgents专项"), env.request)
     with env.engine.begin() as conn:
         add_source(conn, project["id"], "采购交换机10台，质保三年。")
@@ -154,8 +155,8 @@ def report(env, *, topic_flow=False):
     return analysis_api.report_row(env.request, created["id"])
 
 
-def prepared_runtime(env, *, topic_flow=False):
-    row = report(env, topic_flow=topic_flow)
+def prepared_runtime(env):
+    row = report(env)
     row, sources = worker.prepare_report(env.db, row)
     run = env.db.rows(
         """SELECT a.* FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
@@ -165,19 +166,24 @@ def prepared_runtime(env, *, topic_flow=False):
     return agent_runtime.AgentRuntime(env.db, row, run, sources)
 
 
-def test_old_protocol_is_readable_but_retry_is_rejected_before_enqueue(env):
+def test_retired_protocol_is_hidden_and_preserved(env):
     row = report(env)
     frozen = row["skill_snapshot"] | {"__analysis_flow_version__": "research-v2"}
     env.db.execute("UPDATE analysis_report SET skill_snapshot=CAST(:snapshot AS JSONB), "
                    "status='failed' WHERE id=:id",
                    {"snapshot": json.dumps(frozen), "id": row["id"]})
-    result = analysis_api.get_report(row["id"], env.request)
-    assert result["execution_compatible"] is False and not result["runtime_retired"]
-    before = env.db.rows("SELECT * FROM agent_module_run")
-    with pytest.raises(ApiProblem) as caught:
-        analysis_api.retry_report(row["id"], analysis_api.RetryInput(), env.request)
-    assert caught.value.status_code == 409
-    assert env.db.rows("SELECT * FROM agent_module_run") == before
+    before = env.db.report(row["id"])
+    for call in (
+        lambda: analysis_api.get_report(row["id"], env.request),
+        lambda: analysis_api.retry_report(row["id"], analysis_api.RetryInput(), env.request),
+    ):
+        with pytest.raises(ApiProblem) as caught:
+            call()
+        assert caught.value.status_code == 409
+        assert caught.value.code == "runtime_retired"
+    run_async(env.executor.execute(row["id"]))
+    assert env.db.report(row["id"]) == before
+    assert env.db.report_runs(row["id"]) == []
 
 
 def test_batch_children_settle_success_once_and_parent_does_not_spend_budget(env):
@@ -202,7 +208,7 @@ def test_batch_children_settle_success_once_and_parent_does_not_spend_budget(env
 
 def prepared_runtimes(env, count: int = 1):
     """同一报告里按模块顺序取前若干个运行账，用于验证同报告内部的抢槽与收殓。"""
-    row = report(env, topic_flow=True)
+    row = report(env)
     row, sources = worker.prepare_report(env.db, row)
     runs = env.db.rows(
         """SELECT a.* FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
@@ -212,8 +218,8 @@ def prepared_runtimes(env, count: int = 1):
     return [agent_runtime.AgentRuntime(env.db, row, run, sources) for run in runs[:count]]
 
 
-def publishable_state(module_key: str) -> dict:
-    """构造一条已核实、一条未核实的暂存成果，验证 partial 只发布前者。"""
+def draft_state(module_key: str) -> dict:
+    """构造有自查和待自查记录的工作区，用于恢复及发布边界验证。"""
     ref = {
         "block_id": "s1r1c0", "quote": "质保三年", "source_id": 1, "project_id": 1,
         "page_no": 1, "file_name": "fixture.pdf", "bbox": [0, 0, 1, 1],
@@ -237,7 +243,10 @@ def publishable_state(module_key: str) -> dict:
             entry("keep", "warranty", "质保期限", "质保三年", "supported"),
             entry("drop", "delivery", "交货期", "交货期30日", "pending"),
         ],
-        "staged_items_verified": True,
+        "agent_workspace": {
+            "protocol": FLOW_VERSION, "reviews": {}, "issues": {}, "notes": {},
+            "history": [], "finalized": False, "final_ids": [],
+        },
     }
 
 
@@ -376,7 +385,7 @@ def test_claim_backoff_does_not_starve_later_modules(env, monkeypatch):
     )
     monkeypatch.setattr(worker, "AgentRuntime", CountingRuntime)
     monkeypatch.setattr(env.executor, "model_factory", lambda *a, **kw: Model())
-    monkeypatch.setattr(worker, "build_module_agent", lambda **kwargs: (kwargs["key"], {}))
+    monkeypatch.setattr(worker, "build_skill_agent", lambda **kwargs: (kwargs["key"], {}))
 
     async def invoke(graph, files, *, state=None, **kwargs):
         # 每个模块占用配额片刻，后两个必然经历等待与退避轮询。
@@ -697,7 +706,7 @@ class NativeRouter:
 
 def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypatch):
     """真实图、检查点和元素表串联，证明模型看不到位置且只解析最终选中的证据。"""
-    row = report(env, topic_flow=True)
+    row = report(env)
     topics = [{"key": "warranty", "title": "质保", "checks": ["期限"]}]
     path = "project_basic_info_parsing/references/coverage.json"
     row["skill_snapshot"][path] = json.dumps(topics)
@@ -805,7 +814,7 @@ def test_guard_migration_seeds_isolated_config_catalog(env):
 
 
 def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, monkeypatch):
-    row = report(env, topic_flow=True)
+    row = report(env)
     routers = []
 
     def model(feature_key, purpose, **kwargs):
@@ -839,7 +848,6 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     for current in runs:
         assert current["model_calls"] == 4
         assert current["state"]["agent_workspace"]["finalized"]
-        assert "topic_flow" not in current["state"]
     assert all(r["state"]["research"]["seen"] for r in runs)
     assert all(r["state"]["agent_skill_hash"] for r in runs)
     assert result["coverage"]["mode"] == "agent_research"
@@ -993,12 +1001,12 @@ def test_canceled_report_retries_failed_and_canceled_modules(env):
     assert analysis_api.get_report(report_id, env.request)["status"] == "pending"
 
 
-def test_partial_finish_publishes_only_supported_items(env):
-    """校验不可用时模块以 partial 收尾，未核实条目绝不随已核实成果一起发布。"""
+def test_partial_finish_keeps_drafts_without_publishing(env):
+    """校验不可用时保留工作区，正式模块仍为空。"""
     runtime = prepared_runtime(env)
     assert runtime.claim()
     module_key = next(iter(MODULES))
-    runtime.finish("partial", "校验服务不可用", state=publishable_state(module_key))
+    runtime.finish("partial", "校验服务不可用", state=draft_state(module_key))
     runtime.release()
     module = env.db.rows(
         "SELECT * FROM analysis_module WHERE id=:id", {"id": runtime.run["module_id"]}
@@ -1006,21 +1014,20 @@ def test_partial_finish_publishes_only_supported_items(env):
     assert module["status"] == "partial"
     assert module["error_message"] == "校验服务不可用"
     run = env.db.rows(
-        "SELECT status FROM agent_module_run WHERE id=:id", {"id": runtime.run["id"]}
+        "SELECT status,state FROM agent_module_run WHERE id=:id", {"id": runtime.run["id"]}
     )[0]
     assert run["status"] == "partial"
-    assert [item["record_id"] for item in module["items"]] == ["keep"]
-    records = module["business_data"]["records"]
-    assert [record["id"] for record in records] == ["keep"]
-    assert all(record["verification"] == "supported" for record in records)
+    assert [item["id"] for item in run["state"]["staged_items"]] == ["keep", "drop"]
+    assert module["items"] == []
+    assert not module["business_data"].get("records")
 
 
 def test_partial_report_retry_selects_partial_modules(env):
-    """空 module_keys 补跑只选部分完成/失败模块；partial 已发布成果保留。"""
+    """空 module_keys 补跑只选部分完成或失败的模块。"""
     runtime = prepared_runtime(env)
     assert runtime.claim()
     module_key = next(iter(MODULES))
-    runtime.finish("partial", "校验服务不可用", state=publishable_state(module_key))
+    runtime.finish("partial", "校验服务不可用", state=draft_state(module_key))
     runtime.release()
     report_id = runtime.report["id"]
     env.db.execute(
@@ -1039,7 +1046,7 @@ def test_partial_report_retry_selects_partial_modules(env):
 
 
 def test_report_with_all_partial_modules_is_partial(env, monkeypatch):
-    """全部模块只有已核实成果时报告是 partial，快照为未完成模块登记缺口。"""
+    """全部模块只有草稿时报告是 partial，快照为未完成模块登记缺口。"""
 
     class Model:
         async def aclose(self):
@@ -1047,15 +1054,15 @@ def test_report_with_all_partial_modules_is_partial(env, monkeypatch):
 
     monkeypatch.setattr(env.executor, "model_factory", lambda *a, **kw: Model())
     monkeypatch.setattr(
-        worker, "build_module_agent", lambda **kwargs: (kwargs["key"], {}),
+        worker, "build_skill_agent", lambda **kwargs: (kwargs["key"], {}),
     )
 
     async def invoke(graph, files, *, state=None, **kwargs):
-        state.update(publishable_state(graph))
-        raise VerificationUnavailable("校验服务不可用")
+        state.update(draft_state(graph))
+        raise ModelUnavailable("模型服务不可用")
 
     monkeypatch.setattr(worker, "invoke_module", invoke)
-    row = report(env, topic_flow=True)
+    row = report(env)
     run_async(env.executor.analyze_report(row))
 
     result = analysis_api.get_report(row["id"], env.request)
@@ -1063,7 +1070,7 @@ def test_report_with_all_partial_modules_is_partial(env, monkeypatch):
     assert len(result["modules"]) == 13
     assert all(module["status"] == "partial" for module in result["modules"])
     assert all(
-        [item["record_id"] for item in module["items"]] == ["keep"]
+        not module["items"]
         for module in result["modules"]
     )
     snapshot = env.db.rows(
@@ -1154,7 +1161,7 @@ def test_retry_waits_for_canceled_controller_to_exit(env):
 
 
 def test_cancel_interrupts_active_module_and_releases_quota(env, monkeypatch):
-    runtime = prepared_runtime(env, topic_flow=True)
+    runtime = prepared_runtime(env)
     started, stopped = asyncio.Event(), asyncio.Event()
 
     class Model:
@@ -1169,7 +1176,7 @@ def test_cancel_interrupts_active_module_and_releases_quota(env, monkeypatch):
             stopped.set()
 
     monkeypatch.setattr(env.executor, "model_factory", lambda *a, **kw: Model())
-    monkeypatch.setattr(worker, "build_module_agent", lambda **kw: (None, {}))
+    monkeypatch.setattr(worker, "build_skill_agent", lambda **kw: (None, {}))
     monkeypatch.setattr(worker, "invoke_module", blocked_request)
 
     async def scenario():
@@ -1223,7 +1230,7 @@ def test_explicit_retry_reparses_completed_module_from_scratch(env):
         "verification": "supported",
     }
     draft = {"fields": [field], "relations": [], "research_summary": "已经检索"}
-    runtime.save({"staged_items": [field], "staged_items_verified": True, "draft": draft})
+    runtime.save({"staged_items": [field], "draft": draft})
     runtime.finish("completed", draft=draft)
     runtime.release()
     report_id = runtime.report["id"]

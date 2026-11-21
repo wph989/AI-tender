@@ -1,4 +1,4 @@
-"""模块 Agent 的检索会话：权限在工具边界执行，证据在上下文之外保留。"""
+"""分析与问答共用的检索会话，统一核对来源、证据额度与补读版本。"""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from tender.application.knowledge.content import fingerprint, normalized
+from tender.application.knowledge.content import normalized
 from tender.application.shared.validation import InputError, allowed_values
+from tender.domain.shared.digest import fingerprint
 from tender.ports.repository.knowledge.sources import ChunkWindow
 
 Retrieve = Callable[[list[dict], str], Awaitable[tuple[list[dict], dict]]]
@@ -22,10 +23,6 @@ class SourceNotAllowed(PermissionError):
 
 class ToolArgumentError(InputError):
     """工具参数越界或类型不符；属于可自纠正错误，回传给模型修正而不是终止模块。"""
-
-
-class WorkClosed(ToolArgumentError):
-    """正常工作关闭反馈；不占用非法参数纠错额度，硬调用预算仍然生效。"""
 
 
 class EvidenceBudgetError(ValueError):

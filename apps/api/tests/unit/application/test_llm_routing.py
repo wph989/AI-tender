@@ -227,7 +227,7 @@ def test_format_correction_does_not_reset_total_request_budget():
         _ScriptedGateway({name: [InvalidModelOutput("非法 JSON")] * 3 for name in "ab"}),
         records.append,
     )
-    from tender.application.analysis.skills import json_completion
+    from tender.application.knowledge.answer_evidence import json_completion
 
     with pytest.raises(ModelCallFailed):
         asyncio.run(json_completion(router, "分析"))

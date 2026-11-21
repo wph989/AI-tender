@@ -51,6 +51,14 @@ class LocalBlobStore:
     def close(self) -> None:
         """本地文件句柄由各次操作自行关闭，保留统一的装配生命周期接口。"""
 
+    def health(self) -> bool:
+        try:
+            return self._root.is_dir() and os.access(
+                self._root, os.R_OK | os.W_OK | os.X_OK,
+            )
+        except OSError:
+            return False
+
     def put(self, key: str, content: bytes, *, content_type: str) -> None:
         path = self._object_path(key)
         try:

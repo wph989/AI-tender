@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 
-from tender.application.analysis.contract import READABLE_RUNTIMES, RUNTIME_VERSION
 from tender.application.analysis.data import (
     DATA_VERSION,
     assemble_dataset,
@@ -13,6 +12,7 @@ from tender.application.analysis.data import (
     module_records,
 )
 from tender.application.knowledge.content import fingerprint, source_signature, source_state
+from tender.domain.analysis.contract import RUNTIME_VERSION, is_current_report
 from tender.ports.repository.analysis.reports import ReportRepository
 
 
@@ -95,7 +95,7 @@ def snapshot_input_signatures(snapshot: dict, state: dict | None) -> dict:
 
 def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
     report = db.report(report_id)
-    if report is None:
+    if report is None or not is_current_report(report):
         return None
     if report["status"] in {"waiting", "pending", "running"}:
         return None
@@ -103,13 +103,9 @@ def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
     with db.transaction() as session:
         session.lock_project(report["project_id"])
         locked = session.lock_report(report_id)
-        if locked["status"] in {"waiting", "pending", "running"}:
+        if not is_current_report(locked) or locked["status"] in {"waiting", "pending", "running"}:
             return None
         clear_pending = {"snapshot_pending": False, "lease_until": None}
-        if locked["runtime_version"] not in READABLE_RUNTIMES:
-            if locked.get("snapshot_pending"):
-                session.update_report(report_id, clear_pending)
-            return None
         runs = session.report_runs(report_id)
         if unfinished_runs(runs) and locked["status"] in {"failed", "canceled"}:
             # 若收尾进程已退出，回收孤儿运行；仍持锁的模块退出后再生成快照。
@@ -124,15 +120,14 @@ def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
         if existing and session.latest_snapshot_id(report_id) == existing["id"]:
             session.update_report(report_id, clear_pending)
             return existing
-        if locked["runtime_version"] == RUNTIME_VERSION:
-            # 升级前已有的快照在输入及正文完全一致时仍可用，避免同一报告平白增加一版。
-            legacy_hash = snapshot_manifest(locked["status"], runs, modules,
-                                            runtime_version=locked["runtime_version"])
-            legacy = session.snapshot_by_manifest(report_id, legacy_hash)
-            if (legacy and session.latest_snapshot_id(report_id) == legacy["id"]
-                    and same_frozen_inputs(legacy["input_snapshot"], locked)):
-                session.update_report(report_id, clear_pending)
-                return legacy
+        # 升级前已有的快照在输入及正文完全一致时仍可用，避免同一报告平白增加一版。
+        legacy_hash = snapshot_manifest(locked["status"], runs, modules,
+                                        runtime_version=locked["runtime_version"])
+        legacy = session.snapshot_by_manifest(report_id, legacy_hash)
+        if (legacy and session.latest_snapshot_id(report_id) == legacy["id"]
+                and same_frozen_inputs(legacy["input_snapshot"], locked)):
+            session.update_report(report_id, clear_pending)
+            return legacy
         # 同一次发布里标段提取与装配共用一份记录投影，不重复解析业务 JSON。
         records_by_module = {
             module["module_key"]: module_records(module["business_data"]) for module in modules
@@ -143,8 +138,7 @@ def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
             if module["module_key"] != "project_basic_info_parsing":
                 continue
             for record in records_by_module[module["module_key"]]:
-                if (record["kind"] != "lot" or record.get("verification") != "supported"
-                        or record.get("review_status") == "needs_review"):
+                if record["kind"] != "lot" or record.get("verification") != "supported":
                     continue
                 # 项目目录需要稳定查找键；无原文编号时用已核实名称，分析记录中的 code 仍留空。
                 catalog_key = record["code"] or record["title"]

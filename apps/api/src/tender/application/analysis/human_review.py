@@ -56,8 +56,6 @@ def review_projection(data: dict, signatures: dict, signature: str, reviews: dic
         record["human_review"] = review
         if not current or signatures.get(record["module_key"]) != signature:
             status = "outdated"
-        elif record.get("review_status") == "needs_review":
-            status = "pending"
         else:
             status = review["decision"] if review else "pending"
         record["human_review_status"] = status

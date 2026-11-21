@@ -5,25 +5,22 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from tender.application.analysis.contract import FLOW_VERSION as PROTOCOL_VERSION
-from tender.application.analysis.contract import READABLE_RUNTIMES, RUNTIME_VERSION
 from tender.application.analysis.service import AnalysisService
+from tender.application.shared.errors import Conflict
+from tender.domain.analysis.contract import FLOW_VERSION as PROTOCOL_VERSION
+from tender.domain.analysis.contract import RUNTIME_VERSION
 from tender.ports.repository.analysis.reports import ReportRepository
 
 
-@pytest.mark.parametrize("runtime,protocol,status,compatible", [
-    (RUNTIME_VERSION, PROTOCOL_VERSION, "running", True),
-    (RUNTIME_VERSION, PROTOCOL_VERSION, "canceled", True),
-    (RUNTIME_VERSION, PROTOCOL_VERSION, "completed", True),
-    (RUNTIME_VERSION, "research-v2", "canceled", False),
-    (RUNTIME_VERSION, None, "canceled", False),
-    ("legacy", PROTOCOL_VERSION, "canceled", False),
-    ("deepagents-0.7.22-v5-records", "research-v3", "completed", False),
+@pytest.mark.parametrize("protocol,status", [
+    (PROTOCOL_VERSION, "running"),
+    (PROTOCOL_VERSION, "canceled"),
+    (PROTOCOL_VERSION, "completed"),
 ])
 def test_report_compatibility_uses_snapshot_without_exposing_it(
-    monkeypatch, runtime, protocol, status, compatible,
+    monkeypatch, protocol, status,
 ):
-    stored = {"id": 42, "project_id": 15, "status": status, "runtime_version": runtime,
+    stored = {"id": 42, "project_id": 15, "status": status, "runtime_version": RUNTIME_VERSION,
               "source_snapshot": [], "reference_snapshot": [], "summary": [],
               "category": "goods", "topics": [], "lot_settings": []}
     if protocol is not None:
@@ -44,9 +41,34 @@ def test_report_compatibility_uses_snapshot_without_exposing_it(
 
     for _ in range(2):
         result = service.get_report(42)
-        assert result["execution_compatible"] is compatible
-        assert result["runtime_retired"] is (runtime not in READABLE_RUNTIMES)
         assert result["status"] == status
         assert not result["canceling"]
         assert "skill_snapshot" not in result
         assert "私有提示词" not in str(result)
+
+
+@pytest.mark.parametrize("runtime,protocol", [
+    ("legacy", PROTOCOL_VERSION),
+    (RUNTIME_VERSION, "research-v2"),
+    (RUNTIME_VERSION, None),
+])
+def test_retired_report_requests_fail_without_reading_report_contents(runtime, protocol):
+    repository = MagicMock(spec=ReportRepository)
+    repository.report.return_value = {
+        "id": 42, "runtime_version": runtime,
+        "skill_snapshot": {"__analysis_flow_version__": protocol},
+    }
+    service = AnalysisService(repository, 1, Mock(), Mock(), Mock())
+
+    with pytest.raises(Conflict) as error:
+        service.get_report(42)
+
+    assert error.value.code == "runtime_retired"
+    repository.report_modules.assert_not_called()
+    repository.report_runs.assert_not_called()
+
+
+def test_legacy_quality_status_is_machine_self_check_only():
+    from tender.application.analysis.quality import quality_status
+
+    assert quality_status({"quality_status": "verified"}) == "self_check_passed"

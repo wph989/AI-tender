@@ -9,9 +9,6 @@ from unittest.mock import Mock
 import pytest
 from structlog.contextvars import merge_contextvars
 from structlog.testing import capture_logs
-from synthesis_fixtures import research_calls, submission, summary_record
-from test_analysis_synthesis import execute
-from test_deep_analysis import call
 from test_llm_routing import _candidate, _ScriptedGateway
 
 from tender.application.analysis import execution as deep_analysis
@@ -75,59 +72,6 @@ def test_routing_logs_once_with_final_model_and_aggregated_usage(failover_limit)
         assert finished[0]["output_tokens"] == 5
     assert "fixture-key" not in json.dumps(logs, ensure_ascii=False)
     assert "私密模型请求正文" not in json.dumps(logs, ensure_ascii=False)
-
-
-def test_real_agent_logs_tool_parameters_once_with_research_synthesis_and_verification():
-    async def check():
-        with bind_context(project_id=15, report_id=18):
-            return await execute([
-                *research_calls(),
-                call("submit_analysis", submission([summary_record()]), "finish"),
-            ])
-
-    with capture_logs(processors=[merge_contextvars]) as logs:
-        state, _, _ = asyncio.run(check())
-    assert state["draft"]["fields"]
-    events = [log["event"] for log in logs]
-    assert "skill.load" in events
-    assert all(log["log_level"] == "info" for log in logs if log["event"] == "skill.load")
-    assert events.count("review.result") == 1
-    assert not any(event.endswith((".start", ".end", ".queued")) for event in events)
-    phases = {log.get("agent_phase") for log in logs}
-    assert {"research", "synthesis", "verification"} <= phases
-    tools = [log for log in logs if log["event"] == "tool.call"]
-    assert {"list_documents", "search_document", "complete_research", "submit_analysis"} <= {
-        log["tool"] for log in tools
-    }
-    assert all(log["project_id"] == 15 and log["report_id"] == 18 for log in logs)
-    assert all(log["duration_ms"] >= 0 for log in tools)
-    assert all("tool_parameters" in log for log in tools)
-    assert all("tool_call_id" not in log for log in tools)
-    rounds = [log for log in logs if log["event"] == "agent.round"]
-    assert rounds and all(log["log_level"] == "debug" for log in rounds)
-    # 精简展示不能破坏工具消息与调用的绑定，恢复仍需按原 ID 重放。
-    assert state["tool_results"]["call_finish"]["data"]["tool_call_id"] == "call_finish"
-    assert any(
-        log["tool"] == "search_document" and log["tool_parameters"] == {"query": "质保"}
-        for log in tools
-    )
-
-
-def test_validation_rejection_logs_item_reason_and_correction_count():
-    async def reject(items):
-        for item in items:
-            item.update(verification="unsupported", verification_issues=["原文不支持该结论"])
-
-    with capture_logs(processors=[merge_contextvars]) as logs:
-        asyncio.run(execute([
-            *research_calls(),
-            call("submit_analysis", submission([summary_record()], final=False), "bad"),
-            call("submit_analysis", submission(), "finish"),
-        ], review=reject))
-    rejected = next(log for log in logs if log["event"] == "record.reject")
-    assert rejected["item_id"] and rejected["correction_count"] == 1
-    assert rejected["issues"] == "原文不支持该结论"
-    assert rejected["log_level"] == "warning"
 
 
 def test_parallel_modules_keep_context_in_child_tasks_and_threads(monkeypatch, executor):

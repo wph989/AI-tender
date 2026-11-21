@@ -80,6 +80,13 @@ class RedisConfigCache:
         except Exception as exc:
             logger.warning("配置失效消息发送失败，等 TTL 兜底：%s", exc)
 
+    def health(self) -> bool:
+        try:
+            return bool(self._client.ping())
+        except Exception as exc:
+            logger.warning("Redis 健康检查失败：%s", exc)
+            return False
+
     def close(self) -> None:
         try:
             self._client.close()

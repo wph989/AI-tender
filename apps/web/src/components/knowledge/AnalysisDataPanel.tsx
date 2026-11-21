@@ -12,8 +12,8 @@ import type {
 } from "@/types/knowledge";
 
 const readinessLabels = { usable: "依据可用", partial: "有待核对事项", unavailable: "依据不足" };
-type ReviewTarget = Pick<BusinessRecord, "id" | "title" | "citations" | "review_status"
-  | "human_review" | "human_review_status"> & { kind: BusinessRecord["kind"] | "coverage" };
+type ReviewTarget = Pick<BusinessRecord, "id" | "title" | "citations"
+  | "verification" | "human_review" | "human_review_status"> & { kind: BusinessRecord["kind"] | "coverage" };
 interface Props {
   report: AnalysisReport;
   onLocate: (citation: Citation) => void;
@@ -87,14 +87,14 @@ export function AnalysisDataPanel({ report, onLocate, snapshot, open, onClose, o
 
   function reviewControls(record: ReviewTarget) {
     const status = record.human_review_status ?? "pending";
-    const reviewReady = record.review_status !== "needs_review" && record.citations.length > 0;
+    const reviewReady = record.verification === "supported" && record.citations.length > 0;
     const label = ({ pending: "待人工复核", confirmed: "人工确认", corrected: "人工修正",
       rejected: "人工驳回", outdated: "资料已变更" } as const)[status];
     const editable = !report.stale && !snapshot?.stale && status !== "outdated";
     const canCorrect = record.kind === "fact" || record.kind === "requirement";
     return <div className="mt-2 flex flex-wrap items-center gap-2">
-      <Tag color={record.review_status === "needs_review" ? "orange" : "blue"}>
-        {record.review_status === "needs_review" ? "机器自查待复核" : "机器自查通过"}
+      <Tag color={record.verification === "supported" ? "blue" : "orange"}>
+        {record.verification === "supported" ? "机器自查通过" : "机器自查未通过"}
       </Tag>
       <Tag color={status === "confirmed" || status === "corrected" ? "green"
         : status === "rejected" || status === "outdated" ? "red" : "gold"}>{label}</Tag>
@@ -117,7 +117,7 @@ export function AnalysisDataPanel({ report, onLocate, snapshot, open, onClose, o
           loading={reviewing === record.id} onClick={() => void review(record, "rejected")}>驳回</Button>}
       </>}
       {!reviewReady && status === "pending" && <span className="text-xs text-slate-500">
-        {record.review_status === "needs_review" ? "机器自查未通过，须重跑分析后再复核" : "原文依据未齐，暂不能复核"}
+        原文依据未齐，暂不能复核
       </span>}
     </div>;
   }
@@ -181,7 +181,8 @@ export function AnalysisDataPanel({ report, onLocate, snapshot, open, onClose, o
   const data = snapshot?.data;
   const coverage = data?.coverage.flatMap((item) => item.status === "not_applicable"
     && item.review_id && item.citations?.length
-    ? [{ ...item, id: item.review_id, kind: "coverage" as const, citations: item.citations }] : []) ?? [];
+    ? [{ ...item, id: item.review_id, kind: "coverage" as const, citations: item.citations,
+      verification: item.verification ?? "unsupported" }] : []) ?? [];
   return <Drawer title="按标段查看投标要求" open={open} size={760} onClose={onClose}>
       <p className="mb-3 text-sm text-slate-500">这里使用报告快照中已确认的标段范围。公共要求一并保留，范围未确认的条款单列。</p>
       <Space className="mb-4" wrap>

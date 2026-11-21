@@ -11,6 +11,19 @@ from tender.api.shared.common import configs, engine
 from tender.api.shared.dto import StrictModel
 from tender.api.shared.errors import as_api_problem
 from tender.api.shared.logging import throttle_access_log
+from tender.api.shared.responses import (
+    CitationResolutionResponse,
+    CollectionResponse,
+    DeleteResponse,
+    EmbeddingTestResponse,
+    IdStatusResponse,
+    KnowledgeAnswerResponse,
+    KnowledgeCollectionListResponse,
+    KnowledgeSearchResponse,
+    KnowledgeSourcesResponse,
+    LinkedCollectionsResponse,
+    QueuedCountResponse,
+)
 from tender.application.knowledge.service import KnowledgeService
 from tender.application.shared.errors import ServiceError
 from tender.core import settings
@@ -84,12 +97,14 @@ def public_sources(request: Request, ids: list[int]) -> list[dict]:
     return knowledge_service(request).public_sources(ids)
 
 
-@router.get("/knowledge/collections")
+@router.get("/knowledge/collections", response_model=KnowledgeCollectionListResponse,
+            response_model_exclude_unset=True)
 def list_collections(request: Request) -> dict:
     return knowledge_service(request).list_collections()
 
 
-@router.post("/knowledge/collections", status_code=201)
+@router.post("/knowledge/collections", status_code=201, response_model=CollectionResponse,
+             response_model_exclude_unset=True)
 def create_collection(payload: CollectionInput, request: Request) -> dict:
     try:
         return knowledge_service(request).create_collection(
@@ -100,7 +115,8 @@ def create_collection(payload: CollectionInput, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.get("/knowledge/collections/{collection_id}")
+@router.get("/knowledge/collections/{collection_id}", response_model=CollectionResponse,
+            response_model_exclude_unset=True)
 # 知识库页面持续查询来源处理和索引状态。
 @throttle_access_log()
 def get_collection(collection_id: int, request: Request) -> dict:
@@ -110,7 +126,8 @@ def get_collection(collection_id: int, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.patch("/knowledge/collections/{collection_id}")
+@router.patch("/knowledge/collections/{collection_id}", response_model=CollectionResponse,
+              response_model_exclude_unset=True)
 def update_collection(collection_id: int, payload: CollectionInput, request: Request) -> dict:
     try:
         return knowledge_service(request).update_collection(
@@ -122,7 +139,7 @@ def update_collection(collection_id: int, payload: CollectionInput, request: Req
         raise as_api_problem(exc) from exc
 
 
-@router.delete("/knowledge/collections/{collection_id}")
+@router.delete("/knowledge/collections/{collection_id}", response_model=DeleteResponse)
 def delete_collection(collection_id: int, request: Request) -> dict:
     try:
         return knowledge_service(request).delete_collection(collection_id)
@@ -130,7 +147,8 @@ def delete_collection(collection_id: int, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.post("/knowledge/collections/{collection_id}/reindex", status_code=202)
+@router.post("/knowledge/collections/{collection_id}/reindex", status_code=202,
+             response_model=QueuedCountResponse)
 def reindex_collection(collection_id: int, request: Request) -> dict:
     try:
         return knowledge_service(request).reindex_collection(collection_id)
@@ -138,7 +156,8 @@ def reindex_collection(collection_id: int, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.get("/knowledge/collections/{collection_id}/search")
+@router.get("/knowledge/collections/{collection_id}/search",
+            response_model=KnowledgeSearchResponse, response_model_exclude_unset=True)
 async def search_collection(
     collection_id: int,
     request: Request,
@@ -150,7 +169,8 @@ async def search_collection(
         raise as_api_problem(exc) from exc
 
 
-@router.post("/knowledge/citations/resolve")
+@router.post("/knowledge/citations/resolve", response_model=CitationResolutionResponse,
+             response_model_exclude_unset=True)
 def resolve_citation(payload: CitationInput, request: Request) -> dict:
     try:
         return knowledge_service(request).resolve_citation(payload.model_dump())
@@ -158,7 +178,7 @@ def resolve_citation(payload: CitationInput, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.post("/knowledge/embedding/test")
+@router.post("/knowledge/embedding/test", response_model=EmbeddingTestResponse)
 async def test_embedding(request: Request) -> dict:
     try:
         return await knowledge_service(request).test_embedding()
@@ -166,7 +186,8 @@ async def test_embedding(request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.post("/knowledge/sources/{source_id}/process", status_code=202)
+@router.post("/knowledge/sources/{source_id}/process", status_code=202,
+             response_model=IdStatusResponse, response_model_exclude_unset=True)
 def process_source(source_id: int, request: Request) -> dict:
     try:
         return knowledge_service(request).process_source(source_id)
@@ -174,7 +195,8 @@ def process_source(source_id: int, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.get("/projects/{project_id}/knowledge")
+@router.get("/projects/{project_id}/knowledge", response_model=KnowledgeSourcesResponse,
+            response_model_exclude_unset=True)
 def project_knowledge(project_id: int, request: Request) -> dict:
     try:
         return knowledge_service(request).project_knowledge(project_id)
@@ -182,7 +204,8 @@ def project_knowledge(project_id: int, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.put("/projects/{project_id}/knowledge/collections")
+@router.put("/projects/{project_id}/knowledge/collections",
+            response_model=LinkedCollectionsResponse)
 def link_collections(project_id: int, payload: LinkedCollections, request: Request) -> dict:
     try:
         return knowledge_service(request).link_collections(
@@ -237,7 +260,8 @@ def enqueue_question(
         raise as_api_problem(exc) from exc
 
 
-@router.post("/knowledge/collections/{collection_id}/ask", status_code=202)
+@router.post("/knowledge/collections/{collection_id}/ask", status_code=202,
+             response_model=IdStatusResponse, response_model_exclude_unset=True)
 def ask_collection(collection_id: int, payload: AskInput, request: Request) -> dict:
     try:
         return knowledge_service(request).ask_collection(collection_id, payload.question)
@@ -245,7 +269,8 @@ def ask_collection(collection_id: int, payload: AskInput, request: Request) -> d
         raise as_api_problem(exc) from exc
 
 
-@router.post("/projects/{project_id}/knowledge/ask", status_code=202)
+@router.post("/projects/{project_id}/knowledge/ask", status_code=202,
+             response_model=IdStatusResponse, response_model_exclude_unset=True)
 def ask_project(project_id: int, payload: AskInput, request: Request) -> dict:
     try:
         return knowledge_service(request).ask_project(
@@ -257,7 +282,8 @@ def ask_project(project_id: int, payload: AskInput, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.get("/knowledge/answers/{answer_id}")
+@router.get("/knowledge/answers/{answer_id}", response_model=KnowledgeAnswerResponse,
+            response_model_exclude_unset=True)
 # 问答执行期间前端每 2.5 秒查询进度和回答。
 @throttle_access_log()
 def get_answer(answer_id: int, request: Request) -> dict:

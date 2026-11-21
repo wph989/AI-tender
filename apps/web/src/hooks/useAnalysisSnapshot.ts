@@ -13,7 +13,7 @@ export function useAnalysisSnapshot(report: AnalysisReport) {
   const terminal = !["waiting", "pending", "running"].includes(report.status);
   useEffect(() => {
     setSnapshot(null); setError(null);
-    if (!terminal || !report.data_schema_version || report.runtime_retired) {
+    if (!terminal || !report.data_schema_version) {
       setLoading(false); return;
     }
     const abort = new AbortController();
@@ -25,8 +25,7 @@ export function useAnalysisSnapshot(report: AnalysisReport) {
       if (!abort.signal.aborted) setError(reason instanceof Error ? reason.message : "汇总核对暂不可用");
     }).finally(() => { if (!abort.signal.aborted) setLoading(false); });
     return () => abort.abort();
-  }, [report.id, report.finished_at, report.stale, report.data_schema_version,
-    report.runtime_retired, terminal, revision]);
+  }, [report.id, report.finished_at, report.stale, report.data_schema_version, terminal, revision]);
   const reload = useCallback(() => setRevision((value) => value + 1), []);
   return { snapshot: terminal && snapshot?.report_id === report.id ? snapshot : null, error, loading, reload, terminal };
 }

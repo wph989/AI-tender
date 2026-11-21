@@ -8,9 +8,9 @@
 
 草稿与自查随工具回执联合事务保存，保存后响应中断时重放同一回执。相同内容不新增版本；正文、范围、引用或显式依赖变化使旧自查失效。新attempt隔离新增身份，保留原草稿和问题；同attempt恢复保留原额度及截止时间。中断不发布草稿，重跑保留上一轮正式数据；正式业务数据未变时不新增快照版本。
 
-旧v5报告及快照继续可读，旧阶段检查点拒绝按新协议执行，需新建报告。旧独立审查和强制收尾参数在配置页面标为只读，新流程不使用。页面显示最近工具活动、草稿数、当前自查数和未决问题数，旧历史报告仍可展示原进度。
+旧v5报告及快照保留在数据库中，不通过应用接口读取或展示；旧阶段检查点拒绝按新协议执行，需新建报告。页面显示最近工具活动、草稿数、当前自查数和未决问题数。
 
-部署保持 API＋单 Worker＋Beat，未新增业务表。旧 `agent.py` 中的模型适配、摘要和检查点恢复组件继续复用；旧阶段实现仅保留供历史兼容回归，生产入口已切换。
+部署保持 API＋单 Worker＋Beat，未新增业务表。当前专题执行由 `execution.py` 调用 `skill_agent.py`；旧阶段专属实现及仅覆盖旧协议的兼容测试已删除。草稿、自查、质量状态、人工裁定和不可变结果快照仍由各自职责维护。
 
 验证记录位于 `C:/Users/wph98/.codex/recovery/AI-tender-agent-led-20261115/`。初版统一后端1755通过／13跳过，隔离PostgreSQL249通过，前端单测67通过；桌面和手机新进度及定位专项6通过。
 
@@ -136,14 +136,14 @@ v5诊断发现补读请求10块被强截为1块，以及get_research_context默�
 
 | 场景 | 可复核的测试依据 |
 | --- | --- |
-| 坏字段、非法证据、问题身份及不同事项独立修正 | `test_analysis_stability.py`、`test_analysis_argument_failures.py` |
-| 过时工作、分页版本变化及混合批次 | `test_analysis_compact_protocol.py`、`test_analysis_v3.py` |
-| 未知/公共/多标段并存、部分确认及完整替代 | `test_analysis_scope_transitions.py`、PG `test_analysis_topic_flow.py` |
-| 提前final、自然语言、重复工具、采集边界自动审查 | `test_analysis_stability.py`、`test_analysis_v3.py` |
+| 坏字段、非法证据和问题修正 | `test_analysis_validation_feedback.py`、`test_analysis_skill_agent.py`、`test_analysis_audit_repairs.py` |
+| 搜索分页、结果边界及资料版本变化 | `test_analysis_search_paging.py`、`test_analysis_retrieval_limits.py`、PG `test_analysis_data_flow.py` |
+| 结果快照与人工裁定状态 | `test_analysis_data.py`、`test_human_review.py`、PG `test_analysis_data_flow.py` |
+| 最终提交门禁、重复工具回执和草稿恢复 | `test_analysis_agent_workspace.py`、`test_analysis_audit_repairs.py`、PG `test_analysis_recovery_flow.py` |
 | 超时、429、流中断、切换及持久窗口耗尽 | `test_llm_routing.py`、`test_analysis_call_accounting.py`、PG `test_analysis_recovery_flow.py` |
 | 研究保存/草稿/审查缓存后中断，同attempt恢复 | PG `test_saved_business_update_resumes_graph_without_reapplying_or_resettling`的三个边界 |
 | 无重复结算、无预算重置、原截止及无pending预占 | PG `test_deepagents_runtime.py`、`test_analysis_recovery_flow.py` |
-| 取消、撤权及无核实成果时准确结束 | PG `test_deepagents_runtime.py`、`test_analysis_topic_flow.py` |
-| 分包导航不能代替完整正文否决其它包事项 | `test_review_cannot_reject_record_only_present_in_cross_packet_navigation` |
+| 取消、租约中断及执行结果恢复 | PG `test_deepagents_runtime.py`、`test_analysis_recovery_flow.py` |
+| 退役报告拒绝读取或重跑 | `test_analysis_report_compatibility.py` |
 
 当前验收进度及每轮结论见 [解析异常诊断与修复记录](23-解析异常诊断与修复记录.md)。

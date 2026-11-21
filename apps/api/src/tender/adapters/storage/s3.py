@@ -44,6 +44,13 @@ class S3BlobStore:
     def close(self) -> None:
         self._client.close()
 
+    def health(self) -> bool:
+        try:
+            self._client.head_bucket(Bucket=self._bucket)
+            return True
+        except (BotoCoreError, ClientError):
+            return False
+
     def put(self, key: str, content: bytes, *, content_type: str) -> None:
         try:
             self._client.put_object(

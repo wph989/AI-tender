@@ -401,8 +401,7 @@ data: {"status":"completed","version_id":2048}
 `retry` 接受 `failed`、`partial`、`canceled`、`completed` 报告；显式 `module_keys` 可重跑已完成模块，
 已完成模块从零开始，其它模块保持原状态。不传 `module_keys` 时只补跑失败与已取消模块；
 取消时尚未创建任何模块的报告可以重新进入 `waiting`。
-恢复进程中断留下的 `running` 模块不受此限制。`runtime_version` 与当前运行时不一致的历史报告只读展示，
-补跑返回 409 `runtime_retired`。历史报告不比较参考来源快照：旧流程不记录该快照，否则库中只要有参考来源
+恢复进程中断留下的 `running` 模块不受此限制。`runtime_version` 与当前运行时不一致的历史报告读取和补跑均返回 409 `runtime_retired`；项目报告列表不包含这些记录。历史行保留在数据库中，不比较参考来源快照：旧流程不记录该快照，否则库中只要有参考来源
 就会恒判为“材料已变化”。
 
 DeepAgents 报告补跑可选 `max_output_tokens`（整数，最小值 1，无人工最大值）和 `timeout_seconds`（整数 ≥1，无人工最大值），只覆盖新 attempt 的对应字段；其余限值（模型/工具次数、证据块、上下文、时长）取配置中心当前值，用户调大预算后补跑立即生效。旧 attempt、报告创建时的快照和累计用量保留不回写，请求次数不随之扩大。输出仍受模型自身配置的 `max_tokens` 和供应商实际能力约束。各配置的实际限制与建议见 `docs/工程/18-配置限制清单.md`。

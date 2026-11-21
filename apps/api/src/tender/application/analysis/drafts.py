@@ -5,10 +5,8 @@ from __future__ import annotations
 import copy
 from typing import Literal
 
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
-from tender.application.analysis.context import evidence_version
-from tender.application.analysis.contract import FLOW_VERSION
 from tender.application.analysis.data import (
     DataInput,
     DataScope,
@@ -19,11 +17,38 @@ from tender.application.analysis.data import (
     record_identity,
     scope_covers,
 )
-from tender.application.analysis.protocol import SubmissionRecord
 from tender.application.knowledge.content import fingerprint, normalized
 from tender.application.shared.validation import InputError, schema_feedback
+from tender.domain.analysis.contract import FLOW_VERSION
 
 AGENT_PROTOCOL = FLOW_VERSION
+
+
+def evidence_version(row: dict) -> str:
+    """自查凭据绑定来源原文版本，不受检索排序变化影响。"""
+    return fingerprint({key: row.get(key) for key in (
+        "source_id", "collection_id", "project_id", "parse_run_id", "version_id",
+        "block_id", "element_id", "offset", "chapter", "content", "locations",
+    )})
+
+
+def batch_field(model: type[BaseModel], **kwargs):
+    """保留列表项完整 JSON schema，并允许 Agent 按条纠正无效项目。"""
+    schema = model.model_json_schema()
+    definitions = schema.pop("$defs", {})
+
+    def inline(value):
+        if isinstance(value, list):
+            return [inline(item) for item in value]
+        if isinstance(value, dict):
+            if "$ref" in value:
+                return inline(definitions[value["$ref"].split("/")[-1]])
+            return {key: inline(item) for key, item in value.items()}
+        return value
+
+    return Field(
+        json_schema_extra={"items": inline(schema), "x-tender-partial-items": True}, **kwargs,
+    )
 
 
 def resume_workspace(previous: dict) -> dict:
@@ -31,26 +56,40 @@ def resume_workspace(previous: dict) -> dict:
     state = copy.deepcopy(previous)
     if not state:
         return state
-    if state.get("topic_flow") or not state.get("agent_workspace"):
+    if not state.get("agent_workspace"):
         raise InputError.for_field("state", "旧阶段检查点不能补跑为新流程，请新建报告")
     if "research" in state:
         state["research"]["tool_calls"] = 0
     for key in (
         "draft", "tool_results", "tool_outcomes", "tool_call_keys", "stop_reason",
-        "quality_status", "quality_issues", "model_unavailable_retries", "subagent_retries",
+        "quality_status", "quality_issues", "agent_progress",
+        "model_unavailable_retries", "subagent_retries",
     ):
         state.pop(key, None)
     book = state["agent_workspace"]
     book.update(finalized=False, final_ids=[], draft_receipts={}, review_receipts={},
                 attempt_serial=book.get("attempt_serial", 0) + 1)
-    state["staged_items_verified"] = False
     return state
 
 
-class DraftRecord(SubmissionRecord):
-    # 范围属于结果数据；不再要求先改变研究工作的阶段才能修正范围。
+class DraftRecord(DataInput):
+    id: str | None = Field(default=None, min_length=1)
+    key: str | None = Field(default=None, min_length=1, max_length=100)
+    kind: Literal["fact", "requirement", "lot", "format_node", "relation"]
+    group: str
+    content: dict[str, str | list[str]] = Field(min_length=1)
+    title: str | None = Field(default=None, min_length=1, max_length=300)
     scope: DataScope
+    block_ids: list[str] = Field(min_length=1, max_length=160)
     work_ids: list[str] = Field(default_factory=list, max_length=50)
+    code: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    node_type: Literal["group", "section"] | None = None
+    parent_key: str | None = None
+    requirement_keys: list[str] = Field(default_factory=list)
+    predicate: Literal["supersedes", "conflicts", "requires", "contains"] | None = None
+    subject_key: str | None = None
+    object_key: str | None = None
     version: int | None = Field(default=None, ge=1)
 
 
@@ -252,7 +291,6 @@ class DraftWorkspace:
                     draft_version=version,
                     draft_signature=semantic,
                     verification="pending",
-                    review_status="needs_review",
                     work_ids=row.work_ids,
                 )
                 changed = not old or old["draft_version"] != version
@@ -444,7 +482,7 @@ class DraftWorkspace:
             if unresolved and all(i["action"] == "provide_input" for i in unresolved)
             else "needs_review"
             if unresolved
-            else "verified"
+            else "self_check_passed"
         )
         # 缺件和遗漏沿用既有缺口投影，正式页面和下游快照都能保留同一问题身份。
         self.state["business_gaps"] = [
@@ -456,7 +494,7 @@ class DraftWorkspace:
             for i in unresolved
         ]
         for rid in ids:
-            items[rid].update(verification="supported", review_status="current")
+            items[rid].update(verification="supported")
         self.state["draft"] = {
             "fields": [copy.deepcopy(items[rid]) for rid in ids],
             "relations": [],
@@ -469,8 +507,6 @@ class DraftWorkspace:
         return {
             "protocol": AGENT_PROTOCOL,
             "activity": self.book.get("activity"),
-            "topics": [],
-            "audit_round": 0,
             "draft_count": len(self.items()),
             "reviewed_count": sum(self.review_current(rid) for rid in self.items()),
             "unresolved_issues": sum(i["status"] == "open" for i in self.book["issues"].values()),

@@ -7,8 +7,6 @@ from collections.abc import Callable
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
-from tender.application.analysis.contract import FLOW_VERSION as PROTOCOL_VERSION
-from tender.application.analysis.contract import READABLE_RUNTIMES, RUNTIME_VERSION
 from tender.application.analysis.data import (
     DATA_VERSION,
     ContextError,
@@ -56,6 +54,12 @@ from tender.application.shared.errors import (
     ServiceError,
     Unprocessable,
 )
+from tender.domain.analysis.contract import (
+    FLOW_VERSION,
+    FLOW_VERSION_KEY,
+    RUNTIME_VERSION,
+    is_current_report,
+)
 from tender.ports.configuration.registry import ConfigReader
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.repository.analysis.reports import ReportRepository
@@ -73,8 +77,7 @@ def report_inputs_changed(
         or settings["analysis_topics"] != report["topics"]
         or [lot for lot in lots if not (lot["id"] in derived and lot["category"] is None
                                         and lot["topics"] is None)] != report["lot_settings"]
-        or (report["runtime_version"] in READABLE_RUNTIMES
-            and source_signature(references) != source_signature(report["reference_snapshot"]))
+        or source_signature(references) != source_signature(report["reference_snapshot"])
     )
 
 
@@ -153,7 +156,7 @@ class AnalysisService:
                         raise
         rules = skill_snapshot()
         rules["__analysis_data_version__"] = DATA_VERSION
-        rules["__analysis_flow_version__"] = PROTOCOL_VERSION
+        rules[FLOW_VERSION_KEY] = FLOW_VERSION
         references = [
             source
             for source in self.store.sources(self.store.collections_for_project(project_id))
@@ -188,12 +191,16 @@ class AnalysisService:
         report = self.store.report(report_id)
         if report is None:
             raise NotFound("报告不存在")
+        if not is_current_report(report):
+            raise Conflict(
+                "此报告协议已退役，请重新发起分析",
+                code="runtime_retired",
+            )
         return report
 
     def get_report(self, report_id: int) -> dict[str, Any]:
         report = self.report_row(report_id)
-        # 快照不对外返回，但兼容性仍须使用它；提前丢弃会把当前协议误判成旧协议。
-        rules = report.pop("skill_snapshot", {})
+        report.pop("skill_snapshot", None)
         modules = self.store.report_modules(report_id)
         allowed = self.store.collections_for_project(report["project_id"])
         module_inputs = {}
@@ -211,29 +218,19 @@ class AnalysisService:
         for module in modules:
             module["runs"] = [run for run in runs if run["module_id"] == module["id"]]
             latest = module["runs"][-1] if module["runs"] else {}
-            if latest.get("agent_progress"):
-                module["progress"] = latest["agent_progress"]
-            merged = {item["id"]: item for item in module["items"]}
-            if module["status"] != "completed":
-                merged.update(
-                    {
-                        item["id"]: item
-                        for item in latest.get("saved_items") or []
-                        if item.get("verification") == "supported"
-                    }
-                )
+            progress = latest.get("agent_progress")
+            if progress and progress.get("protocol") == FLOW_VERSION:
+                module["progress"] = progress
             module["items"] = visible_items(
                 self.store,
                 display_items(
                     merge_field_entries(
-                        list(merged.values()),
+                        module["items"],
                         is_outline=module["module_key"] == "bid_format_outline_parsing",
                     )
                 ),
                 allowed,
             )
-        for run in runs:
-            run.pop("saved_items", None)
         report["summary"] = visible_items(self.store, report["summary"], allowed)
         current = self.analysis_status(report["project_id"])
         live = {source["source_id"]: source for source in self.store.sources(allowed)}
@@ -259,7 +256,9 @@ class AnalysisService:
                 module["research_summary"] = ""
                 module["research_gaps"] = []
                 module["quality_issues"] = []
-        retired = report["runtime_version"] not in READABLE_RUNTIMES
+                module.pop("progress", None)
+                for run in module["runs"]:
+                    run.pop("agent_progress", None)
         stale = report_inputs_changed(
             report, current, current["lots"], current["sources"], current_references,
         )
@@ -270,20 +269,11 @@ class AnalysisService:
             "modules": modules,
             "quality_status": aggregate_quality([m["quality_status"] for m in modules]),
             "stale": stale,
-            "runtime_retired": retired,
-            "execution_compatible": report["runtime_version"] == RUNTIME_VERSION and rules.get(
-                "__analysis_flow_version__",
-            ) == PROTOCOL_VERSION,
-            "data_schema_version": None if retired else DATA_VERSION,
+            "data_schema_version": DATA_VERSION,
         }
 
     def data_snapshot(self, report_id: int, snapshot_id: int | None = None) -> dict:
-        report = self.report_row(report_id)
-        if report["runtime_version"] not in READABLE_RUNTIMES:
-            raise Conflict(
-                "此报告没有业务数据，请重新发起分析",
-                code="data_reanalysis_required",
-            )
+        self.report_row(report_id)
         snapshot = self.store.data_snapshot(report_id, snapshot_id)
         if snapshot is None:
             raise Conflict("正式业务数据快照尚未就绪", code="data_not_ready")
@@ -336,18 +326,17 @@ class AnalysisService:
             data["evidence_ids"] = list(record["evidence_ids"])
             evidence.update({key: stored_evidence[key] for key in data["evidence_ids"]})
             records.append(data)
+        inputs_accessible = self.progress_accessible(report, allowed)
         return {
             "schema_version": DATA_VERSION,
             "module_key": module_key,
             "status": module["status"],
             "quality_status": quality_status(business),
             "quality_issues": (business.get("quality_issues", [])
-                               if self.progress_accessible(report, allowed) else []),
+                               if inputs_accessible else []),
             "records": records,
             "evidence": evidence,
             "output_schema": output_schema(report["skill_snapshot"], module_key),
-            **({"progress": business["progress"]} if business.get("progress")
-               and self.progress_accessible(report, allowed) else {}),
         }
 
     def progress_accessible(self, report: dict, allowed: list[int]) -> bool:
@@ -391,6 +380,7 @@ class AnalysisService:
             self.store, snapshot["data"], self.store.collections_for_project(report["project_id"]),
             sources=sources,
         )
+        data["quality_status"] = quality_status({"quality_status": data.get("quality_status")})
         # 来源撤销后不回显可能含原文的人工备注或修正结果。
         if any(gap["code"] == "source_unavailable" for gap in data["gaps"]):
             return review_projection(data, signatures, signature, {}, current=False)
@@ -427,7 +417,7 @@ class AnalysisService:
             raise NotFound("事项不存在或原文已不可访问")
         if record["human_review_status"] == "outdated":
             raise Conflict("该专题尚未核对当前资料，请重新解析后复核", code="record_outdated")
-        if record.get("review_status") == "needs_review" or not record.get("citations"):
+        if not record.get("citations"):
             raise Conflict("该事项的原文依据尚未齐备", code="record_unready")
         if payload.decision == "corrected" and record["kind"] not in CORRECTABLE_KINDS:
             raise InvalidArgument("只有项目事实和招标要求支持人工修正正文")
@@ -562,14 +552,6 @@ class AnalysisService:
         mode: Literal["restart", "resume"] | None = None,
     ) -> dict[str, Any]:
         report = self.report_row(report_id)
-        if report["runtime_version"] != RUNTIME_VERSION:
-            raise Conflict(
-                "该报告由已下线的解析流程生成，请重新发起分析",
-                code="runtime_retired",
-            )
-        if report.get("skill_snapshot", {}).get("__analysis_flow_version__") != PROTOCOL_VERSION:
-            raise Conflict("解析协议已升级，请新建报告；旧报告仍可查看",
-                           code="execution_incompatible")
         if report["status"] in {"waiting", "pending", "running"}:
             raise Conflict(
                 "报告正在排队或执行，请等待完成或先取消再补跑",

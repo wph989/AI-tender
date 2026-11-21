@@ -3,11 +3,11 @@
 import copy
 
 import pytest
+from agent_fixtures import KEY, raw, schema
 from test_analysis_research import block
-from test_analysis_v3 import KEY, raw, schema
 
+from tender.application.analysis.data import published_items
 from tender.application.analysis.drafts import DraftWorkspace
-from tender.application.analysis.state import published_items
 from tender.application.shared.validation import InputError
 
 
@@ -39,11 +39,11 @@ def approve(book, receipt):
 def test_draft_and_review_never_publish_before_explicit_final():
     book = workspace()
     row = saved(book)
-    assert published_items(book.state, final=True) == []
+    assert published_items(book.state) == []
     approve(book, row)
-    assert published_items(book.state, final=True) == []
+    assert published_items(book.state) == []
     book.finalize([row["id"]], "已核对质保要求")
-    assert len(published_items(book.state, final=True)) == 1
+    assert len(published_items(book.state)) == 1
     assert book.state["draft"]["business_data"]["records"][0]["content"] == raw()["content"]
 
 
@@ -197,17 +197,6 @@ def test_deleted_mistake_can_be_closed_and_does_not_return_in_final():
     assert book.state["draft"]["fields"] == []
     assert any(event["event"] == "delete" for event in book.book["history"])
 
-
-def test_runtime_does_not_project_drafts_even_after_final_tool_before_commit():
-    from tender.application.analysis.runtime import AgentRuntime
-
-    book = workspace()
-    row = saved(book)
-    approve(book, row)
-    assert AgentRuntime._staged_payload(book.state, include_relations=True) is None
-
-    book.finalize([row["id"]], "完成")
-    assert AgentRuntime._staged_payload(book.state, include_relations=True) is None
 
 
 def test_new_attempt_call_ids_cannot_overwrite_previous_drafts():

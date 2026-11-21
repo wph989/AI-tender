@@ -10,6 +10,7 @@ from starlette.responses import Response
 
 from tender.api.shared.common import actor, blobs, configs, engine
 from tender.api.shared.errors import as_api_problem
+from tender.api.shared.responses import ProjectFileResponse, ReplaceFileResponse, UploadResponse
 from tender.api.shared.storage import stream_object
 from tender.application.projects.files import (
     MAX_ARCHIVE_BYTES,
@@ -48,7 +49,7 @@ def _service(request: Request) -> ProjectFileService:
     )
 
 
-@router.post("", status_code=202)
+@router.post("", status_code=202, response_model=UploadResponse)
 async def upload_files(
     project_id: int,
     request: Request,
@@ -88,7 +89,7 @@ async def upload_files(
     except ServiceError as exc:
         raise as_api_problem(exc) from exc
 
-@router.patch("/{file_id}")
+@router.patch("/{file_id}", response_model=ProjectFileResponse)
 def patch_file(
     project_id: int,
     file_id: int,
@@ -102,7 +103,7 @@ def patch_file(
         raise as_api_problem(exc) from exc
 
 
-@router.post("/{file_id}/replace", status_code=202)
+@router.post("/{file_id}/replace", status_code=202, response_model=ReplaceFileResponse)
 async def replace_file(
     project_id: int,
     file_id: int,
@@ -127,7 +128,7 @@ async def replace_file(
         raise as_api_problem(exc) from exc
 
 
-@router.delete("/{file_id}", status_code=204)
+@router.delete("/{file_id}", status_code=204, response_model=None)
 def delete_file(project_id: int, file_id: int, request: Request) -> Response:
     try:
         _service(request).delete(project_id, file_id)
@@ -136,7 +137,7 @@ def delete_file(project_id: int, file_id: int, request: Request) -> Response:
     return Response(status_code=204)
 
 
-@router.get("/{file_id}/original")
+@router.get("/{file_id}/original", response_model=None)
 def get_original(project_id: int, file_id: int, request: Request) -> Response:
     try:
         original = _service(request).original(project_id, file_id)

@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from tender.api.shared.common import engine
 from tender.api.shared.errors import as_api_problem
 from tender.api.shared.logging import throttle_access_log
+from tender.api.shared.responses import JobResponse
 from tender.application.jobs.service import JobService
 from tender.application.shared.errors import ServiceError
 from tender.core import settings
@@ -31,7 +32,7 @@ def _payload(request: Request, job_id: str) -> dict[str, object] | None:
         return None
 
 
-@router.get("/{job_id}")
+@router.get("/{job_id}", response_model=JobResponse)
 # 前端等待解析时每秒查询，只压缩重复访问摘要。
 @throttle_access_log()
 def get_job(job_id: str, request: Request) -> dict[str, object]:
@@ -41,7 +42,7 @@ def get_job(job_id: str, request: Request) -> dict[str, object]:
         raise as_api_problem(exc) from exc
 
 
-@router.get("/{job_id}/events")
+@router.get("/{job_id}/events", response_model=None)
 async def job_events(job_id: str, request: Request) -> StreamingResponse:
     _payload_or_raise(request, job_id)
 
@@ -84,7 +85,7 @@ def _payload_or_raise(request: Request, job_id: str) -> dict[str, object]:
         raise as_api_problem(exc) from exc
 
 
-@router.post("/{job_id}/cancel")
+@router.post("/{job_id}/cancel", response_model=JobResponse)
 def cancel_job(job_id: str, request: Request) -> dict[str, object]:
     """取消任务；已终态的任务返回 409，避免给出「取消成功」的假象。"""
     try:

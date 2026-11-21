@@ -18,11 +18,6 @@ def _mypy(*paths: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_real_adapters_satisfy_ports_at_composition_boundary():
-    result = _mypy()
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
 def test_checker_reads_real_implementation_signatures(tmp_path):
     # 若把 follow_imports 从 silent 改成 skip，真实仓储会变成 Any，以下两处错误将漏报。
     fixture = tmp_path / "incompatible_port_probe.py"

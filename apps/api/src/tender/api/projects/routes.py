@@ -9,6 +9,7 @@ from starlette.responses import Response
 from tender.api.shared.common import engine
 from tender.api.shared.errors import as_api_problem
 from tender.api.shared.logging import throttle_access_log
+from tender.api.shared.responses import ProjectDetailResponse, ProjectListResponse, ProjectResponse
 from tender.application.projects.service import ProjectService
 from tender.application.shared.errors import ServiceError
 from tender.core import settings
@@ -37,7 +38,7 @@ def _service(request: Request) -> ProjectService:
     return create_project_service(engine(request), settings.company_id())
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, response_model=ProjectResponse)
 def create_project(payload: ProjectCreate, request: Request) -> dict[str, object]:
     try:
         return _service(request).create(
@@ -49,7 +50,7 @@ def create_project(payload: ProjectCreate, request: Request) -> dict[str, object
         raise as_api_problem(exc) from exc
 
 
-@router.get("")
+@router.get("", response_model=ProjectListResponse)
 def list_projects(
     request: Request,
     offset: int = Query(default=0, ge=0),
@@ -62,7 +63,7 @@ def list_projects(
         raise as_api_problem(exc) from exc
 
 
-@router.get("/{project_id}")
+@router.get("/{project_id}", response_model=ProjectDetailResponse)
 # 文件管理和文档预览会轮询项目详情，跟进转换与解析进度。
 @throttle_access_log()
 def get_project(project_id: int, request: Request) -> dict[str, object]:
@@ -72,7 +73,7 @@ def get_project(project_id: int, request: Request) -> dict[str, object]:
         raise as_api_problem(exc) from exc
 
 
-@router.patch("/{project_id}")
+@router.patch("/{project_id}", response_model=ProjectDetailResponse)
 def patch_project(
     project_id: int,
     payload: ProjectPatch,
@@ -85,7 +86,7 @@ def patch_project(
         raise as_api_problem(exc) from exc
 
 
-@router.delete("/{project_id}", status_code=204)
+@router.delete("/{project_id}", status_code=204, response_model=None)
 def delete_project(project_id: int, request: Request) -> Response:
     try:
         _service(request).delete(project_id)

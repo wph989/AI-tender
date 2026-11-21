@@ -34,14 +34,6 @@ it("一个维度读取失败不阻断其它维度，也不回退旧报告正文"
   expect(fetch.mock.calls[0]?.[0]).toBe("/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records");
 });
 
-it("历史报告保留原来展示，不请求新版独立结果接口", async () => {
-  const fetch = vi.fn();
-  vi.stubGlobal("fetch", fetch);
-  const old = { ...report, runtime_retired: true };
-  expect(await loadReportRecords(old)).toBe(old);
-  expect(fetch).not.toHaveBeenCalled();
-});
-
 it("逐条绑定校验失败只标记当前专题，其它有效专题仍正常加载", async () => {
   const ref = {
     source_id: 1, collection_id: 1, project_id: 1, project_file_id: 1, version_id: 1,

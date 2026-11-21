@@ -2,7 +2,7 @@
 
 职责刻意分两层：**这里**只做「该不该继续跑」的权限与预算判断，以及「哪些成果可以
 发布」的应用层投影；配额锁、fencing、`pg_locks` 判断这些持久化细节在
-``adapters/pg/repositories/agent_runtime.py``（见 ``ports/repository/agent_runtime.py``）。
+``adapters/pg/repositories/analysis/runtime.py``（见 ``ports/repository/analysis/runtime.py``）。
 数据库会话锁存活时绝不抢占这条底线由实现保证，本层只负责把权限变化变成明确的异常。
 """
 
@@ -10,9 +10,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from tender.application.analysis.data import display_items, module_data
-from tender.application.analysis.research import AgentLimits
-from tender.application.analysis.state import published_items
+from tender.application.analysis.data import display_items
+from tender.application.shared.research import AgentLimits
 from tender.core.logging import get_logger
 from tender.ports.analysis.archive import AnalysisArchive
 from tender.ports.repository.analysis.reports import ReportRepository
@@ -114,7 +113,7 @@ class AgentRuntime:
 
     def save(self, state: dict) -> None:
         self.guard()
-        self.store.save(state, publish=self._staged_payload(state))
+        self.store.save(state)
         self._last_state = state
 
     def finish(
@@ -125,32 +124,14 @@ class AgentRuntime:
         *,
         state: dict | None = None,
     ) -> None:
-        topic_settlement = bool(state and (state.get("topic_flow") or state.get("agent_workspace"))
-                                and status in {"partial", "failed"})
-        if status in {"completed", "partial"} or topic_settlement:
-            # 部分发布同样要复核报告状态、所有权、租约与资料权限。
-            if topic_settlement:
-                check_report_access(self.db, self.report, self.sources)
-                self.store.guard_settlement()
-            else:
-                self.guard()
-        publish: dict | None
-        if status == "completed" and draft is not None:
-            publish = self._draft_payload(draft)
-        elif status == "partial" or topic_settlement:
-            if status == "partial" and state:
-                flow = state.get("topic_flow", {})
-                if flow.get("output_mode") == "after-research":
-                    # 权限和所有权核对通过后才发布已核实批次，正常暂存不提前展示。
-                    flow.update(phase="partial", release_results=True)
-            # 只有待复核旧版时仍同步展示投影，不能让失败前的 current 标记进入正式快照。
-            publish = self._staged_payload(state or {}, include_relations=True)
-        else:
-            publish = None
-        if state and (state.get("topic_flow") or state.get("agent_workspace")):
-            self.store.finish(status, error, publish=publish, state=state)
-        else:
-            self.store.finish(status, error, publish=publish)
+        if status == "completed":
+            self.guard()
+        elif state is not None:
+            # 到期允许收尾，租约、锁和报告状态仍必须有效才能写入工作区。
+            check_report_access(self.db, self.report, self.sources)
+            self.store.guard_settlement()
+        publish = self._draft_payload(draft) if status == "completed" and draft else None
+        self.store.finish(status, error, publish=publish, state=state)
         self._archive(state)
 
     def _archive(self, state: dict | None = None) -> None:
@@ -175,11 +156,9 @@ class AgentRuntime:
                                   "model_calls", "tool_calls", "prompt_tokens", "completion_tokens",
                               )}},
                 "research": current.get("research", {}),
-                "topics": current.get("topic_flow", {}),
                 "drafts": current.get("staged_items", []),
                 "agent_workspace": current.get("agent_workspace", {}),
                 "gaps": current.get("business_gaps", []),
-                "research_conclusion": current.get("research_completed", {}),
                 "tool_errors": [value["data"] for value in current.get("tool_results", {}).values()
                                 if value.get("data", {}).get("status") == "error"],
             })
@@ -202,21 +181,3 @@ class AgentRuntime:
             "business": draft.get("business_data", {}),
             "relations": draft.get("relations") or [],
         }
-
-    @staticmethod
-    def _staged_payload(state: dict, *, include_relations: bool = False) -> dict | None:
-        """未完成也保存已核实字段的展示投影；未通过校验时不发布。"""
-        if state.get("agent_workspace"):
-            return None
-        if not state.get("staged_items_verified") and not state.get("topic_flow"):
-            return None
-        payload = {
-            "items": display_items(
-                published_items(state)
-            ),
-            "business": module_data(state),
-        }
-        if include_relations:
-            # 部分发布只带已通过支持性校验的关系；未审关系不能随暂存成果外泄。
-            payload["relations"] = state.get("staged_relations") or []
-        return payload

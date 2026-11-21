@@ -1,104 +1,18 @@
 """校验失败必须给模型足够的信息修正，且不能把错误正文再次回显到上下文。"""
 
 import asyncio
-import copy
-import json
 
 import pytest
-from synthesis_fixtures import summary_record
-from test_analysis_combined_review import approve
-from test_analysis_compact_protocol import ledger
+from agent_fixtures import summary_record
 from test_analysis_research import block
 
-from tender.application.analysis.completeness import review_completeness
 from tender.application.analysis.data import SynthesisRecord, prepare_records
 from tender.application.analysis.output import output_schema, record_output
-from tender.application.analysis.protocol import ResearchDelta
-from tender.application.analysis.review import review_combined, validate
-from tender.application.analysis.skills import json_completion, skill_snapshot
+from tender.application.analysis.skills import skill_snapshot
+from tender.application.knowledge.answer_evidence import json_completion
 from tender.application.knowledge.content import validate_items
 from tender.domain.shared.errors import InvalidModelOutput
 from tender.ports.llm.chat import Completion
-
-
-def packet():
-    return {
-        "topic": "a", "topics": ["a"], "records": [
-            {"record_id": "r1", "block_ids": ["s1r1c0"]},
-            {"record_id": "r2", "block_ids": ["s1r1c0"]},
-        ],
-        "record_index": [{"record_id": "r1"}, {"record_id": "r2"}],
-        "evidence": [{"id": "s1r1c0", "unit_id": "unit1"}], "context_evidence": [],
-    }
-
-
-@pytest.mark.parametrize("field,wrong,expected", [
-    ("topic", "wrong", "a"),
-    ("detail", "", "非空"),
-    ("kind", "wrong", "omission"),
-    ("kind", [], "omission"),
-    ("record_ids", ["foreign"], "r1"),
-    ("evidence_ids", ["foreign"], "s1r1c0"),
-    ("target", 123, "字符串"),
-])
-def test_review_issue_feedback_names_exact_field_and_allowed_values(field, wrong, expected):
-    payload = packet()
-    result = approve(payload)
-    issue = {"topic": "a", "detail": "缺少具体条件", "kind": "omission",
-             "record_ids": [], "evidence_ids": [], "target": "附件正文"}
-    issue[field] = wrong
-    result["issues"] = [issue]
-    with pytest.raises(InvalidModelOutput) as caught:
-        validate(result, payload)
-    feedback = str(caught.value)
-    assert "issues.0." + field in feedback
-    assert expected in feedback
-
-
-def test_review_collects_record_and_binding_errors_before_retry():
-    payload = packet()
-    result = approve(payload)
-    result["reviews"].pop("r2")
-    result["reviews"]["r1"]["block_ids"] = ["foreign"]
-    with pytest.raises(InvalidModelOutput) as caught:
-        validate(result, payload)
-    feedback = str(caught.value)
-    assert "reviews" in feedback and "r2" in feedback
-    assert "reviews.r1.block_ids" in feedback and "s1r1c0" in feedback
-
-
-def test_review_retry_receives_exact_binding_fix_and_finishes_next_request():
-    async def run():
-        payload = packet()
-
-        class Model:
-            def __init__(self):
-                self.prompts = []
-
-            async def complete(self, prompt):
-                self.prompts.append(prompt)
-                result = approve(payload)
-                if len(self.prompts) == 1:
-                    result["reviews"]["r1"]["block_ids"] = []
-                else:
-                    assert "reviews.r1.block_ids" in prompt and "s1r1c0" in prompt
-                return Completion(content=json.dumps(result), model="fixture")
-
-        from dataclasses import replace
-
-        from test_llm_routing import _candidate
-
-        from tender.application.llm.routing import RoutingModel
-
-        client = Model()
-        records = []
-        model = RoutingModel("analysis", "fixture", [replace(_candidate("a", 1), extra_retries=1)],
-                             lambda *args, **kwargs: client, records.append)
-        result = await review_combined(model, payload)
-        assert result == approve(payload) and len(client.prompts) == 2
-        assert [record.status for record in records] == ["error", "ok"]
-
-    asyncio.run(run())
 
 
 def test_citation_feedback_collects_paths_and_read_instructions_for_all_bad_refs():
@@ -126,19 +40,6 @@ def test_output_reports_scalar_and_empty_cells_together_with_column_paths():
     assert "content.内容" in feedback and "省略" in feedback
 
 
-def test_research_feedback_reports_bad_work_and_evidence_before_updating_state():
-    book, flow, state, _ = ledger()
-    before = copy.deepcopy(state)
-    with pytest.raises(ValueError) as caught:
-        book.update([ResearchDelta(work_ids=["foreign"], evidence_ids=["foreign"],
-                                   detail="不能回显的错误正文")])
-    feedback = str(caught.value)
-    assert "updates.0.work_ids" in feedback and "w1" in feedback
-    assert "updates.0.evidence_ids" in feedback and "s1r1c0" in feedback
-    assert "不能回显的错误正文" not in feedback
-    assert state == before
-
-
 def test_relation_feedback_identifies_endpoint_and_available_targets():
     good = SynthesisRecord.model_validate(summary_record(key="valid"))
     relation = SynthesisRecord.model_validate(summary_record(
@@ -151,25 +52,6 @@ def test_relation_feedback_identifies_endpoint_and_available_targets():
                         {"s1r1c0": block()}, key)
     feedback = str(caught.value)
     assert "subject_key" in feedback and "object_key" in feedback and "valid" in feedback
-
-
-def test_completeness_schema_feedback_does_not_echo_invalid_payload():
-    async def run():
-        class Model:
-            def __init__(self):
-                self.calls = 0
-
-            async def complete(self, prompt):
-                self.calls += 1
-                if self.calls > 1:
-                    assert "issues" in prompt and "不能回显的错误正文" not in prompt
-                    return Completion(content='{"issues":[]}', model="fixture")
-                return Completion(content='{"issues":"不能回显的错误正文"}', model="fixture")
-
-        payload = {"topic": "a", "evidence_ids": [], "record_keys": []}
-        assert await review_completeness(Model(), payload) == {"issues": []}
-
-    asyncio.run(run())
 
 
 def test_json_retry_replaces_stale_error_and_preserves_all_current_field_fixes():
@@ -219,12 +101,3 @@ def test_json_syntax_and_duplicate_keys_receive_specific_fix_before_retry(conten
         assert await json_completion(model, "返回JSON对象") == {} and model.calls == 2
 
     asyncio.run(run())
-
-
-@pytest.mark.parametrize("field,wrong", [("reviews", []), ("issues", {})])
-def test_review_root_type_feedback_names_field_before_dependent_validation(field, wrong):
-    payload = packet()
-    result = approve(payload) | {field: wrong}
-    with pytest.raises(InvalidModelOutput) as caught:
-        validate(result, payload)
-    assert field in str(caught.value) and "须为" in str(caught.value)

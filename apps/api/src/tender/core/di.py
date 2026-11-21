@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import lru_cache, partial
 from typing import Any
 
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 
 from tender.adapters.analysis.file_archive import FileAnalysisArchive
 from tender.adapters.configuration.redis_cache import RedisConfigCache
@@ -173,6 +173,11 @@ class ApiComponents:
     queue: TaskQueue
     model_gateway: ModelGateway
     configs: ConfigRegistry
+
+    def postgres_healthy(self) -> bool:
+        # 就绪探测走真实连接，使连接错误和池耗尽都能反映在健康状态上。
+        with self.engine.connect() as connection:
+            return connection.execute(select(1)).scalar_one() == 1
 
     async def aclose(self) -> None:
         await self.converter.aclose()

@@ -58,7 +58,7 @@ from tender.adapters.pg.models import (
     ProjectKnowledgeCollection,
 )
 from tender.adapters.pg.models.analysis import AnalysisRecordReview
-from tender.adapters.pg.repositories.analysis.reports import ReportQueries
+from tender.adapters.pg.repositories.analysis.reports import ReportQueries, current_protocol
 from tender.adapters.pg.repositories.analysis.runtime import (
     AgentRunStore,
     cancel_unlocked_runs,
@@ -907,7 +907,7 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
         due = model.status.in_(("pending", "waiting", "running"))
         if kind == "report":
             # 复用报告消息补发快照；不为发布再运行 Agent 或占用模型槽。
-            due = or_(due, AnalysisReport.snapshot_pending.is_(True))
+            due = current_protocol() & or_(due, AnalysisReport.snapshot_pending.is_(True))
         with self.engine.begin() as connection:
             ids = list(
                 connection.execute(
@@ -1438,6 +1438,7 @@ class KnowledgeSession:
                 select(AnalysisReport.id).where(
                     AnalysisReport.project_id == project_id,
                     AnalysisReport.status.in_(("waiting", "pending", "running")),
+                    current_protocol(),
                 )
             )
             .scalar_one_or_none()
@@ -1451,6 +1452,7 @@ class KnowledgeSession:
                     AnalysisReport.project_id == project_id,
                     AnalysisReport.id != report_id,
                     AnalysisReport.status.in_(("waiting", "pending", "running")),
+                    current_protocol(),
                 )
             )
             .scalar_one_or_none()

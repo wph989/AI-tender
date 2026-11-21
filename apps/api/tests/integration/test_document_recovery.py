@@ -2,6 +2,7 @@
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
 from unittest.mock import AsyncMock, Mock
@@ -129,6 +130,45 @@ def test_failed_publish_remains_recoverable(database, monkeypatch):
     assert dispatch.recover_pending(1) == 0
 
 
+def test_message_is_retried_after_database_commit_failure(database, monkeypatch):
+    """Broker 已接收消息但派发事务回滚时，下一轮重发且任务仍可被幂等认领。"""
+    seed(database, "commit-failed", stage="submitting")
+    repository = DispatchRepository(database)
+    original_transaction = repository.transaction
+    fail_commit = True
+
+    @contextmanager
+    def transaction_with_one_commit_failure():
+        nonlocal fail_commit
+        with original_transaction() as transaction:
+            yield transaction
+            if fail_commit:
+                fail_commit = False
+                raise RuntimeError("模拟数据库提交失败")
+
+    monkeypatch.setattr(repository, "transaction", transaction_with_one_commit_failure)
+    monkeypatch.setattr(dispatch, "_repository", repository)
+    send = Mock()
+    monkeypatch.setattr(dispatch.celery_app, "send_task", send)
+
+    with pytest.raises(RuntimeError, match="提交失败"):
+        dispatch.dispatch_stream(dispatch.STREAMS[1], 1, 1)
+
+    assert send.call_count == 1
+    with database.connect() as connection:
+        row = connection.execute(
+            text("SELECT status, dispatched_at FROM job WHERE id='commit-failed'")
+        ).mappings().one()
+    assert row["status"] == "pending" and row["dispatched_at"] is None
+
+    monkeypatch.setattr(repository, "transaction", original_transaction)
+    assert dispatch.dispatch_stream(dispatch.STREAMS[1], 1, 1) == 1
+    assert send.call_count == 2
+    with database.connect() as connection:
+        row = connection.execute(
+            text("SELECT status, dispatched_at FROM job WHERE id='commit-failed'")
+        ).mappings().one()
+    assert row["status"] == "pending" and row["dispatched_at"] is not None
 def test_persisted_attempt_blocks_early_duplicates(database):
     seed(database, "poll", status="running", stage="parsing", dispatched=True)
     repository = DocumentPipelineRepository(database, Mock())

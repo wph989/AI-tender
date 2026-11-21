@@ -1,18 +1,10 @@
 """同一查询用 offset 翻页，避免靠改写同义词反复检索。"""
 
 import asyncio
-import json
 
-import pytest
-from langchain.agents.middleware.types import ToolCallRequest
-from langchain_core.messages import AIMessage, ToolMessage
-from synthesis_fixtures import noop, research_calls, submission, summary_record
 from test_analysis_research import block, session
-from test_analysis_synthesis import execute
-from test_deep_analysis import call
 
-from tender.application.analysis.agent import ResearchMiddleware
-from tender.application.analysis.research import AgentLimits
+from tender.application.shared.research import AgentLimits
 
 
 def rows(count):
@@ -40,41 +32,6 @@ def paged(data, *, limits=None):
     return research, calls
 
 
-def tool_request(name, args, *, call_id):
-    call_data = {"name": name, "args": args, "id": call_id, "type": "tool_call"}
-    return ToolCallRequest(
-        tool_call=call_data,
-        tool=None,
-        state={"messages": [AIMessage(content="", id=call_id, tool_calls=[call_data])]},
-        runtime=None,
-    )
-
-
-def test_search_document_accepts_offset_and_returns_next_offset():
-    _, _, router = asyncio.run(
-        execute([
-            call("search_document", {"query": "质保补充", "offset": 6}, "page"),
-            *research_calls(),
-            call("submit_analysis", submission([summary_record()]), "final"),
-        ])
-    )
-    params = {
-        tool["function"]["name"]: tool["function"]["parameters"]
-        for tool in router.requests[0][1]
-    }
-    assert params["search_document"]["properties"]["offset"]["minimum"] == 0
-    assert params["search_knowledge"]["properties"]["offset"]["minimum"] == 0
-
-    async def run():
-        research, _ = paged(rows(8))
-        first = await research.search("质保", "project")
-        assert first["page"] == {
-            "offset": 0, "limit": 6, "next_offset": 6, "has_more": True,
-        }
-
-    asyncio.run(run())
-
-
 def test_same_query_pages_without_rephrasing():
     async def run():
         research, calls = paged(rows(14))
@@ -91,45 +48,6 @@ def test_same_query_pages_without_rephrasing():
         ]
         # 未读候选不会因为缓存而提前进入证据账。
         assert len(research.seen) == 12
-
-    asyncio.run(run())
-
-
-def test_identical_query_and_offset_still_hits_repeat_limit():
-    async def run():
-        research, _ = paged(rows(14))
-        state = {}
-        wraps = ResearchMiddleware(research, state, noop, noop)
-
-        async def handler(req):
-            args = req.tool_call["args"]
-            result = await research.search(
-                args["query"], "project", offset=args.get("offset", 0)
-            )
-            return ToolMessage(
-                content=json.dumps(result, ensure_ascii=False),
-                tool_call_id=req.tool_call["id"],
-                name="search_document",
-            )
-
-        for ordinal in range(3):
-            await wraps.awrap_tool_call(
-                tool_request("search_document", {"query": "质保", "offset": 3},
-                             call_id=f"c{ordinal}"),
-                handler,
-            )
-        # 翻页游标同样进入工具指纹：相同 query+offset 仍受重复调用上限约束。
-        with pytest.raises(RuntimeError, match="重复调用已达上限"):
-            await wraps.awrap_tool_call(
-                tool_request("search_document", {"query": "质保", "offset": 3},
-                             call_id="c3"),
-                handler,
-            )
-        await wraps.awrap_tool_call(
-            tool_request("search_document", {"query": "质保", "offset": 9},
-                         call_id="c4"),
-            handler,
-        )
 
     asyncio.run(run())
 

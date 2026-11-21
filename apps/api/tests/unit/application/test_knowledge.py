@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from tender.application.analysis.skills import json_completion
+from tender.application.knowledge.answer_evidence import json_completion
 from tender.application.knowledge.content import (
     cosine,
     fingerprint,

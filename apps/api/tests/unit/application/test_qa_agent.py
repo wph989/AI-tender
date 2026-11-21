@@ -4,13 +4,13 @@ import asyncio
 import json
 
 import pytest
+from agent_fixtures import call, submitted_field
 from langchain_core.messages import AIMessage, message_to_dict
 from test_analysis_research import block, session
-from test_deep_analysis import call, submitted_field
 
-from tender.application.analysis.research import AgentLimits
 from tender.application.knowledge.qa_agent import QABudgetExceeded, answer_with_agent
 from tender.application.llm.routing import ModelCandidate, RoutingModel
+from tender.application.shared.research import AgentLimits
 from tender.domain.shared.errors import ModelUnavailable
 from tender.ports.llm.chat import Completion
 

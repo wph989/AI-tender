@@ -11,6 +11,18 @@ from tender.api.shared.common import actor, configs, engine
 from tender.api.shared.dto import StrictModel
 from tender.api.shared.errors import as_api_problem
 from tender.api.shared.logging import throttle_access_log
+from tender.api.shared.responses import (
+    AnalysisContextResponse,
+    AnalysisDataResponse,
+    AnalysisEventsResponse,
+    AnalysisReportResponse,
+    AnalysisStartResponse,
+    AnalysisStatusResponse,
+    CancelReportResponse,
+    HumanReviewResponse,
+    ModuleRecordsResponse,
+    RetriedReportResponse,
+)
 from tender.application.analysis.data import ContextInput
 from tender.application.analysis.human_review import RecordReviewInput
 from tender.application.analysis.service import AnalysisService
@@ -54,7 +66,8 @@ def analysis_service(request: Request) -> AnalysisService:
     return create_analysis_service(engine(request), settings.company_id(), configs(request))
 
 
-@router.get("/projects/{project_id}/analysis")
+@router.get("/projects/{project_id}/analysis", response_model=AnalysisStatusResponse,
+            response_model_exclude_unset=True)
 # 分析页每三秒刷新状态、报告和专题记录。
 @throttle_access_log()
 def analysis_status(project_id: int, request: Request) -> dict:
@@ -64,7 +77,8 @@ def analysis_status(project_id: int, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.put("/projects/{project_id}/analysis/settings")
+@router.put("/projects/{project_id}/analysis/settings", response_model=AnalysisStatusResponse,
+            response_model_exclude_unset=True)
 def save_settings(project_id: int, payload: AnalysisSettings, request: Request) -> dict:
     try:
         return analysis_service(request).save_settings(
@@ -77,7 +91,8 @@ def save_settings(project_id: int, payload: AnalysisSettings, request: Request) 
         raise as_api_problem(exc) from exc
 
 
-@router.post("/projects/{project_id}/analysis", status_code=202)
+@router.post("/projects/{project_id}/analysis", status_code=202,
+             response_model=AnalysisStartResponse, response_model_exclude_unset=True)
 def start_analysis(project_id: int, payload: AnalysisInput, request: Request) -> dict:
     try:
         return analysis_service(request).start_analysis(
@@ -101,7 +116,8 @@ def visible_items(
     return _visible_items(db, items, allowed_collections)
 
 
-@router.get("/analysis/reports/{report_id}")
+@router.get("/analysis/reports/{report_id}", response_model=AnalysisReportResponse,
+            response_model_exclude_unset=True)
 @throttle_access_log()
 def get_report(report_id: int, request: Request) -> dict:
     try:
@@ -117,7 +133,8 @@ def data_snapshot(request: Request, report_id: int, snapshot_id: int | None = No
         raise as_api_problem(exc) from exc
 
 
-@router.get("/analysis/reports/{report_id}/modules/{module_key}/records")
+@router.get("/analysis/reports/{report_id}/modules/{module_key}/records",
+            response_model=ModuleRecordsResponse, response_model_exclude_unset=True)
 @throttle_access_log()
 def get_module_records(report_id: int, module_key: str, request: Request) -> dict:
     try:
@@ -126,7 +143,7 @@ def get_module_records(report_id: int, module_key: str, request: Request) -> dic
         raise as_api_problem(exc) from exc
 
 
-@router.get("/analysis/reports/{report_id}/data")
+@router.get("/analysis/reports/{report_id}/data", response_model=AnalysisDataResponse)
 def get_analysis_data(
     report_id: int,
     request: Request,
@@ -145,7 +162,8 @@ def context_data(request: Request, report_id: int, snapshot: dict) -> tuple[dict
         raise as_api_problem(exc) from exc
 
 
-@router.post("/analysis/reports/{report_id}/context")
+@router.post("/analysis/reports/{report_id}/context", response_model=AnalysisContextResponse,
+             response_model_exclude_unset=True)
 async def get_analysis_context(
     report_id: int,
     payload: ContextInput,
@@ -157,7 +175,7 @@ async def get_analysis_context(
         raise as_api_problem(exc) from exc
 
 
-@router.post("/analysis/reports/{report_id}/cancel")
+@router.post("/analysis/reports/{report_id}/cancel", response_model=CancelReportResponse)
 def cancel_report(report_id: int, request: Request) -> dict:
     try:
         return analysis_service(request).cancel_report(report_id)
@@ -165,7 +183,8 @@ def cancel_report(report_id: int, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.get("/analysis/reports/{report_id}/runs/{run_id}/events")
+@router.get("/analysis/reports/{report_id}/runs/{run_id}/events",
+            response_model=AnalysisEventsResponse)
 def run_events(
     report_id: int,
     run_id: int,
@@ -184,7 +203,8 @@ def run_events(
         raise as_api_problem(exc) from exc
 
 
-@router.post("/analysis/reports/{report_id}/retry", status_code=202)
+@router.post("/analysis/reports/{report_id}/retry", status_code=202,
+             response_model=RetriedReportResponse)
 def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
     try:
         return analysis_service(request).retry_report(
@@ -198,7 +218,8 @@ def retry_report(report_id: int, payload: RetryInput, request: Request) -> dict:
         raise as_api_problem(exc) from exc
 
 
-@router.post("/analysis/reports/{report_id}/reviews")
+@router.post("/analysis/reports/{report_id}/reviews", response_model=HumanReviewResponse,
+             response_model_exclude_unset=True)
 def review_record(report_id: int, payload: RecordReviewInput, request: Request) -> dict:
     try:
         return analysis_service(request).record_human_review(

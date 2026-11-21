@@ -9,6 +9,7 @@ from test_deepagents_runtime import prepared_runtime
 from test_knowledge_flow import add_source
 
 from tender.adapters.pg.repositories.knowledge.store import KnowledgeSession
+from tender.application.analysis.drafts import AGENT_PROTOCOL
 from tender.application.knowledge.content import source_signature
 from tender.config.registry import ConfigRegistry
 from tender.core.di import create_analysis_service
@@ -20,8 +21,17 @@ pytestmark = pytest.mark.skipif(
 KEY = "project_basic_info_parsing"
 
 
+def agent_state_with_notes():
+    # 缺件与自查持久化使用现行工作区，不依赖历史研究阶段。
+    return {"agent_workspace": {
+        "protocol": AGENT_PROTOCOL, "notes": {"n1": {"text": "待补附件甲"}},
+        "reviews": {"old": {"status": "passed"}}, "finalized": True,
+        "issues": {"missing": {"action": "provide_input", "detail": "待补附件甲"}},
+    }}
+
+
 def terminal_module(env, status):
-    runtime = prepared_runtime(env, topic_flow=True)
+    runtime = prepared_runtime(env)
     assert runtime.claim()
     old = {"research": {"seen": {"historical": {"content": "旧研究内容"}}},
            "stop_reason": {"message": "旧停止原因"}}
@@ -81,9 +91,8 @@ def test_restart_rolls_back_cleanup_when_new_run_insert_fails(env, monkeypatch):
 
 
 def test_new_attachment_reopens_confirmed_missing_input_and_preserves_current_evidence(env):
-    from test_analysis_research_first import agent_state_with_notes
 
-    runtime = prepared_runtime(env, topic_flow=True)
+    runtime = prepared_runtime(env)
     assert runtime.claim()
     state = agent_state_with_notes()
     row = env.db.read_chunk_window(runtime.sources[0], 0, 1).rows[0]
@@ -114,9 +123,8 @@ def test_new_attachment_reopens_confirmed_missing_input_and_preserves_current_ev
 
 
 def test_local_restart_keeps_other_modules_new_input_signal_in_real_postgres(env):
-    from test_analysis_research_first import agent_state_with_notes
 
-    runtime = prepared_runtime(env, topic_flow=True)
+    runtime = prepared_runtime(env)
     report_id = runtime.report["id"]
     modules = env.db.report_modules(report_id)
     first = next(row for row in modules if row["module_key"] == KEY)

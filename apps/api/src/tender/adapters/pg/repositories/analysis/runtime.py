@@ -521,14 +521,8 @@ class AgentRunStore:
             )
         self._refresh_counts()
 
-    def save(self, state: dict[str, Any], *, publish: dict[str, Any] | None = None) -> None:
+    def save(self, state: dict[str, Any]) -> None:
         with self.engine.begin() as conn:
-            if state.get("topic_flow"):
-                status = conn.execute(select(AnalysisReport.status).where(
-                    AnalysisReport.id == self.report["id"]
-                ).with_for_update()).scalar_one_or_none()
-                if status != "running":
-                    raise InterruptedError("报告已停止，不能写入增量成果")
             previous = conn.execute(
                 select(AgentModuleRun.state)
                 .where(
@@ -556,13 +550,6 @@ class AgentRunStore:
                         kind="skill_loaded",
                         detail=state["loaded_skill"],
                     )
-                )
-            if publish is not None:
-                # 运行状态与成果分开：未完成/失败仍可展示已核实字段，且与检查点同事务保存。
-                conn.execute(
-                    update(AnalysisModule)
-                    .where(AnalysisModule.id == self.run["module_id"])
-                    .values(items=publish["items"], business_data=publish["business"])
                 )
             for call_id in (
                 (state.get("tool_results", {}).keys() - previous.get("tool_results", {}).keys())
@@ -597,15 +584,13 @@ class AgentRunStore:
     ) -> None:
         publish_error: Exception | None = None
         should_publish = publish is not None
-        topic_settlement = bool(state and state.get("topic_flow"))
         with self.engine.begin() as conn:
             report_status = conn.execute(
                 select(AnalysisReport.status)
                 .where(AnalysisReport.id == self.report["id"])
                 .with_for_update()
             ).scalar_one_or_none()
-            if (status in {"completed", "partial"} or topic_settlement
-                    ) and report_status != "running":
+            if status in {"completed", "partial"} and report_status != "running":
                 # 与取消 API 串行提交；取消已落库后不能再发布刚完成或部分完成的模块结果。
                 status, should_publish, error = "canceled", False, "报告已停止，未发布模块结果"
             row = conn.execute(
@@ -632,8 +617,7 @@ class AgentRunStore:
                     {"id": self.run["id"], "ns": QUOTA_NAMESPACE}).first()
                 if valid is None:
                     raise InterruptedError("模块租约或配额锁已失效")
-            if should_publish and (status in {"completed", "partial"}
-                                   or topic_settlement and status == "failed"):
+            if should_publish and status == "completed":
                 # 成果在 savepoint 内发布：业务库缺少 business_data 等新列时只回滚成果，
                 # 运行终态照常提交。否则异常会连 UPDATE agent_module_run 一起回滚，留下
                 # lease 已过期却永远 status='running' 的僵尸，把该报告后面的模块全部饿死。

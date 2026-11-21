@@ -1,11 +1,14 @@
-export type QualityStatus = "verified" | "needs_review" | "needs_input" | "unknown";
+import type { ApiSchemas } from "@/types/api.generated";
+
+export type QualityStatus = "self_check_passed" | "needs_review" | "needs_input" | "unknown";
 export interface QualityIssue {
   scope?: AnalysisScope;
   issue_id: string; kind: string; action: "read" | "repair" | "provide_input";
   topic: string; topics?: string[]; detail: string; target: string;
 }
 export const QUALITY_LABELS: Record<QualityStatus, string> = {
-  verified: "核实通过", needs_review: "结论待复核", needs_input: "资料待核对", unknown: "质量未记录",
+  self_check_passed: "机器自查通过", needs_review: "结论待复核",
+  needs_input: "资料待核对", unknown: "质量未记录",
 };
 
 /** 引用保留全部来源身份，避免切文件或重新解析后误用同名锚点。 */
@@ -107,32 +110,10 @@ export interface AnalysisModule {
   research_gaps?: { key: string; detail: string }[];
   records_loading?: boolean;
   records_error?: string;
-  progress?: TopicProgress;
+  progress?: AgentProgress;
 }
 
-export interface TopicProgress {
-  protocol?: "skill-agent-v1";
-  activity?: string;
-  draft_count?: number;
-  reviewed_count?: number;
-  unresolved_issues?: number;
-  phase?: "research" | "synthesis" | "review" | "completed" | "partial";
-  audit_round: number;
-  review?: {
-    stage: "initial" | "repair";
-    repairs_used: number;
-    repairs_limit: number;
-    completed_packets: number;
-    total_packets: number;
-    unresolved_issues?: number;
-  };
-  topics: {
-    topic: string; title: string; scope: Omit<AnalysisScope, "lot_ids">;
-    status: "pending" | "researching" | "ready" | "blocked" | "needs_review";
-    checks: string[]; checked: string[]; detail: string;
-    tasks: { detail: string; status: "pending" | "resolved" | "blocked" }[];
-  }[];
-}
+export type AgentProgress = ApiSchemas["AgentProgressResponse"];
 
 export interface AgentRun {
   mode?: "restart" | "resume";
@@ -166,8 +147,6 @@ export interface AnalysisReport {
   finished_at?: string | null;
   data_schema_version?: string | null;
   stale: boolean;
-  runtime_retired?: boolean;
-  execution_compatible?: boolean;
   error_message: string | null;
   modules: AnalysisModule[];
   runtime_version?: string;
@@ -201,7 +180,6 @@ export interface AnalysisReviewState {
 
 /** 正式业务记录与展示字段分离，编制任务固定快照和记录身份。 */
 export interface BusinessRecord extends AnalysisReviewState {
-  review_status?: "current" | "needs_review";
   id: string;
   key: string;
   kind: "fact" | "requirement" | "lot" | "format_node" | "relation";
@@ -212,7 +190,7 @@ export interface BusinessRecord extends AnalysisReviewState {
   structuring: "complete" | "partial";
   citations: Citation[];
   module_key: string;
-  verification: "supported";
+  verification: "supported" | "unsupported" | "unavailable";
   group: string;
   sort_order: number;
   category: string;
@@ -253,7 +231,6 @@ export interface BusinessRecord extends AnalysisReviewState {
 
 /** 维度原始业务记录未解析标段目录，引用通过独立证据集合关联。 */
 export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"> {
-  review_status?: "current" | "needs_review";
   evidence_ids: string[];
   content_evidence?: Record<string, string[][]>;
   scope: Omit<AnalysisScope, "lot_ids">;
@@ -262,7 +239,6 @@ export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"
 export interface ModuleRecords {
   quality_status?: QualityStatus;
   quality_issues?: QualityIssue[];
-  progress?: TopicProgress;
   // schema_version 与 status 仅随契约透传，前端尚无版本分支；读取方不要据此推断兼容性。
   schema_version: string;
   module_key: string;
@@ -288,6 +264,7 @@ export interface AnalysisGap {
 }
 
 export interface AnalysisCoverage extends AnalysisReviewState {
+  verification?: BusinessRecord["verification"];
   topic: string;
   title: string;
   status: string;

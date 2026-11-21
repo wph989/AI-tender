@@ -15,8 +15,12 @@ try {
     # 用同一解释器启用 UTF-8，避免 Windows 控制台把中文契约名称输出成乱码。
     & $PythonExe -X utf8 -c 'from importlinter.cli import lint_imports_command; lint_imports_command()' --config pyproject.toml
     if ($LASTEXITCODE -ne 0) { throw '架构导入检查失败' }
+    & $PythonExe -X utf8 -m mypy --config-file pyproject.toml
+    if ($LASTEXITCODE -ne 0) { throw '后端静态类型检查失败' }
     & $PythonExe -X utf8 -m pytest tests/unit tests/contract -q
     if ($LASTEXITCODE -ne 0) { throw '离线测试或协议类型检查失败' }
+    & $PythonExe -X utf8 ../../scripts/generate-api-types.py --check
+    if ($LASTEXITCODE -ne 0) { throw '前端 OpenAPI 类型未同步' }
 }
 finally {
     Pop-Location

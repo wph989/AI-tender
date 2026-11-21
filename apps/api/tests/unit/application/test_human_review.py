@@ -29,6 +29,19 @@ def test_pending_records_and_unreviewed_coverage_are_withheld():
     assert {gap["code"] for gap in result["gaps"]} == {"human_review_required"}
 
 
+def test_machine_self_check_does_not_confirm_a_human_review():
+    target = record("requirement-a", human_review_status="pending")
+    data = {
+        "quality_status": "self_check_passed", "gaps": [], "coverage": [], "lots": [],
+        "facts": [], "requirements": [target], "format_nodes": [], "relations": [],
+    }
+
+    result = reviewed_compilation(data)
+
+    assert result["requirements"] == []
+    assert result["gaps"][0]["code"] == "human_review_required"
+
+
 def test_corrected_record_retains_original_citation_but_drops_machine_structure():
     target = record("requirement-a", human_review_status="corrected", human_review={
         "decision": "corrected", "corrected_text": "人工修正正文",
