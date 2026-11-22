@@ -2,6 +2,7 @@
 
 import copy
 
+import pytest
 from test_analysis_research import block
 
 from tender.application.analysis.data import (
@@ -113,3 +114,48 @@ def test_revoked_content_only_citation_hides_public_projection_without_mutating_
     assert result["verification"] == "unavailable"
     assert result["values"] == [] and "output" not in result
     assert items == original
+
+
+def test_shared_citation_is_resolved_once_per_response_and_rechecked_next_request():
+    ref = block() | {"block_id": "s1r1g2c0", "quote": "质保三年", "project_id": 1,
+                     "project_file_id": 1, "bbox": [0.1, 0.1, 0.8, 0.2], "page_no": 1}
+    items = [{"id": str(index), "field": "质保", "output": True,
+              "values": [{"value": "三年", "citations": [ref]}]} for index in range(3)]
+
+    class Store:
+        calls = 0
+        revoked = False
+
+        def resolve(self, citation, *, with_content):
+            self.calls += 1
+            if self.revoked:
+                raise LookupError("来源已删除")
+            return citation
+
+    store = Store()
+    assert all(item["values"] for item in visible_items(store, items, [1]))
+    assert store.calls == 1
+    store.revoked = True
+    assert all(item["verification"] == "unavailable"
+               for item in visible_items(store, items, [1]))
+    assert store.calls == 2
+
+
+@pytest.mark.parametrize("identity", ["collection_id", "project_id", "project_file_id"])
+def test_same_block_cannot_reuse_a_resolution_for_another_source_identity(identity):
+    ref = block() | {"block_id": "s1r1g2c0", "quote": "质保三年", "project_id": 1,
+                     "project_file_id": 1, "bbox": [0.1, 0.1, 0.8, 0.2], "page_no": 1}
+    changed = ref | {identity: 2}
+    items = [{"id": str(index), "field": "质保", "output": True,
+              "values": [{"value": "三年", "citations": [citation]}]}
+             for index, citation in enumerate([ref, changed])]
+
+    class Store:
+        def resolve(self, citation, *, with_content):
+            if citation[identity] != ref[identity]:
+                raise LookupError("引用的来源身份不匹配")
+            return citation
+
+    result = visible_items(Store(), items, [1, 2])
+    assert result[0]["values"]
+    assert result[1]["verification"] == "unavailable"

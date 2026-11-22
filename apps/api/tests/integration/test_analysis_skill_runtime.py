@@ -8,7 +8,7 @@ import pytest
 import test_deepagents_runtime
 from test_deepagents_runtime import draft_state, prepared_runtime, report
 
-from tender.application.analysis.service import AnalysisService
+from tender.api.analysis import routes as analysis_api
 
 env = test_deepagents_runtime.env
 pytestmark = pytest.mark.skipif(
@@ -93,7 +93,7 @@ def test_progress_is_hidden_after_source_access_is_revoked(env):
     assert runtime.claim()
     state = progress_state()
     runtime.save(state)
-    service = AnalysisService(env.db, 1, None, None, None)
+    service = analysis_api.analysis_service(env.request)
     assert "progress" in service.get_report(runtime.report["id"])["modules"][0]
     env.db.execute("UPDATE knowledge_collection SET deleted_at=now() WHERE id=:id",
                    {"id": runtime.sources[0]["collection_id"]})

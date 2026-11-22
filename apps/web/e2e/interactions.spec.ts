@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
-import { calls, mockApi, selectModule, models, profile } from "./fixtures";
+import { calls, collections, mockApi, selectModule, models, profile } from "./fixtures";
+import type { KnowledgeSource } from "../src/types/knowledge";
 
 let pageErrors: string[];
 test.beforeEach(async ({ page }) => {
@@ -11,7 +12,7 @@ test.afterEach(() => {
   expect(pageErrors, "浏览器未捕获异常").toEqual([]);
 });
 
-test("配置范围由服务端下发，大预算可保存且未接入项只读", async ({ page }) => {
+test("配置范围由服务端下发，大预算可保存且只读项不可修改", async ({ page }) => {
   let saved: unknown;
   await page.route("**/api/v1/config/items", (route) => route.fulfill({ json: {
     active: { release_id: 1, version_no: 1 },
@@ -19,9 +20,9 @@ test("配置范围由服务端下发，大预算可保存且未接入项只读",
       { key: "analysis.max_output_tokens", layer: "L1", value_type: "int",
         description: "单次模型输出上限（Token）", default: 8192, value: 8192, writable: true,
         minimum: 1, overridden: false, requires_gate: false },
-      { key: "preprocess.denoise", layer: "L2", value_type: "bool",
-        description: "扫描件去噪", default: true, value: true, writable: false,
-        readonly_reason: "当前执行流程尚未接入该配置", overridden: false, requires_gate: true },
+      { key: "mineru.ocr_mode", layer: "L2", value_type: "string",
+        description: "默认文字识别方式", default: "auto", value: "auto", writable: false,
+        choices: ["auto", "ocr"], overridden: false, requires_gate: true },
     ],
   } }));
   await page.route("**/api/v1/config/releases", async (route) => {
@@ -42,8 +43,7 @@ test("配置范围由服务端下发，大预算可保存且未接入项只读",
   await page.goto("/settings/config");
   await expect(page.getByLabel("单次模型输出上限（Token）", { exact: true })).toHaveCount(0);
   await page.getByRole("tab", { name: "解析配置", exact: true }).click();
-  await expect(page.getByText("只读：当前执行流程尚未接入该配置")).toBeVisible();
-  await expect(page.getByLabel("扫描件去噪", { exact: true })).toBeDisabled();
+  await expect(page.getByLabel("默认文字识别方式", { exact: true })).toBeDisabled();
 });
 
 test("模型超时允许小数并移除预算人工上限", async ({ page }) => {
@@ -144,7 +144,7 @@ test("模型单次总时限允许清空，零值不能保存", async ({ page }, 
 });
 
 test("模型列表直接启停，失败保留原状态并使用当前版本", async ({ page }) => {
-  let current = { ...models[0] };
+  let current = { ...models[0]! };
   const updates: { enabled: boolean; revision: number }[] = [];
   await page.route("**/api/v1/llm/models", (route) =>
     route.fulfill({ json: { items: [current] } }),
@@ -178,6 +178,37 @@ test("模型列表直接启停，失败保留原状态并使用当前版本", as
     { enabled: true, revision: 8 },
   ]);
   await expect(page.getByRole("dialog", { name: "编辑模型", exact: true })).toHaveCount(0);
+});
+
+test("模型删除失败保留确认框，重试成功后移除模型", async ({ page }) => {
+  let attempts = 0;
+  let deleted = false;
+  await page.route("**/api/v1/llm/models", (route) => route.fulfill({
+    json: { items: deleted ? models.filter((model) => model.id !== 1) : models },
+  }));
+  await page.route("**/api/v1/llm/models/1", (route) => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    if (++attempts === 1) return route.fulfill({
+      status: 409, json: { error: { message: "模型删除失败，请重试" } },
+    });
+    deleted = true;
+    return route.fulfill({ json: { status: "deleted" } });
+  });
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: /管理模型/ }).click();
+  const panel = page.getByRole("tabpanel", { name: /管理模型/ });
+  const row = panel.getByRole("row").filter({ has: page.getByText("测试模型 1", { exact: true }) });
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  const confirm = dialog.getByRole("button", { name: /删除/ });
+  await confirm.click();
+  await expect(page.getByRole("alert").filter({ hasText: "模型删除失败，请重试" }).first()).toBeVisible();
+  await expect(dialog).toBeVisible();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect(dialog).not.toBeVisible();
+  await expect(panel.getByText("测试模型 1", { exact: true })).toHaveCount(0);
+  expect(attempts).toBe(2);
 });
 
 test("功能大预算可保存，候选上限继续读取服务端规则", async ({ page }) => {
@@ -552,7 +583,13 @@ test("导入模型的选择和提交位于弹窗，保留选中的模型 ID", as
   expect(submitted?.model_ids).toEqual(["model-a"]);
 });
 
-test("知识库重命名预填当前名称，删除取消后仍可操作", async ({ page }) => {
+test("知识库重命名预填当前名称，删除失败与取消后仍可操作", async ({ page }) => {
+  let attempts = 0;
+  await page.route("**/api/v1/knowledge/collections/1", (route) => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    attempts++;
+    return route.fulfill({ status: 409, json: { error: { message: "知识库删除失败，请重试" } } });
+  });
   await page.goto("/knowledge/1");
   await page.getByRole("button", { name: "重命名", exact: true }).click();
   const dialog = page.getByRole("dialog", {
@@ -562,6 +599,11 @@ test("知识库重命名预填当前名称，删除取消后仍可操作", async
   await expect(dialog.getByLabel("知识库名称")).toHaveValue("测试知识库");
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "删除知识库", exact: true }).click();
+  const confirm = page.getByRole("dialog");
+  await confirm.getByRole("button", { name: "删除知识库", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "知识库删除失败，请重试" }).first()).toBeVisible();
+  await expect(confirm).toBeVisible();
+  await expect(confirm.getByRole("button", { name: /删除知识库/ })).toBeEnabled();
   await page
     .getByRole("dialog")
     .getByRole("button", { name: "取消", exact: true })
@@ -569,6 +611,41 @@ test("知识库重命名预填当前名称，删除取消后仍可操作", async
   await expect(
     page.getByRole("button", { name: "重命名", exact: true }),
   ).toBeEnabled();
+  expect(attempts).toBe(1);
+});
+
+test("知识库资料删除失败可重试，成功后清除已删除资料", async ({ page }) => {
+  let attempts = 0;
+  let deleted = false;
+  const source: KnowledgeSource = {
+    source_id: 1, collection_id: 1, project_id: 1, project_file_id: 1,
+    file_name: "测试资料.pdf", version_id: 1, parse_run_id: 1, state: "ready", purpose: "company",
+    index_status: "completed", index_error: null, error_message: null, embedding_model_id: null,
+  };
+  await page.route("**/api/v1/knowledge/collections/1", (route) => route.fulfill({
+    json: { ...collections[0], file_count: deleted ? 0 : 1, sources: deleted ? [] : [source] },
+  }));
+  await page.route("**/api/v1/projects/1/files/1", (route) => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    if (++attempts === 1) return route.fulfill({
+      status: 409, json: { error: { message: "资料删除失败，请重试" } },
+    });
+    deleted = true;
+    return route.fulfill({ status: 204 });
+  });
+  await page.goto("/knowledge/1");
+  const row = page.getByRole("row").filter({ has: page.getByText("测试资料.pdf", { exact: true }) });
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  const confirm = dialog.getByRole("button", { name: /删除资料/ });
+  await confirm.click();
+  await expect(page.getByRole("alert").filter({ hasText: "资料删除失败，请重试" }).first()).toBeVisible();
+  await expect(dialog).toBeVisible();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect(dialog).not.toBeVisible();
+  await expect(page.getByText("测试资料.pdf", { exact: true })).toHaveCount(0);
+  expect(attempts).toBe(2);
 });
 
 test("上传组件选择文件不会自动提交，多个 ZIP 给出明确反馈", async ({

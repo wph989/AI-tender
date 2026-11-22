@@ -16,23 +16,21 @@ def record(record_id: str, kind: str = "requirement", **values):
     }
 
 
-def test_pending_records_and_unreviewed_coverage_are_withheld():
+def test_pending_records_are_withheld():
     target = record("requirement-a")
     data = {
-        "gaps": [], "coverage": [{"topic": "coverage-a", "status": "extracted",
-                                     "record_ids": [target["id"]], "scope": target["scope"]}],
+        "gaps": [],
         "lots": [], "facts": [], "requirements": [target], "format_nodes": [], "relations": [],
     }
     result = reviewed_compilation(data)
     assert result["requirements"] == []
-    assert result["coverage"][0]["status"] == "pending"
     assert {gap["code"] for gap in result["gaps"]} == {"human_review_required"}
 
 
 def test_machine_self_check_does_not_confirm_a_human_review():
     target = record("requirement-a", human_review_status="pending")
     data = {
-        "quality_status": "self_check_passed", "gaps": [], "coverage": [], "lots": [],
+        "quality_status": "self_check_passed", "gaps": [], "lots": [],
         "facts": [], "requirements": [target], "format_nodes": [], "relations": [],
     }
 
@@ -46,7 +44,7 @@ def test_corrected_record_retains_original_citation_but_drops_machine_structure(
     target = record("requirement-a", human_review_status="corrected", human_review={
         "decision": "corrected", "corrected_text": "人工修正正文",
     })
-    data = {"gaps": [], "coverage": [], "lots": [], "facts": [], "requirements": [target],
+    data = {"gaps": [], "lots": [], "facts": [], "requirements": [target],
             "format_nodes": [], "relations": []}
     result = reviewed_compilation(data)
     assert result["requirements"][0]["text"] == "人工修正正文"
@@ -60,7 +58,7 @@ def test_unconfirmed_parent_and_relation_endpoints_do_not_reach_compilation():
     parent = record("parent-a", "format_node")
     child = record("child-a", "format_node", parent_id="parent-a")
     relation = record("relation-a", "relation", subject_id="child-a", object_id="fact-a")
-    data = {"gaps": [], "coverage": [], "lots": [], "facts": [record("fact-a")],
+    data = {"gaps": [], "lots": [], "facts": [record("fact-a")],
             "requirements": [], "format_nodes": [parent, child], "relations": [relation]}
     result = reviewed_compilation(data)
     assert result["format_nodes"] == []
@@ -91,7 +89,7 @@ def test_only_confirmed_relations_change_the_requirement_manifest(decision, pred
     relation = record("rel", "relation", human_review_status=decision, predicate=predicate,
                       subject_id=subject["id"], object_id=target["id"])
     data = {"gaps": [{"code": "conflict", "scope": scope, "record_id": "rel"}]
-            if predicate == "conflicts" else [], "coverage": [], "lots": [], "facts": [],
+            if predicate == "conflicts" else [], "lots": [], "facts": [],
             "requirements": [subject, target], "format_nodes": [], "relations": [relation]}
     context = build_context(
         reviewed_compilation(data), ContextInput(snapshot_id=1, purpose="check"),
@@ -111,28 +109,9 @@ def test_corrected_endpoint_invalidates_confirmed_relation():
     subject = record("new", human_review_status="confirmed")
     relation = record("rel", "relation", human_review_status="confirmed", predicate="supersedes",
                       subject_id="new", object_id="old", object_text=target["text"])
-    data = {"gaps": [], "coverage": [], "lots": [], "facts": [], "format_nodes": [],
+    data = {"gaps": [], "lots": [], "facts": [], "format_nodes": [],
             "requirements": [subject, target], "relations": [relation]}
     result = reviewed_compilation(data)
     assert result["relations"] == []
     assert "superseded_in" not in result["requirements"][1]
     assert result["gaps"][0]["code"] == "unresolved_relation"
-
-
-@pytest.mark.parametrize(
-    ("decision", "status", "gap"),
-    [("pending", "pending", True), ("rejected", "pending", True),
-     ("confirmed", "not_applicable", False)],
-)
-def test_not_applicable_coverage_requires_human_confirmation(decision, status, gap):
-    item = {
-        "review_id": "coverage-proof", "status": "not_applicable", "topic": "deposit",
-        "module_key": "module-a", "title": "投标保证金", "detail": "本项目不收取保证金。",
-        "scope": {"kind": "common", "lot_refs": []}, "citations": [{"block_id": "block-a"}],
-        "human_review_status": decision,
-    }
-    data = {"gaps": [], "coverage": [item], "lots": [], "facts": [], "requirements": [],
-            "format_nodes": [], "relations": []}
-    result = reviewed_compilation(data)
-    assert result["coverage"][0]["status"] == status
-    assert any(g["code"] == "human_review_required" for g in result["gaps"]) is gap

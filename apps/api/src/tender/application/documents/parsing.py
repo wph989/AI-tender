@@ -82,7 +82,6 @@ class ParseService:
                 "execution": document_execution_snapshot(
                     active_config.resolved if active_config is not None else None
                 ),
-                "execution_origin": "created",
                 "auto_parse": True,
                 "trigger": "reparse" if force else "first",
                 "reason": reason.strip() if reason else None,

@@ -5,7 +5,7 @@
 .DESCRIPTION
     把《本地启动指南》第 3.1-3.3 节的三条命令固化成一条。
     API、Worker 与 Beat 的职责，见指南第 1 节与
-    docs/工程/10-技术选型与工程结构.md 第 3.5 节：API 只往数据库写 pending 的 job，
+    docs/工程/10-技术选型与工程结构.md：API 只往数据库写 pending 的 job，
     beat 每秒向 Worker 投递调度消息，按配置中心的上限派发差额，worker 才是真正执行任务的一方。
 
     用法：
@@ -51,7 +51,8 @@ $TmpDir = Join-Path $Root '.tmp'
 $LogDir = Join-Path $Root 'logs'
 $PidFile = Join-Path $TmpDir 'backend-pids.json'
 $BeatSchedule = Join-Path $TmpDir 'celerybeat-schedule'
-$HealthUrl = 'http://127.0.0.1:8300/api/v1/healthz'
+# 启动成功要求数据库、Redis 和存储就绪；进程存活单独由 healthz 表达。
+$ReadinessUrl = 'http://127.0.0.1:8300/api/v1/readyz'
 $ApiPort = 8300
 
 function Get-ServiceDefs {
@@ -207,14 +208,14 @@ function Wait-PortFree {
 }
 
 
-function Wait-ApiHealthy {
+function Wait-ApiReady {
     param([int]$Seconds, [int]$ApiPid)
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
         # 进程都崩了就没必要等满超时，早点把日志打出来
         if (-not (Test-ProcessAlive -ProcessId $ApiPid)) { return $false }
         try {
-            $response = Invoke-WebRequest -Uri $HealthUrl -UseBasicParsing -TimeoutSec 5
+            $response = Invoke-WebRequest -Uri $ReadinessUrl -UseBasicParsing -TimeoutSec 5
             if ($response.StatusCode -eq 200) { return $true }
         } catch {
             # 端口刚起、还没 accept 时连不上是正常的，继续轮询
@@ -390,14 +391,14 @@ foreach ($def in Get-ServiceDefs) {
     Write-Host ("  {0,-7} pid={1}" -f $def.Name, $process.Id) -ForegroundColor Green
     if ($def.Name -eq 'api') {
         # 先等 API 健康再起 worker/beat：反序也能跑，但日志顺序乱，出问题不好定位
-        if (-not (Wait-ApiHealthy -Seconds $TimeoutSeconds -ApiPid $process.Id)) {
+        if (-not (Wait-ApiReady -Seconds $TimeoutSeconds -ApiPid $process.Id)) {
             Write-Host ("API 在 {0} 秒内没有就绪，回滚本次启动。" -f $TimeoutSeconds) -ForegroundColor Red
             Show-LogTail -Name 'api'
             Write-TrackedState -Services $started
             Invoke-BackendStop | Out-Null
             exit 1
         }
-        Write-Host '  API 健康检查通过（GET /api/v1/healthz）' -ForegroundColor Green
+        Write-Host '  API 就绪检查通过（GET /api/v1/readyz）' -ForegroundColor Green
     } else {
         # 起来后立刻退出说明参数或依赖有问题（漏 -P threads、读不到 .env 等），直接回滚
         Start-Sleep -Seconds 2
@@ -414,7 +415,7 @@ foreach ($def in Get-ServiceDefs) {
 Write-TrackedState -Services $started
 Write-Host ''
 Write-Host '后端已启动' -ForegroundColor Cyan
-Write-Host '  API      http://127.0.0.1:8300   （/docs 交互文档；/api/v1/healthz 健康检查）'
+Write-Host '  API      http://127.0.0.1:8300   （/docs 交互文档；/api/v1/readyz 就绪检查）'
 Write-Host '  worker   消费 convert、parse、tender、poll、analysis 队列'
 Write-Host '  beat     每秒投递文档调度消息，由 worker 按配置派发差额'
 Write-Host ''

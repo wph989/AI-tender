@@ -1,11 +1,11 @@
 /**
- * 坐标契约的 TS 实现：0–1 归一化、左上原点、视觉方向（见 docs/设计/03 第 3 节）。
+ * 坐标契约的 TS 实现：0–1 归一化、左上原点、视觉方向（见 docs/设计/03-数据模型与溯源设计.md）。
  *
  * 这是全项目唯一允许重复的逻辑：后端 domain/bbox.py 负责落库与裁剪，前端负责画高亮与缩放重算。
  * 两侧共用 packages/contract/coords-vectors.json 的向量，任何一侧改了规则，另一侧测试立刻变红。
  *
  * 前端用 number 而非十进制库：这里只做乘法与比较，精度需求远低于落库
- * （后端用 Decimal 是因为 NUMERIC(7,6) 要参与相等比较，见 docs/工程/10 第 6 节）。
+ * （后端用 Decimal 是因为 NUMERIC(7,6) 要参与相等比较，见 docs/工程/10-技术选型与工程结构.md）。
  */
 
 export type Bbox = readonly [number, number, number, number];
@@ -30,7 +30,7 @@ export function isValidBbox(bbox: Bbox): boolean {
 
 /**
  * 归一化 bbox → 视口像素矩形。
- * 只有乘法、没有坐标系转换——这正是归一化契约换来的红利（见 docs/设计/03 第 3.1 节）。
+ * 只有乘法、没有坐标系转换——这正是归一化契约换来的红利（见 docs/设计/03-数据模型与溯源设计.md）。
  */
 export function bboxToRect(bbox: Bbox, viewport: Size): Rect {
   const [x0, y0, x1, y1] = bbox;

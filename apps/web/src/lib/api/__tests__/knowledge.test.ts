@@ -18,12 +18,12 @@ const report: AnalysisReport = {
   modules: [1, 2].map((id) => ({
     id, module_key: id === 1 ? "tech_requirement_parsing" : "scoring_standard_parsing",
     title: "专题" + id, status: "completed", error_message: null,
-    items: [{ id: "old", field: "旧投影", group: "", sort_order: 0,
+    items: [{ id: "cached", field: "缓存正文", group: "", sort_order: 0,
       values: [], note: "", verification: "supported" }],
   })),
 };
 
-it("一个维度读取失败不阻断其它维度，也不回退旧报告正文", async () => {
+it("读取失败清除本专题缓存正文，其它专题仍正常加载", async () => {
   const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(data)))
     .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "暂时不可用" } }), { status: 503 }));
   vi.stubGlobal("fetch", fetch);

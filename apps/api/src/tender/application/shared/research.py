@@ -45,23 +45,13 @@ class AgentLimits:
     timeout_seconds: int = 1800
     context_tokens: int = 24000
     max_output_tokens: int = 8192
-    max_tool_failures: int = 3
-    max_no_progress_rounds: int = 3
-    max_finish_corrections: int = 2
     rate_limit_backoff_seconds: int = 30
     rate_limit_max_wait_seconds: int = 600
-    max_identical_tool_calls: int = 3
-    max_validation_failures: int = 3
     max_subagent_retries: int = 2
-    # 参数/来源/证据额度错误可自纠正；达到上限只收窄工具，不终止模块。
-    max_argument_failures: int = 6
-    max_evidence_budget_failures: int = 2
     # 供应商不可用时在同一 thread/attempt 内的有界恢复次数。
     max_model_recoveries: int = 2
     # 同一查询最多翻 5 页；候选窗口按页大小成倍缓存，避免改写同义词续命。
     max_search_pages: int = 5
-    max_review_repairs: int = 1
-    review_max_input_tokens: int = 12000
 
     @property
     def search_window(self) -> int:
@@ -126,16 +116,9 @@ class ResearchSession:
                 cached[anchor] = value["block_ids"]
             else:
                 pending.add(anchor)
-        # 审查必须接纳全部依赖；工具补读则可在完整元素之间按软容量截断交付。
         # 入库大块已含完整条款；重新核对本块身份即可，自动邻域会引入无关整节并耗尽证据额度。
-        complete = {key for key in pending if self.seen[key].get("chunk_version") == "2"}
-        blocks, prepared = await self._context_blocks(complete, 0, 0, extend=False,
+        blocks, prepared = await self._context_blocks(pending, 0, 0, extend=False,
                                                       check_capacity=True)
-        legacy_blocks, legacy_prepared = await self._context_blocks(
-            pending - complete, 1, 1, extend=True, check_capacity=True,
-        )
-        blocks.extend(legacy_blocks)
-        prepared.update(legacy_prepared)
         blocks = list({r["block_id"]: r for r in [
             *(self.seen[k] for ids in cached.values() for k in ids), *blocks,
         ]}.values())

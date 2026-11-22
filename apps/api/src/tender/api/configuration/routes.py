@@ -1,4 +1,4 @@
-"""配置中心 HTTP 入口：三层配置的读写、发布、门禁、确认与回滚。"""
+"""配置中心 HTTP 入口：运行与解析配置的读写、发布、确认与回滚。"""
 
 from __future__ import annotations
 
@@ -48,7 +48,6 @@ class AcknowledgeRequest(BaseModel):
 class ActivateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    force: bool = False
     reason: str | None = Field(default=None, max_length=1000)
 
 
@@ -124,7 +123,6 @@ def activate_release(
 ) -> dict[str, Any]:
     return _service(request).activate(
         release_id,
-        force=payload.force,
         reason=payload.reason,
         role=role(request),
         actor=actor(request),

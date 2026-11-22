@@ -322,7 +322,6 @@ class ProjectFileService:
                             "execution": document_execution_snapshot(
                                 active_config.resolved if active_config is not None else None
                             ),
-                            "execution_origin": "created",
                         },
                         "config_snapshot_id": snapshot_id,
                     }

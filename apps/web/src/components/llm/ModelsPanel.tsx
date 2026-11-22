@@ -507,8 +507,9 @@ export function ModelsPanel({ providers, models, profiles, fields = {}, onChange
                 <Button
                   danger
                   disabled={busy}
-                  onClick={() =>
-                    modal.confirm({
+                  onClick={async () =>
+                    // await 模式保留失败重试，并由确认框处理拒绝，避免触发全局未处理异常。
+                    await modal.confirm({
                       title: `删除模型「${model.display_name}」？`,
                       content: "有效绑定或索引引用会阻止删除。",
                       okText: "删除",

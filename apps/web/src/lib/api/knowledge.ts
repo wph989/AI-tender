@@ -3,7 +3,7 @@ import { recordItems } from "@/lib/analysis/records";
 import { message } from "@/lib/errors";
 import { requestJson } from "@/lib/api/request";
 
-/** 新接口沿用现有错误协议；AbortSignal 用于防止快速切换时旧响应覆盖新状态。 */
+/** 知识接口共用错误协议；AbortSignal 防止快速切换时在途响应覆盖新状态。 */
 export async function knowledgeRequest<T>(path: string, method = "GET", body?: unknown, signal?: AbortSignal): Promise<T> {
   return requestJson<T>("/api/v1" + path, {
     method,
@@ -20,7 +20,7 @@ export function resolveCitation(ref: Citation, signal?: AbortSignal): Promise<Ci
     .then((resolved) => ({ ...ref, ...resolved }));
 }
 
-/** 新版专题直接取独立记录；单个维度失败不阻断其它维度，也不回退旧报告条目。 */
+/** 专题独立读取记录；失败时清除本专题缓存正文，避免继续展示已撤销的依据。 */
 export function loadReportRecords(report: AnalysisReport, signal?: AbortSignal): Promise<AnalysisReport> {
   // 请求成功后仍可能在逐条绑定校验中失败，必须与请求错误一起隔离在当前专题。
   const modules = report.modules.map((module) =>

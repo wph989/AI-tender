@@ -5,7 +5,7 @@ import { Alert, App, Button, Drawer, Input, Spin } from "antd";
 /**
  * 配置版本面板：版本列表 + 详情（diff / 影响清单逐条确认 / 门禁 / 审计）。
  *
- * 门禁的关键是"每条影响单独确认"（设计文档 09 第 7.1 节）：这里不给"全部确认"按钮，
+ * 门禁的关键是"每条影响单独确认"（docs/质量/09-评测与质量门禁.md）：这里不给"全部确认"按钮，
  * 一次点击就能过掉的确认等同于没有确认——门禁事后要能回答"谁看了哪一条"。
  */
 
@@ -33,12 +33,12 @@ interface Props {
   busy: boolean;
   onSelect: (id: number) => void;
   onAcknowledge: (entry: ImpactEntry, comment: string) => Promise<void>;
-  onActivate: (force: boolean, reason: string) => Promise<void>;
+  onActivate: (reason: string) => Promise<void>;
   onRollback: (reason: string) => Promise<void>;
 }
 
 /** 状态的圆点色。为什么不用药丸：一列版本号各顶一个填色胶囊，眼睛会被色块带走，
- *  反而读不到版本号本身；圆点的重量刚好够把六种状态区分开。 */
+ *  反而读不到版本号本身；圆点的重量刚好够区分状态。 */
 const STATUS_DOT_CLASS: Record<string, string> = {
   draft: "bg-amber-500",
   active: "bg-emerald-500",
@@ -70,7 +70,6 @@ export function ReleasePanel({
   const [reason, setReason] = useState("");
 
   const isDraft = detail?.status === "draft";
-  const softBreaches = detail?.gate.soft_breaches ?? [];
   const rows = detail === null ? [] : diffRows(detail.changed);
   const unacked = detail?.impact.filter((entry) => !entry.acked).length ?? 0;
 
@@ -300,11 +299,6 @@ export function ReleasePanel({
                     暂不能发布：{blockerLabel(code)}
                   </li>
                 ))}
-                {softBreaches.map((code) => (
-                  <li key={code} className="text-amber-700">
-                    需二次确认：{blockerLabel(code)}
-                  </li>
-                ))}
               </ul>
             )}
 
@@ -313,11 +307,7 @@ export function ReleasePanel({
                 <Input
                   className={" min-w-0 flex-1"}
                   aria-label="发布理由"
-                  placeholder={
-                    softBreaches.length > 0
-                      ? "强制发布必须填写理由"
-                      : "发布理由（可选）"
-                  }
+                  placeholder="发布理由（可选）"
                   value={reason}
                   onChange={(event) => setReason(event.target.value)}
                 />
@@ -325,23 +315,17 @@ export function ReleasePanel({
                   type="primary"
                   htmlType="button"
 
-                  disabled={
-                    busy ||
-                    detail.gate.blockers.length > 0 ||
-                    (softBreaches.length > 0 && reason.trim() === "")
-                  }
+                  disabled={busy || detail.gate.blockers.length > 0}
                   onClick={() =>
                     modal.confirm({
-                      title: softBreaches.length
-                        ? "确认强制发布？"
-                        : "确认发布该版本？",
+                      title: "确认发布该版本？",
                       content: "生效后，新任务将使用本次配置。",
                       okText: "确认发布",
-                      onOk: () => onActivate(softBreaches.length > 0, reason),
+                      onOk: () => onActivate(reason),
                     })
                   }
                 >
-                  {softBreaches.length > 0 ? "强制发布" : "发布"}
+                  发布
                 </Button>
               </div>
             )}
@@ -382,7 +366,7 @@ export function ReleasePanel({
               {detail.audit.map((entry) => (
                 <li key={entry.id}>
                   {formatTime(entry.created_at)} · {entry.actor} ·{" "}
-                  {({ create: "创建版本", acknowledge: "确认影响", activate: "发布版本", force_activate: "强制发布", rollback: "恢复历史版本" } as Record<string, string>)[entry.action] ?? entry.action}
+                  {({ create: "创建版本", acknowledge: "确认影响", activate: "发布版本", rollback: "恢复历史版本" } as Record<string, string>)[entry.action] ?? entry.action}
                   {entry.reason !== null && entry.reason !== ""
                     ? " · " + entry.reason
                     : ""}

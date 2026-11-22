@@ -1,14 +1,9 @@
 /**
  * 原文视图的 UI 状态。
  *
- * 为什么用 Zustand 且只放这些：当前高亮、缩放、提示语、当前页码都是「与数据无关的视图状态」，
- * 放 React 上下文会在页面级滚动时反复重建，放 Redux 又不值当（见 docs/工程/10 第 2 节）。
- *
- * 关键在 `activeEvidence` **必须进状态**而不是画完即忘：
- * 缩放、容器 resize、页面卸载重挂之后都要靠它自动重算高亮矩形（见 docs/设计/06 第 6 节）。
- *
- * `jumpRequest` 用「请求 + token」而不是暴露滚动函数：Toolbar 与原文视图分属两棵子树，
- * 用状态传命令可以避免把滚动容器的 ref 一路透传（见 docs/工程/11 第 6 节的组件通信取舍）。
+ * Zustand集中管理高亮、缩放、提示和页码，供工具栏与原文视图共享。
+ * activeEvidence保留归一化坐标，缩放、窗口变化或重新挂载时据此重算高亮矩形。
+ * jumpRequest的递增token让重复选择同一位置也触发滚动。
  */
 
 import { create } from "zustand";
@@ -19,7 +14,7 @@ export interface ActiveEvidence {
   evidenceId: number;
   anchor: string;
   pageNo: number;
-  /** null = 只有页级定位（bbox 缺失或非法），此时高亮整页边框（见 docs/设计/06 第 5 节）。 */
+  /** null = 只有页级定位（bbox 缺失或非法），此时高亮整页边框（见 docs/设计/06-前端展示与定位.md）。 */
   bbox: Bbox | null;
   label: string;
 }

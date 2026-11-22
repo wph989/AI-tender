@@ -1,6 +1,6 @@
 """ORM 模型与迁移 DDL 的一致性契约（事实源链条的最后一跳）。
 
-事实源链条：设计文档 → 迁移 `_STATEMENTS`（真执行的 SQL）→ 模型。
+当前基线 SQL 是物理结构的权威；文档登记表与列，ORM只表达访问映射。
 前两跳由 test_ddl_matches_docs 守住，这里守最后一跳：Base.metadata 的
 表名、列名、可空性、列类型必须与把全部迁移顺序执行后的库完全一致。
 
@@ -72,6 +72,7 @@ def _statement_text() -> str:
 
 def _column_type(rest: str, label: str) -> tuple[str, bool]:
     """从列定义的类型起头处解析出「归一化类型 + 是否可空」。"""
+    rest = rest.upper().replace("CHARACTER VARYING", "VARCHAR").replace("CHARACTER", "CHAR")
     match = _TYPE_RE.match(rest)
     assert match is not None, f"{label} 的列类型没解析出来：{rest}（解析器要跟进）"
     raw_type = match.group(1)
@@ -105,7 +106,7 @@ def _parse_ddl_columns() -> dict[str, dict[str, tuple[str, bool]]]:
                 continue
             rest = line[len(head) :].strip()
             assert rest, f"{table}.{head} 没有类型（解析器要跟进）：{line}"
-            columns[head] = _column_type(rest, f"{table}.{head}")
+            columns[head.strip('"')] = _column_type(rest, f"{table}.{head}")
         # 联合主键的列必然 NOT NULL；解析不到说明前面漏了列，直接 KeyError 暴露
         for column in pk_columns:
             columns[column] = (columns[column][0], False)

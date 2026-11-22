@@ -1,6 +1,6 @@
 """用碎标题、跨页条件和独立条款验证检索单元，不改变原文证据身份。"""
 
-from tender.domain.knowledge.text import chunk_locations, iter_retrieval_chunks, split_elements
+from tender.domain.knowledge.text import chunk_locations, iter_element_chunks, iter_retrieval_chunks
 
 
 def elements(*texts):
@@ -26,7 +26,7 @@ def test_fragmented_clause_keeps_title_value_condition_and_exception_together():
 
 def test_original_block_identity_content_offsets_and_element_mapping_are_unchanged():
     rows = elements("第一章 招标公告", "开标时间", "正文" * 2000, "下一条款")
-    original, actual = split_elements(rows), chunks(rows)
+    original, actual = [chunk for _, chunk in iter_element_chunks(rows)], chunks(rows)
     assert "\n".join(r["content"] for r in actual) == "\n".join(r["content"] for r in original)
     assert {r["element_id"] for r in actual} <= {r["element_id"] for r in original}
     assert [row["ordinal"] for row in actual] == list(range(len(actual)))

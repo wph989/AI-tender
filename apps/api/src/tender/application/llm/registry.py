@@ -1,4 +1,4 @@
-"""LLM 管理模块的纯规则：优先级整表展开与转移深度夹取（设计文档 12 第 3、4 节）。
+"""LLM 管理模块的纯规则：优先级整表展开与转移深度夹取（docs/设计/12-LLM管理与模型路由.md）。
 
 放在 application 而不是 api 里：这些规则同时约束接口写入与 worker 读取，
 只有一份实现，页面提交与任务执行才不会对"合法优先级"产生两种理解。
@@ -45,7 +45,7 @@ def binding_rows(model_ids: Sequence[int]) -> list[tuple[int, int]]:
     """把整表提交的有序模型 id 展开成 (model_id, priority) 行。
 
     优先级由数组位置推导，而不是接收客户端传来的数字：数字会带来空洞、同级、越界
-    三类非法状态，而"有序数组"天然只有一种解释（见设计文档 12 第 3 节）。
+    三类非法状态，而"有序数组"天然只有一种解释（见docs/设计/12-LLM管理与模型路由.md）。
     """
     if len(model_ids) > MAX_BINDINGS:
         raise PriorityLimitExceeded(f"一个功能最多绑定 {MAX_BINDINGS} 个模型")

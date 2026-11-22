@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -185,16 +184,6 @@ class FeaturePatch(BaseModel):
         default=6, strict=True, **field_bounds(FEATURE_FIELDS["max_total_requests"])
     )
     revision: int = Field(ge=1)
-
-
-def _service_from_engine(db: Any) -> LlmService:
-    return create_llm_service(
-        db,
-        lambda *args, **kwargs: None,
-        embedding_gateway=create_embedding_gateway,
-        image_gateway=create_image_gateway,
-        rerank_gateway=create_rerank_gateway,
-    )
 
 
 def _service(request: Request) -> LlmService:
@@ -391,41 +380,4 @@ def list_calls(
         invocation_id=invocation_id,
         limit=limit,
         offset=offset,
-    )
-
-
-def _api_key_for(row: Mapping[str, Any]) -> str | None:
-    """兼容旧测试的纯函数入口；真实规则仍在服务层。"""
-    return LlmService._api_key_for(row)
-
-
-def _feature_item(request: Request, feature_key: str) -> dict[str, Any]:
-    """兼容既有管理测试，避免测试为了取一项配置而复制展示逻辑。"""
-    return _service(request).feature_item(feature_key)
-
-
-def _model_row(db: Any, model_id: int) -> dict[str, Any]:
-    return _service_from_engine(db)._model_row(model_id)
-
-
-def _begin_test(db: Any, row: Mapping[str, Any], capability: str, is_model: bool) -> int:
-    return _service_from_engine(db)._begin_test(row, capability, is_model=is_model)
-
-
-def _finish_test(
-    db: Any,
-    row: Mapping[str, Any],
-    test_id: int,
-    status: str,
-    error: str | None,
-    latency_ms: int,
-    is_model: bool,
-) -> None:
-    _service_from_engine(db)._finish_test(
-        row,
-        test_id,
-        status=status,
-        error=error,
-        latency_ms=latency_ms,
-        is_model=is_model,
     )

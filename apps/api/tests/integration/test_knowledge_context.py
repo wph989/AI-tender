@@ -128,24 +128,3 @@ def test_short_qa_quote_resolves_to_its_actual_page_regions(environment, indexed
         assert resolved["page_no"] == place["page_no"]
         assert resolved["bbox"] == place["bbox"]
         assert ref["quote"] in resolved["content"]
-
-
-def test_historical_attempt_reads_frozen_small_block_identity_after_index_upgrade(environment):
-    from tender.domain.knowledge.text import split_elements
-
-    db, source, chunks = grouped_source(environment)
-    db.create_index(source)
-    index_id = environment[1].execute(text('SELECT max(id) FROM knowledge_index')).scalar_one()
-    db.complete_index(index_id, chunks=chunks, vectors=[[1.0, 0.0]] * len(chunks),
-                      config={"id": None, "signature": "test-space"})
-    ready = db.sources([source["collection_id"]])[0]
-    legacy = ready | {"chunk_format_version": "1"}
-    expected = split_elements(db.blocks(legacy))
-    restored = db.read_chunk_window(legacy, 0, 12).rows
-    assert [r["content"] for r in restored] == [r["content"] for r in expected]
-    assert all(r["block_id"] == f"s{r['source_id']}r{r['parse_run_id']}c{r['offset']}"
-               for r in restored)
-    assert all("g2c" in r["block_id"] for r in db.readable_chunks(ready))
-    found = db.search_candidates([legacy], "开标", [1.0, 0.0], "test-space",
-                                 limit=6, min_similarity=0.6)
-    assert found.rows and not found.semantic_source_ids

@@ -1,4 +1,4 @@
-﻿"""配置门禁只处理逐项确认，退役功能不能再影响发布。"""
+"""配置门禁只处理逐项确认，退役功能不能再影响发布。"""
 
 import pytest
 
@@ -14,21 +14,20 @@ def test_build_impact_is_stable_ordered_and_unique():
 
 
 def test_impact_state_marks_only_matching_acknowledgements():
-    impact = gate.build_impact(["mineru.tier", "render.crop_dpi"])
-    state = gate.impact_state(impact, [("config_changed", "render.crop_dpi")])
+    impact = gate.build_impact(["mineru.tier", "mineru.ocr_mode"])
+    state = gate.impact_state(impact, [("config_changed", "mineru.ocr_mode")])
     assert [(entry["ref"], entry["acked"]) for entry in state] == [
-        ("mineru.tier", False), ("render.crop_dpi", True),
+        ("mineru.ocr_mode", True), ("mineru.tier", False),
     ]
 
 
-@pytest.mark.parametrize("force", [False, True])
-def test_gate_never_bypasses_missing_confirmation(force):
-    impact = gate.build_impact(["mineru.tier", "render.crop_dpi"])
+def test_gate_blocks_missing_confirmation():
+    impact = gate.build_impact(["mineru.tier", "mineru.ocr_mode"])
     result = gate.evaluate_gate(
-        impact=impact, acknowledged=[("config_changed", "mineru.tier")], force=force,
+        impact=impact, acknowledged=[("config_changed", "mineru.tier")],
     )
     assert result.as_dict() == {
-        "passed": False, "blockers": ["impact_not_acknowledged"], "soft_breaches": [],
+        "passed": False, "blockers": ["impact_not_acknowledged"],
     }
 
 

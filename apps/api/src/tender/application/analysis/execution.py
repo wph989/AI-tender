@@ -383,12 +383,6 @@ class AnalysisExecutor:
                 raise ValueError("解析协议已升级，旧检查点不能恢复；请重新创建报告")
             limits = AgentLimits(**runtime.run["limits"])
             prior = state.get("research", {})
-            # 历史attempt已交付的小块身份不能被新分块重新解释；从零重解析始终使用新大块。
-            legacy_sources = {row["source_id"] for key, row in prior.get("seen", {}).items()
-                              if key == (f"s{row['source_id']}r{row['parse_run_id']}"
-                                         f"c{row['offset']}" )}
-            sources = [{**source, "chunk_format_version": "1"}
-                       if source["source_id"] in legacy_sources else source for source in sources]
             research = ResearchSession(
                 sources,
                 report["project_id"],
@@ -714,7 +708,7 @@ class AnalysisExecutor:
             return
         from tender.application.shared.schema_guard import missing_schema
 
-        # ORM 全列读取也会访问新列，所以先只读旧版已有的状态列，再核对结构；
+        # 先读取任务状态再核对结构，避免缺列异常先于门禁发生；
         # 否则缺列异常会在门禁前抛出，报告无法记录失败原因并结束派发。
         absent = missing_schema(db)
         if absent:
@@ -722,13 +716,13 @@ class AnalysisExecutor:
                 "report",
                 report_id,
                 "failed",
-                "数据库结构落后于当前代码，请先执行数据库迁移；缺少 " + "、".join(absent),
+                "数据库结构不完整，请初始化当前版本数据库；缺少 " + "、".join(absent),
             )
             return
         report = db.report_for_analysis(report_id)
         if report is None or report["status"] not in {"waiting", "pending", "running"}:
             return
-        # 队列可能在升级期间仍含旧协议消息，执行前按报告快照统一拒绝。
+        # 执行条件必须与报告冻结的协议一致，不能把无效消息接入当前 Agent。
         if not is_current_report(report):
             return
         await self.analyze_report(report)

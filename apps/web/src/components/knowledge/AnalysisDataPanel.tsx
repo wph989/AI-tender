@@ -13,7 +13,7 @@ import type {
 
 const readinessLabels = { usable: "依据可用", partial: "有待核对事项", unavailable: "依据不足" };
 type ReviewTarget = Pick<BusinessRecord, "id" | "title" | "citations"
-  | "verification" | "human_review" | "human_review_status"> & { kind: BusinessRecord["kind"] | "coverage" };
+  | "verification" | "human_review" | "human_review_status" | "kind">;
 interface Props {
   report: AnalysisReport;
   onLocate: (citation: Citation) => void;
@@ -116,8 +116,10 @@ export function AnalysisDataPanel({ report, onLocate, snapshot, open, onClose, o
         {status !== "rejected" && <Button size="small" danger disabled={Boolean(reviewing) || !reviewReady}
           loading={reviewing === record.id} onClick={() => void review(record, "rejected")}>驳回</Button>}
       </>}
+      {/* 分别说明机器自查与引用缺失，避免已有完整原文时仍被提示缺件。 */}
       {!reviewReady && status === "pending" && <span className="text-xs text-slate-500">
-        原文依据未齐，暂不能复核
+        {record.verification === "supported" ? "原文依据未齐，暂不能复核"
+          : "机器自查未通过，须重跑分析后再复核"}
       </span>}
     </div>;
   }
@@ -179,10 +181,6 @@ export function AnalysisDataPanel({ report, onLocate, snapshot, open, onClose, o
   }
 
   const data = snapshot?.data;
-  const coverage = data?.coverage.flatMap((item) => item.status === "not_applicable"
-    && item.review_id && item.citations?.length
-    ? [{ ...item, id: item.review_id, kind: "coverage" as const, citations: item.citations,
-      verification: item.verification ?? "unsupported" }] : []) ?? [];
   return <Drawer title="按标段查看投标要求" open={open} size={760} onClose={onClose}>
       <p className="mb-3 text-sm text-slate-500">这里使用报告快照中已确认的标段范围。公共要求一并保留，范围未确认的条款单列。</p>
       <Space className="mb-4" wrap>
@@ -209,20 +207,6 @@ export function AnalysisDataPanel({ report, onLocate, snapshot, open, onClose, o
           <summary className="cursor-pointer py-2 font-medium">格式目录（{data.format_nodes.length}）</summary>
           <Tree className="my-3" showLine defaultExpandAll treeData={tree(data.format_nodes)} />
         </details>}
-        {coverage.length > 0 && <details className="mb-3">
-          <summary className="cursor-pointer py-2 font-medium">不适用结论（{coverage.length}）</summary>
-          <Table<(typeof coverage)[number]> size="small" rowKey="id" dataSource={coverage}
-            pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
-            scroll={{ x: 550 }} columns={[
-              { title: "专题事项", width: 135, render: (_, row) => <>
-                {row.title}
-                <div className="text-xs text-slate-600">{report.modules.find((m) => m.module_key === row.module_key)?.title}</div>
-              </> },
-              { title: "不适用依据", render: (_, row) => <div className="whitespace-pre-wrap break-words">
-                {row.detail}{citations(row)}{reviewControls(row)}</div> },
-              { title: "适用范围", width: 115, render: (_, row) => scopeLabelFor(row.scope) },
-            ]} />
-        </details>}
       </>}
       {previewError && <Alert className="mb-3" type="error" title={previewError} />}
       {context && <>
@@ -238,7 +222,7 @@ export function AnalysisDataPanel({ report, onLocate, snapshot, open, onClose, o
           key: String(index), detail: gap.detail, code: gap.code, scope: gap.scope, scopeLabel: scopeLabelFor(gap.scope),
           moduleKey: gap.module_key, recordId: gap.record_id,
           moduleTitle: report.modules.find((module) => module.module_key === gap.module_key)?.title,
-          topicTitle: data?.coverage.find((entry) => entry.topic === gap.topic && entry.module_key === gap.module_key)?.title ?? gap.topic,
+          topicTitle: gap.topic,
         }))} />
       </>}
     </Drawer>;

@@ -2,3 +2,5 @@
 # 前端通过相对路径直接引用它，避免为了一个 JSON 文件再走一层包发布。
 packages:
   - apps/web
+# 验证和启动命令不得隐式安装依赖，安装由开发者显式执行。
+verifyDepsBeforeRun: false

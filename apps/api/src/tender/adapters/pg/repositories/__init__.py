@@ -1,4 +1,4 @@
-"""``ports/repository`` 的 PostgreSQL 实现（docs/工程/10 第 4.2 节）。
+"""``ports/repository`` 的 PostgreSQL 实现（docs/工程/10-技术选型与工程结构.md）。
 
 这个包是「业务库取数」这一可替换细节的唯一落点：上层按 ``ports/repository`` 里的
 ``Protocol`` 编程，装配点（``core.di``、API 路由、worker 任务）在这里取具体实现。

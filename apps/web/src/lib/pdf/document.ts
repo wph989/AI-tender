@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * PDF 基座加载器（见 docs/设计/06 第 3 节）。
+ * PDF 基座加载器（见 docs/设计/06-前端展示与定位.md）。
  *
  * 为什么用动态 import：pdfjs 在模块求值阶段就会碰浏览器全局对象（DOMMatrix / Worker 等），
  * 静态 import 会被 SSR 一并求值而报错。这里保证只在浏览器、只在 effect 里加载。
@@ -17,7 +17,7 @@
 
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
-/** 只配置一次；重复赋值本身无害，但保留标志位方便将来加一次性校验 */
+/** Worker地址是全局选项，多个PDF共用一次初始化。 */
 let workerConfigured = false;
 
 export async function loadPdfDocument(url: string): Promise<PDFDocumentProxy> {

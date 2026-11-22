@@ -31,7 +31,7 @@ interface Props {
   items: readonly EvidenceItem[];
   registry: PageRegistry;
   onError: (message: string) => void;
-  /** 点原文页上的角标 → 反向定位到对应结果卡（见 docs/设计/06 第 11 节）。 */
+  /** 点原文页上的角标 → 反向定位到对应结果卡（见 docs/设计/06-前端展示与定位.md）。 */
   onLocate: (item: EvidenceItem) => void;
 }
 
@@ -64,7 +64,7 @@ export function PageView({ pdf, page, scale, items, registry, onError, onLocate 
 
   const handleRendered = useCallback(
     (size: Size) => {
-      // 渲染基座与解析基座必须吻合（见 05 第 3.2 节）：不吻合说明两边几何口径已错位，
+      // 渲染基座与解析基座必须吻合（见 docs/设计/05-后端API设计.md）：不吻合说明两边几何口径已错位，
       // 此时画出来的高亮不可信，必须让用户看见，而不是静默画一个漂移的框
       const mismatch = assertViewportMatches(
         { width: expected.width * scale, height: expected.height * scale },

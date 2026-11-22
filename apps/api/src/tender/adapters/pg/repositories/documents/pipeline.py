@@ -30,7 +30,6 @@ from tender.adapters.pg.models import (
     DocumentVersion,
     Element,
     Job,
-    JobConfigSnapshot,
     Page,
     ParseRun,
     Project,
@@ -39,7 +38,6 @@ from tender.adapters.pg.models import (
 from tender.adapters.pg.repositories.jobs.dispatch import DISPATCH_LEASE
 from tender.adapters.pg.repositories.jobs.tasks import finish_canceled_job
 from tender.config.registry import ConfigRegistry
-from tender.config.schema import document_execution_snapshot
 from tender.domain.documents.element import NormalizedElement
 from tender.domain.shared.errors import ParseFailed
 from tender.ports.documents.inspection import PdfInspection
@@ -127,49 +125,12 @@ class DocumentPipelineRepository:
                     ).values(**values))
 
     def runtime_values(self, job_id: str) -> Mapping[str, Any]:
-        """优先使用创建时快照；老任务首次补齐后也不能随重试读取新配置。"""
+        """只使用创建时冻结的预算，重试和恢复不能改变执行条件。"""
         with self.engine.connect() as connection:
-            row = (
-                connection.execute(
-                    select(Job.config_snapshot, Job.config_snapshot_id, Job.company_id).where(
-                        Job.id == job_id
-                    )
-                )
-                .mappings()
-                .one()
-            )
-            snapshot = dict(row["config_snapshot"] or {})
-            if "execution" in snapshot:
-                return dict(snapshot["execution"])
-            frozen = None
-            if row["config_snapshot_id"] is not None:
-                frozen = connection.execute(
-                    select(JobConfigSnapshot.resolved).where(
-                        JobConfigSnapshot.id == row["config_snapshot_id"]
-                    )
-                ).scalar_one()
-        # 旧任务没有创建时快照时，只能固定首次执行时的配置，并标记来源。
-        # 活动配置可能访问 Redis，必须在锁定任务行之前读取。
-        origin = "job_config_snapshot" if frozen is not None else "legacy_first_execution"
-        values = document_execution_snapshot(
-            frozen if frozen is not None else self.configs.resolved(int(row["company_id"]))
-        )
-        with self.engine.begin() as connection:
-            current = connection.execute(
-                select(Job.config_snapshot).where(Job.id == job_id).with_for_update()
+            snapshot = connection.execute(
+                select(Job.config_snapshot).where(Job.id == job_id)
             ).scalar_one()
-            snapshot = dict(current or {})
-            if "execution" not in snapshot:
-                snapshot.update(
-                    execution=values,
-                    execution_origin=origin,
-                    execution_frozen_at=datetime.now(UTC).isoformat(),
-                )
-                connection.execute(
-                    update(Job).where(Job.id == job_id).values(config_snapshot=snapshot)
-                )
-            # 并发补齐时必须采用获锁者已写入的值，不能返回本次预读值。
-            return dict(snapshot["execution"])
+        return dict(snapshot["execution"])
 
     def job(self, job_id: str) -> Mapping[str, Any] | None:
         with self.engine.connect() as connection:

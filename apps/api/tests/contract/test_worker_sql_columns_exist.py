@@ -4,7 +4,7 @@
 但 `api_key_ciphertext` 属于 `llm_provider`（见 alembic 0003 第 21 行与
 docs/设计/12 第 6 节，api/llm.py 取的是 `p.api_key_ciphertext`）。这个错误只在真机
 跑抽取时以 `column m.api_key_ciphertext does not exist` 暴露，而抽取这一环此前从没
-在真机跑通过（见 HANDOVER 第 21 节），所以它一直躺着。
+仓储SQL必须与当前物理列对应，不能依靠历史运行结果判断正确。
 
 为什么值得单独一个契约测试：这类错误编译器、ruff、分层检查全都不管，只有真机才会报，
 而「真机跑一遍抽取」的成本远高于一个纯文本断言。

@@ -10,10 +10,10 @@ from tender.application.knowledge.content import (
     fingerprint,
     merge_field_entries,
     rank_chunks,
-    split_elements,
     validate_items,
 )
 from tender.application.knowledge.retrieval import retrieve_chunks
+from tender.domain.knowledge.text import iter_element_chunks
 from tender.domain.shared.errors import (
     InvalidModelOutput,
     ModelCallFailed,
@@ -62,7 +62,8 @@ def item(row):
 
 def test_long_tables_are_fully_covered():
     content = "".join(f"第{i}项技术条件。" for i in range(2500))
-    chunks = split_elements([{"id": 1, "type": "table", "html": "<table>" + content + "</table>"}])
+    elements = [{"id": 1, "type": "table", "html": "<table>" + content + "</table>"}]
+    chunks = [chunk for _, chunk in iter_element_chunks(elements)]
     covered = set()
     for chunk in chunks:
         covered.update(range(chunk["char_start"], chunk["char_end"]))

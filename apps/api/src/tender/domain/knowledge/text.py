@@ -1,15 +1,10 @@
-"""元素到检索分块的纯规则：表格 HTML 与纯文本都保留信息，不沿用旧的 6000 字截断。
-
-放 ``domain`` 而不是 ``application``：分块是纯函数规则，而 ``adapters/pg`` 的检索入库
-也要用它（``readable_chunks`` 在仓储里拼定位信息），application 与 adapters 不能互相引用
-（``pyproject.toml`` 的 import-linter 契约），纯规则只有落在最底层的 domain 才能被两边共用。
-"""
+"""元素到语义块的纯规则，由索引入库和未建索引的检索共用，保持正文与定位一致。"""
 
 from __future__ import annotations
 
 import html
 import re
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 # 分块版本随切分规则升级：索引写入与检索回退共用这一口径，避免读取端各自硬编码。
@@ -17,18 +12,15 @@ CHUNK_VERSION = "2"
 
 
 def plain_text(element: Mapping[str, Any]) -> str:
-    # 表格的完整 HTML 与纯文本同时保留信息；不沿用旧抽取的 6000 字截断。
+    # 优先读取表格 HTML，避免只使用文本副本时遗漏单元格内容。
     source = str(element.get("html") or element.get("text") or "")
     return html.unescape(re.sub(r"<[^>]+>", " ", source))
 
 
-def chunk_block_id(source_id: int, parse_run_id: int, ordinal: int) -> str:
-    """引文身份：同一解析批次内的块编号，索引分块与原文回退必须完全一致。"""
-    return f"s{source_id}r{parse_run_id}c{ordinal}"
 
 
 def retrieval_block_id(source_id: int, parse_run_id: int, ordinal: int) -> str:
-    """语义块有独立版本命名空间，旧报告的原文块ID不会被重新解释。"""
+    """块身份包含分块规则版本，防止不同切分结果被解释为同一证据。"""
     return f"s{source_id}r{parse_run_id}g{CHUNK_VERSION}c{ordinal}"
 
 
@@ -55,8 +47,6 @@ def chunk_locations(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def split_elements(elements: Sequence[Mapping[str, Any]], size: int = 1800) -> list[dict]:
-    return [chunk for _, chunk in iter_element_chunks(elements, size)]
 
 
 def iter_element_chunks(
@@ -87,7 +77,7 @@ def iter_element_chunks(
                 ordinal += 1
 
 
-# 历史小块编号保留旧口径，新切片独立版本化，避免旧报告的证据 ID 指向不同原文。
+# 按明确的章节和编号组织语义块，防止标题与条款正文分离。
 _CHAPTER = re.compile(
     r"^第[一二三四五六七八九十百零\d]+(?:章|篇|部分|节)"
     r"|^附[录件][一二三四五六七八九十\d:：]"

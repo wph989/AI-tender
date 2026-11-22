@@ -1,10 +1,7 @@
-"""三层配置项定义与值解析（设计文档 08 第 2 节）。
+"""运行与解析配置的定义、默认值和类型校验（docs/质量/08-动态配置中心.md）。
 
-默认值在代码里必须存在一份：读不到某个 key 时（迁移未跑、release 为空）业务要有确定答案。
-`config_item` 表里的同名列是给页面与审计看的副本，两侧一致性由
-`tests/contract/test_config_items_match_migration.py` 盯着——手工同步两份清单迟早漂移。
-
-`value_type` 里的 `number` 是 DDL 注释中 `int|bool|string|json|secret` 的补充：
+代码默认值补齐当前版本未覆盖的参数，`config_item` 保存页面与审计使用的元数据。
+基线种子与代码清单由 `test_config_items_match_migration.py` 核对，防止默认值漂移。
 参数值按登记类型校验，防止前端与执行端对同一个值作出不同解释。
 """
 
@@ -19,7 +16,7 @@ L1 = "L1"
 L2 = "L2"
 LAYERS: tuple[str, ...] = (L1, L2)
 
-# 谁能写哪一层（08 第 9 节）：viewer/reviewer 只读，operator 只写 L1，admin 全写。
+# 谁能写哪一层（docs/质量/08-动态配置中心.md）：viewer/reviewer 只读，operator 只写 L1，admin 全写。
 WRITERS: dict[str, frozenset[str]] = {
     L1: frozenset({"operator", "admin"}),
     L2: frozenset({"admin"}),
@@ -57,24 +54,12 @@ ITEMS: tuple[ConfigItem, ...] = (
         "每模块每次运行的成功模型请求上限，含摘要，协议失败不扣次数"
     ),
     _item("analysis.max_tool_calls", L1, "int", 48, "每模块每次运行的成功工具执行上限"),
-    _item("analysis.max_review_repairs", L1, "int", 1,
-          "完整审查后的自动修复及定向复核上限，0表示不自动修复"),
-    _item("analysis.review_max_input_tokens", L1, "int", 12000,
-          "审查单包完整输入的估算token上限，包含规则、正文、引文及依赖"),
     _item("analysis.max_evidence_blocks", L1, "int", 160, "每模块保留的原文证据块上限"),
     _item(
         "analysis.similarity_threshold", L1, "number", 0.6,
         "专题语义检索的最低余弦相似度（0到1）；关键词独立召回，按命中数参与融合排序",
     ),
     _item("analysis.max_search_results", L1, "int", 6, "每次专题检索通过阈值后返回的证据块上限"),
-    _item("analysis.max_tool_failures", L1, "int", 3, "工具连续失败上限，按工具及全局分别计数"),
-    _item(
-        "analysis.max_no_progress_rounds", L1, "int", 3, "无新增证据或有效成果的轮数，达到后收尾"
-    ),
-    _item(
-        "analysis.max_finish_corrections", L1, "int", 2,
-        "进入收尾后允许的连续无进展纠正轮数，耗尽时保留已核实成果并终止",
-    ),
     _item(
         "analysis.rate_limit_backoff_seconds", L1, "int", 30,
         "上游429未给出恢复时间时的首次等待秒数，后续按倍数递增",
@@ -83,15 +68,13 @@ ITEMS: tuple[ConfigItem, ...] = (
         "analysis.rate_limit_max_wait_seconds", L1, "int", 600,
         "单个模块内为上游限流累计等待的上限秒数，超出后按可补跑失败收尾",
     ),
-    _item("analysis.max_identical_tool_calls", L1, "int", 3, "同一工具与参数的累计调用上限"),
-    _item("analysis.max_validation_failures", L1, "int", 3, "同一事实校验失败上限，含首次失败"),
     _item("analysis.max_subagent_retries", L1, "int", 2, "子Agent本地执行故障的自动恢复上限"),
     _item(
         "analysis.timeout_seconds", L1, "int", 1800, "单个模块的总时限（非单次请求），恢复不重置"
     ),
     _item("analysis.context_tokens", L1, "int", 24000, "模块上下文预算，达到百分之八十时压缩"),
     _item("analysis.max_output_tokens", L1, "int", 8192, "模块单次模型输出上限"),
-    # L1 运行参数（08 第 2.1 节）：改了不影响结果，可以随便改、立即生效
+    # 并发与派发间隔实时读取；任务执行预算在创建时冻结。
     _item("convert.max_inflight", L1, "int", 4, "同时在途的 Gotenberg 转换请求数"),
     _item(
         "parse.max_inflight",
@@ -113,8 +96,7 @@ ITEMS: tuple[ConfigItem, ...] = (
     _item("job.timeout.convert_minutes", L1, "int", 10, "转换超时（分钟）"),
     _item("job.timeout.parse_minutes", L1, "int", 60, "解析超时（分钟）"),
     _item("job.retry.convert_500", L1, "int", 3, "Gotenberg 5xx 重试次数（400 不重试）"),
-    _item("queue.priority.batch", L1, "string", "low", "批量任务的队列优先级"),
-    # L2 解析配置（08 第 2.2 节）：改的是解析产物，必须绑定快照与门禁
+    # L2 解析配置（docs/质量/08-动态配置中心.md）：改的是解析产物，必须绑定快照与门禁
     _item(
         "mineru.tier",
         L2,
@@ -123,52 +105,14 @@ ITEMS: tuple[ConfigItem, ...] = (
         "MinerU 生产固定档；advanced 建议仅由人工对单文档触发",
     ),
     _item("mineru.ocr_mode", L2, "string", "auto", "逐页自适应；扫描件占比高时可评估改 ocr"),
-    _item(
-        "mineru.output_formats",
-        L2,
-        "json",
-        ["middle_json", "zip"],
-        "需要的输出格式；ZIP 默认不下载，按需获取",
-    ),
-    _item(
-        "mineru.page_range",
-        L2,
-        "string",
-        "all",
-        "解析页码范围，必须为 all，否则 title_leveling 失效",
-    ),
-    _item("render.crop_dpi", L2, "int", 300, "页面裁剪图 DPI"),
-    _item("llm_aided.title_leveling", L2, "bool", True, "章节树构建依赖的标题分级"),
-    _item("llm_aided.cross_page_table_cell_merge", L2, "bool", True, "跨页表格单元格合并"),
-    _item("preprocess.deskew", L2, "bool", True, "扫描件纠偏"),
-    _item("preprocess.denoise", L2, "bool", True, "扫描件去噪"),
-    _item("preprocess.min_dpi", L2, "int", 300, "低于此值的扫描件先升采样"),
 
 )
 
 ITEMS_BY_KEY: dict[str, ConfigItem] = {entry.key: entry for entry in ITEMS}
 
-# 未接入的能力不能伪装成生效开关；保留登记项以便查看历史版本和后续接入。
-READONLY_REASONS: dict[str, str] = {
-    **dict.fromkeys(("analysis.max_review_repairs", "analysis.review_max_input_tokens",
-                    "analysis.max_no_progress_rounds", "analysis.max_finish_corrections"),
-                   "当前由单个Agent按Skill自主核对，不再使用程序阶段或固定修复轮数"),
-    "queue.priority.batch": "当前队列未接入动态批次优先级",
-    "mineru.output_formats": "当前解析协议固定使用 middle_json 和 zip",
-    "mineru.page_range": "当前章节与坐标契约要求解析全部页码 all",
-    **dict.fromkeys(
-        ("render.crop_dpi", "llm_aided.title_leveling", "llm_aided.cross_page_table_cell_merge",
-         "preprocess.deskew", "preprocess.denoise", "preprocess.min_dpi"),
-        "当前执行流程尚未接入该配置",
-    ),
-}
-
-
 def value_rules(key: str) -> dict[str, Any]:
     """让页面与写入校验共享约束；无 maximum 就表示没有人工最大值。"""
     entry = item(key)
-    if key in READONLY_REASONS:
-        return {}
     if key == "mineru.tier":
         return {"choices": ["flash", "basic", "standard", "advanced"]}
     if key == "mineru.ocr_mode":
@@ -177,7 +121,6 @@ def value_rules(key: str) -> dict[str, Any]:
         return {"minimum": 0, "maximum": 1}
     if entry.value_type == "int":
         nonnegative = {
-            "analysis.max_review_repairs",
             "analysis.max_subagent_retries", "convert.max_inflight", "parse.max_inflight",
             "job.retry.convert_500",
         }
@@ -209,7 +152,7 @@ def default_values() -> dict[str, Any]:
 
 
 def resolve_values(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
-    """只解析仍登记的参数；历史快照原样留存，已下线参数不再进入执行配置。"""
+    """从当前登记项补齐默认值，任务在创建时冻结执行参数。"""
     resolved = default_values()
     resolved.update({k: v for k, v in (overrides or {}).items() if k in ITEMS_BY_KEY})
     return resolved
@@ -285,7 +228,7 @@ def diff_values(
     old: Mapping[str, Any],
     new: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
-    """逐项 diff（08 第 6 节差异视图）：只列真正变化的 key。"""
+    """逐项 diff（docs/质量/08-动态配置中心.md差异视图）：只列真正变化的 key。"""
     changed: dict[str, dict[str, Any]] = {}
     for key in sorted(set(old) | set(new)):
         before = old.get(key)
@@ -303,9 +246,6 @@ def write_denial(role: str, keys: object) -> str | None:
     """角色能否写这些 key：返回拒绝说明；None 表示允许。"""
     if role not in READERS:
         return f"未知角色：{role}"
-    readonly = [str(key) for key in keys if str(key) in READONLY_REASONS]
-    if readonly:
-        return f"配置项暂为只读：{'、'.join(readonly)}"
     denied = [layer for layer in sorted(layers_of(keys)) if role not in WRITERS[layer]]
     if denied:
         return f"角色 {role} 无权修改 {'/'.join(denied)} 配置"

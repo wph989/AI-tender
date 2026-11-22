@@ -95,7 +95,10 @@ def test_model_crud_binding_revision_and_history(env):
     with pytest.raises(ApiProblem) as conflict:
         llm.replace_bindings("analysis", llm.BindingsRequest(model_ids=[], revision=1), request)
     assert conflict.value.status_code == 412
-    assert llm._feature_item(request, "analysis")["bindings"][0]["model_row_id"] == m["id"]
+    analysis_feature = next(
+        item for item in llm.list_features(request)["items"] if item["key"] == "analysis"
+    )
+    assert analysis_feature["bindings"][0]["model_row_id"] == m["id"]
     with pytest.raises(ModelInUse):
         llm.delete_model(m["id"], request)
     llm.update_model(
@@ -157,18 +160,20 @@ def test_latest_started_test_wins_and_old_provider_revision_cannot_write_back(en
     request, c = env
     p = provider(request)
     m = model(request, p["id"])
-    db = request.app.state.components.engine
-    row = llm._model_row(db, m["id"])
-    older = llm._begin_test(db, row, "language", True)
-    newer = llm._begin_test(db, row, "language", True)
+    service = llm._service(request)
+    row = service._model_row(m["id"])
+    older = service._begin_test(row, "language", is_model=True)
+    newer = service._begin_test(row, "language", is_model=True)
     assert llm.list_models(request)["items"][0]["test_validity"] == "running"
-    llm._finish_test(db, row, older, "ok", None, 1, True)
+    service._finish_test(row, older, status="ok", error=None, latency_ms=1, is_model=True)
     assert llm.list_models(request)["items"][0]["last_test_status"] == "running"
-    llm._finish_test(db, row, newer, "error", "模拟失败", 2, True)
+    service._finish_test(
+        row, newer, status="error", error="模拟失败", latency_ms=2, is_model=True
+    )
     assert llm.list_models(request)["items"][0]["last_test_status"] == "error"
-    latest = llm._begin_test(db, row, "language", True)
+    latest = service._begin_test(row, "language", is_model=True)
     llm.update_provider(p["id"], llm.ProviderPatch(base_url="http://localhost/new"), request)
-    llm._finish_test(db, row, latest, "ok", None, 1, True)
+    service._finish_test(row, latest, status="ok", error=None, latency_ms=1, is_model=True)
     assert llm.list_models(request)["items"][0]["test_validity"] == "config_changed"
     assert (
         c.execute(text("SELECT status FROM llm_test WHERE id=:id"), {"id": latest}).scalar() == "ok"
@@ -197,7 +202,10 @@ def test_import_is_enabled_deduplicated_and_requires_matching_kind(env):
         llm.replace_bindings(
             "analysis", llm.BindingsRequest(model_ids=[models[0]["id"]], revision=1), request
         )
-    assert llm._feature_item(request, "analysis")["bindings"] == []
+    analysis_feature = next(
+        item for item in llm.list_features(request)["items"] if item["key"] == "analysis"
+    )
+    assert analysis_feature["bindings"] == []
 
 
 def test_rerank_catalog_is_explicitly_unsupported_without_network(env):
@@ -467,25 +475,6 @@ def test_healthy_long_test_is_not_stale_and_late_result_cannot_revive_expired_le
     assert llm.list_calls(request, limit=25, offset=0)["items"][0]["status"] == "unknown"
 
 
-def test_migration_preserves_old_interval_and_removes_all_binding_deadlines(env):
-    request, c = env
-    p = provider(request)
-    m = model(request, p["id"], timeout_seconds=90)
-    # 在私有schema恢复迁移前列形态，再运行正式增量，核对已有数据的迁移结果。
-    c.execute(text("ALTER TABLE llm_feature ADD COLUMN deadline_seconds INT DEFAULT 123"))
-    c.execute(text("ALTER TABLE llm_model DROP COLUMN total_timeout_seconds"))
-    c.execute(text("ALTER TABLE llm_model DROP CONSTRAINT llm_model_timeout_seconds_check"))
-    c.execute(text("ALTER TABLE llm_model ALTER COLUMN timeout_seconds TYPE NUMERIC(6,1)"))
-    c.execute(text("ALTER TABLE llm_test DROP COLUMN heartbeat_at"))
-    path = Path(__file__).resolve().parents[2] / "alembic/versions/0020_llm_response_timeout.py"
-    spec = importlib.util.spec_from_file_location("timeout_migration", path)
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
-    for statement in migration._STATEMENTS:
-        c.execute(text(statement))
-    changed = next(row for row in llm.list_models(request)["items"] if row["id"] == m["id"])
-    assert changed["timeout_seconds"] == 90 and changed["total_timeout_seconds"] is None
-    assert "deadline_seconds" not in llm.list_features(request)["items"][0]
 
 
 @pytest.mark.parametrize("field,value", [

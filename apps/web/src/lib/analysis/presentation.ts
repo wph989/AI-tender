@@ -73,15 +73,15 @@ export function filterResults(items: AnalysisField[], options: {
     .map((item) => ({ ...item, contextOnly: !direct.has(item.id) }));
 }
 
+/** 标段也是项目信息，和事实一并计数，避免遗漏报告范围。 */
 export function resultCounts(modules: AnalysisModule[]) {
-  const counts = { facts: 0, requirements: 0, materials: 0, relations: 0, other: 0 };
+  const counts = { facts: 0, requirements: 0, materials: 0, relations: 0 };
   for (const item of modules.flatMap((module) => module.items)) {
     const kind = item.record?.kind;
     if (kind === "fact" || kind === "lot") counts.facts++;
     else if (kind === "requirement") counts.requirements++;
     else if (kind === "format_node") counts.materials++;
     else if (kind === "relation") counts.relations++;
-    else counts.other++;
   }
   return counts;
 }

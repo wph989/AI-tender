@@ -23,7 +23,7 @@ from tender.application.analysis.data import (
     module_data,
     prepare_records,
 )
-from tender.application.analysis.data_store import publish_data_snapshot, snapshot_manifest
+from tender.application.analysis.data_store import publish_data_snapshot
 from tender.application.knowledge.content import encode, source_signature
 
 pytestmark = pytest.mark.skipif(
@@ -42,7 +42,7 @@ def basis(environment):
     ))
     analysis_api.save_settings(pid, analysis_api.AnalysisSettings(category="goods"), request)
     created = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
-    store = knowledge.store(request)
+    store = knowledge.knowledge_service(request).store
     # 夹具与终态断言要写测试 schema：直连同一批临时表，但展示与发布仍走仓储。
     db = SqlStore(store.engine, store.company_id)
     source = db.sources(db.collections_for_project(pid))[0]
@@ -163,7 +163,7 @@ def test_independent_module_json_uses_separate_evidence_and_live_permissions(bas
     assert all("citations" not in r for r in result["records"])
     record = next(r for r in result["records"] if r["key"] == "a")
     refs = [result["evidence"][key] for key in record["evidence_ids"]]
-    # 原文由服务端按实际已读块生成；模型传入的旧quote不再决定引用范围。
+    # 服务端按实际已读块生成原文范围，核对持久化引用身份。
     assert refs[0]["quote"] == basis.block["content"]
     assert refs[0]["element_id"] == basis.block["element_id"]
     # 独立数据入口同样检查实时依据，删除来源后不能绕过报告权限读取正文。
@@ -222,6 +222,9 @@ def test_report_keeps_business_identity_and_never_exposes_internal_payload(basis
             })
     module = basis.client.get(basis.path).json()["modules"][0]
     items = module["items"]
+    if staged:
+        assert not items and "business_data" not in module
+        return
     assert len([item for item in items if item["field"] == "质保期"]) == 2
     assert {item["record_id"] for item in items} == {r["id"] for r in basis.business["records"]}
     assert "business_data" not in module
@@ -396,7 +399,7 @@ def test_revoked_source_used_only_in_gaps_is_redacted_without_rewriting_snapshot
     assert secret in encode(persisted)
 
 
-def test_legacy_snapshot_reuses_matching_module_signature_and_review_stays_in_transaction(basis):
+def test_snapshot_review_resolves_evidence_in_same_transaction(basis):
     report = basis.db.report(basis.report_id)
     signature = source_signature(report["source_snapshot"] + report["reference_snapshot"])
     business = copy.deepcopy(basis.business)
@@ -404,19 +407,6 @@ def test_legacy_snapshot_reuses_matching_module_signature_and_review_stays_in_tr
     basis.db.execute("UPDATE analysis_module SET business_data=CAST(:data AS JSONB) WHERE id=:id",
                      {"data": encode(business), "id": basis.module_id})
     snapshot = publish_data_snapshot(basis.db, basis.report_id)
-
-    # 模拟0023前的快照：移除输入签名映射，并恢复旧版成果指纹。
-    inputs = {k: v for k, v in snapshot["input_snapshot"].items()
-              if k not in {"publication_version", "module_input_signatures"}}
-    report_runs = basis.db.report_runs(basis.report_id)
-    modules = basis.db.report_modules(basis.report_id)
-    legacy_hash = snapshot_manifest(
-        report["status"], report_runs, modules, runtime_version=report["runtime_version"],
-    )
-    basis.db.execute("""UPDATE analysis_data_snapshot
-        SET input_snapshot=CAST(:inputs AS JSONB), manifest_hash=:manifest WHERE id=:id""", {
-        "inputs": encode(inputs), "manifest": legacy_hash, "id": snapshot["id"],
-    })
 
     loaded = basis.client.get(basis.path + "/data").json()
     assert loaded["stale"] is False

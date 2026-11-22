@@ -42,7 +42,6 @@ def test_item_rejects_unknown_key() -> None:
         ("convert.max_inflight", True),  # bool 不是 int，避免 True 被当成 1
         ("convert.max_inflight", "4"),
         ("mineru.tier", 5),
-        ("llm_aided.title_leveling", 1),
     ],
 )
 def test_validate_value_rejects_wrong_types(key: str, value: object) -> None:
@@ -53,8 +52,6 @@ def test_validate_value_rejects_wrong_types(key: str, value: object) -> None:
     ("key", "value"),
     [
         ("convert.max_inflight", 4),
-        ("mineru.output_formats", ["middle_json", "zip"]),
-        ("llm_aided.title_leveling", False),
     ],
 )
 def test_validate_value_accepts_expected_types(key: str, value: object) -> None:
@@ -113,7 +110,6 @@ def test_gated_keys_only_keeps_l2() -> None:
 @pytest.mark.parametrize("key", [
     entry.key for entry in schema.ITEMS
     if entry.key.startswith("analysis.") and entry.value_type == "int"
-    and entry.key not in schema.READONLY_REASONS
 ])
 def test_analysis_budgets_have_no_artificial_maximum(key: str) -> None:
     assert schema.validate_value(key, 1000000) is None
@@ -138,10 +134,6 @@ def test_nonnegative_budgets_keep_pause_and_no_retry_semantics() -> None:
     assert schema.validate_value("analysis.max_inflight", 0) is not None
 
 
-def test_unimplemented_controls_are_readonly_even_for_admin() -> None:
-    assert schema.write_denial("admin", ["preprocess.denoise"]) is not None
-    assert schema.write_denial("admin", ["mineru.page_range"]) is not None
-    assert schema.write_denial("admin", ["mineru.tier"]) is None
 
 
 def test_poll_maximum_cannot_be_smaller_than_initial_interval() -> None:

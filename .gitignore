@@ -23,6 +23,7 @@ __pycache__/
 
 # 本地临时工作目录（诊断脚本、uv/pytest 缓存，不进版本库）
 .tmp/
+.cache/
 # 本地存储包含上传原件和解析产物。
 /apps/api/.storage/
 

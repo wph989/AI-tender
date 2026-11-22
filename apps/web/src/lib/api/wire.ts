@@ -1,7 +1,7 @@
 /**
  * 线格式（snake_case）→ 内部模型（camelCase）的转换，全项目只此一处。
  *
- * 为什么要有这一层：接口字段名由后端冻结（见 docs/设计/05 第 7 节），
+ * 为什么要有这一层：接口字段名由后端冻结（见 docs/设计/05-后端API设计.md），
  * 内部坐标模型的字段名已经在共享向量里定死了。两边各改各的名字就会漂移，
  * 所以把差异集中在这里，而不是让 snake_case 渗进坐标库、或者让坐标库去迁就接口。
  */
@@ -24,7 +24,7 @@ export function toPageGeometry(page: WirePageMeta): PageGeometry {
  * 校验来自接口的 bbox。
  *
  * 不合法时返回 null 而不是抛错：一条坏坐标不该让整页结果都渲染不出来，
- * 调用方按「仅页级定位」降级处理（见 docs/设计/06 第 5 节）。
+ * 调用方按「仅页级定位」降级处理（见 docs/设计/06-前端展示与定位.md）。
  */
 export function toBbox(raw: readonly number[] | null): Bbox | null {
   if (raw === null || raw.length !== 4) return null;
@@ -37,7 +37,7 @@ export function toBbox(raw: readonly number[] | null): Bbox | null {
 /**
  * 页面几何一致性断言：接口给的 pt 尺寸必须与 PDF.js 读出来的视口尺寸吻合（容差 1%）。
  *
- * 见 docs/设计/05 第 3.2 节：两者不一致说明「渲染基座」与「解析基座」错位，
+ * 见 docs/设计/05-后端API设计.md：两者不一致说明「渲染基座」与「解析基座」错位，
  * 此时继续渲染高亮只会得到整体漂移的框，必须立刻告警而不是假装正常。
  */
 export function assertViewportMatches(

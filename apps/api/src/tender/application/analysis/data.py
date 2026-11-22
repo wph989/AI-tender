@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
 from typing import Literal
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from tender.application.analysis.output import canonical_topic, record_output
+from tender.application.analysis.output import record_output
 from tender.application.analysis.quality import aggregate_quality, quality_status
 from tender.application.knowledge.content import (
     dedupe_citations,
@@ -144,13 +143,6 @@ class SynthesisRecord(BusinessRecord):
     )
 
 
-class CoverageInput(DataInput):
-    topic: str = Field(min_length=1, max_length=100)
-    scope: DataScope
-    status: Literal["extracted", "searched_not_found", "pending", "not_applicable"]
-    record_keys: list[str] = Field(default_factory=list)
-    detail: str = Field(min_length=1, max_length=2000)
-    citations: list[DataCitation] = Field(default_factory=list)
 
 
 class GapInput(DataInput):
@@ -170,10 +162,6 @@ def record_identity(state: dict, key: str) -> str:
     return str(uuid5(UUID(namespace), key))
 
 
-def semantic_payload(record: Mapping) -> dict:
-    """校验全部业务属性；内部编号和展示排序没有业务含义，不浪费审查上下文。"""
-    excluded = {"id", "key", "module_key", "citations", "verification", "sort_order"}
-    return {k: v for k, v in record.items() if k not in excluded}
 
 
 def missing_scope_refs(scope: dict, citations: list[dict]) -> list[str]:
@@ -284,91 +272,8 @@ def prepare_records(
     return result
 
 
-def prepare_record_batch(raw: list[SynthesisRecord], state: dict, seen: dict,
-                         module_key: str) -> tuple[list[dict], list[dict]]:
-    """共享同批有效引用图；仅移除坏记录及依赖它的事项，保留无关的有效依赖组。"""
-    candidates, rejected = {}, {}
-    details: dict[int, list[tuple[str, str]]] = {}
-    for index, record in enumerate(raw):
-        try:
-            value = record.model_dump()
-            if state.get("output_schema"):
-                output = record_output(value, state["output_schema"])
-                value["content"] = output["content"]
-                value["text"] = "\n".join(
-                    name + "：" + ("\n".join(v) if isinstance(v, list) else v)
-                    for name, v in value["content"].items()
-                )
-            candidates[index] = value
-        except InputError as exc:
-            rejected[index] = str(exc)
-            details[index] = exc.field_issues
-    while candidates:
-        context = dict(state) | {"staged_items": [
-            *state.get("staged_items", []),
-            *({"business": value} for value in candidates.values()),
-        ]}
-        accepted, failures = {}, {}
-        for index in candidates:
-            try:
-                accepted[index] = prepare_records([raw[index]], context, seen, module_key)[0]
-            except InputError as exc:
-                failures[index] = str(exc)
-                details[index] = exc.field_issues
-        if not failures:
-            return list(accepted.values()), [
-                {"index": i, "key": raw[i].key, "title": raw[i].title, "error": error,
-                 "field_issues": details.get(i, [])}
-                for i, error in sorted(rejected.items())
-            ]
-        rejected.update(failures)
-        candidates = {i: value for i, value in candidates.items() if i not in failures}
-    return [], [{"index": i, "key": raw[i].key, "title": raw[i].title, "error": error,
-                 "field_issues": details.get(i, [])}
-                for i, error in sorted(rejected.items())]
-
-
-def prepare_coverage(
-    raw: list[CoverageInput], state: dict, seen: dict, topics: list[dict], module_key: str,
-) -> tuple[list[dict], list[dict]]:
-    entries, reviews = [], []
-    for value in raw:
-        entry = value.model_dump()
-        entry["topic"] = canonical_topic(entry["topic"], topics)
-        if entry["status"] == "extracted" and not entry["record_keys"]:
-            entry.update(status="pending", detail="已保留分析结果，主题与具体条目的关联待核对")
-        if entry["status"] == "not_applicable":
-            if not entry["citations"]:
-                # 无证明不能发布“不适用”结论，但也不应阻断其它有原文支持的分析条目。
-                entry.update(status="pending", detail="不适用说明缺少原文依据，待核对")
-                entries.append(entry)
-                continue
-            item = validate_items([{
-                "field": "主题不适用：" + entry["topic"],
-                "values": [{"value": entry["detail"], "citations": entry["citations"]}],
-            }], seen, align=False, source_locations=True)[0]
-            entry["citations"] = item["values"][0]["citations"]
-            proof_key = "coverage:" + fingerprint([entry["topic"], entry["scope"]])
-            previous = next((v for v in state.get("business_coverage", [])
-                             if v["topic"] == entry["topic"] and v["scope"] == entry["scope"]
-                             and v.get("review_id")), None)
-            # 同一主题与范围的证明改写不能重置纠错次数；恢复旧检查点时沿用旧证明ID，
-            # 不同标段仍独立计数。文字与引用变化会重新校验，不参与身份计算。
-            item["id"] = previous["review_id"] if previous else record_identity(state, proof_key)
-            item["business"] = {
-                "id": item["id"],
-                "key": proof_key,
-                "kind": "coverage", "scope": entry["scope"], "module_key": module_key,
-                "topic": entry["topic"], "text": entry["detail"],
-            }
-            entry["review_id"] = item["id"]
-            reviews.append(item)
-        entries.append(entry)
-    return entries, reviews
-
-
 def module_records(data: dict) -> list[dict]:
-    """内部消费时回填引用；持久化业务 JSON 与证据分开，兼容历史内嵌引用。"""
+    """内部消费时从独立证据映射回填引用，不完整的证据整条拒绝使用。"""
     result = copy.deepcopy(data.get("records", []))
     evidence = data.get("evidence", {})
     for record in result:
@@ -425,9 +330,7 @@ def module_data(state: dict) -> dict:
         "quality_status": quality_status(state),
         "quality_issues": copy.deepcopy(state.get("quality_issues", [])),
         "quality_input_signature": state.get("quality_input_signature"),
-        "coverage": copy.deepcopy(state.get("business_coverage", [])),
         "gaps": copy.deepcopy(state.get("business_gaps", [])),
-        "topics": copy.deepcopy(state.get("business_topics", [])),
         "research_summary": state.get("draft", {}).get("research_summary", ""),
     }
 
@@ -437,8 +340,6 @@ def display_items(items: list[dict]) -> list[dict]:
     result = []
     for item in items:
         business = item.get("business")
-        if business and business["kind"] == "coverage":
-            continue
         rendered = {k: v for k, v in item.items() if k != "business"}
         if bindings := (item.get("output") or {}).get("citations"):
             # 逐条选中的额外出处也要经过既有可见性检查，避免整体出处可读时漏检局部引用。
@@ -549,7 +450,7 @@ def assemble_dataset(
         "quality_issues": [{**issue, "module_key": m["module_key"]}
                            for m in modules
                            for issue in (m.get("business_data") or {}).get("quality_issues", [])],
-        "format_nodes": [], "relations": [], "coverage": [], "gaps": [],
+        "format_nodes": [], "relations": [], "gaps": [],
     }
     records, by_key = [], {}
     for module in modules:
@@ -565,12 +466,10 @@ def assemble_dataset(
                 ))
                 continue
             available.append(record)
-        accepted = {r["key"]: r for r in available if r["kind"] != "coverage"}
-        # 旧检查点的证明 key 可能相同；覆盖条目固定 review_id，不按业务 key 合并证明。
-        proofs = {r["id"]: r for r in available if r["kind"] == "coverage"}
+        accepted = {r["key"]: r for r in available}
         structure_issues = format_tree_issues(list(accepted.values()))
         for raw in accepted.values():
-            if raw.get("kind") in {"lot", "coverage"}:
+            if raw["kind"] == "lot":
                 continue
             record = copy.deepcopy(raw)
             record["scope"] = resolve_scope(record["scope"], lots)
@@ -592,62 +491,6 @@ def assemble_dataset(
                     "incomplete_structure", "已保留原文，部分业务条件尚未结构化", record["scope"],
                     record_id=record["id"], module_key=key,
                 ))
-        coverage = data.get("coverage", [])
-        # 新协议由Agent按Skill核对覆盖，旧阶段缺少回执不再自动生成整专题未完成结论。
-        for topic in ([] if data.get("protocol") == "skill-agent-v1" else data.get("topics", [])):
-            entries = [c for c in coverage if c["topic"] == topic["key"]]
-            if not entries:
-                entries = [{"topic": topic["key"], "status": "unchecked",
-                            "scope": {"kind": "unknown", "lot_refs": []},
-                            "detail": "此主题尚未完成核对", "record_keys": []}]
-            elif lots:
-                # A 标段已提取不能替 B 标段完成覆盖；公共条目才可覆盖所有标段。
-                covered_scopes = [resolve_scope(c["scope"], lots) for c in entries]
-                entries = [*entries, *[{
-                    "topic": topic["key"], "status": "unchecked",
-                    "scope": {"kind": "lots", "lot_refs": [lot["code"] or lot["title"]]},
-                    "detail": "此标段的主题尚未完成核对", "record_keys": [],
-                } for lot in lots if not any(
-                    matches_scope(scope, lot["lot_id"]) for scope in covered_scopes
-                )]]
-            for entry in entries:
-                item = copy.deepcopy(entry)
-                item.update(module_key=key, title=topic["title"])
-                item["scope"] = resolve_scope(item["scope"], lots)
-                linked = [accepted[k] for k in item["record_keys"] if k in accepted]
-                item["record_ids"] = [r["id"] for r in linked]
-                if item["status"] == "extracted" and (
-                    not item["record_ids"] or len(item["record_ids"]) != len(item["record_keys"])
-                ):
-                    item["status"] = "pending"
-                    item["detail"] = "关联要求尚未全部通过校验"
-                if item["status"] == "extracted":
-                    scopes = [resolve_scope(r["scope"], lots) for r in linked]
-                    covered = (
-                        all(s["kind"] == "common" for s in scopes)
-                        if item["scope"]["kind"] == "common" else
-                        item["scope"]["kind"] == "lots" and all(
-                            any(matches_scope(s, lot_id) for s in scopes)
-                            for lot_id in item["scope"]["lot_ids"]
-                        )
-                    )
-                    if not covered:
-                        item.update(status="pending", detail="关联要求未覆盖所声明的适用范围")
-                # 过程说明可以保存，但它不能成为无证据的缺席性业务结论。
-                item.pop("citations", None)
-                if item["status"] == "not_applicable":
-                    proof = proofs.get(item.get("review_id"))
-                    if proof:
-                        # 保存校验器最终选中的证据，读取时仍要检查此结论的资料权限。
-                        item["citations"] = copy.deepcopy(proof["citations"])
-                    else:
-                        item.update(status="pending", detail="不适用结论尚未通过原文校验")
-                result["coverage"].append(item)
-                if item["status"] not in {"extracted", "not_applicable"}:
-                    result["gaps"].append(data_gap(
-                        "coverage_" + item["status"], item["detail"], item["scope"],
-                        topic=item["topic"], module_key=key,
-                    ))
         for gap in data.get("gaps", []):
             result["gaps"].append({**gap, "module_key": key,
                                    "scope": resolve_scope(gap["scope"], lots)})
@@ -767,8 +610,6 @@ def build_context(data: dict, request: ContextInput) -> dict:
         "purpose": request.purpose, "lot_id": lot_id, "facts": facts,
         "requirements": page, "format_nodes": nodes, "unresolved": unresolved,
         "relations": [r for r in data["relations"] if eligible(r)],
-        "coverage": [c for c in data["coverage"]
-                     if matches_scope(c["scope"], lot_id, unknown=True)],
         "gaps": gaps, "readiness": readiness, "references": [],
         "requirement_manifest": manifest, "total_requirements": len(manifest),
         "next_offset": next_offset if next_offset < len(manifest) else None,

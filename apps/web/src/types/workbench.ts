@@ -41,7 +41,7 @@ export interface WireParseRun {
   error_message?: string | null;
 }
 
-/** 章节树节点（`GET /versions/{vid}/outline`，见 docs/设计/06 第 2 节的 OutlineNav）。 */
+/** 章节树节点（`GET /versions/{vid}/outline`，见 docs/设计/06-前端展示与定位.md）。 */
 export interface WireOutlineItem {
   element_id: number;
   anchor: string;

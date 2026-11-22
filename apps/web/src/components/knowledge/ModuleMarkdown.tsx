@@ -10,9 +10,9 @@ import { presentCitations } from "@/lib/analysis/citations";
 import type { AnalysisField, BusinessRecord, Citation, FieldValue } from "@/types/knowledge";
 
 /**
- * 专题结果优先使用 Skill 定义的分类、列名和树结构；历史报告保留原有投影。
+ * 专题使用 Skill 定义的分类、列名和树结构，问答展示逐项取值，共用 Markdown 与引用渲染。
  * - 定位与综合正文独立绑定，让归纳后的要求仍可回查完整原文。
- * - 新结果按正文单元绑定来源，同一事项内的位置只在首次出现的正文后展示，全部摘录保留在提示中。
+ * - 专题正文按单元绑定来源，同一事项内的位置只在首次出现的正文后展示，全部摘录保留在提示中。
  * - 每个值仍绑定自己的引用（经校验的真实依据），重复值提醒与未支持提示保持原样。
  * - 正文由 react-markdown 与 GFM 插件渲染，支持标准列表和表格，忽略模型返回的 HTML。
  */
@@ -302,7 +302,7 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
           <thead><tr>{output.columns.map((column) => <th scope="col" key={column}>{column}</th>)}</tr></thead>
           <tbody>{rows.map((item) => <tr key={item.id} {...identity(item)}>
             {output.columns.map((column, index) => <td key={column} data-label={column} className="module-markdown-body">
-              {/* 标题来源列已经包含事项名称；缺少声明的历史记录也避免逐字重复。 */}
+              {/* 标题来源列已经包含事项名称；未声明标题列时也避免逐字重复。 */}
               {index === 0 && !output.title_column && item.field !== [item.output?.content[column]].flat().join("；")
                 && <h5>{renderInline(item.field)}</h5>}
               {/* 分值只在所属列展示，避免标题与单元格重复绘制同一定位入口。 */}

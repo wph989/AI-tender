@@ -16,16 +16,16 @@ from sqlalchemy import (
     union_all,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.sql import ColumnElement
 from sqlalchemy.sql.expression import Grouping
+from sqlalchemy.types import TypeEngine
 
 from tender.adapters.pg.models import Element, KnowledgeChunk, KnowledgeIndex
 from tender.domain.knowledge.search import keywords
 from tender.domain.knowledge.text import (
     CHUNK_VERSION,
     chunk_bbox,
-    chunk_block_id,
     chunk_locations,
-    iter_element_chunks,
     iter_retrieval_chunks,
     retrieval_block_id,
 )
@@ -71,10 +71,6 @@ def _payload(row: Mapping[str, Any], source: dict) -> dict:
         block_id=retrieval_block_id(source["source_id"], source["parse_run_id"], row["ordinal"]),
         bbox=chunk_bbox(row),
     )
-    if source.get("chunk_format_version") == "1":
-        result["block_id"] = chunk_block_id(
-            source["source_id"], source["parse_run_id"], row["ordinal"],
-        )
     if row.get("locations"):
         result["bbox"] = chunk_locations(result)[0]["bbox"]
     return result
@@ -111,7 +107,7 @@ def indexed_chunks(store, source: dict) -> list[dict] | None:
         if rows:
             return rows
         # 空结果可能是索引失效而非文档无内容；只在空结果时补一次校验，保留原文回退。
-        # 旧快照或尚未完成的索引允许走原文回退，不把索引缺失解释成文档无内容。
+        # 索引被重建或尚未完成时允许读取原文，不把索引缺失解释成文档无内容。
         valid = connection.execute(
             select(KnowledgeIndex.id).where(
                 *_ready_index(source["index_id"]),
@@ -125,8 +121,7 @@ def read_chunk_window(store, source: dict, offset: int, limit: int) -> ChunkWind
     if offset < 0 or not 1 <= limit <= 12:
         raise ValueError("补读范围无效")
     with store.engine.connect() as connection:
-        legacy = source.get("chunk_format_version") == "1"
-        if source.get("index_id") and not legacy:
+        if source.get("index_id"):
             valid = connection.execute(select(KnowledgeIndex.id).where(
                 *_ready_index(source["index_id"]),
                 KnowledgeIndex.source_id == source["source_id"],
@@ -146,15 +141,14 @@ def read_chunk_window(store, source: dict, offset: int, limit: int) -> ChunkWind
                 ).mappings()]
                 return ChunkWindow(rows, total, offset + limit < total)
 
-        # 旧索引/未建索引只扫描所需前缀；不为取得精确总数读取其余全文。
+        # 未建索引只扫描所需前缀；不为取得精确总数读取其余全文。
         rows = []
         total = 0
         result = connection.execute(
             store._blocks_query(source).execution_options(stream_results=True, max_row_buffer=16),
         )
         with result:
-            iterator = iter_element_chunks if legacy else iter_retrieval_chunks
-            for element, chunk in iterator(result.mappings()):
+            for element, chunk in iter_retrieval_chunks(result.mappings()):
                 total = chunk["ordinal"] + 1
                 if chunk["ordinal"] >= offset + limit:
                     return ChunkWindow(rows, None, True)
@@ -191,8 +185,8 @@ def search_candidates(
     indexed = []
     fallback = []
     for order, source in enumerate(sources):
-        if source.get("index_id") in ready and source.get("chunk_format_version") != "1":
-            embedding = (
+        if source.get("index_id") in ready:
+            indexed_embedding = (
                 case(
                     (
                         (KnowledgeIndex.embedding_signature == signature)
@@ -209,7 +203,7 @@ def search_candidates(
                     literal(source["source_id"]).label("source_id"),
                     literal(order).label("source_order"),
                     *_columns(),
-                    embedding.label("embedding"),
+                    indexed_embedding.label("embedding"),
                 )
             )
         else:
@@ -236,7 +230,7 @@ def search_candidates(
     statements = [*indexed]
     if fallback:
         # 此路径只处理未建索引的资料，已完成索引不向应用传输全文或向量。
-        names = [
+        names: list[tuple[str, type[TypeEngine[Any]] | TypeEngine[Any]]] = [
             ("source_id", BigInteger),
             ("source_order", Integer),
             ("ordinal", Integer),
@@ -280,11 +274,14 @@ def search_candidates(
         literal(0),
     )
     embedding = lowered.c.embedding
-    cosine = literal(None, type_=Double)
+    cosine: ColumnElement[float | None] = literal(None, type_=Double)
     if vector:
-        dimensions = func.generate_subscripts(embedding, 1).column_valued("dim")
-        other = Grouping(literal(vector, type_=ARRAY(Double)))[dimensions]
-        item = embedding[dimensions]
+        # 展开一次数组，避免每个分量下标访问都重复解压同一个数据库向量。
+        components = func.unnest(embedding).table_valued(
+            column("value", Double), with_ordinality="dim",
+        ).render_derived(name="components")
+        other = Grouping(literal(vector, type_=ARRAY(Double)))[components.c.dim]
+        item = components.c.value
         cosine = (
             select(
                 func.coalesce(
@@ -296,20 +293,24 @@ def search_candidates(
                     0,
                 )
             )
-            .correlate(lowered)
+            .select_from(components).correlate(lowered)
             .scalar_subquery()
         )
+    # 评分先物化：否则 PostgreSQL 内联后会为过滤及两个排名反复计算同一余弦。
+    # 向量只用于本次计算，不进入物化结果，避免高维数组挤占工作内存。
     scored = select(
-        *(lowered.c[name] for name in candidates.c.keys()),
+        *(lowered.c[name] for name in candidates.c.keys() if name != "embedding"),
         hits.label("hits"),
-        # 与领域排序一致：关键词独立召回，语义阈值仅约束余弦相似度。
-        (hits > 0).label("lexical"),
-        (embedding.is_not(None) & (cosine >= (
-            min_similarity if min_similarity is not None else -1
-        ))).label("semantic"),
-        cosine.label("similarity"),
-    ).cte("scored")
-    eligible = select(scored).where(scored.c.lexical | scored.c.semantic).cte("eligible")
+        case((embedding.is_not(None), cosine), else_=None).cast(Double).label("similarity"),
+    ).cte("scored").prefix_with("MATERIALIZED", dialect="postgresql")
+    lexical = scored.c.hits > 0
+    # 关键词独立召回；无有效向量时没有语义资格，零向量仍沿用相似度零的规则。
+    semantic = func.coalesce(scored.c.similarity >= (
+        min_similarity if min_similarity is not None else -1
+    ), False)
+    eligible = select(scored, lexical.label("lexical"), semantic.label("semantic")).where(
+        lexical | semantic,
+    ).cte("eligible")
     # 通道资格分别排名，另一通道不合格的候选不能挤占本通道的名次。
     ties = [eligible.c.source_order.desc(), eligible.c.ordinal.desc()]
     ranked = select(

@@ -4,7 +4,7 @@ import { useFeedback } from "@/hooks/useFeedback";
 import { App, Button, ConfigProvider, Input, Select, Tabs } from "antd";
 
 /**
- * 功能绑定面板：给功能选模型、排优先级、改不同候选上限（设计文档 12 第 3、4、8 节）。
+ * 功能绑定面板：给功能选模型、排优先级、改不同候选上限（docs/设计/12-LLM管理与模型路由.md）。
  *
  * 优先级是"整表"的：草稿就是一份有序的模型行 id 数组，任何排序动作都只改这份数组，
  * 保存时整表 PUT（服务端按位置写 1..N）。单行改数字会造出空洞与同级，接口也不接受。

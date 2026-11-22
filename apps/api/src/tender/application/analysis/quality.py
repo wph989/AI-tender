@@ -5,7 +5,6 @@ import re
 from tender.application.knowledge.content import source_signature
 
 QUALITY_STATUSES = {"self_check_passed", "needs_review", "needs_input", "unknown"}
-LEGACY_QUALITY_STATUSES = {"verified"}
 ABSENCE_TERMS = (
     "未载明", "未约定", "未见", "未检索到", "未找到", "无法认定", "条款缺失",
     "未明示", "未列示", "未单独列示", "未给出", "未规定", "未明确", "未划分", "缺失细节",
@@ -41,12 +40,9 @@ def validate_project_claims(
 
 def quality_status(data: dict) -> str:
     explicit = data.get("quality_status")
-    # 历史 JSON 中的 verified 仅指机器自查完成，读取时改用不混淆人工裁定的名称。
-    if explicit in LEGACY_QUALITY_STATUSES:
-        return "self_check_passed"
     if explicit in QUALITY_STATUSES:
         return explicit
-    # 历史结果无独立质量结算记录，不能根据 completed 猜测所有问题均已核清。
+    # 执行结束不能证明质量通过；未结算时只依据已登记的问题表达状态。
     issues = data.get("quality_issues", [])
     if issues:
         return ("needs_input" if all(i.get("action") == "provide_input" for i in issues)
@@ -61,11 +57,9 @@ def aggregate_quality(values: list[str]) -> str:
     return "self_check_passed" if values else "unknown"
 
 
-def input_changed(data: dict, sources: list[dict], previous_sources: list[dict]) -> bool:
-    """按专题上次处理的资料判断变化，历史无签名时沿用报告的输入快照。"""
-    # 局部重新解析会推进报告快照，但不能替其他专题消费尚未处理的新附件。
-    previous = data.get("quality_input_signature") or source_signature(previous_sources)
-    return previous != source_signature(sources)
+def input_changed(data: dict, sources: list[dict]) -> bool:
+    """按专题实际消费的输入判断变化，未处理过的资料需要重新研究。"""
+    return data.get("quality_input_signature") != source_signature(sources)
 
 
 def refresh_input(state: dict, sources: list[dict]) -> None:

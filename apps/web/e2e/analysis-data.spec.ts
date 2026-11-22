@@ -37,7 +37,7 @@ function snapshot(reportId = 1): AnalysisDataSnapshot {
         ...Array.from({ length: 101 }, (_, i) => record(`a-${i}`, `A标段要求${i}`, 1)),
         record("b", "B标段专用要求", 2),
       ],
-      format_nodes: [], relations: [], coverage: [],
+      format_nodes: [], relations: [],
       gaps: [{ code: "incomplete_structure", detail: "质保起算点待核对",
         scope: { kind: "common", lot_ids: [], lot_refs: [] } }],
     },
@@ -211,7 +211,7 @@ test("人工确认绑定当前快照和事项版本", async ({ page }) => {
 
 test("机器自查未通过的事项不能提交人工复核", async ({ page }) => {
   const data = snapshot();
-  data.data.facts[0]!.review_status = "needs_review";
+  data.data.facts[0]!.verification = "unsupported";
   await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({ json: data }));
   let submitted = false;
   await page.route("**/api/v1/analysis/reports/1/reviews", async (route) => {
@@ -259,41 +259,4 @@ test("重新打开复核可对照人工修正和机器原文，预览只展示�
   await dialog.getByRole("button", { name: "查看要求", exact: true }).click();
   await expect(dialog.getByRole("cell", { name: corrected, exact: false })).toBeVisible();
   await expect(dialog.getByText("机器原文：")).toBeHidden();
-});
-
-test("有原文的不适用结论可确认并按当前裁定版本驳回", async ({ page }, info) => {
-  const data = snapshot();
-  const coverage = { topic: "deposit", title: "投标保证金", status: "not_applicable",
-    detail: "A标段不收取投标保证金。", scope: record("a", "", 1).scope, citations: [citation],
-    module_key: "project_basic_info_parsing", review_id: "proof-a" } satisfies AnalysisDataSnapshot["data"]["coverage"][number];
-  data.data.coverage = [coverage];
-  const requests: Record<string, unknown>[] = [];
-  await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({ json: data }));
-  await page.route("**/api/v1/analysis/reports/1/reviews", (route) => {
-    const input = route.request().postDataJSON();
-    requests.push(input);
-    const decision = { ...input, id: requests.length + 80, actor: "operator", created_at: "2026-11-21T00:00:00Z" };
-    data.data.coverage = [{ ...coverage, human_review_status: input.decision, human_review: decision }];
-    return route.fulfill({ json: decision });
-  });
-  const dialog = await openPreview(page);
-  const section = dialog.getByText("不适用结论（1）", { exact: true });
-  await section.click();
-  const row = dialog.getByRole("row").filter({ hasText: "A标段不收取投标保证金。" });
-  await expect(row.getByRole("button", { name: /定位：/ })).toBeVisible();
-  await expect(row.getByRole("button", { name: "保存修正" })).toHaveCount(0);
-  await page.screenshot({ path: info.outputPath("analysis-coverage.png") });
-  const refetched = page.waitForResponse((response) => response.url().endsWith("/1/data"));
-  await row.getByRole("button", { name: "确认", exact: true }).click();
-  await refetched;
-  // 刷新快照会重建复核分组。
-  await expect(section).toBeVisible();
-  await section.click();
-  await expect(row.getByText("人工确认", { exact: true })).toBeVisible();
-  await row.getByRole("textbox", { name: "投标保证金 驳回理由" }).fill("补遗要求重新核对");
-  await row.getByRole("button", { name: "驳回", exact: true }).click();
-  await expect.poll(() => requests).toMatchObject([
-    { record_id: "proof-a", previous_review_id: null, decision: "confirmed" },
-    { record_id: "proof-a", previous_review_id: 81, decision: "rejected" },
-  ]);
 });

@@ -1,4 +1,6 @@
-"""Redis 活动配置缓存：key `config:active:{company_id}` + TTL 60 秒兜底（设计文档 08 第 8 节）。
+"""Redis 活动配置缓存：key `config:active:{company_id}` + TTL 60 秒兜底。
+
+读取策略见 docs/质量/08-动态配置中心.md。
 
 Redis 在这里只是缓存，不是事实源：连接失败或 pub/sub 丢消息都只降级成"多回源几次数据库"，
 所以所有操作都吞掉异常并记日志——把读配置做成会因为 Redis 抖动而 500 的接口，

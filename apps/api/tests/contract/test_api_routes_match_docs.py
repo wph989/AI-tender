@@ -12,14 +12,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from tender.api.analysis import routes as analysis_api
-from tender.api.configuration import routes as config
-from tender.api.documents import parsing, versions
-from tender.api.jobs import routes as jobs
-from tender.api.knowledge import routes as knowledge
-from tender.api.llm import routes as llm
-from tender.api.projects import files as project_files
-from tender.api.projects import routes as projects
+from tender.api.app import app
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _DOC = _REPO_ROOT / "docs" / "设计" / "05-后端API设计.md"
@@ -28,10 +21,7 @@ _ROW_RE = re.compile(r"^\|\s*`(GET|POST|PATCH|PUT|DELETE)`\s*\|\s*`(/api/v1/[^`]
 _PLACEHOLDER_RE = re.compile(r"\{[^}]+\}")
 
 # 清单里没有但要保留的接口：写明为什么，别让它们变成第二份事实源。
-_UNDOCUMENTED = {
-    "GET /api/v1/versions/{}/elements": "工作台一次拉全量块建证据索引；清单只列了按页拉取",
-    "GET /api/v1/projects/{}/files/{}/original": "单个上传件原件下载；05 §3.1 只写了签名 URL 原则",
-}
+_UNDOCUMENTED: dict[str, str] = {}
 
 # 已进清单、代码还没写的接口（阶段 3 已完成，表留空以防下一阶段再加）。
 _PLANNED: dict[str, str] = {}
@@ -48,25 +38,13 @@ def _documented() -> set[str]:
 
 
 def _implemented() -> set[str]:
-    routers = (
-        config.router,
-        projects.router,
-        project_files.router,
-        versions.router,
-        parsing.router,
-        jobs.router,
-        knowledge.router,
-        analysis_api.router,
-        llm.router,
-    )
-    found: set[str] = set()
-    for router in routers:
-        for route in router.routes:
-            for method in sorted(getattr(route, "methods", None) or []):
-                if method in {"HEAD", "OPTIONS"}:
-                    continue
-                found.add(f"{method} {_normalize(route.path)}")
-    return found
+    # 从最终应用取契约，路由模块清单会漏掉健康探针或新增注册入口。
+    return {
+        f"{method.upper()} {_normalize(path)}"
+        for path, operations in app.openapi()["paths"].items()
+        for method in operations
+        if method.upper() in {"GET", "POST", "PATCH", "PUT", "DELETE"}
+    }
 
 
 def _missing() -> set[str]:

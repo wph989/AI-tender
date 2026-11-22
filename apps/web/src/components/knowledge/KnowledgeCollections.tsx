@@ -88,8 +88,9 @@ export function KnowledgeCollections() {
           type="text"
           danger
           disabled={busy}
-          onClick={() =>
-            modal.confirm({
+          onClick={async () =>
+            // await 模式保留失败重试，并由确认框处理拒绝，避免触发全局未处理异常。
+            await modal.confirm({
               title: `删除知识库「${item.name}」？`,
               content:
                 "关联项目将无法继续检索其中的资料，相关引用会变为不可用。",

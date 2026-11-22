@@ -1,8 +1,8 @@
 """领域错误基类。
 
-`code` 与 docs/设计/05 第 5 节的错误码表同名，但领域层不认识 HTTP：
+`code` 与 docs/设计/05-后端API设计.md的错误码表同名，但领域层不认识 HTTP：
 TenderError → HTTP 状态码 + 响应体的映射只允许出现在 api/errors.py 一处
-（见 docs/工程/11 第 5.1 节），
+（见 docs/工程/11-架构设计.md），
 散落各处会让同一个错误在不同接口返回不同状态码，前端只能靠猜。
 """
 
@@ -12,7 +12,7 @@ from typing import ClassVar
 
 
 class TenderError(Exception):
-    """领域层唯一基类。带机器可读的 code 与 retryable 信号（见 docs/设计/05 第 5 节）。"""
+    """领域层唯一基类。带机器可读的 code 与 retryable 信号（见 docs/设计/05-后端API设计.md）。"""
 
     code: ClassVar[str] = "invalid_argument"
     retryable: ClassVar[bool] = False
@@ -85,7 +85,7 @@ class ServiceRestarted(TenderError):
 
 
 class PriorityLimitExceeded(TenderError):
-    """一个功能最多绑定 10 个模型（设计文档 12 第 3 节）。"""
+    """一个功能最多绑定 10 个模型（docs/设计/12-LLM管理与模型路由.md）。"""
 
     code: ClassVar[str] = "priority_limit_exceeded"
 

@@ -15,6 +15,7 @@ from tender.application.projects.files import role_is_parseable
 from tender.application.shared.errors import Conflict, Forbidden, InvalidArgument, NotFound
 from tender.config.schema import document_execution_snapshot, parse_options
 from tender.domain.knowledge.text import CHUNK_VERSION
+from tender.domain.shared.digest import fingerprint
 from tender.ports.configuration.registry import ConfigReader
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.repository.knowledge.management import KnowledgeRepository
@@ -26,11 +27,12 @@ def visible_items(
     allowed_collections: list[int] | None = None,
 ) -> list[dict]:
     result = []
+    # 同一引文可被多条事项引用；本次读取共用解析结果，下次请求仍重新核对权限。
+    # 用完整引文和正文读取模式作键，不能把另一页、另一范围的定位结果混用。
+    resolved_elements: dict[tuple, dict | None] = {}
     for item in items:
         accessible = True
         values: list[dict] = []
-        # 同一元素会被多个值引用，按元素复用解析结果，避免反复查库与重复解析正文。
-        resolved_elements: dict[tuple, dict] = {}
         for value in item.get("values", []):
             refs: list[dict] = []
             for ref in value.get("citations", []):
@@ -40,23 +42,23 @@ def visible_items(
                         and ref["collection_id"] not in allowed_collections
                     ):
                         raise LookupError("已解除知识库关联")
-                    element_key = (
-                        ref.get("source_id"),
-                        ref.get("block_id"),
-                        ref.get("version_id"),
-                        ref.get("parse_run_id"),
-                        ref.get("element_id"),
-                        ref.get("anchor"),
-                    )
-                    resolved = resolved_elements.get(element_key)
-                    if resolved is None:
+                    with_content = not item.get("output")
+                    element_key = (fingerprint(ref), with_content)
+                    if element_key not in resolved_elements:
                         # 只判可见性时不需要正文，避免为被丢弃的文本渲染全文。
-                        resolved = store.resolve(ref, with_content=not item.get("output"))
-                        resolved_elements[element_key] = resolved
+                        try:
+                            resolved_elements[element_key] = store.resolve(
+                                ref, with_content=with_content,
+                            )
+                        except LookupError:
+                            resolved_elements[element_key] = None
+                    resolved = resolved_elements[element_key]
+                    if resolved is None:
+                        raise LookupError("引用已不可用")
                 except LookupError:
                     accessible = False
                     break
-                # 历史报告可能把同块其它事实当摘录；展示前按值回查元素原文收敛定位，
+                # 展示前按值回查元素原文收敛定位，
                 # 只在原文里确定性找到该值时改写，找不到就保留原引用，不伪造位置。
                 refs.append(
                     {**ref, "bbox": resolved["bbox"], "page_no": resolved["page_no"]}
@@ -280,7 +282,6 @@ class KnowledgeService:
                         "execution": document_execution_snapshot(
                             active.resolved if active is not None else None
                         ),
-                        "execution_origin": "created",
                     },
                     "config_snapshot_id": tx.snapshot_for_job(active),
                 }

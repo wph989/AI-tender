@@ -19,7 +19,7 @@ _TASK_ROUTES = {
     "tender.worker.tasks.submit_parse": {"queue": "parse"},
     "tender.worker.tasks.poll_parse": {"queue": "poll"},
     # 调度器是短任务（几次数据库查询），但要保证有 worker 消费默认队列；
-    # 部署命令里的 -Q 必须包含 tender（见 docs/工程/07 第 1 节）。
+    # 部署命令里的 -Q 必须包含 tender（见 docs/工程/07-部署与实施计划.md）。
     "tender.worker.dispatch.dispatch_pending": {"queue": "tender"},
 }
 

@@ -1,20 +1,19 @@
 [build-system]
-# 现在起是可安装包（editable 装进 .venv）。原因是 import-linter 必须真的能 import 到
-# root package 才能扫描依赖方向；靠 PYTHONPATH 手工喂路径的命令没人会记得写。
+# 安装成可导入的包，让 import-linter 直接扫描真实依赖方向。
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
 name = "tender-api"
 version = "0.0.0"
-description = "AI-Tender 后端：API + Worker + Scheduler 同一代码库（目录约定见 docs/工程/10 第 4.2 节）"
+description = "AI-Tender 后端：API + Worker + Scheduler 同一代码库（目录约定见 docs/工程/10-技术选型与工程结构.md）"
 requires-python = ">=3.12"
 # 运行时依赖按当前已落地的 API、对象存储、PDF 探测与异步任务能力分组。
 dependencies = [
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "psycopg[binary]>=3.2",
-    # 适配器统一用它（async；见 docs/工程/10 第 2 节）。只在 adapters 层 import，
+    # 适配器统一用它（async；见 docs/工程/10-技术选型与工程结构.md）。只在 adapters 层 import，
     # 上层依赖的是 ports 里的 Protocol，不认识 httpx。
     "httpx>=0.28",
     # Anthropic/GenAI新SDK使用httpx2，原始流适配也须识别其响应和传输错误。
@@ -28,7 +27,7 @@ dependencies = [
     "boto3>=1.35",
     "pypdfium2>=4.30",
     "celery[redis]>=5.4",
-    # 配置中心的活动配置缓存（08 第 8 节）：celery[redis] 会带 redis-py，
+    # 配置中心的活动配置缓存（docs/质量/08-动态配置中心.md）：celery[redis] 会带 redis-py，
     # 但直接 import redis 的模块必须自己声明依赖，不能靠传递依赖。
     "redis>=5.0",
     # 生图测试必须解码校验可读性，不能将任意 base64 当图片返回浏览器。
@@ -45,14 +44,14 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8",
-    # ruff 一个工具替代 flake8 + isort + black；版本口径见 docs/工程/10 第 2 节
+    # 统一检查语法、导入顺序与过时写法。
     "ruff>=0.9",
-    # 分层依赖方向必须由工具强制：规则一旦靠自觉遵守，三个月后必然破防（docs/工程/10 第 4.4 节）
+    # 分层依赖由自动检查约束，防止用例直接引用具体实现。
     "import-linter>=2.0",
     # 协议签名必须由静态检查核对，依赖方向检查不能代替实现兼容性验证。
     "mypy>=1.18,<2",
     # 只用于生成合成样本（scripts/make_sample_pdf.py）。用 reportlab 而不是内嵌系统字体：
-    # 内嵌宋体/雅黑属于再分发字体程序，而样本 PDF 要进版本库（见 docs/工程/07 第 3 节）。
+    # 内嵌宋体/雅黑属于再分发字体程序，而样本 PDF 要进版本库（见 docs/工程/07-部署与实施计划.md）。
     "reportlab>=4.0",
 ]
 
@@ -64,7 +63,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.mypy]
-# 对端口、装配边界和关键应用契约持续做类型检查，不把历史业务中的 Any 当作全量 strict。
+# 对端口、装配边界和关键应用契约持续做类型检查，不把现有业务中的 Any 当作全量 strict。
 # silent 仍解析导入实现的签名，只不报告非目标模块内部的存量类型问题；不能改成 skip。
 files = [
     "src/tender/ports", "src/tender/core/di.py",
@@ -74,6 +73,8 @@ files = [
     "src/tender/application/jobs/service.py", "src/tender/domain/knowledge/text.py",
     "src/tender/adapters/pg/repositories/analysis/reports.py",
     "src/tender/adapters/pg/repositories/llm/retrieval.py",
+    "src/tender/application/knowledge/service.py",
+    "src/tender/adapters/pg/repositories/knowledge/retrieval.py",
 ]
 mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
 python_version = "3.12"
@@ -82,7 +83,7 @@ check_untyped_defs = true
 warn_unused_ignores = true
 
 [tool.ruff]
-# 中文注释按字符数计宽（一个汉字算 1 个字），100 已经是相当宽的一行，再宽就没法并排看 diff 了
+# 限制单行显示宽度，保留并排阅读差异的空间。
 line-length = 100
 target-version = "py312"
 # 必须显式写：不写的话 ruff 会把 apps/api/alembic/（迁移目录）当成第一方包，
@@ -94,14 +95,13 @@ src = ["src"]
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-# 迁移里的 SQL 是逐字对应设计文档的，折行会让「文档 ↔ 迁移」的比对变难。
-# 这条豁免是刻意的：让工具迁就事实源，而不是让事实源迁就工具。
+# 基线 SQL 是物理结构事实源，保留数据库语句便于核对约束与索引。
 "alembic/versions/*.py" = ["E501"]
 
 [tool.importlinter]
 root_package = "tender"
 
-# 依赖方向见 docs/工程/10 第 4.4 节。五张契约各自管一件事，不要合并成一条——
+# 依赖方向见 docs/工程/10-技术选型与工程结构.md。五张契约各自管一件事，不要合并成一条——
 # 合并后报错只会说「分层错了」，说不清错在哪一层。
 [[tool.importlinter.contracts]]
 name = "分层只能向内：domain ← ports ← application ← api/worker"
@@ -132,8 +132,7 @@ forbidden_modules = [
     "tender.core",
 ]
 
-# 装配容器（core/di.py）将来要同时知道所有层，它出现时改成列举式 source_modules，
-# 把 di.py 排除掉即可；在此之前 core 保持「只能被依赖」。
+# 装配容器 core/di.py 连接各层；设置、日志与脱敏模块保持独立，不反向依赖业务。
 [[tool.importlinter.contracts]]
 name = "core 只能被依赖：不反向引用任何业务分层"
 type = "forbidden"

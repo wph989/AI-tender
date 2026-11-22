@@ -74,18 +74,6 @@ def knowledge_service(request: Request) -> KnowledgeService:
 
 
 
-def store(request: Request):
-    """兼容既有测试辅助；业务代码不应从路由层取仓储。"""
-    return knowledge_service(request).store
-
-
-def collection_or_404(request: Request, collection_id: int) -> dict:
-    try:
-        return knowledge_service(request).collection(collection_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
-
-
 def project_collection(request: Request, project_id: int) -> int:
     try:
         return knowledge_service(request).project_collection(project_id)

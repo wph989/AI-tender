@@ -4,7 +4,7 @@ import { useFeedback } from "@/hooks/useFeedback";
 import { Button, Input, Select } from "antd";
 
 /**
- * 单层配置编辑器：本地草稿 → 补丁 → 创建版本（设计文档 08 第 2 节）。
+ * 单层配置编辑器：本地草稿 → 补丁 → 创建版本（docs/质量/08-动态配置中心.md）。
  *
  * L1 保存即生效；L2 保存后是草稿，要等影响清单逐条确认后才能激活——
  * 这个差异由后端 status 决定，前端只负责把结果说清楚（"已生效" vs "已生成草稿"）。
@@ -130,9 +130,6 @@ export function LayerEditor({ layer, items, onSaved }: Props) {
                   <code className="block break-all pt-1">{item.key}</code>
                   <p className="mt-1">{item.description}</p>
                 </details>
-                {item.readonly_reason && (
-                  <p className="mt-1 text-xs text-slate-500">只读：{item.readonly_reason}</p>
-                )}
                 {item.key === "analysis.context_tokens" && Number(value) < 4096 && (
                   <p className="mt-1 text-xs text-amber-700">
                     固定指令和工具说明也占用上下文，较小预算可能无法容纳完整任务。

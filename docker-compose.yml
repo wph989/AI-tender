@@ -267,7 +267,8 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/healthz"]
+      # 依赖就绪后再启动前端，避免把 API 进程存活误判为可以处理业务请求。
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/readyz"]
       interval: 30s
       timeout: 5s
       retries: 5

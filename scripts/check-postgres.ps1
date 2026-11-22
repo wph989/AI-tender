@@ -3,6 +3,8 @@ PostgreSQL 集成验证入口。必须显式提供独立测试库连接串，避
 #>
 $ErrorActionPreference = 'Stop'
 $TestDatabaseUrl = $env:TENDER_TEST_DATABASE_URL
+$PreviousDatabaseUrl = $env:DATABASE_URL
+$PreviousRunDbTests = $env:TENDER_RUN_DB_TESTS
 if ([string]::IsNullOrWhiteSpace($TestDatabaseUrl)) {
     throw '请先设置 TENDER_TEST_DATABASE_URL 指向独立 PostgreSQL 测试数据库。'
 }
@@ -31,5 +33,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL 集成验证失败' }
 }
 finally {
+    # 验证只影响本次调用，不能把开发者后续命令切换到测试数据库。
+    $env:DATABASE_URL = $PreviousDatabaseUrl
+    $env:TENDER_RUN_DB_TESTS = $PreviousRunDbTests
     Pop-Location
 }

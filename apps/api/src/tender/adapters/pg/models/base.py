@@ -6,7 +6,7 @@ from sqlalchemy.orm import DeclarativeBase
 class Base(DeclarativeBase):
     """全部表映射模型的基类。
 
-    约定（与 docs/工程/10 第 4.2 节「三个容易走样的地方」配套）：
+    约定（与 docs/工程/10-技术选型与工程结构.md配套）：
 
     - 这些类只是「表 ↔ 对象」映射，不是领域模型；业务语义在 domain/ 与 application/。
     - 不复制默认值、索引、约束、外键行级行为：这些的权威是设计文档 + 迁移 DDL，

@@ -1,13 +1,21 @@
 import { test, expect } from "@playwright/test";
 import { collections, mockApi, project } from "./fixtures";
 
+let pageErrors: string[];
+
 test.beforeEach(async ({ page }) => {
+  pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
   await mockApi(page);
+});
+
+test.afterEach(() => {
+  expect(pageErrors, "操作失败和重试均不能触发浏览器未处理异常").toEqual([]);
 });
 
 test("管理列表在桌面和窄屏保持可读", async ({ page }, info) => {
   for (const [name, path] of [["projects", "/projects"], ["files", "/projects/1/files"],
-    ["knowledge", "/knowledge"], ["sources", "/knowledge/1"]]) {
+    ["knowledge", "/knowledge"], ["sources", "/knowledge/1"]] as const) {
     await page.goto(path);
     await expect(page.locator("h1")).toBeVisible();
     if (name === "projects") await expect(page.getByText(`${project.name} 1`, { exact: true })).toBeVisible();
@@ -94,21 +102,32 @@ test("卡片与表格保留相同分页并可切换", async ({ page }) => {
   await expect(page.locator(".project-summary-card")).toHaveCount(3);
 });
 
-test("知识库删除直接可见，项目资料库提供项目入口", async ({ page }) => {
+test("知识库删除失败可重试，项目资料库提供项目入口", async ({ page }) => {
   let deleted = false;
+  let attempts = 0;
   await page.route("**/api/v1/knowledge/collections", (route) => route.fulfill({ json: { items: [
     ...(deleted ? [] : collections), { ...collections[0], id: 2, is_project: true, name: "项目资料" },
   ] } }));
   await page.route("**/api/v1/knowledge/collections/1", async (route) => {
     if (route.request().method() !== "DELETE") return route.fallback();
+    if (++attempts === 1) return route.fulfill({
+      status: 409, json: { error: { message: "知识库删除失败，请重试" } },
+    });
     deleted = true; return route.fulfill({ json: { deleted: true } });
   });
   await page.goto("/knowledge");
   await page.getByRole("button", { name: "删除", exact: true }).click();
-  await page.getByRole("dialog").getByRole("button", { name: "删除知识库", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  const confirm = dialog.getByRole("button", { name: /删除知识库/ });
+  await confirm.click();
+  await expect(page.getByText("知识库删除失败，请重试", { exact: true })).toBeVisible();
+  await expect(dialog).toBeVisible();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
   await expect(page.getByText("测试知识库", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("link", { name: "查看项目", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
+  expect(attempts).toBe(2);
 });
 
 test("文件重命名、下载、换版和删除入口完整", async ({ page }) => {
@@ -147,7 +166,7 @@ test("文件重命名、下载、换版和删除入口完整", async ({ page }) 
 
 test("窄屏操作列不遮挡文件和模型名称", async ({ page }) => {
   test.skip((page.viewportSize()?.width ?? 1440) > 767, "仅检查窄屏固定列的覆盖行为");
-  for (const [path, name] of [["/projects/1/files", "招标文件.pdf"], ["/settings/models", "测试模型 1"]]) {
+  for (const [path, name] of [["/projects/1/files", "招标文件.pdf"], ["/settings/models", "测试模型 1"]] as const) {
     await page.goto(path);
     if (path === "/settings/models") await page.getByRole("tab", { name: /管理模型/ }).click();
     const title = page.getByText(name, { exact: true });

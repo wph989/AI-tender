@@ -154,8 +154,9 @@ export function KnowledgeCollectionDetail({
                 <Button
                   danger
                   disabled={busy}
-                  onClick={() =>
-                    modal.confirm({
+                  onClick={async () =>
+                    // await 模式保留失败重试，并由确认框处理拒绝，避免触发全局未处理异常。
+                    await modal.confirm({
                       title: "删除这个知识库？",
                       content: "关联项目将无法继续检索其中的资料。",
                       okText: "删除知识库",
@@ -368,7 +369,7 @@ export function KnowledgeCollectionDetail({
                   <Button type="link" href={`/api/v1/projects/${collection.upload_project_id}/files/${source.project_file_id}/original`} download>下载原件</Button>
                   {["pending", "failed", "unsupported"].includes(source.state) && <Button disabled={busy}
                     onClick={() => void perform(() => knowledgeRequest(`/knowledge/sources/${source.source_id}/process`, "POST", {}))}>重新处理</Button>}
-                  <Button danger type="text" disabled={busy} onClick={() => modal.confirm({
+                  <Button danger type="text" disabled={busy} onClick={async () => await modal.confirm({
                     title: `删除资料「${source.file_name}」？`, content: "对应引用将变为不可用。",
                     okText: "删除资料", cancelText: "取消", okButtonProps: { danger: true },
                     onOk: async () => {

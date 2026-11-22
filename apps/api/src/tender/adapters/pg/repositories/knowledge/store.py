@@ -77,9 +77,7 @@ from tender.config.registry import ConfigRegistry
 from tender.domain.knowledge.text import (
     CHUNK_VERSION,
     chunk_bbox,
-    chunk_block_id,
     chunk_locations,
-    iter_element_chunks,
     iter_retrieval_chunks,
     plain_text,
     retrieval_block_id,
@@ -479,23 +477,20 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
 
     def readable_chunks(self, source: dict[str, Any]) -> list[dict[str, Any]]:
         """分块由元素派生，元素越界一次也不额外查库。"""
-        legacy = source.get("chunk_format_version") == "1"
-        if source.get("index_id") and source.get("index_status") == "completed" and not legacy:
+        if source.get("index_id") and source.get("index_status") == "completed":
             rows = indexed_chunks(self, source)
             if rows is not None:
                 return rows
         elements = self.blocks(source)
         result = []
-        iterator = iter_element_chunks if legacy else iter_retrieval_chunks
-        identify = chunk_block_id if legacy else retrieval_block_id
-        for element, chunk in iterator(elements):
+        for element, chunk in iter_retrieval_chunks(elements):
             offset = chunk["ordinal"]
             result.append(
                 {
                     **source,
                     **chunk,
                     "offset": offset,
-                    "block_id": identify(
+                    "block_id": retrieval_block_id(
                         source["source_id"], source["parse_run_id"], offset
                     ),
                     "anchor": element["anchor"],

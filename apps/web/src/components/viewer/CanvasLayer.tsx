@@ -3,12 +3,8 @@
 /**
  * 用 pdf.js 把一页画到 canvas 上。
  *
- * 两个容易踩的点：
- *  1. `rotation` 必须显式传 `page.rotate`。不传的话 pdf.js 用的是页面自带旋转，
- *     看似正确，但只要将来支持「用户手动旋转视图」，两条路径就会分叉——
- *     显式传等于把「视口方向 = 视觉方向」这件事写在代码里（见 docs/设计/03 第 3.4 节）。
- *  2. 卸载时必须 `renderTask.cancel()` + `page.cleanup()`。不取消的话缩放时会留下
- *     一次「幽灵渲染」，它在新内容之后完成、把旧尺寸的位图盖回去（见 docs/设计/06 第 7 节）。
+ * 画布和页尺寸统一使用PDF的旋转信息，保证证据坐标与渲染方向一致。
+ * 卸载时取消渲染并清理页面，避免缩放前的旧任务覆盖新画布。
  */
 
 import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";

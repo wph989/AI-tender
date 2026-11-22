@@ -300,13 +300,16 @@ class ReportQueries:
             ).scalar_one_or_none())
 
     def record_reviews(self, snapshot_id: int) -> dict[str, dict[str, Any]]:
-        # DISTINCT ON 只读取每条事项的最后一次裁定；历史事件继续留存。
+        # 裁定追加写入，递增ID确定每条事项的最新决定，旧裁定仍保留在原表。
+        latest = (
+            select(func.max(AnalysisRecordReview.id))
+            .where(AnalysisRecordReview.snapshot_id == snapshot_id)
+            .group_by(AnalysisRecordReview.record_id)
+        )
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(AnalysisRecordReview)
-                .where(AnalysisRecordReview.snapshot_id == snapshot_id)
-                .distinct(AnalysisRecordReview.record_id)
-                .order_by(AnalysisRecordReview.record_id, AnalysisRecordReview.id.desc())
+                .where(AnalysisRecordReview.id.in_(latest))
             ).mappings()
             return {row["record_id"]: dict(row) for row in rows}
 

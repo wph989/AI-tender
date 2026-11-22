@@ -18,7 +18,6 @@ from tender.application.projects.files import (
     MAX_UPLOAD_TOTAL_BYTES,
     FileInput,
     ProjectFileService,
-    role_is_parseable,
     safe_filename,
     validate_upload_limits,
 )
@@ -27,10 +26,6 @@ from tender.core import settings
 from tender.core.di import create_project_file_service
 
 router = APIRouter(prefix="/api/v1/projects/{project_id}/files", tags=["project-files"])
-
-# 兼容仍在迁移中的调用方；规则本身由服务层维护。
-_role_is_parseable = role_is_parseable
-
 
 class ProjectFilePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")

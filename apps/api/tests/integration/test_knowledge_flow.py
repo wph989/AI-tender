@@ -435,7 +435,7 @@ def test_retired_runtime_report_cannot_run_or_retry(environment):
     stored = conn.execute(
         text("SELECT status FROM analysis_report WHERE id=:id"), {"id": report["id"]}
     ).scalar_one()
-    assert stored == "failed"
+    assert stored == "waiting"
     with pytest.raises(ApiProblem) as read_error:
         analysis_api.get_report(report["id"], request)
     assert read_error.value.status_code == 409 and read_error.value.code == "runtime_retired"

@@ -22,7 +22,7 @@ from tender.ports.configuration.registry import ActiveConfig, ConfigReader
 from tender.ports.repository.configuration.releases import ConfigRepository, ConfigTransaction
 
 SECRET_MASK = "******"
-AUDIT_ACTIONS = frozenset({"create", "acknowledge", "activate", "rollback", "force_activate"})
+AUDIT_ACTIONS = frozenset({"create", "acknowledge", "activate", "rollback"})
 
 
 class ConfigService:
@@ -49,9 +49,7 @@ class ConfigService:
                     "default": self._mask(entry, entry.default),
                     "value": self._mask(entry, current),
                     "overridden": entry.key in overrides,
-                    "writable": role in schema.WRITERS[entry.layer]
-                    and entry.key not in schema.READONLY_REASONS,
-                    "readonly_reason": schema.READONLY_REASONS.get(entry.key),
+                    "writable": role in schema.WRITERS[entry.layer],
                     **schema.value_rules(entry.key),
                 }
             )
@@ -134,7 +132,7 @@ class ConfigService:
                     actor=actor,
                     action="activate",
                     diff=changed,
-                    reason="L1 即时生效（不改变解析与抽取结果）",
+                    reason="运行配置生效",
                 )
 
         if status == "active":
@@ -224,15 +222,12 @@ class ConfigService:
         self,
         release_id: int,
         *,
-        force: bool,
         reason: str | None,
         role: str,
         actor: str,
     ) -> dict[str, Any]:
         if role != "admin":
             raise Forbidden("只有 admin 能激活 L2 配置")
-        if force and not (reason and reason.strip()):
-            raise InvalidArgument("强制激活必须填写理由")
         with self.repository.transaction() as transaction:
             transaction.lock_company()
             row = self._release(transaction, release_id)
@@ -240,14 +235,13 @@ class ConfigService:
                 raise Conflict("只有 draft 版本可以激活", code="release_not_draft")
             values = dict(row["values"])
             impact, acks = self._impact_for(transaction, release_id, values)
-            result = gate.evaluate_gate(impact=impact, acknowledged=acks, force=force)
+            result = gate.evaluate_gate(impact=impact, acknowledged=acks)
             if not result.passed:
                 raise Unprocessable(
                     "配置未通过门禁，不能激活",
                     code="gate_failed",
                     detail={
                         "blockers": list(result.blockers),
-                        "soft_breaches": list(result.soft_breaches),
                         "impact": gate.impact_state(impact, acks),
                     },
                 )
@@ -258,7 +252,7 @@ class ConfigService:
                 transaction,
                 release_id=release_id,
                 actor=actor,
-                action="force_activate" if force else "activate",
+                action="activate",
                 diff=changed,
                 reason=reason,
             )

@@ -1,5 +1,5 @@
 /**
- * 配置草稿 → 提交补丁、文案口径（设计文档 08 第 2、5 节）。
+ * 配置草稿 → 提交补丁、文案口径（docs/质量/08-动态配置中心.md）。
  *
  * 断言的重点是"哪些 key 会被提交"：多提交一个 L2 的 key 就会把版本送进门禁流程，
  * 少提交一个则表现为"改了没生效"，两者都不该靠人工点一遍页面才发现。
@@ -40,14 +40,16 @@ const ITEMS: ConfigItem[] = [
     value_type: "string",
     value: "standard",
   }),
+  // 通用类型转换用独立样例键验证，避免测试依赖已经移除的业务配置。
   item({
-    key: "llm_aided.title_leveling",
+    key: "sample.enabled",
     layer: "L2",
     value_type: "bool",
     value: true,
   }),
   item({
-    key: "mineru.output_formats",
+    key: "sample.formats",
+    description: "示例格式",
     layer: "L2",
     value_type: "json",
     value: ["middle_json", "zip"],
@@ -64,8 +66,8 @@ describe("itemsOfLayer", () => {
   it("按层分组", () => {
     expect(itemsOfLayer(ITEMS, "L2").map((entry) => entry.key)).toEqual([
       "mineru.tier",
-      "llm_aided.title_leveling",
-      "mineru.output_formats",
+      "sample.enabled",
+      "sample.formats",
     ]);
   });
 });
@@ -120,15 +122,15 @@ describe("buildPatch", () => {
   it("按类型转换后才提交", () => {
     const result = buildPatch(ITEMS, {
       "convert.max_inflight": "6",
-      "llm_aided.title_leveling": "false",
-      "mineru.output_formats": '["middle_json"]',
+      "sample.enabled": "false",
+      "sample.formats": '["middle_json"]',
       "sample.ratio": "0.2",
     });
     expect(result.errors).toEqual([]);
     expect(result.patch).toEqual({
       "convert.max_inflight": 6,
-      "llm_aided.title_leveling": false,
-      "mineru.output_formats": ["middle_json"],
+      "sample.enabled": false,
+      "sample.formats": ["middle_json"],
       "sample.ratio": 0.2,
     });
   });
@@ -136,12 +138,12 @@ describe("buildPatch", () => {
   it("类型写错时不提交并给出可读原因", () => {
     const result = buildPatch(ITEMS, {
       "convert.max_inflight": "4.5",
-      "mineru.output_formats": "middle_json",
+      "sample.formats": "middle_json",
     });
     expect(result.patch).toEqual({});
     expect(result.errors).toEqual([
       "同时转换的文件数 需要整数",
-      "解析结果格式 不是合法 JSON",
+      "示例格式 不是合法 JSON",
     ]);
   });
 

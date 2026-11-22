@@ -1,8 +1,6 @@
 """单标段编制基线：范围、条件、完整清单、版本身份与未决事项。"""
 
 import copy
-import json
-from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -12,15 +10,12 @@ from tender.application.analysis.data import (
     BusinessRecord,
     ContextError,
     ContextInput,
-    CoverageInput,
     assemble_dataset,
     build_context,
     display_items,
     module_data,
-    prepare_coverage,
     prepare_records,
 )
-from tender.application.analysis.data_store import accessible_data
 from tender.application.knowledge.content import merge_field_entries
 
 KEY = "project_basic_info_parsing"
@@ -40,7 +35,7 @@ def record(key="r", text="质保三年", scope=None, **kwargs):
     )
 
 
-def dataset(records, *, topics=None, coverage=None, gaps=None, lots=None, key=KEY):
+def dataset(records, *, topics=None, gaps=None, lots=None, key=KEY):
     state = {}
     content = "\n".join(r.text for r in records)
     seen = {"s1r1c0": block() | {"content": content}}
@@ -48,7 +43,7 @@ def dataset(records, *, topics=None, coverage=None, gaps=None, lots=None, key=KE
     for item in items:
         item["verification"] = "supported"
     state["agent_workspace"] = {"finalized": True, "final_ids": [i["id"] for i in items]}
-    state.update(staged_items=items, business_topics=topics or [], business_coverage=coverage or [],
+    state.update(staged_items=items, business_topics=topics or [],
                  business_gaps=gaps or [])
     module = {"module_key": key, "title": "测试专题", "status": "completed",
               "business_data": module_data(state)}
@@ -139,45 +134,10 @@ def test_display_projection_keeps_same_title_records_in_different_lots():
     assert {item["record_id"] for item in projected} == {item["id"] for item in items}
 
 
-def test_lot_coverage_does_not_silently_complete_other_lots():
-    data = dataset([record("a", scope={"kind": "lots", "lot_refs": ["A"]})],
-        topics=[{"key": "warranty", "title": "质保要求"}], coverage=[{
-            "topic": "warranty", "scope": {"kind": "lots", "lot_refs": ["A"]},
-            "status": "extracted", "record_keys": ["a"], "detail": "已核对A标段",
-        }])
-    b = build_context(data, ContextInput(snapshot_id=1, purpose="check", lot_id=2))
-    assert any(c["topic"] == "warranty" and c["status"] == "unchecked" for c in b["coverage"])
 
 
-def test_lot_specific_records_cannot_prove_common_topic_coverage():
-    data = dataset([record("a", scope={"kind": "lots", "lot_refs": ["A"]})],
-        topics=[{"key": "warranty", "title": "质保要求"}], coverage=[{
-            "topic": "warranty", "scope": COMMON, "status": "extracted",
-            "record_keys": ["a"], "detail": "公共要求已核对",
-        }])
-    assert data["coverage"][0]["status"] == "pending"
 
 
-def test_not_applicable_proof_is_preserved_and_rechecked_on_read():
-    seen = {"s1r1c0": block() | {"content": "本项目无需保证金"}}
-    state = {"business_topics": [{"key": "deposit", "title": "保证金"}]}
-    entries, items = prepare_coverage([CoverageInput(
-        topic="deposit", scope=COMMON, status="not_applicable", detail="本项目无需保证金",
-        citations=[{"block_id": "s1r1c0"}],
-    )], state, seen, state["business_topics"], KEY)
-    items[0]["verification"] = "supported"
-    state.update(staged_items=items, business_coverage=entries, agent_workspace={
-        "finalized": True, "final_ids": [item["id"] for item in items],
-    })
-    data = assemble_dataset([{
-        "module_key": KEY, "title": "保证金", "status": "completed",
-        "business_data": module_data(state),
-    }], [])
-    assert data["coverage"][0].get("citations")
-    visible = accessible_data(SimpleNamespace(resolve=lambda ref: ref), data, [])
-    assert visible["coverage"] == []
-    assert visible["gaps"][0]["code"] == "source_unavailable"
-    assert "无需保证金" not in json.dumps(visible, ensure_ascii=False)
 
 
 def test_relation_scope_cannot_suppress_requirements_in_an_unrelated_lot():
@@ -211,46 +171,8 @@ def test_incomplete_catalog_does_not_auto_select_the_only_known_lot():
     assert selected["lot_id"] == 1 and selected["readiness"] == "partial"
 
 
-@pytest.mark.parametrize("legacy_keys", [False, True])
-def test_not_applicable_proofs_are_independent_for_each_lot(legacy_keys):
-    state = {"business_topics": [{"key": "deposit", "title": "保证金"}]}
-    quote = "A标段和B标段均无需保证金"
-    entries, items = prepare_coverage([
-        CoverageInput(topic="deposit", scope={"kind": "lots", "lot_refs": [lot]},
-                      status="not_applicable", detail=f"{lot}标段无需保证金",
-                      citations=[{"block_id": "s1r1c0"}])
-        for lot in ("A", "B")
-    ], state, {"s1r1c0": block() | {"content": quote}}, state["business_topics"], KEY)
-    if not legacy_keys:
-        assert len({item["business"]["key"] for item in items}) == 2
-    for item in items:
-        item["verification"] = "supported"
-        if legacy_keys:
-            # 已保存的旧检查点也必须按证明 ID 查找，不能再次按重复 key 丢掉前一标段。
-            item["business"]["key"] = "coverage:deposit"
-    state.update(staged_items=items, business_coverage=entries, agent_workspace={
-        "finalized": True, "final_ids": [item["id"] for item in items],
-    })
-    data = assemble_dataset([{"module_key": KEY, "title": "保证金", "status": "completed",
-                              "business_data": module_data(state)}], LOTS)
-    assert [c["status"] for c in data["coverage"]] == ["not_applicable", "not_applicable"]
-    assert all(c["citations"][0]["quote"] == quote for c in data["coverage"])
 
 
-@pytest.mark.parametrize("legacy_id", [False, True])
-def test_coverage_correction_reuses_proof_identity_from_checkpoint(legacy_id):
-    state = {"business_topics": [{"key": "deposit", "title": "保证金"}]}
-    quote = "本项目无需保证金"
-    seen = {"s1r1c0": block() | {"content": quote}}
-    entry = CoverageInput(topic="deposit", scope=COMMON, status="not_applicable", detail=quote,
-                          citations=[{"block_id": "s1r1c0"}])
-    coverage, first = prepare_coverage([entry], state, seen, state["business_topics"], KEY)
-    expected = "legacy-proof" if legacy_id else first[0]["id"]
-    coverage[0]["review_id"] = expected
-    state["business_coverage"] = coverage
-    _, corrected = prepare_coverage([entry.model_copy(update={"detail": "无需提交投标保证金"})],
-                                    state, seen, state["business_topics"], KEY)
-    assert corrected[0]["id"] == expected
 
 
 

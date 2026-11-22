@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from analysis_review_fixture import review_payload
 from data_schema import install_data_schema
 from langchain_core.messages import AIMessage, ToolMessage, message_to_dict
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -25,7 +24,8 @@ from tender.api.projects import routes as projects
 from tender.api.shared.errors import ApiProblem
 from tender.application.analysis import execution as worker
 from tender.application.analysis import runtime as agent_runtime
-from tender.application.analysis.skills import MODULES, skill_snapshot
+from tender.application.analysis.skills import MODULES
+from tender.application.knowledge.content import source_signature
 from tender.application.llm.routing import CallRecord
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
@@ -638,8 +638,6 @@ class NativeRouter:
     def __init__(self, *, purpose="", **kwargs):
         self.before_call, self.on_call = kwargs["before_call"], kwargs["on_call"]
         self.invocation_id, self.requests = str(uuid4()), 0
-        self.key = next((key for key in MODULES if key in purpose), "project_basic_info_parsing")
-        self.topics = json.loads(skill_snapshot()[self.key + "/references/coverage.json"])
         self.calls = 0
 
     async def reserve(self):
@@ -681,25 +679,6 @@ class NativeRouter:
             ),
         ))
 
-    async def complete(self, prompt):
-        await self.reserve()
-        payload = review_payload(prompt)
-        blocks = [s["id"] for s in payload["evidence"] + payload["context_evidence"]]
-        return Completion(
-            content=json.dumps({"reviews": {}, "issues": [], "check_results": {
-                check["check_id"]: {"status": "not_required", "summary": "已核对测试资料无适用事项",
-                    "record_ids": [], "block_ids": blocks[:1], "issue_indexes": []}
-                for check in payload.get("check_items", [])}}), model="fixture"
-        )
-
-    async def complete_validated(self, prompt, *, validate=None, validate_input=None, **kwargs):
-        if validate_input:
-            validate_input(prompt)
-        result = await self.complete(prompt)
-        if validate:
-            validate(result)
-        return self.respond(result)
-
     async def aclose(self):
         pass
 
@@ -731,10 +710,6 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
         return original_resolve(ref, **kwargs)
 
     class EvidenceRouter(NativeRouter):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self.topics = topics
-
         async def chat(self, messages, tools):
             if self.calls < 2:
                 return await super().chat(messages, tools)
@@ -795,22 +770,6 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
     assert [module["business_data"]["evidence"][key] for key in business["evidence_ids"]] == refs
 
 
-def test_guard_migration_seeds_isolated_config_catalog(env):
-    import importlib.util
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[2] / "alembic/versions/0010_analysis_guards.py"
-    spec = importlib.util.spec_from_file_location("guard_migration", path)
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
-    with env.engine.begin() as conn:
-        # search_path首先命中测试schema；不给业务配置定义或活动发布写入任何内容。
-        conn.execute(text("CREATE TABLE config_item (LIKE public.config_item INCLUDING ALL)"))
-        for statement in migration._STATEMENTS:
-            conn.execute(text(statement))
-        rows = conn.execute(text("SELECT key,default_value FROM config_item")).all()
-    assert len(rows) == 5
-    assert dict(rows)["analysis.max_subagent_retries"] == 2
 
 
 def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, monkeypatch):
@@ -858,7 +817,6 @@ def test_controller_runs_13_independent_graphs_with_postgres_checkpoints(env, mo
     assert len(snapshots) == 1 and snapshots[0]["schema_version"] == "1"
     # 模型只提交空结果时，13 个模块执行完成也不能伪装成业务覆盖完整。
     assert snapshots[0]["data"]["readiness"] == "unavailable"
-    assert not snapshots[0]["data"]["coverage"]
     assert not env.db.rows(
         "SELECT objid FROM pg_locks WHERE locktype='advisory' AND classid=:ns"
         " AND objsubid=2 AND granted",
@@ -914,7 +872,9 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
 
     seen = {r["block_id"]: r for r in env.db.read_chunk_window(runtime.sources[0], 0, 1).rows}
     saved_state = {"output_schema": output_schema(runtime.report["skill_snapshot"],
-                                                  "project_basic_info_parsing")}
+                                                  "project_basic_info_parsing"),
+                   "quality_input_signature": source_signature(
+                       runtime.report["source_snapshot"] + runtime.report["reference_snapshot"])}
     book = DraftWorkspace(saved_state, seen, "project_basic_info_parsing")
     receipt = book.save_records([{"kind": "fact", "group": "项目基本信息",
         "content": {"字段": "质保", "内容": "三年"}, "scope": {"kind": "common"},
@@ -1033,6 +993,12 @@ def test_partial_report_retry_selects_partial_modules(env):
     env.db.execute(
         "UPDATE analysis_report SET status='partial' WHERE id=:id", {"id": report_id}
     )
+    signature = source_signature(runtime.report["source_snapshot"]
+                                 + runtime.report["reference_snapshot"])
+    env.db.execute("UPDATE analysis_module SET status='completed', "
+                   "business_data=CAST(:data AS JSONB) WHERE report_id=:report AND id!=:module",
+                   {"report": report_id, "module": runtime.run["module_id"],
+                    "data": json.dumps({"quality_input_signature": signature})})
     result = analysis_api.retry_report(report_id, analysis_api.RetryInput(), env.request)
     assert result["status"] == "pending"
     rows = env.db.rows(
@@ -1095,7 +1061,7 @@ def test_cancel_without_worker_closes_queued_and_orphaned_modules(env):
     assert result == {"status": "canceled", "canceling": False}
     assert analysis_api.cancel_report(report_id, env.request) == result
     current = analysis_api.get_report(report_id, env.request)
-    assert current["execution_compatible"] is True
+    assert current["status"] == "canceled"
     assert "skill_snapshot" not in current
     assert all(m["status"] == "canceled" for m in current["modules"])
     assert all(r["status"] == "canceled" for m in current["modules"] for r in m["runs"])
@@ -1103,7 +1069,7 @@ def test_cancel_without_worker_closes_queued_and_orphaned_modules(env):
     analysis_api.retry_report(report_id, analysis_api.RetryInput(
         module_keys=[selected["module_key"]]), env.request)
     after = analysis_api.get_report(report_id, env.request)
-    assert after["execution_compatible"] is True
+    assert after["status"] == "pending"
     assert [(m["id"], m["runs"][-1]["attempt"]) for m in after["modules"]
             if m["status"] == "pending"] == [(selected["id"], 2)]
 
@@ -1111,7 +1077,7 @@ def test_cancel_without_worker_closes_queued_and_orphaned_modules(env):
 def test_cancel_before_modules_created_can_retry(env):
     row = report(env)
     analysis_api.cancel_report(row["id"], env.request)
-    assert analysis_api.get_report(row["id"], env.request)["execution_compatible"] is True
+    assert analysis_api.get_report(row["id"], env.request)["status"] == "canceled"
     assert analysis_api.retry_report(row["id"], analysis_api.RetryInput(), env.request)[
         "status"] == "waiting"
 
@@ -1312,7 +1278,6 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
         "SELECT limits FROM agent_module_run WHERE id=:id", {"id": runtime.run["id"]}
     )[0]["limits"]
     assert old["max_model_calls"] == 40 and old["context_tokens"] == 24000
-    assert old["max_finish_corrections"] == 2
     assert runtime.claim()
     runtime.finish("failed", "故障注入")
     runtime.release()
@@ -1323,8 +1288,7 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
     env.db.execute(
         """INSERT INTO config_release (company_id, version_no, values, status, created_by)
         VALUES (1, 1, CAST(:values AS JSONB), 'active', '测试')""",
-        {"values": json.dumps({"analysis.max_model_calls": 80, "analysis.context_tokens": 200000,
-                               "analysis.max_finish_corrections": 5})},
+        {"values": json.dumps({"analysis.max_model_calls": 80, "analysis.context_tokens": 200000})},
     )
     analysis_api.retry_report(runtime.report["id"], analysis_api.RetryInput(), env.request)
     runs = env.db.rows(
@@ -1334,8 +1298,6 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
     assert runs[-1]["attempt"] == 2
     assert runs[-1]["limits"]["max_model_calls"] == 80
     assert runs[-1]["limits"]["context_tokens"] == 200000
-    assert runs[0]["limits"]["max_finish_corrections"] == 2
-    assert runs[-1]["limits"]["max_finish_corrections"] == 5
     # 未在配置中心显式调整的键回落默认值，同样不沿用旧快照。
     assert runs[-1]["limits"]["max_tool_calls"] == 48
     # 报告创建时的快照保持原值，只作为历史记录，不被补跑改写。

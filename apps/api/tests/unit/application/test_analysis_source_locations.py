@@ -6,9 +6,7 @@ from agent_fixtures import KEY, summary_record
 from test_analysis_research import block
 
 from tender.application.analysis.data import (
-    CoverageInput,
     SynthesisRecord,
-    prepare_coverage,
     prepare_records,
 )
 from tender.application.analysis.output import output_schema
@@ -32,18 +30,6 @@ def test_summary_with_block_location_needs_no_verbatim_quote():
     }
 
 
-def test_coverage_location_uses_the_same_contract():
-    row = block() | {"content": "本项目不收取投标保证金。"}
-    coverage = CoverageInput(
-        topic="deposit", scope={"kind": "common", "lot_refs": []},
-        status="not_applicable", detail="无需提交投标保证金",
-        citations=[{"block_id": row["block_id"]}],
-    )
-    entries, items = prepare_coverage(
-        [coverage], {}, {row["block_id"]: row}, [{"key": "deposit", "title": "保证金"}], KEY,
-    )
-    assert items[0]["values"][0]["value"] == "无需提交投标保证金"
-    assert entries[0]["citations"][0]["quote"] == row["content"]
 
 
 def test_source_location_still_rejects_an_unread_block():

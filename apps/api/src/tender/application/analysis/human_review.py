@@ -31,20 +31,11 @@ class RecordReviewInput(BaseModel):
         return self
 
 
-def coverage_review_id(item: dict) -> str | None:
-    if item["status"] == "not_applicable" and item.get("citations"):
-        return item.get("review_id")
-    return None
-
-
 def review_record(data: dict, record_id: str) -> dict | None:
     for bucket in REVIEW_BUCKETS:
         for record in data[bucket]:
             if record["id"] == record_id:
                 return record
-    for item in data["coverage"]:
-        if coverage_review_id(item) == record_id:
-            return {**item, "id": record_id, "kind": "coverage"}
     return None
 
 
@@ -63,9 +54,6 @@ def review_projection(data: dict, signatures: dict, signature: str, reviews: dic
     for bucket in REVIEW_BUCKETS:
         for record in data[bucket]:
             project(record, record["id"])
-    for item in data["coverage"]:
-        if record_id := coverage_review_id(item):
-            project(item, record_id)
     return data
 
 
@@ -76,7 +64,6 @@ def reviewed_compilation(data: dict) -> dict:
         **data,
         "gaps": [g for g in data["gaps"] if g["code"] != "conflict"
                  or g.get("record_id") not in machine_relation_ids],
-        "coverage": [],
     }
     approved_ids: set[str] = set()
     for bucket in REVIEW_BUCKETS:
@@ -147,20 +134,4 @@ def reviewed_compilation(data: dict) -> dict:
                 side.setdefault("conflicts_in", []).append(scope)
             result["gaps"].append(data_gap("conflict", relation["text"], scope,
                                            record_id=relation["id"]))
-    for item in data["coverage"]:
-        linked = item.get("record_ids", [])
-        reviewed = bool(linked) and all(record_id in approved_ids for record_id in linked)
-        if ((item["status"] == "extracted" and reviewed)
-                or (coverage_review_id(item) and item.get("human_review_status") == "confirmed")):
-            result["coverage"].append(item)
-        elif item["status"] in {"extracted", "not_applicable"}:
-            result["coverage"].append({**item, "status": "pending",
-                                       "detail": "覆盖结论尚未通过人工复核"})
-            result["gaps"].append(data_gap(
-                "human_review_required", "专题覆盖结论尚未通过人工复核",
-                item["scope"], module_key=item.get("module_key"), topic=item.get("topic"),
-            ))
-        else:
-            # 原缺件或待核对原因仍然有效，不替换成人工复核提示。
-            result["coverage"].append(item)
     return result

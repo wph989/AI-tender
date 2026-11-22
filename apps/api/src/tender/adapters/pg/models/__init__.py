@@ -1,6 +1,6 @@
 """业务库表映射模型（SQLAlchemy 2.0 typed declarative）。
 
-这些类只是「表 ↔ 对象」映射，不是领域模型（docs/工程/10 第 4.2 节）；
+这些类只是「表 ↔ 对象」映射，不是领域模型（docs/工程/10-技术选型与工程结构.md）；
 通用约定与「刻意不复制哪些东西」的理由见 base.py。与迁移 DDL 的一致性由
 tests/contract/test_orm_models_match_ddl.py 守住（表名/列名/可空性/类型四样）。
 

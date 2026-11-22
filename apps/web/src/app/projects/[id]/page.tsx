@@ -3,7 +3,7 @@ import { Suspense } from "react";
 import { ProjectWorkspace } from "@/components/projects/ProjectWorkspace";
 
 /**
- * 项目工作台页（设计文档 06 第 1 节）。
+ * 项目工作台页（docs/设计/06-前端展示与定位.md）。
  *
  * 包一层 Suspense 是因为内部的文件切换用 useSearchParams 读 ?file=：
  * 这个 hook 在预渲染阶段没有查询串，Next 要求调用方给出边界，否则整页会被判为不可静态化。

@@ -439,7 +439,6 @@ class AnalysisDatasetResponse(ApiResponse):
     requirements: list[AnalysisRecordResponse]
     format_nodes: list[AnalysisRecordResponse]
     relations: list[AnalysisRecordResponse]
-    coverage: list[dict[str, Any]]
     gaps: list[dict[str, Any]]
     quality_status: Literal[
         "self_check_passed", "needs_review", "needs_input", "unknown",
@@ -542,7 +541,6 @@ class AnalysisContextResponse(ApiResponse):
     format_nodes: list[dict[str, Any]]
     unresolved: list[dict[str, Any]]
     relations: list[dict[str, Any]]
-    coverage: list[dict[str, Any]]
     gaps: list[dict[str, Any]]
     readiness: str
     references: list[dict[str, Any]]

@@ -148,7 +148,7 @@ export interface LlmModel {
   updated_at: string;
 }
 
-/** 功能绑定行：priority 只在这一层存在（设计文档 12 第 2 节）。 */
+/** 功能绑定行：priority 只在这一层存在（docs/设计/12-LLM管理与模型路由.md）。 */
 export interface LlmBinding {
   priority: number;
   model_row_id: number;

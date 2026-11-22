@@ -10,9 +10,9 @@ import { configLabel } from "./presentation";
 
 export const LAYERS: readonly ConfigLayer[] = ["L1", "L2"] as const;
 
-// 只调整编辑入口，沿用原配置键和版本链，避免迁移后丢失已保存的预算。
+// 分析预算集中到模型设置，避免在运行设置中重复编辑。
 export function isModelConfig(key: string): boolean {
-  return key.startsWith("analysis.") || key.startsWith("llm_aided.");
+  return key.startsWith("analysis.");
 }
 
 export const LAYER_LABELS: Record<ConfigLayer, string> = {
@@ -40,9 +40,6 @@ export const BLOCKER_LABELS: Record<string, string> = {
   impact_not_acknowledged: "变更影响清单还有未确认项",
 };
 
-export const SOFT_BREACH_LABELS: Record<string, string> = {
-};
-
 export function releaseStatusLabel(status: string): string {
   return RELEASE_STATUS_LABELS[status] ?? status;
 }
@@ -52,7 +49,7 @@ export function impactKindLabel(kind: string): string {
 }
 
 export function blockerLabel(code: string): string {
-  return BLOCKER_LABELS[code] ?? SOFT_BREACH_LABELS[code] ?? code;
+  return BLOCKER_LABELS[code] ?? code;
 }
 
 export function itemsOfLayer(

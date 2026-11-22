@@ -12,11 +12,11 @@ from tender.api.llm.routes import (
     FeaturePatch,
     ModelCreate,
     ModelPatch,
-    _api_key_for,
     router,
 )
 from tender.api.shared.errors import install_error_handlers
 from tender.application.llm.profiles import validate_model
+from tender.application.llm.service import LlmService
 from tender.core.error_details import error_detail
 from tender.core.secrets import SecretKeyUnavailable
 
@@ -61,8 +61,8 @@ def test_database_decimal_temperature_is_accepted():
 def test_missing_credential_never_uses_environment_key(monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "fixture-env-key")
     with pytest.raises(SecretKeyUnavailable):
-        _api_key_for({"auth_mode": "api_key", "api_key_ciphertext": None})
-    assert _api_key_for({"auth_mode": "none", "api_key_ciphertext": None}) is None
+        LlmService._api_key_for({"auth_mode": "api_key", "api_key_ciphertext": None})
+    assert LlmService._api_key_for({"auth_mode": "none", "api_key_ciphertext": None}) is None
 
 
 def test_validation_error_never_echoes_provider_secret():

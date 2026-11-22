@@ -66,9 +66,3 @@ def test_retired_report_requests_fail_without_reading_report_contents(runtime, p
     assert error.value.code == "runtime_retired"
     repository.report_modules.assert_not_called()
     repository.report_runs.assert_not_called()
-
-
-def test_legacy_quality_status_is_machine_self_check_only():
-    from tender.application.analysis.quality import quality_status
-
-    assert quality_status({"quality_status": "verified"}) == "self_check_passed"

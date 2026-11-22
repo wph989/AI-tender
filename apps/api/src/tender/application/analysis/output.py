@@ -6,7 +6,6 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from tender.application.knowledge.content import normalized
 from tender.application.shared.validation import InputError, validation_message
 
 OUTPUT_VERSION = "1"
@@ -117,14 +116,3 @@ def record_output(record: dict, schema: dict) -> dict:
         "parent_key": record.get("parent_key"), "key": record["key"],
         "node_type": record.get("node_type"),
     }
-
-
-def canonical_topic(name: str, expected_topics: list[dict]) -> str:
-    """key 和中文名称均可归档；不能确定归属的描述保留原名并登记覆盖缺口。"""
-    key_match = next((t["key"] for t in expected_topics
-                      if normalized(t["key"]) == normalized(name)), None)
-    if key_match:
-        return key_match
-    matches = {t["key"] for t in expected_topics
-               if t.get("title") and normalized(t["title"]) == normalized(name)}
-    return next(iter(matches)) if len(matches) == 1 else name.strip()

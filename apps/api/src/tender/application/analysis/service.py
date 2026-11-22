@@ -20,7 +20,6 @@ from tender.application.analysis.data_store import (
     citations_accessible,
     matching_snapshot_state,
     publish_data_snapshot,
-    snapshot_input_signatures,
 )
 from tender.application.analysis.human_review import (
     CORRECTABLE_KINDS,
@@ -232,16 +231,15 @@ class AnalysisService:
                 allowed,
             )
         report["summary"] = visible_items(self.store, report["summary"], allowed)
-        current = self.analysis_status(report["project_id"])
         live = {source["source_id"]: source for source in self.store.sources(allowed)}
+        current_sources = [source for source in live.values()
+                           if source["project_id"] == report["project_id"]]
         current_references = [source for source in live.values()
                               if source["project_id"] != report["project_id"]]
         for module in modules:
             # 页面入口与补跑事务共用专题输入判断，报告快照已更新也不能禁用其他专题。
-            signature = module_inputs[module["id"]]["quality_input_signature"]
-            module["input_changed"] = not signature or input_changed(
-                module_inputs[module["id"]], current["sources"] + current_references,
-                report["source_snapshot"] + report["reference_snapshot"],
+            module["input_changed"] = input_changed(
+                module_inputs[module["id"]], current_sources + current_references,
             )
         if any(
             source["source_id"] not in live
@@ -259,8 +257,12 @@ class AnalysisService:
                 module.pop("progress", None)
                 for run in module["runs"]:
                     run.pop("agent_progress", None)
+        settings = self.store.analysis_settings(report["project_id"])
+        if settings is None:
+            raise NotFound("项目不存在")
         stale = report_inputs_changed(
-            report, current, current["lots"], current["sources"], current_references,
+            report, settings, self.store.project_lots(report["project_id"]),
+            current_sources, current_references,
         )
         canceling = report["status"] == "canceled" and self.store.execution_active(report_id)
         return {
@@ -297,8 +299,7 @@ class AnalysisService:
         candidates = [
             record
             for record in module_records(business)
-            if record.get("kind") != "coverage"
-            and record.get("evidence_ids")
+            if record.get("evidence_ids")
             and all(key in stored_evidence for key in record["evidence_ids"])
         ]
         visible = visible_items(
@@ -375,7 +376,7 @@ class AnalysisService:
         inputs = snapshot["input_snapshot"]
         sources = inputs["source_snapshot"] + inputs["reference_snapshot"]
         signature = source_signature(sources)
-        signatures = snapshot_input_signatures(snapshot, state)
+        signatures = inputs["module_input_signatures"]
         data = accessible_data(
             self.store, snapshot["data"], self.store.collections_for_project(report["project_id"]),
             sources=sources,
@@ -560,7 +561,7 @@ class AnalysisService:
         keys = module_keys or list(MODULES)
         if set(keys) - MODULES.keys():
             raise InvalidArgument("未知解析模块", code="invalid_module")
-        # 显式选择模块的旧调用表达重新解析；只有 resume 才继承历史分析状态。
+        # 显式选择模块默认重新解析，全量补跑默认续跑。
         mode = mode or ("restart" if module_keys else "resume")
         if mode not in {"restart", "resume"}:
             raise InvalidArgument("未知重解析模式", code="invalid_retry_mode")
@@ -582,8 +583,6 @@ class AnalysisService:
             # 完成状态不能证明已处理当前资料；统一取回后按专题输入和质量筛选。
             rows = tx.modules_for_retry(report_id, keys, explicit=explicit)
             changed = False
-            previous_sources = (report.get("source_snapshot", [])
-                                + report.get("reference_snapshot", []))
             current_sources = report.get("source_snapshot", [])
             current_references = report.get("reference_snapshot", [])
             if "source_snapshot" in report:
@@ -598,22 +597,25 @@ class AnalysisService:
                 if changed:
                     tx.update_report(report_id, {"source_snapshot": current_sources,
                                                  "reference_snapshot": current_references})
+            # 草稿尚未发布时，已消费输入记在工作区；不能用旧正式成果让有效自查失效。
+            previous_states = {row["id"]: tx.previous_run_state(row["id"])
+                               for row in rows} if mode == "resume" else {}
+            current_signature = source_signature(current_sources + current_references)
             changed_modules = {row["id"] for row in rows if "source_snapshot" in report and (
-                not (row.get("business_data") or {}).get("quality_input_signature")
-                or input_changed(
-                    row.get("business_data") or {}, current_sources + current_references,
-                    previous_sources,
-                )
-            )}
+                previous_states.get(row["id"], {}).get("quality_input_signature")
+                or (row.get("business_data") or {}).get("quality_input_signature")
+            ) != current_signature}
             if mode == "resume":
-                pending_input = [row for row in rows
-                                 if quality_status(row.get("business_data") or {}) == "needs_input"]
+                # 中断轮尚未发布正式成果，质量必须取本轮工作区；未结算时不能沿用旧缺件结论。
+                module_qualities = {row["id"]: quality_status(
+                    (row.get("business_data") or {}) if row["status"] == "completed"
+                    else previous_states[row["id"]]
+                ) for row in rows}
                 rows = [row for row in rows if (
                     row["id"] in changed_modules
-                    or quality_status(row.get("business_data") or {}) == "needs_review"
-                    or row["status"] in {"failed", "canceled", "partial"}
-                    and quality_status(row.get("business_data") or {}) != "needs_input"
-                    or row in pending_input and row["id"] in changed_modules
+                    or module_qualities[row["id"]] == "needs_review"
+                    or (row["status"] in {"failed", "canceled", "partial"}
+                        and module_qualities[row["id"]] != "needs_input")
                 )]
             has_modules = tx.report_has_modules(report_id)
             if not rows and (explicit or has_modules):
@@ -621,7 +623,6 @@ class AnalysisService:
                     "没有需要补跑的模块；重新解析已完成模块请显式指定模块",
                     code="nothing_to_retry",
                 )
-            restarted = {row["id"] for row in rows} if mode == "restart" else set()
             # 重跑期间保留上一轮正式投影；只有新Agent显式final并原子发布后才替换。
             retried = [row["id"] for row in rows]
             tx.mark_modules_pending(retried)
@@ -635,8 +636,7 @@ class AnalysisService:
             for module_id in sorted(retried):
                 attempt = tx.module_attempt(module_id)
                 # 冷启动连旧检查点都不读取，避免经草稿、待办或缓存旁路继承旧内容。
-                previous_state = (tx.previous_run_state(module_id)
-                                  if module_id not in restarted else {})
+                previous_state = previous_states.get(module_id, {})
                 # 仅显式补跑新attempt重置调用额度；草稿、自查与问题身份继续保留。
                 from tender.application.analysis.drafts import resume_workspace
 

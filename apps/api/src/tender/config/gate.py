@@ -20,13 +20,11 @@ class ImpactItem:
 class GateResult:
     passed: bool
     blockers: tuple[str, ...]
-    soft_breaches: tuple[str, ...]
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "blockers": list(self.blockers),
-            "soft_breaches": list(self.soft_breaches),
         }
 
 
@@ -48,14 +46,11 @@ def evaluate_gate(
     *,
     impact: Sequence[ImpactItem],
     acknowledged: Iterable[tuple[str, str]],
-    force: bool = False,
 ) -> GateResult:
-    """force 也不能跳过逐项确认，避免误激活未评估的解析策略。"""
+    """逐项确认后才能发布，避免激活未评估的解析策略。"""
     acked = set(acknowledged)
     blockers: list[str] = []
     if any((entry.kind, entry.ref) not in acked for entry in impact):
         blockers.append("impact_not_acknowledged")
 
-
-    passed = not blockers
-    return GateResult(passed=passed, blockers=tuple(blockers), soft_breaches=())
+    return GateResult(passed=not blockers, blockers=tuple(blockers))

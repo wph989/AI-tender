@@ -9,7 +9,9 @@ from test_deepagents_runtime import prepared_runtime
 from test_knowledge_flow import add_source
 
 from tender.adapters.pg.repositories.knowledge.store import KnowledgeSession
-from tender.application.analysis.drafts import AGENT_PROTOCOL
+from tender.application.analysis.drafts import AGENT_PROTOCOL, DraftWorkspace
+from tender.application.analysis.output import output_schema
+from tender.application.analysis.runtime import AgentRuntime
 from tender.application.knowledge.content import source_signature
 from tender.config.registry import ConfigRegistry
 from tender.core.di import create_analysis_service
@@ -120,6 +122,103 @@ def test_new_attachment_reopens_confirmed_missing_input_and_preserves_current_ev
     assert not latest["agent_workspace"]["finalized"]
     assert not latest["agent_workspace"]["reviews"]
     assert len(env.db.report(runtime.report["id"])["source_snapshot"]) == 2
+
+
+@pytest.mark.parametrize("status", ["partial", "failed", "canceled"])
+def test_new_attachment_interrupted_attempt_can_resume_its_reviewed_draft(env, status):
+    runtime = prepared_runtime(env)
+    report_id, module_id = runtime.report["id"], runtime.run["module_id"]
+    row = env.db.read_chunk_window(runtime.sources[0], 0, 1).rows[0]
+    state = {
+        "output_schema": output_schema(runtime.report["skill_snapshot"], KEY),
+        "authorized_sources": runtime.sources,
+        "quality_input_signature": source_signature(
+            runtime.report["source_snapshot"] + runtime.report["reference_snapshot"]),
+        "research": {"seen": {row["block_id"]: row}},
+    }
+    book = DraftWorkspace(state, state["research"]["seen"], KEY)
+    book.record_review([], [{
+        "topic": "项目基本信息", "target": "开标日期", "detail": "待补附件甲",
+        "action": "provide_input", "missing_input": {
+            "file_name": "附件甲", "reference_ids": [row["block_id"]],
+            "checked_source_ids": [row["source_id"]],
+        },
+    }], "missing")
+    book.finalize([], "开标日期待补件")
+    assert runtime.claim()
+    try:
+        runtime.save(state)
+        runtime.finish("completed", draft=state["draft"], state=state)
+    finally:
+        runtime.release()
+    formal = next(module for module in env.db.report_modules(report_id)
+                  if module["id"] == module_id)
+    assert formal["business_data"]["quality_status"] == "needs_input"
+    # 模拟其他专题已完成，释放真实队列中的队首位置，让所选专题的新轮次能够领取。
+    env.db.execute("UPDATE agent_module_run SET status='completed' WHERE module_id IN "
+                   "(SELECT id FROM analysis_module WHERE report_id=:report AND id<>:module)",
+                   {"report": report_id, "module": module_id})
+    env.db.execute("UPDATE analysis_module SET status='completed' "
+                   "WHERE report_id=:report AND id<>:module",
+                   {"report": report_id, "module": module_id})
+    env.db.execute("UPDATE analysis_report SET status='completed' WHERE id=:id", {"id": report_id})
+    with env.engine.begin() as connection:
+        add_source(connection, runtime.report["project_id"], "附件甲：开标日期为2026年12月1日。")
+    service = create_analysis_service(env.engine, 1, ConfigRegistry(env.engine))
+    service.retry_report(report_id, module_keys=[KEY], mode="resume",
+                         max_output_tokens=None, timeout_seconds=None)
+    prepared = test_deepagents_runtime.worker.prepare_report(env.db, env.db.report(report_id))
+    assert prepared is not None
+    current_report, sources = prepared
+    latest = env.db.rows("SELECT * FROM agent_module_run WHERE module_id=:id "
+                         "ORDER BY attempt DESC LIMIT 1", {"id": module_id})[0]
+    current = AgentRuntime(env.db, current_report, latest, sources)
+    assert current.claim()
+    try:
+        current_state = current.run["state"]
+        signature = source_signature(current_report["source_snapshot"]
+                                     + current_report["reference_snapshot"])
+        current_state["quality_input_signature"] = signature
+        current_state["authorized_sources"] = sources
+        attachment = next(source for source in sources if source["source_id"] != row["source_id"])
+        evidence = env.db.read_chunk_window(attachment, 0, 1).rows[0]
+        seen = current_state["research"]["seen"]
+        seen[evidence["block_id"]] = evidence
+        book = DraftWorkspace(current_state, seen, KEY)
+        accepted = book.save_records([{
+            "kind": "fact", "group": "项目基本信息",
+            "content": {"字段": "开标日期", "内容": "2026年12月1日"},
+            "scope": {"kind": "common"}, "block_ids": [evidence["block_id"]],
+        }], "draft")["accepted"][0]
+        book.record_review([{
+            "record_id": accepted["id"], "version": accepted["version"], "status": "passed",
+            "reason": "已对照新附件核对开标日期", "block_ids": [evidence["block_id"]],
+        }], [], "review")
+        assert book.review_current(accepted["id"])
+        if status == "partial":
+            current_state["quality_status"] = "needs_review"
+        current.save(current_state)
+        current.finish(status, state=current_state)
+    finally:
+        current.release()
+    env.db.execute("UPDATE analysis_report SET status=:status WHERE id=:id",
+                   {"id": report_id, "status": status})
+    service.retry_report(report_id, module_keys=[KEY], mode="resume",
+                         max_output_tokens=None, timeout_seconds=None)
+    runs = env.db.rows("SELECT * FROM agent_module_run WHERE module_id=:id ORDER BY attempt",
+                       {"id": module_id})
+    assert [run["attempt"] for run in runs] == [1, 2, 3]
+    assert runs[1]["state"] == current_state
+    carried = runs[-1]["state"]
+    assert carried["quality_input_signature"] == signature
+    assert carried["staged_items"] == current_state["staged_items"]
+    assert carried["agent_workspace"]["reviews"] == current_state["agent_workspace"]["reviews"]
+    assert not carried["agent_workspace"]["finalized"]
+    assert DraftWorkspace(carried, carried["research"]["seen"], KEY).review_current(accepted["id"])
+    module = next(module for module in env.db.report_modules(report_id)
+                  if module["id"] == module_id)
+    assert module["items"] == formal["items"]
+    assert module["business_data"] == formal["business_data"]
 
 
 def test_local_restart_keeps_other_modules_new_input_signal_in_real_postgres(env):

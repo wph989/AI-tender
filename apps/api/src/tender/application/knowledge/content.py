@@ -19,7 +19,7 @@ from tender.application.shared.validation import (
 
 # 分块与去标签的纯规则落 domain，adapters 的检索仓储也要用；这里按用例层的入口再导出。
 from tender.domain.knowledge.search import keywords
-from tender.domain.knowledge.text import chunk_locations, plain_text, split_elements
+from tender.domain.knowledge.text import chunk_locations, plain_text
 from tender.domain.shared.digest import fingerprint
 
 __all__ = [
@@ -35,7 +35,6 @@ __all__ = [
     "rank_chunks",
     "source_signature",
     "source_state",
-    "split_elements",
     "validate_items",
     "value_cores",
 ]

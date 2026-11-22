@@ -5,7 +5,7 @@
  *
  * 缩放基准取「适应宽度 × 用户倍率」，且**所有页共用一个 scale**：
  * 横版页（带 /Rotate 的扫描件）在自己的页框里居中留白，而不是被单独放大——
- * 否则跨页时字号忽大忽小，用户会怀疑解析坐标有偏差（见 docs/设计/06 第 3 节）。
+ * 否则跨页时字号忽大忽小，用户会怀疑解析坐标有偏差（见 docs/设计/06-前端展示与定位.md）。
  */
 
 import type { PDFDocumentProxy } from "pdfjs-dist";
@@ -25,7 +25,7 @@ interface Props {
   index: EvidenceIndex;
   registry: PageRegistry;
   onError: (message: string) => void;
-  /** 原文页角标 → 结果卡的反向定位（见 docs/设计/06 第 11 节）。 */
+  /** 原文页角标 → 结果卡的反向定位（见 docs/设计/06-前端展示与定位.md）。 */
   onLocate: (item: EvidenceItem) => void;
 }
 

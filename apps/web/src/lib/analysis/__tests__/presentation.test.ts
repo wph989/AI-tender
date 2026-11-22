@@ -62,11 +62,11 @@ it("同专题同主题同范围说明去重，不合并不同主题、标段和�
   expect(groups.at(-1)?.category).toBe("分析尚未完成");
 });
 
-it("统计区分信息、要求、材料节点、关联及历史条目", () => {
+it("统计区分信息、要求、材料节点和关联", () => {
   const items = [item("fact", { kind: "fact" }), item("lot", { kind: "lot" }), item("req"),
-    item("format", { kind: "format_node" }), item("relation", { kind: "relation" }), { ...item("old"), record: undefined }];
+    item("format", { kind: "format_node" }), item("relation", { kind: "relation" })];
   expect(resultCounts([{ id: 1, title: "专题", module_key: "tech", status: "completed", error_message: null, items }]))
-    .toEqual({ facts: 2, requirements: 1, materials: 1, relations: 1, other: 1 });
+    .toEqual({ facts: 2, requirements: 1, materials: 1, relations: 1 });
 });
 
 it("显示文案相同的未知标段缺口仍按原始范围区分", () => {

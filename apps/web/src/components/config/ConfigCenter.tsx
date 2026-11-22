@@ -3,7 +3,7 @@ import { Button, Tabs } from "antd";
 import { useFeedback } from "@/hooks/useFeedback";
 
 /**
- * 配置中心页容器（设计文档 08 第 2、5、6 节）。
+ * 配置中心页容器（docs/质量/08-动态配置中心.md）。
  *
  * 任何写操作后统一重取"配置项 + 版本列表 + 当前选中版本详情"：
  * 激活会同时改三处状态（旧 active 归档、新 active 生效、审计多两条），
@@ -265,11 +265,10 @@ export function ConfigWorkspace({ scope }: { scope: "system" | "models" }) {
                       setInfo("已确认：" + configLabel(entry.ref));
                     })
                   }
-                  onActivate={(force: boolean, reason: string) =>
+                  onActivate={(reason: string) =>
                     run("发布失败", async () => {
                       if (detail === null) return;
                       await activateRelease(detail.id, {
-                        force,
                         reason: reason || undefined,
                       });
                       setInfo("版本 v" + detail.version_no + " 已生效");

@@ -46,7 +46,7 @@ export function acknowledgeRelease(
 
 export function activateRelease(
   id: number,
-  input: { force: boolean; reason?: string },
+  input: { reason?: string },
 ): Promise<{ gate: { passed: boolean } }> {
   return sendJson<{ gate: { passed: boolean } }>(
     BASE + "/releases/" + id + "/activate",

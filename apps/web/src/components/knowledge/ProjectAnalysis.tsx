@@ -152,7 +152,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     return () => clearInterval(timer);
   }, [running, processingFiles, refresh]);
 
-  // 接口仅发布已核实成果；模块尚未完成时同样允许定位，避免失败后已有成果无法核对。
+  // 最终提交后的成果可直接定位；失败或取消时保留正式成果，便于继续核对原文。
   const refs = useMemo(
     () => [
       ...(report?.modules.flatMap((m) =>

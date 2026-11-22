@@ -1,4 +1,4 @@
-/** 配置中心的前端类型（对齐后端 `tender/api/config.py` 的响应）。 */
+/** 配置中心的前端类型（对齐后端 `tender/api/configuration/routes.py` 的响应）。 */
 
 export type ConfigLayer = "L1" | "L2";
 
@@ -14,7 +14,6 @@ export interface ConfigItem {
   value: unknown;
   overridden: boolean;
   writable: boolean;
-  readonly_reason?: string | null;
   minimum?: number;
   maximum?: number;
   choices?: string[];
@@ -50,7 +49,6 @@ export interface ImpactEntry {
 export interface GateResult {
   passed: boolean;
   blockers: string[];
-  soft_breaches: string[];
 }
 
 export interface ConfigAuditEntry {

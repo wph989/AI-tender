@@ -1,15 +1,8 @@
 "use client";
 
 /**
- * 虚拟页列表（本切片为简化版，见 docs/设计/06 第 7 节）。
- *
- * 做法：**每一页都渲染等高的占位容器**，只有进入视口上下各两屏的页才挂载真实 PageView。
- *
- * 为什么占位容器必须常驻：定位时序第 ① 步要先 scrollIntoView 到目标页的占位元素，
- * IntersectionObserver 才会去挂载它——占位元素不存在，「跳到第 50 页」就无从下手。
- *
- * 为什么本切片不做真正的虚拟滚动（按滚动量回收 DOM）：占位容器是轻量 div，
- * 几百页也只有几百个节点；真实回收要引入滚动锚定与测量缓存，等页数上限明确后再做。
+ * 每页保留轻量占位容器，进入视口附近时才挂载PageView，以限制PDF渲染资源。
+ * 占位容器保持可定位：先滚到目标页，再由IntersectionObserver挂载实际页面。
  */
 
 import type { PDFDocumentProxy } from "pdfjs-dist";

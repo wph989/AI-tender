@@ -235,7 +235,7 @@ export async function mockApi(page: Page) {
         ...releases[id - 1],
         changed: {},
         impact: [],
-        gate: { passed: true, blockers: [], soft_breaches: [] },
+        gate: { passed: true, blockers: [] },
         audit: [],
       };
     } else {

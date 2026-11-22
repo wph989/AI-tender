@@ -78,8 +78,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
         issueId: gap.issue_id, action: gap.action,
         moduleKey: module?.module_key ?? gap.module_key, recordId: gap.record_id,
         moduleTitle: module?.title ?? "报告整体",
-        topicTitle: data.coverage.find((entry) => entry.module_key === module?.module_key && entry.topic === gap.topic)?.title
-          ?? module?.items.find((item) => item.id === gap.record_id)?.field ?? gap.topic,
+        topicTitle: module?.items.find((item) => item.id === gap.record_id)?.field ?? gap.topic,
         scopeLabel: scopeLabel(gap.scope, (id) => data.lots.find((lot) => lot.lot_id === id)?.title),
       };
     }) : modules.flatMap((module) => module.quality_issues?.length
@@ -154,7 +153,6 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
       </div>
       <p className="results-counts" aria-label="结果统计">
         报告记录：信息 {counts.facts} · 要求 {counts.requirements} · 材料节点 {counts.materials} · 关联 {counts.relations}
-        {counts.other > 0 && ` · 历史条目 ${counts.other}`}
         <span>专题完成 {modules.filter((module) => module.status === "completed").length}/{modules.length}</span>
       </p>
       <div className="report-actions" role="group" aria-label="报告操作">
@@ -225,17 +223,6 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
     {loading && <p className="snapshot-notice" role="status">正在核对跨专题范围与关联…</p>}
     <div id={`module-panel-${report.id}`} role="tabpanel" aria-labelledby={`module-tab-${report.id}-${currentId}`}>
     {view === "gaps" ? <>
-      {!!data?.coverage.length && <details className="coverage-details"><summary>查看专题检查进度</summary>
-        <ul>{data.coverage.filter((entry) => !current || entry.module_key === current.module_key).map((entry, index) => <li key={index}>
-          <strong>{modules.find((module) => module.module_key === entry.module_key)?.title} · {entry.title}</strong>
-          <p>{({ extracted: "已汇总", searched_not_found: "本次检索未找到", pending: "尚未核对完整",
-            not_applicable: entry.human_review_status === "confirmed" ? "已确认不适用"
-              : entry.human_review_status === "rejected" ? "不适用结论已驳回"
-              : entry.human_review_status === "outdated" ? "不适用结论待更新" : "不适用结论待复核",
-            unchecked: "未检查" } as Record<string, string>)[entry.status] ?? entry.status}
-            {" · "}{scopeLabel(entry.scope)}</p><p>{entry.detail}</p>
-        </li>)}</ul>
-      </details>}
       <ResearchGaps gaps={visibleGaps} expanded onNavigate={navigateGap} />
       {!visibleGaps.length && <p className="result-empty">当前专题没有已登记的待核对事项；条目数量不代表原文已完整覆盖。</p>}
     </> : <>
@@ -274,7 +261,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
               <div className="run-summary"><strong>第 {run.attempt} 次 · {STATE_LABELS[run.status] ?? run.status}</strong>
                 {run.mode && <span>{run.mode === "restart" ? "从零解析" : "补跑"}</span>}
                 {run.quality_status && run.quality_status !== "unknown" && <span>{QUALITY_LABELS[run.quality_status]}</span>}
-                {/* 新旧接口切换时可能缺少成功字段；保留真实零值，缺失不能用尝试数或零冒充。 */}
+                {/* 保留成功计数的真实零值，缺失不能用尝试数冒充。 */}
                 <span>模型请求成功 {run.successful_model_calls == null ? "未记录" : `${run.successful_model_calls} 次`}
                   {" · "}工具执行成功 {run.successful_tool_calls == null ? "未记录" : `${run.successful_tool_calls} 次`}</span>
               </div>

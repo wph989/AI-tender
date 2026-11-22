@@ -214,8 +214,9 @@ export function ProjectList() {
         type="text"
         danger
         disabled={busy}
-        onClick={() =>
-          modal.confirm({
+        onClick={async () =>
+          // await 模式保留失败重试，并由确认框处理拒绝，避免触发全局未处理异常。
+          await modal.confirm({
             title: `删除项目「${project.name}」？`,
             content:
               "项目及其资料将无法继续访问，相关报告引用会受影响。此操作无法在页面中撤销。",

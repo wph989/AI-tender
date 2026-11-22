@@ -116,7 +116,7 @@ def test_schema_guard_runs_before_loading_full_report(monkeypatch, missing):
     db.report_for_analysis.assert_not_called()
     db.finish_task.assert_called_once()
     assert db.finish_task.call_args.args[:3] == ("report", 16, "failed")
-    assert "请先执行数据库迁移" in db.finish_task.call_args.args[3]
+    assert "请初始化当前版本数据库" in db.finish_task.call_args.args[3]
 
 
 @pytest.mark.parametrize("status", [None, "completed", "failed", "canceled"])

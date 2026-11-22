@@ -42,6 +42,58 @@ def test_confirmed_missing_input_does_not_restart_on_the_same_materials():
     assert not tx.inserted
 
 
+@pytest.mark.parametrize("status", ["partial", "failed", "canceled"])
+@pytest.mark.parametrize(("latest_quality", "formal_quality", "can_resume"), [
+    ("needs_review", "needs_input", True),
+    (None, "needs_input", True),
+    ("needs_input", "needs_review", False),
+])
+def test_new_materials_interrupted_attempt_uses_its_own_quality(
+    status, latest_quality, formal_quality, can_resume,
+):
+    from test_analysis_agent_workspace import approve, saved, workspace
+
+    old = [{"source_id": 1, "project_id": 1, "version_id": 1, "parse_run_id": 1}]
+    current = old + [{"source_id": 2, "project_id": 1, "version_id": 2, "parse_run_id": 2}]
+    book = workspace()
+    approve(book, saved(book))
+    previous = book.state
+    previous["quality_input_signature"] = source_signature(current)
+    previous["agent_workspace"]["finalized"] = latest_quality == "needs_input"
+    if latest_quality is not None:
+        previous["quality_status"] = latest_quality
+    business = {"quality_status": formal_quality, "quality_input_signature": source_signature(old)}
+    # 补件后的中断轮只保存工作区，正式正文仍属于上一轮；二者不能混用来决定续跑。
+    tx = _RetryTx([{"id": 9, "status": status, "business_data": business}], previous)
+    store = _RetryStore(tx)
+    store.report = Mock(return_value=store.report(3) | {
+        "source_snapshot": current, "reference_snapshot": [],
+    })
+    store.sources = Mock(return_value=current)
+    store.collections_for_project = Mock(return_value=[1])
+    service = AnalysisService(store, 1, Mock(), Mock(), Mock())
+    service.analysis_status = Mock(return_value={"sources": current})
+
+    if not can_resume:
+        with pytest.raises(Conflict) as error:
+            service.retry_report(3, module_keys=[], mode="resume",
+                                 max_output_tokens=None, timeout_seconds=None)
+        assert error.value.code == "nothing_to_retry"
+        assert not tx.inserted and tx.pending is None
+        return
+
+    result = service.retry_report(3, module_keys=[], mode="resume",
+                                  max_output_tokens=None, timeout_seconds=None)
+    assert result["status"] == "pending" and tx.pending == [9]
+    carried = tx.inserted[0]["state"]
+    assert carried["execution_mode"] == "resume"
+    assert carried["quality_input_signature"] == source_signature(current)
+    assert carried["staged_items"] == previous["staged_items"]
+    assert carried["agent_workspace"]["reviews"] == previous["agent_workspace"]["reviews"]
+    assert not carried["agent_workspace"]["finalized"]
+    assert tx.rows[0]["business_data"] == business
+
+
 
 
 def test_partial_restart_does_not_consume_another_modules_input_change():

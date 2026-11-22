@@ -49,7 +49,7 @@ export interface AnalysisOutput {
   node_type: "group" | "section" | null;
 }
 
-/** 报告条目沿用历史身份，新增专题 output；问答和历史报告仍使用 values 投影。 */
+/** 问答展示 values，专题记录生成 output；两者共用引用身份以支持原文定位。 */
 export interface AnalysisField {
   id: string;
   field: string;
@@ -239,7 +239,7 @@ export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"
 export interface ModuleRecords {
   quality_status?: QualityStatus;
   quality_issues?: QualityIssue[];
-  // schema_version 与 status 仅随契约透传，前端尚无版本分支；读取方不要据此推断兼容性。
+  // 协议版本与执行状态由服务端提供，界面从独立记录组装正文。
   schema_version: string;
   module_key: string;
   status: string;
@@ -263,18 +263,6 @@ export interface AnalysisGap {
   module_key?: string;
 }
 
-export interface AnalysisCoverage extends AnalysisReviewState {
-  verification?: BusinessRecord["verification"];
-  topic: string;
-  title: string;
-  status: string;
-  scope: AnalysisScope;
-  detail: string;
-  module_key?: string;
-  review_id?: string;
-  citations?: Citation[];
-}
-
 export interface AnalysisDataset {
   quality_status?: QualityStatus;
   quality_issues?: QualityIssue[];
@@ -284,7 +272,6 @@ export interface AnalysisDataset {
   requirements: BusinessRecord[];
   format_nodes: BusinessRecord[];
   relations: BusinessRecord[];
-  coverage: AnalysisCoverage[];
   gaps: AnalysisGap[];
   readiness: "usable" | "partial" | "unavailable";
 }

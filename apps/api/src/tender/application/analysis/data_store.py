@@ -12,31 +12,18 @@ from tender.application.analysis.data import (
     module_records,
 )
 from tender.application.knowledge.content import fingerprint, source_signature, source_state
-from tender.domain.analysis.contract import RUNTIME_VERSION, is_current_report
+from tender.domain.analysis.contract import is_current_report
 from tender.ports.repository.analysis.reports import ReportRepository
 
 
-def snapshot_manifest(
-    status: str, runs: list[dict], modules: list[dict], *, runtime_version: str | None = None,
-    inputs: dict | None = None,
-) -> str:
-    """发布和取数共用指纹；新协议仅在正式业务数据变化时产生新版本。"""
-    if inputs is not None:
-        # 正文相同也不能让新补遗沿用旧复核；同一份输入下仅运行状态变化则复用。
-        return fingerprint([
-            2, runtime_version,
-            source_signature(inputs["source_snapshot"] + inputs["reference_snapshot"]),
-            inputs["category"], inputs["topics"], inputs["lot_settings"], inputs["skill_version"],
-            [[m["module_key"], m["business_data"]] for m in modules],
-        ])
-    if runtime_version == RUNTIME_VERSION:
-        # 新运行的状态变化不是正式数据变更；中断重跑应继续保留上一轮同一快照。
-        return fingerprint([runtime_version, [
-            [m["module_key"], m["business_data"]] for m in modules
-        ]])
-    return fingerprint([status, runs, [
-        [m["module_key"], m["status"], m["business_data"]] for m in modules
-    ]])
+def snapshot_manifest(inputs: dict, modules: list[dict]) -> str:
+    """正文及冻结输入共同决定版本，避免新补遗沿用旧人工裁定。"""
+    return fingerprint([
+        inputs["runtime_version"],
+        source_signature(inputs["source_snapshot"] + inputs["reference_snapshot"]),
+        inputs["category"], inputs["topics"], inputs["lot_settings"], inputs["skill_version"],
+        [[m["module_key"], m["business_data"]] for m in modules],
+    ])
 
 
 def unfinished_runs(runs: list[dict]) -> bool:
@@ -61,7 +48,7 @@ def same_frozen_inputs(left: dict, right: dict) -> bool:
 def matching_snapshot_state(
     read_state: Callable[[int], dict | None], snapshot: dict,
 ) -> dict | None:
-    # 旧版指纹并未绑定输入；冻结资料也一致时才可使用这次读到的专题成果。
+    # 读取和人工裁定必须与发布时的冻结输入、正文保持一致。
     state = read_state(snapshot["report_id"])
     if state is None:
         return None
@@ -71,9 +58,7 @@ def matching_snapshot_state(
         and not state.get("snapshot_pending")
         and not unfinished_runs(state["runs"])
         and same_frozen_inputs(inputs, state)
-        and snapshot_manifest(state["status"], state["runs"], state["modules"],
-                              runtime_version=inputs.get("runtime_version"),
-                              inputs=state if inputs.get("publication_version") == 2 else None)
+        and snapshot_manifest(state, state["modules"])
         == snapshot["manifest_hash"]
     ):
         return state
@@ -83,14 +68,6 @@ def matching_snapshot_state(
 def module_input_signatures(modules: list[dict]) -> dict:
     return {m["module_key"]: (m.get("business_data") or {}).get("quality_input_signature")
             for m in modules}
-
-
-def snapshot_input_signatures(snapshot: dict, state: dict | None) -> dict:
-    inputs = snapshot["input_snapshot"]
-    if "module_input_signatures" in inputs:
-        return inputs["module_input_signatures"] or {}
-    # 历史版本或指纹不匹配时，不能用当前专题的成果给旧结论补签名。
-    return module_input_signatures(state["modules"]) if state is not None else {}
 
 
 def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
@@ -114,20 +91,11 @@ def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
         if unfinished_runs(runs):
             return None
         modules = session.report_modules(report_id)
-        digest = snapshot_manifest(locked["status"], runs, modules,
-                                   runtime_version=locked["runtime_version"], inputs=locked)
+        digest = snapshot_manifest(locked, modules)
         existing = session.snapshot_by_manifest(report_id, digest)
         if existing and session.latest_snapshot_id(report_id) == existing["id"]:
             session.update_report(report_id, clear_pending)
             return existing
-        # 升级前已有的快照在输入及正文完全一致时仍可用，避免同一报告平白增加一版。
-        legacy_hash = snapshot_manifest(locked["status"], runs, modules,
-                                        runtime_version=locked["runtime_version"])
-        legacy = session.snapshot_by_manifest(report_id, legacy_hash)
-        if (legacy and session.latest_snapshot_id(report_id) == legacy["id"]
-                and same_frozen_inputs(legacy["input_snapshot"], locked)):
-            session.update_report(report_id, clear_pending)
-            return legacy
         # 同一次发布里标段提取与装配共用一份记录投影，不重复解析业务 JSON。
         records_by_module = {
             module["module_key"]: module_records(module["business_data"]) for module in modules
@@ -159,15 +127,13 @@ def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
                     lots.append(item)
         session.set_derived_lots(report_id, sorted(derived))
         data = assemble_dataset(modules, lots, records_by_module)
-        catalog = [c for c in data["coverage"]
-                   if c["module_key"] == "project_basic_info_parsing" and c["topic"] == "lots"]
         missing_lots = {lot["id"] for lot in locked["lot_settings"]} - {
             lot["lot_id"] for lot in lots
         }
         catalog_incomplete = any(
             m["module_key"] == "project_basic_info_parsing" and m["status"] != "completed"
             for m in modules
-        ) or any(c["status"] not in {"extracted", "not_applicable"} for c in catalog)
+        )
         if missing_lots or catalog_incomplete:
             # 一个已识别标段不等于项目只有一个标段，目录缺口期间不能自动选中它。
             data["gaps"].append(data_gap(
@@ -190,8 +156,7 @@ def publish_data_snapshot(db: ReportRepository, report_id: int) -> dict | None:
             inputs={k: locked[k] for k in (
                 "source_snapshot", "reference_snapshot", "category", "topics", "lot_settings",
                 "runtime_version", "skill_version",
-            )} | {"publication_version": 2,
-                  "module_input_signatures": module_input_signatures(modules)},
+            )} | {"module_input_signatures": module_input_signatures(modules)},
             data=data,
         )
         session.update_report(report_id, clear_pending)
@@ -230,20 +195,19 @@ def accessible_data(
         if any(s["source_id"] not in live_sources for s in sources):
             unavailable.add("input_source_unavailable")
     checked: dict[tuple, bool] = {}
-    for bucket in ("lots", "facts", "requirements", "format_nodes", "relations", "coverage"):
+    for bucket in ("lots", "facts", "requirements", "format_nodes", "relations"):
         visible = []
         for record in result[bucket]:
             if citations_accessible(db.resolve, record.get("citations", []), allowed, checked):
                 visible.append(record)
             else:
-                unavailable.add(record.get("id") or record["review_id"])
+                unavailable.add(record["id"])
         result[bucket] = visible
     if unavailable:
         # 缺口文本也可能重述撤销资料；此时仅保留访问状态，不泄露历史内容。
         result["gaps"] = [data_gap("source_unavailable", "部分依据已删除或撤销访问，请更新分析")]
         result["quality_issues"] = []
         result["quality_status"] = "unknown"
-        result["coverage"] = []
         result["relations"] = [r for r in result["relations"]
                                if r.get("subject_id") not in unavailable
                                and r.get("object_id") not in unavailable]

@@ -20,10 +20,12 @@ from tender.api.llm import routes as llm
 from tender.api.projects import files as project_files
 from tender.api.projects import routes as projects
 from tender.api.shared.errors import ApiProblem
+from tender.application.knowledge.content import encode
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.profiles import FEATURE_FIELDS, MODEL_FIELDS
 from tender.application.shared.research import AgentLimits, ResearchSession
 from tender.config.registry import ConfigRegistry
+from tender.config.schema import document_execution_snapshot
 from tender.core.di import create_document_pipeline_repository
 from tender.domain.shared.errors import ParseUnavailable
 from tender.ports.documents.parser import ParseJobStatus, ParseProgress
@@ -58,7 +60,7 @@ def test_numeric_rules_drive_api_metadata_and_database_limits(runtime):
     entries = {entry["key"]: entry for entry in config.list_items(request)["items"]}
     assert entries["analysis.max_model_calls"]["minimum"] == 1
     assert "maximum" not in entries["analysis.max_model_calls"]
-    assert entries["preprocess.denoise"]["writable"] is False
+    assert "preprocess.denoise" not in entries
     with pytest.raises(ApiProblem):
         release(request, {"preprocess.denoise": False})
     with pytest.raises(ApiProblem):
@@ -98,21 +100,6 @@ def test_retrieval_config_metadata_bounds_and_migration_seed(runtime):
             release(request, patch)
 
 
-def test_old_finish_correction_config_is_readonly_and_snapshot_remains_readable(runtime):
-    request, connection, pid = runtime
-    entry = next(item for item in config.list_items(request)["items"]
-                 if item["key"] == "analysis.max_finish_corrections")
-    assert entry["value"] == entry["default"] == 2
-    assert not entry["writable"]
-    for value in (0, 5):
-        with pytest.raises(ApiProblem):
-            release(request, {"analysis.max_finish_corrections": value})
-    add_source(connection, pid, "质保三年")
-    analysis_api.save_settings(pid, analysis_api.AnalysisSettings(category="goods"), request)
-    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
-    frozen = connection.execute(text("SELECT runtime_settings FROM analysis_report WHERE id=:id"),
-                                {"id": report["id"]}).scalar_one()
-    assert frozen["max_finish_corrections"] == 2
 
 
 def test_saved_retrieval_config_freezes_report_and_filters_real_document_chunks(runtime):
@@ -127,7 +114,7 @@ def test_saved_retrieval_config_freezes_report_and_filters_real_document_chunks(
     assert frozen["similarity_threshold"] == 0.8 and frozen["max_search_results"] == 3
     # 发布后改配置不能改变已有报告的检索口径；真实仓储仍按该报告冻结参数检索。
     release(request, {"analysis.similarity_threshold": 0.2, "analysis.max_search_results": 20})
-    db = knowledge.store(request)
+    db = knowledge.knowledge_service(request).store
     sources = db.sources(db.collections_for_project(pid))
     limits = AgentLimits(**frozen)
 
@@ -161,6 +148,17 @@ def test_saved_retrieval_config_freezes_report_and_filters_real_document_chunks(
 def test_upload_and_reparse_freeze_configured_defaults_with_explicit_override(runtime):
     request, connection, pid = runtime
     draft = release(request, {"mineru.tier": "advanced", "mineru.ocr_mode": "ocr"})
+    # 发布校验与版本变更在同一事务中，未确认时不能推进生效版本。
+    active = connection.execute(
+        text("SELECT id FROM config_release WHERE status='active'"),
+    ).scalar_one()
+    with pytest.raises(ApiProblem) as denied:
+        config.activate_release(draft["id"], config.ActivateRequest(reason="准备发布"), request)
+    assert denied.value.status_code == 422
+    assert config.get_release(draft["id"], request)["status"] == "draft"
+    assert connection.execute(
+        text("SELECT id FROM config_release WHERE status='active'"),
+    ).scalar_one() == active
     impacts = config.get_release(draft["id"], request)["impact"]
     config.acknowledge_release(draft["id"], config.AcknowledgeRequest(
         items=[config.ImpactRef(kind=item["kind"], ref=item["ref"]) for item in impacts],
@@ -189,7 +187,15 @@ def parsing_job(runtime):
         SELECT 'poll-fixture',1,:pid,id,:version,:run,'running','parsing'
         FROM project_file WHERE version_id=:version"""),
                        {"pid": pid, "version": version, "run": run})
+    freeze_fixture_budget(request, connection)
     return request, connection
+
+
+def freeze_fixture_budget(request, connection):
+    values = request.app.state.components.configs.resolved(1)
+    connection.execute(text("UPDATE job SET config_snapshot=CAST(:snapshot AS JSONB) "
+                            "WHERE id='poll-fixture'"),
+                       {"snapshot": encode({"execution": document_execution_snapshot(values)})})
 
 
 def test_poll_interval_and_attempts_survive_new_task_invocations(runtime, monkeypatch):
@@ -202,6 +208,7 @@ def test_poll_interval_and_attempts_survive_new_task_invocations(runtime, monkey
         calls.append(True)
         return ParseJobStatus("fixture", "running", ParseProgress(10, 1, 0), False), None
 
+    freeze_fixture_budget(request, connection)
     monkeypatch.setattr(tasks, "_poll", poll)
     tasks.poll_parse.run("poll-fixture")
     first = tasks._repository.execution_start("poll-fixture", "parse")
@@ -226,6 +233,7 @@ def test_poll_interval_and_attempts_survive_new_task_invocations(runtime, monkey
 def test_expired_parse_deadline_stops_before_external_poll(runtime, monkeypatch):
     request, connection = parsing_job(runtime)
     release(request, {"job.timeout.parse_minutes": 1})
+    freeze_fixture_budget(request, connection)
     expired = datetime.now(UTC) - timedelta(minutes=2)
     connection.execute(text("""UPDATE job SET progress=jsonb_build_object(
         'parse_started_at',CAST(:started AS text)) WHERE id='poll-fixture'"""),
@@ -247,6 +255,7 @@ def test_poll_network_retry_uses_configured_delay_and_consumes_attempt(runtime, 
         calls.append(True)
         raise ParseUnavailable("测试网络故障")
 
+    freeze_fixture_budget(request, connection)
     monkeypatch.setattr(tasks, "_poll", unavailable)
     tasks.poll_parse.run("poll-fixture")
     due = connection.execute(text(
@@ -270,6 +279,7 @@ def test_conversion_uses_configured_budget_and_preserves_first_start(runtime, mo
     row = {"id": "convert-fixture", "company_id": 1}
     # 复用真实job表记录首启时间，转换适配器只记录实际收到的总预算与重试次数。
     _, connection = parsing_job(runtime)
+    freeze_fixture_budget(request, connection)
     connection.execute(text("UPDATE job SET id='convert-fixture' WHERE id='poll-fixture'"))
     received = []
 
@@ -297,41 +307,9 @@ def test_new_job_budget_stays_fixed_after_config_change(runtime):
     assert tasks._repository.runtime_values(created["job_id"]) == before
     assert before["job.timeout.parse_minutes"] == 4
     assert before["job.poll.max_attempts"] == 9
-    snapshot = connection.execute(text("SELECT config_snapshot FROM job WHERE id=:id"),
-                                  {"id": created["job_id"]}).scalar_one()
-    assert snapshot["execution_origin"] == "created"
 
 
-def test_legacy_job_freezes_first_execution_and_records_origin(runtime):
-    request, connection = parsing_job(runtime)
-    release(request, {"job.timeout.parse_minutes": 3})
-    before = tasks._repository.runtime_values("poll-fixture")
-    release(request, {"job.timeout.parse_minutes": 33})
-    assert tasks._repository.runtime_values("poll-fixture") == before
-    assert before["job.timeout.parse_minutes"] == 3
-    snapshot = connection.execute(text(
-        "SELECT config_snapshot FROM job WHERE id='poll-fixture'"
-    )).scalar_one()
-    assert snapshot["execution_origin"] == "legacy_first_execution"
-    assert snapshot["execution_frozen_at"]
 
-
-def test_legacy_job_uses_historical_snapshot_instead_of_live_values(runtime):
-    request, connection, pid = runtime
-    release(request, {"job.timeout.parse_minutes": 6})
-    version, _ = add_source(connection, pid, "历史快照")
-    created = parsing._create_parse_job(
-        version, parsing.ParseRequest(), request, force=True,
-    )
-    # 模拟升级前的任务：只有 config_snapshot_id，没有内嵌 execution 数据。
-    connection.execute(text("""UPDATE job SET config_snapshot = config_snapshot
-        - 'execution' - 'execution_origin' WHERE id=:id"""), {"id": created["job_id"]})
-    release(request, {"job.timeout.parse_minutes": 66})
-    restored = tasks._repository.runtime_values(created["job_id"])
-    assert restored["job.timeout.parse_minutes"] == 6
-    snapshot = connection.execute(text("SELECT config_snapshot FROM job WHERE id=:id"),
-                                  {"id": created["job_id"]}).scalar_one()
-    assert snapshot["execution_origin"] == "job_config_snapshot"
 
 
 def test_submit_retry_backoff_survives_new_task_messages(runtime, monkeypatch):

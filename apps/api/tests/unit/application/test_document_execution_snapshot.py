@@ -39,7 +39,6 @@ def test_parse_job_freezes_runtime_values_and_excludes_dispatch_controls():
     service.create_job(4, tier=None, ocr_mode=None, force=False, reason=None, actor="test")
     snapshot = created[0]["config_snapshot"]
     values["job.timeout.parse_minutes"] = 99
-    assert snapshot["execution_origin"] == "created"
     assert snapshot["execution"]["job.timeout.parse_minutes"] == 7
     assert snapshot["execution"]["job.poll.max_attempts"] == 12
     assert "dispatch.interval_seconds" not in snapshot["execution"]

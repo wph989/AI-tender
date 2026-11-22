@@ -52,7 +52,7 @@ def indexed_sources(environment, count=2):
 
 
 @pytest.mark.parametrize("query", ["资质 等级", "不存在的词"])
-@pytest.mark.parametrize("vector", [None, [1.0, 0.0]])
+@pytest.mark.parametrize("vector", [None, [1.0, 0.0], [0.0, 0.0]])
 @pytest.mark.parametrize("threshold", [None, 0.0, 0.6, 1.0])
 def test_sql_ranking_matches_reference_with_mixed_sources(environment, query, vector, threshold):
     db, sources, vectors = indexed_sources(environment)
