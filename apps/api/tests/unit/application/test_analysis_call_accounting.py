@@ -18,6 +18,7 @@ from tender.domain.shared.errors import (
     ModelCallFailed,
     ModelUnavailable,
 )
+from tender.ports.llm.chat import Completion
 
 
 class InvocationStore:
@@ -31,24 +32,26 @@ class InvocationStore:
         self.rows[key] = copy.deepcopy(value)
 
 
-def test_protocol_validation_runs_before_success_and_shares_configured_retries():
-    records, validations = [], []
-    gateway = _ScriptedGateway({"a": [None, None], "b": [None]})
+def messages():
+    return [{"type": "human", "data": {"id": "checkpoint-1", "content": "核对原文"}}]
+
+
+def test_native_protocol_error_shares_configured_retries_and_records_tokens():
+    records = []
+    failure = InvalidModelOutput("工具参数缺少必填ID")
+    failure.prompt_tokens, failure.completion_tokens = 3, 5
+    gateway = _ScriptedGateway({"a": [failure, None]})
     model = RoutingModel(
         "analysis", "fixture", [replace(_candidate("a", 1), extra_retries=1)],
         gateway, records.append,
     )
 
-    def validate(completion):
-        validations.append(completion.content)
-        if len(validations) == 1:
-            raise InvalidModelOutput("reviews 缺少本包ID")
-
-    asyncio.run(model.complete_validated("审查", validate=validate, call_key="packet"))
+    asyncio.run(model.chat(messages(), []))
     assert [r.status for r in records] == ["error", "ok"]
     assert [r.request_ordinal for r in records] == [1, 2]
     assert len({r.invocation_id for r in records}) == 1
-    assert "reviews 缺少本包ID" in gateway.prompts[1]
+    assert "工具参数缺少必填ID" in gateway.prompts[1]
+    assert [(r.prompt_tokens, r.completion_tokens) for r in records] == [(3, 5), (3, 5)]
 
 
 def test_zero_extra_retries_does_not_secretly_add_format_corrections():
@@ -58,7 +61,7 @@ def test_zero_extra_retries_does_not_secretly_add_format_corrections():
         _ScriptedGateway({"a": [InvalidModelOutput("格式错误"), None]}), records.append,
     )
     with pytest.raises(ModelCallFailed):
-        asyncio.run(model.complete("审查"))
+        asyncio.run(model.chat(messages(), []))
     assert len(records) == 1
 
 
@@ -72,24 +75,24 @@ def test_exhausted_invocation_is_not_reopened_by_new_router():
             invocation_store=store,
         )
         with pytest.raises((ModelCallFailed, ModelUnavailable)):
-            asyncio.run(model.complete_validated("审查", call_key="same-packet"))
+            asyncio.run(model.chat(messages(), []))
     assert len(records) == 2
     assert [r.request_ordinal for r in records] == [1, 2]
 
 
-def test_validated_business_rejection_is_cached_across_router_recreation():
+def test_business_rejection_is_success_and_cached_across_router_recreation():
     store, records = InvocationStore(), []
+    rejection = Completion('{"status":"unsupported","reason":"原文无此要求"}', "a", 3, 5)
     for _ in range(2):
-        gateway = _ScriptedGateway({"a": [None]})
+        gateway = _ScriptedGateway({"a": [rejection]})
         model = RoutingModel(
             "analysis", "fixture", [_candidate("a", 1)], gateway, records.append,
             invocation_store=store,
         )
-        result = asyncio.run(model.complete_validated(
-            "审查", call_key="same-packet", validate=lambda c: json.loads(c.content),
-        ))
-        assert json.loads(result.content) == {"ok": True}
+        result = asyncio.run(model.chat(messages(), []))
+        assert json.loads(result.content)["status"] == "unsupported"
     assert len({(r.invocation_id, r.request_ordinal) for r in records}) == 1
+    assert all(r.status == "ok" for r in records)
 
 
 def test_rate_limited_sends_have_unique_ordinals_and_obey_total_request_limit():
@@ -101,7 +104,7 @@ def test_rate_limited_sends_have_unique_ordinals_and_obey_total_request_limit():
         rate_limit_backoff_seconds=0, rate_limit_max_wait_seconds=1,
     )
     with pytest.raises((ModelCallFailed, ModelUnavailable)):
-        asyncio.run(model.complete("审查"))
+        asyncio.run(model.chat(messages(), []))
     assert [r.request_ordinal for r in records] == [1, 2]
 
 
@@ -121,7 +124,7 @@ def test_cancel_during_reservation_preserves_identity_and_frozen_retry_policy():
             gateway, records.append, invocation_store=store, before_call=before,
             max_total_requests=2,
         )
-        task = asyncio.create_task(first.complete_validated("审查", call_key="packet"))
+        task = asyncio.create_task(first.chat(messages(), []))
         await entered.wait()
         task.cancel()
         release.set()
@@ -133,7 +136,7 @@ def test_cancel_during_reservation_preserves_identity_and_frozen_retry_policy():
             "analysis", "fixture", [replace(_candidate("a", 1), extra_retries=0)],
             gateway, records.append, invocation_store=store, max_total_requests=1,
         )
-        await second.complete_validated("审查", call_key="packet")
+        await second.chat(messages(), [])
         assert [r.request_ordinal for r in records] == [1, 2]
         assert len({r.invocation_id for r in records}) == 1
 
@@ -141,22 +144,21 @@ def test_cancel_during_reservation_preserves_identity_and_frozen_retry_policy():
 
 
 def test_protocol_error_then_timeout_share_one_window_and_token_ledger():
-    records, validations = [], []
+    records = []
+    failure = InvalidModelOutput("工具参数缺少判定ID")
+    failure.prompt_tokens, failure.completion_tokens = 3, 5
     model = RoutingModel(
         "analysis", "fixture", [replace(_candidate("a", 1), extra_retries=3)],
-        _ScriptedGateway({"a": [None, ModelUnavailable("504", http_status=504), None]}),
+        _ScriptedGateway({"a": [failure, ModelUnavailable("504", http_status=504), None]}),
         records.append, max_total_requests=2, retry_base_seconds=0,
     )
 
-    def reject(completion):
-        validations.append(completion)
-        raise InvalidModelOutput("缺少判定ID")
-
     with pytest.raises(ModelCallFailed):
-        asyncio.run(model.complete_validated("审查", validate=reject))
+        asyncio.run(model.chat(messages(), []))
     assert [r.request_ordinal for r in records] == [1, 2]
     assert [r.status for r in records] == ["error", "error"]
-    assert len(validations) == 1
+    assert records[0].prompt_tokens == 3 and records[0].completion_tokens == 5
+    assert records[1].prompt_tokens is None and records[1].completion_tokens is None
     assert len({r.invocation_id for r in records}) == 1
 
 
@@ -182,7 +184,7 @@ def test_checkpoint_resume_does_not_reopen_window_when_budget_hint_changes():
 
 
 @pytest.mark.parametrize("budget_error", [False, True])
-def test_exhausted_window_preserves_failure_class_and_deadline_after_router_recreation(
+def test_exhausted_window_preserves_failure_class_and_records_after_router_recreation(
     budget_error,
 ):
     async def run():
@@ -195,32 +197,18 @@ def test_exhausted_window_preserves_failure_class_and_deadline_after_router_recr
             remaining_seconds=(lambda: 0) if budget_error else None,
         )
         with pytest.raises(error_type):
-            await first.complete_validated("审查", call_key="packet")
+            await first.chat(messages(), [])
         original = copy.deepcopy(store.rows)
         second = RoutingModel(
             "analysis", "fixture", [_candidate("a", 1)],
             _ScriptedGateway({"a": [None]}), records.append, invocation_store=store,
         )
         with pytest.raises(error_type):
-            await second.complete_validated("审查", call_key="packet")
+            await second.chat(messages(), [])
         assert store.rows == original
         assert len(records) == (0 if budget_error else 1)
 
     asyncio.run(run())
-
-
-def test_legacy_exhausted_window_uses_incomplete_settlement_without_a_new_request():
-    store, records = InvocationStore(), []
-    store.rows["packet"] = {"exhausted": True, "error": "上游504", "deadline_at": 12345,
-                            "requests": [{"ordinal": 1}]}
-    original = copy.deepcopy(store.rows)
-    model = RoutingModel(
-        "analysis", "fixture", [_candidate("a", 1)], _ScriptedGateway({"a": [None]}),
-        records.append, invocation_store=store,
-    )
-    with pytest.raises(ModelBudgetExhausted, match="上游504"):
-        asyncio.run(model.complete_validated("审查", call_key="packet"))
-    assert not records and store.rows == original
 
 
 @pytest.mark.parametrize("has_results", [False, True])
@@ -245,7 +233,7 @@ def test_executor_settles_restored_unavailable_window_without_losing_verified_re
         router = RoutingModel("analysis", "fixture", [_candidate("a", 1)], gateway,
                               records.append, invocation_store=store)
         with pytest.raises(ModelUnavailable):
-            await router.complete_validated("研究下一事项", call_key="checkpoint")
+            await router.chat(messages(), [])
         original = copy.deepcopy(store.rows)
         runtime = Mock()
         runtime.run = {"state": state, "limits": asdict(AgentLimits()), "thread_id": "same",
@@ -257,7 +245,7 @@ def test_executor_settles_restored_unavailable_window_without_losing_verified_re
             yield None
 
         async def invoke(*args, **kwargs):
-            await router.complete_validated("研究下一事项", call_key="checkpoint")
+            await router.chat(messages(), [])
 
         async def claimed(*args):
             pass

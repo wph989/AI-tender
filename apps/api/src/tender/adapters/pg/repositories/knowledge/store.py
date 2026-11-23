@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import Any
 
 from sqlalchemy import (
@@ -1502,7 +1502,7 @@ class KnowledgeSession:
         cancel_unlocked_runs(self._connection(), report_id)
 
     def modules_for_retry(
-        self, report_id: int, keys: list[str], *, explicit: bool
+        self, report_id: int, keys: list[str]
     ) -> list[dict[str, Any]]:
         statement = (
             select(AnalysisModule.id, AnalysisModule.status, AnalysisModule.business_data)
@@ -1518,14 +1518,6 @@ class KnowledgeSession:
             .execute(select(exists().where(AnalysisModule.report_id == report_id)))
             .scalar_one()
         )
-
-    def reset_modules(self, module_ids: list[int]) -> None:
-        if module_ids:
-            self._connection().execute(
-                update(AnalysisModule)
-                .where(AnalysisModule.id.in_(module_ids))
-                .values(items=[], business_data={})
-            )
 
     def mark_modules_pending(self, module_ids: list[int]) -> None:
         if module_ids:
@@ -1587,17 +1579,9 @@ class KnowledgeSession:
         return self.configs.snapshot_for_job(self._connection(), active)
 
 
-@contextmanager
-def project_lock(connection: Any, project_id: int):
-    """给调用方在同一事务里显式加项目会话锁的便捷包装。"""
-    connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": project_id})
-    yield connection
-
-
 __all__ = [
     "KnowledgeSession",
     "KnowledgeStore",
     "ensure_project_collection",
-    "project_lock",
     "sync_sources",
 ]

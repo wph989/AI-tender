@@ -68,7 +68,7 @@ def refresh_input(state: dict, sources: list[dict]) -> None:
     research = state.get("research", {})
     seen = {key: row for key, row in research.get("seen", {}).items()
             if (row["source_id"], row.get("version_id"), row.get("parse_run_id")) in allowed}
-    research.update(seen=seen, dependencies={})
+    research.update(seen=seen)
     items = [item for item in state.get("staged_items", [])
              if all(ref.get("block_id") in seen
                     for ref in item.get("business", {}).get("citations", []))]

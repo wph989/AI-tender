@@ -145,17 +145,6 @@ class SynthesisRecord(BusinessRecord):
 
 
 
-class GapInput(DataInput):
-    key: str = Field(min_length=1, max_length=100)
-    topic: str = Field(min_length=1, max_length=100)
-    scope: DataScope
-    code: Literal[
-        "unresolved_reference", "unknown_condition", "scope_unknown", "conflict",
-        "missing_source", "incomplete_structure", "search_exhausted",
-    ]
-    detail: str = Field(min_length=1, max_length=2000)
-
-
 def record_identity(state: dict, key: str) -> str:
     # 命名空间随检查点保存；改名、改值、换引用不会改变同一个 key 的身份。
     namespace = state.setdefault("business_namespace", str(uuid4()))

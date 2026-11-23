@@ -7,7 +7,7 @@ import re
 import pytest
 from test_analysis_research import block
 
-from tender.application.analysis.data import GapInput, SynthesisRecord, prepare_records
+from tender.application.analysis.data import SynthesisRecord, prepare_records
 from tender.application.analysis.drafts import DraftRecord, DraftWorkspace
 from tender.application.analysis.output import output_schema
 from tender.application.analysis.policy import load_module_skill
@@ -116,8 +116,6 @@ def test_packaged_examples_pass_real_record_and_citation_validation(path):
             raw = [business_record(r) for r in submission["records"]]
             entries = prepare_records(raw, state, seen, key)
             state["staged_items"].extend(entries)
-            for gap in submission.get("gaps", []):
-                GapInput.model_validate(gap)
             for item in entries:
                 assert item["output"]["content"] == item["business"]["content"]
                 for ref in item["business"]["citations"]:

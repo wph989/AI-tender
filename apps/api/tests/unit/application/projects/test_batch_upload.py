@@ -26,7 +26,6 @@ def run_upload(effects):
         tier=None,
         ocr_mode=None,
         role=None,
-        actor="test",
     ))
     return result, service.add_project_file
 

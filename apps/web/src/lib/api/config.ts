@@ -1,7 +1,6 @@
 /** 配置中心 API 客户端。 */
 
 import type {
-  ConfigAuditEntry,
   ConfigItemsResponse,
   ConfigRelease,
   ConfigReleaseDetail,
@@ -57,9 +56,4 @@ export function activateRelease(
 
 export function rollbackRelease(id: number, reason?: string): Promise<{ id: number }> {
   return sendJson<{ id: number }>(BASE + "/releases/" + id + "/rollback", "POST", { reason });
-}
-
-export async function listAudit(limit = 50): Promise<ConfigAuditEntry[]> {
-  const data = await sendJson<{ items: ConfigAuditEntry[] }>(BASE + "/audit?limit=" + limit, "GET");
-  return data.items;
 }

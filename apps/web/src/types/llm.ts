@@ -63,7 +63,6 @@ export interface AdapterProfile {
   default_capabilities: string[];
   parameter_schema: Record<string, ParameterSchema>;
   adapter_version: string;
-  parameter_bounds: Record<string, { min: number; max?: number }>;
 }
 export interface LlmSettings {
   secret_key_ready: boolean;
@@ -160,7 +159,6 @@ export interface LlmBinding {
 }
 
 export interface LlmFeature {
-  binding_available?: boolean;
   revision: number;
   max_total_requests: number;
   required_kind: ModelKind;

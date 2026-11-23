@@ -125,7 +125,7 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
   const modelById = new Map(models.map((model) => [model.id, model]));
   const unbound = models.filter(
     (model) =>
-      active.binding_available !== false && !ids.includes(model.id) &&
+      !ids.includes(model.id) &&
       model.kind === active.required_kind &&
       (active.required_kind !== "language" ||
         model.capabilities.includes("json_output")),
@@ -168,7 +168,6 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
               </h2>
               <p className="mt-1 text-[13px] leading-5 text-slate-500">
                 暂时故障按模型的额外次数重试，再尝试后续候选；请求总量与时间预算始终优先。
-                图片生成目前仅支持在模型列表中测试，尚未接入业务功能绑定。
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-2 whitespace-nowrap text-[13px] text-slate-600">
@@ -401,7 +400,7 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
             <Button
               htmlType="button"
 
-              disabled={active.binding_available === false || pendingAdd === "" || ids.length >= maxBindings}
+              disabled={pendingAdd === "" || ids.length >= maxBindings}
               onClick={add}
             >
               添加为备选

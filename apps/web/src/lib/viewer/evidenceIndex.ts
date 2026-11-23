@@ -1,5 +1,4 @@
 import type { Bbox } from "@/lib/coords/bbox";
-import type { ActiveEvidence } from "@/lib/store/viewerStore";
 
 /** 原文定位只接收证据身份，不依赖任何业务结果模型。 */
 export interface EvidenceTarget {
@@ -19,14 +18,4 @@ export interface EvidenceItem extends EvidenceTarget {
 export interface EvidenceIndex {
   byPage: Map<number, EvidenceItem[]>;
   byEvidence: Map<number, EvidenceTarget[]>;
-}
-
-export function toActiveEvidence(target: EvidenceTarget): ActiveEvidence {
-  return {
-    evidenceId: target.evidenceId,
-    anchor: target.anchor,
-    pageNo: target.pageNo,
-    bbox: target.bbox,
-    label: target.label,
-  };
 }

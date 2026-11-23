@@ -59,7 +59,6 @@ from tender.domain.analysis.contract import (
     RUNTIME_VERSION,
     is_current_report,
 )
-from tender.ports.configuration.registry import ConfigReader
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.repository.analysis.reports import ReportRepository
 
@@ -85,12 +84,10 @@ class AnalysisService:
         self,
         repository: ReportRepository,
         company_id: int,
-        configs: ConfigReader,
         embedding_gateway: Callable[[dict], EmbeddingModel],
         knowledge: KnowledgeService,
     ) -> None:
         self.company_id = company_id
-        self.configs = configs
         self.embedding_gateway = embedding_gateway
         self.store = repository
         self.knowledge = knowledge
@@ -581,7 +578,7 @@ class AnalysisService:
             if tx.other_active_report(report["project_id"], report_id) is not None:
                 raise Conflict("项目已有其它分析任务", code="analysis_in_flight")
             # 完成状态不能证明已处理当前资料；统一取回后按专题输入和质量筛选。
-            rows = tx.modules_for_retry(report_id, keys, explicit=explicit)
+            rows = tx.modules_for_retry(report_id, keys)
             changed = False
             current_sources = report.get("source_snapshot", [])
             current_references = report.get("reference_snapshot", [])

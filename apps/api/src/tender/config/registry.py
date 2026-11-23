@@ -64,8 +64,6 @@ class ConfigRegistry:
         self,
         connection: Connection,
         active: ActiveConfig | None = None,
-        *,
-        company_id: int | None = None,
     ) -> int | None:
         """在创建任务的同一个事务里写配置快照，返回快照 ID。
 

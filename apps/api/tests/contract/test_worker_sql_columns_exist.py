@@ -1,15 +1,9 @@
-"""裸 SQL 里 `别名.列名` 引用的列必须在 DDL 里存在（2026-10-01 真机 bug 的回归）。
+"""裸 SQL 中的 `别名.列名` 必须属于当前基线对应的物理表。
 
-背景：`worker/extraction.py` 的 `_load_candidates` 曾写 `m.api_key_ciphertext`，
-但 `api_key_ciphertext` 属于 `llm_provider`（见 alembic 0003 第 21 行与
-docs/设计/12 第 6 节，api/llm.py 取的是 `p.api_key_ciphertext`）。这个错误只在真机
-跑抽取时以 `column m.api_key_ciphertext does not exist` 暴露，而抽取这一环此前从没
-仓储SQL必须与当前物理列对应，不能依靠历史运行结果判断正确。
+SQL 列引用不会被 Python 编译器、Ruff 或分层检查验证，需要独立核对物理结构。
+与 ORM 和文档契约共用基线解析器，避免不同测试维护不同的表、列事实源。
 
-为什么值得单独一个契约测试：这类错误编译器、ruff、分层检查全都不管，只有真机才会报，
-而「真机跑一遍抽取」的成本远高于一个纯文本断言。
-
-扫描范围仍保留 `worker/` 与 `adapters/pg/`，以覆盖历史位置的潜在回流。
+扫描范围包括 `worker/` 与 `adapters/pg/`。
 当前 Worker 不允许直接访问数据库，导入边界由 test_layer_boundaries.py 检查；
 ORM 表达不到的系统目录查询留在 adapters/pg/locks.py 与
 repositories/analysis/runtime.py。这里仅核对能够识别的裸 SQL 列引用。
@@ -24,17 +18,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from test_orm_models_match_ddl import _parse_ddl_columns
+
 API_ROOT = Path(__file__).resolve().parents[2]
 SQL_DIRS = (
     API_ROOT / "src" / "tender" / "worker",
     API_ROOT / "src" / "tender" / "adapters" / "pg",
 )
-ALEMBIC_DIR = API_ROOT / "alembic" / "versions"
-
-_CREATE_TABLE = re.compile(r"CREATE TABLE\s+(\w+)\s*\((?P<body>.*?)\);", re.S)
-# 不少列是后加的（0001 的 document.company_id、0002 的 project_file.sha256…），
-# 漏掉 ALTER 会把它们误判成「不存在的列」——这个测试必须先真的承认 DDL 的现状。
-_ALTER_ADD = re.compile(r"ALTER TABLE\s+(\w+)\s+(.*?);", re.I | re.S)
 _ALIAS = re.compile(r"\b(\w+)\s+AS\s+(\w+)\b")
 # 适配层的 pg_locks 查询用简写别名（`FROM agent_module_run a`），不带 AS 关键字。
 _IMPLICIT_ALIAS = re.compile(r"\b(?:FROM|JOIN)\s+(\w+)\s+(\w+)\b", re.I)
@@ -46,28 +36,6 @@ _SQL_KEYWORDS = {
     "SELECT", "VALUES", "RETURNING", "USING", "AS", "WITH", "HAVING",
 }
 _QUALIFIED = re.compile(r"\b(\w+)\.(\w+)\b")
-# DDL 的列定义行：第一段是列名；约束行不是列。
-_NOT_A_COLUMN = {"CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "LIKE"}
-
-
-def _ddl_columns() -> dict[str, set[str]]:
-    """从全部迁移里解析出 表名 → 列名集合。"""
-    tables: dict[str, set[str]] = {}
-    for path in sorted(ALEMBIC_DIR.glob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        for match in _CREATE_TABLE.finditer(text):
-            table = match.group(1)
-            columns: set[str] = tables.setdefault(table, set())
-            for line in match.group("body").splitlines():
-                head = line.strip().split(" ")[0].strip(",")
-                if not head or head.upper() in _NOT_A_COLUMN:
-                    continue
-                columns.add(head)
-        for table, operations in _ALTER_ADD.findall(text):
-            # 同一 ALTER 可以连续 ADD 多列，不能只识别第一列而误报合法 SQL。
-            for column in re.findall(r"\bADD COLUMN\s+(\w+)", operations, re.I):
-                tables.setdefault(table, set()).add(column)
-    return tables
 
 
 def _sql_blocks(source: str) -> list[str]:
@@ -85,7 +53,7 @@ def _aliases(sql: str) -> dict[str, str]:
 
 
 def test_sql_columns_belong_to_their_alias_target() -> None:
-    tables = _ddl_columns()
+    tables = {table: set(columns) for table, columns in _parse_ddl_columns().items()}
     assert tables, "没有解析到任何表结构，DDL 解析器已经和迁移格式脱节"
 
     checked = 0

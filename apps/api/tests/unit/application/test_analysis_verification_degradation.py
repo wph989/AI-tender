@@ -12,7 +12,6 @@ class _RetryTx:
     def __init__(self, rows, previous):
         self.rows, self.previous = rows, previous
         self.retry_call = None
-        self.reset = None
         self.pending = None
         self.inserted = []
 
@@ -37,15 +36,12 @@ class _RetryTx:
     def other_active_report(self, project_id, report_id):
         return None
 
-    def modules_for_retry(self, report_id, keys, *, explicit):
-        self.retry_call = (report_id, keys, explicit)
+    def modules_for_retry(self, report_id, keys):
+        self.retry_call = (report_id, keys)
         return self.rows
 
     def report_has_modules(self, report_id):
         return True
-
-    def reset_modules(self, module_ids):
-        self.reset = module_ids
 
     def mark_modules_pending(self, module_ids):
         self.pending = module_ids
@@ -89,13 +85,13 @@ def test_partial_report_retry_selects_partial_modules():
     approve(book, saved(book))
     previous = copy.deepcopy(book.state)
     tx = _RetryTx([{"id": 9, "status": "partial"}], previous)
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
+    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
     result = service.retry_report(
         3, module_keys=[], max_output_tokens=None, timeout_seconds=None
     )
     assert result["status"] == "pending"
-    assert tx.retry_call == (3, list(MODULES), False)
-    assert tx.reset is None and tx.pending == [9]
+    assert tx.retry_call == (3, list(MODULES))
+    assert tx.pending == [9]
     carried = tx.inserted[0]["state"]
     assert carried["staged_items"] == previous["staged_items"]
     assert carried["agent_workspace"]["reviews"] == previous["agent_workspace"]["reviews"]

@@ -41,13 +41,6 @@ __all__ = [
 
 CATEGORIES = {"engineering": "工程", "goods": "货物", "service": "服务"}
 TOPICS = {"installation": "安装施工", "commissioning": "调试验收", "maintenance": "运维服务"}
-PURPOSES = {
-    "tender": "招标材料",
-    "company": "企业资料",
-    "history": "历史标书",
-    "reference": "参考资料",
-}
-
 
 def encode(value: object) -> str:
     """JSONB 参数与日志正文共用的序列化口径：中文不转义、未知类型落回字符串。"""

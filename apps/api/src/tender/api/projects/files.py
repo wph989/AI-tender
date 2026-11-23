@@ -8,7 +8,7 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import Response
 
-from tender.api.shared.common import actor, blobs, configs, engine
+from tender.api.shared.common import blobs, configs, engine
 from tender.api.shared.errors import as_api_problem
 from tender.api.shared.responses import ProjectFileResponse, ReplaceFileResponse, UploadResponse
 from tender.api.shared.storage import stream_object
@@ -79,7 +79,6 @@ async def upload_files(
             tier=tier,
             ocr_mode=ocr_mode,
             role=role,
-            actor=actor(request),
         )
     except ServiceError as exc:
         raise as_api_problem(exc) from exc
@@ -117,7 +116,6 @@ async def replace_file(
             auto_parse=auto_parse,
             tier=tier,
             ocr_mode=ocr_mode,
-            actor=actor(request),
         )
     except ServiceError as exc:
         raise as_api_problem(exc) from exc
@@ -164,34 +162,3 @@ async def _read_upload(
     if not content:
         raise InvalidArgument("不能上传空文件")
     return FileInput(name, content)
-
-
-async def _add_project_file(
-    request: Request,
-    *,
-    project_id: int,
-    item: FileInput,
-    role: str,
-    auto_parse: bool,
-    tier: str | None,
-    ocr_mode: str | None,
-    replaces_id: int | None,
-    sort_no: int | None = None,
-    display_name: str | None = None,
-) -> dict[str, object]:
-    """保留旧入口给内部调用与回归测试；实际逻辑在服务层。"""
-    try:
-        return await _service(request).add_project_file(
-            project_id=project_id,
-            item=item,
-            role=role,
-            auto_parse=auto_parse,
-            tier=tier,
-            ocr_mode=ocr_mode,
-            replaces_id=replaces_id,
-            actor=actor(request),
-            sort_no=sort_no,
-            display_name=display_name,
-        )
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc

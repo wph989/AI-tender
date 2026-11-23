@@ -57,6 +57,10 @@ class MiddleJson:
 
 
 class DocumentParser(Protocol):
+    async def aclose(self) -> None:
+        """提交、轮询与排空结束后释放客户端，避免 Worker 遗留连接。"""
+        ...
+
     async def submit(
         self,
         pdf_key: str,
@@ -74,8 +78,4 @@ class DocumentParser(Protocol):
 
     async def fetch_middle_json(self, job_id: str) -> MiddleJson:
         """用任务句柄查找并下载已完成任务的 MiddleJson。"""
-        ...
-
-    async def health(self) -> bool:
-        """探测解析服务；任何非 200 响应都表示不健康。"""
         ...

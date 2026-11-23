@@ -11,8 +11,6 @@ from fastapi import Request
 
 from tender.config import schema
 from tender.config.registry import ConfigRegistry
-from tender.ports.documents.converter import OfficeConverter
-from tender.ports.jobs.queue import TaskQueue
 from tender.ports.storage.blob_store import BlobStore
 
 
@@ -24,16 +22,8 @@ def blobs(request: Request) -> BlobStore:
     return request.app.state.components.blobs
 
 
-def converter(request: Request) -> OfficeConverter:
-    return request.app.state.components.converter
-
-
 def configs(request: Request) -> ConfigRegistry:
     return request.app.state.components.configs
-
-
-def queue(request: Request) -> TaskQueue:
-    return request.app.state.components.queue
 
 
 def role(request: Request) -> str:

@@ -31,7 +31,6 @@ from tender.application.llm.registry import (
     DEFAULT_FAILOVER_LIMIT,
     FEATURE_DESCRIPTIONS,
     FEATURES,
-    INACTIVE_FEATURES,
     MAX_BINDINGS,
     binding_rows,
 )
@@ -646,7 +645,6 @@ class LlmService:
                     if configured
                     else DEFAULT_FAILOVER_LIMIT,
                     "description": FEATURE_DESCRIPTIONS[key],
-                    "binding_available": key not in INACTIVE_FEATURES,
                     "bindings": bindings,
                 }
             )
@@ -658,11 +656,6 @@ class LlmService:
 
     def update_feature(self, feature_key: str, values: Mapping[str, Any]) -> dict[str, Any]:
         self._require_feature(feature_key)
-        if feature_key in INACTIVE_FEATURES:
-            raise Conflict(
-                "该功能尚未接入业务调用，无需设置路由预算",
-                code="feature_unavailable",
-            )
         with self.repository.transaction() as transaction:
             revision = transaction.lock_feature(feature_key)
             if revision is None:
@@ -681,11 +674,6 @@ class LlmService:
     def replace_bindings(self, feature_key: str, values: Mapping[str, Any]) -> dict[str, Any]:
         self._require_feature(feature_key)
         model_ids = list(values["model_ids"])
-        if feature_key in INACTIVE_FEATURES and model_ids:
-            raise Conflict(
-                "该功能尚未接入业务调用，请在模型列表测试",
-                code="feature_unavailable",
-            )
         if feature_key in {"embedding", "rerank"} and len(model_ids) > 1:
             raise InvalidArgument("当前向量与重排功能只支持绑定一个模型")
         rows = binding_rows(model_ids)

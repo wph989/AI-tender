@@ -34,7 +34,6 @@ export const profile = {
     temperature: { label: "温度", type: "number", min: 0, max: 2 },
     max_tokens: { label: "输出上限", type: "integer", min: 1, max: 100000 },
   },
-  parameter_bounds: {},
   adapter_version: "test",
 };
 export const models = Array.from({ length: 20 }, (_, i) => ({

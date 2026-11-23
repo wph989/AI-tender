@@ -31,7 +31,6 @@ from tender.ports.documents.converter import ConvertResult
 
 _CONVERT_PATH = "/forms/libreoffice/convert"
 _VERSION_PATH = "/version"
-_HEALTH_PATH = "/health"
 
 # 我们的固定取值（docs/调研/02 第 3.2 节）。
 _CONVERT_OPTIONS: dict[str, str] = {
@@ -159,17 +158,6 @@ class GotenbergConverter:
             )
         self._version = version
         return version
-
-    async def health(self) -> bool:
-        """健康检查按「非 200 即不健康」判定（503 = 依赖模块未就绪），且不抛异常。
-
-        调用方要的是状态而不是异常——健康探针抛错会把「不健康」与「探针本身写错了」混在一起。
-        """
-        try:
-            response = await self._client.get(_HEALTH_PATH)
-        except httpx.HTTPError:
-            return False
-        return response.status_code == 200
 
     async def to_pdf(self, src: BinaryIO, *, filename: str, trace_id: str) -> ConvertResult:
         version = await self.version()

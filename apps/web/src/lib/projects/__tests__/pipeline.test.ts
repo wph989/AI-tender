@@ -1,6 +1,6 @@
 ﻿import { describe, expect, it } from "vitest";
 
-import { derivePipeline, needsReparse, type PipelineInput } from "../pipeline";
+import { derivePipeline, type PipelineInput } from "../pipeline";
 
 function input(overrides: Partial<PipelineInput> = {}): PipelineInput {
   return { version_id: 7, parse_status: "completed", ...overrides };
@@ -48,20 +48,5 @@ describe("文件转换与解析", () => {
     }
     expect(derivePipeline(input({ parse_status: "partial" })))
       .toMatchObject({ inFlight: false, tone: "done", headline: "部分解析完成" });
-  });
-});
-
-describe("建议重新解析的条件", () => {
-  it("有版本且解析未完成或失败时建议重试", () => {
-    for (const parse_status of [null, "failed", "canceled"]) {
-      expect(needsReparse(input({ parse_status }))).toBe(true);
-    }
-  });
-
-  it("无版本、正在处理或已有解析成果时不重复建议", () => {
-    expect(needsReparse(input({ version_id: null, parse_status: null }))).toBe(false);
-    for (const parse_status of ["running", "pending", "completed", "partial"]) {
-      expect(needsReparse(input({ parse_status }))).toBe(false);
-    }
   });
 });

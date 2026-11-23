@@ -101,10 +101,6 @@ export async function deleteModel(id: number): Promise<void> {
   await sendJson<unknown>(BASE + "/models/" + id, "DELETE");
 }
 
-export function testModel(id: number): Promise<LlmTestResult> {
-  return sendJson<LlmTestResult>(BASE + "/models/" + id + "/test", "POST", {});
-}
-
 export async function listFeatures(): Promise<LlmFeature[]> {
   const data = await sendJson<{ items: LlmFeature[] }>(BASE + "/features", "GET");
   return data.items;

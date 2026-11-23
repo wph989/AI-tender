@@ -4,9 +4,11 @@ import asyncio
 import os
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from fastapi import UploadFile
 from sqlalchemy import text
 from test_knowledge_flow import add_source
 from test_llm_management import env as env
@@ -164,10 +166,11 @@ def test_upload_and_reparse_freeze_configured_defaults_with_explicit_override(ru
         items=[config.ImpactRef(kind=item["kind"], ref=item["ref"]) for item in impacts],
     ), request)
     config.activate_release(draft["id"], config.ActivateRequest(), request)
-    upload = asyncio.run(project_files._add_project_file(
-        request, project_id=pid, item=project_files.FileInput("样本.pdf", b"%PDF-fixture"),
-        role="main", auto_parse=True, tier=None, ocr_mode=None, replaces_id=None,
+    receipt = asyncio.run(project_files.upload_files(
+        pid, request,
+        files=[UploadFile(filename="样本.pdf", file=BytesIO(b"%PDF-fixture"))], role="main",
     ))
+    upload = receipt["added"][0]
     snapshot = connection.execute(text("SELECT config_snapshot FROM job WHERE id=:id"),
                                   {"id": upload["job_id"]}).scalar_one()
     assert snapshot["tier"] == "advanced" and snapshot["ocr_mode"] == "ocr"

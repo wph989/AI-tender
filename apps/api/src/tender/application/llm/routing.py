@@ -167,11 +167,6 @@ class RoutingModel:
     async def complete(self, prompt: str) -> Completion:
         return await self._complete(prompt)
 
-    async def complete_validated(self, prompt: str, *, validate=None, call_key=None,
-                                 validate_input=None) -> Completion:
-        return await self._complete(prompt, validate=validate, call_key=call_key,
-                                    validate_input=validate_input)
-
     async def chat(self, messages: list[dict], tools: list[dict]) -> Completion:
         # 图检查点里的消息ID固定；恢复时动态预算提示变化不能生成一套新调用额度。
         checkpoint = [m for m in messages if m.get("data", {}).get("id")
@@ -183,7 +178,7 @@ class RoutingModel:
                                     call_key=call_key)
 
     async def _complete(self, prompt: str, chat_request: dict | None = None,
-                        *, validate=None, call_key=None, validate_input=None) -> Completion:
+                        *, call_key: str | None = None) -> Completion:
         key = call_key or hashlib.sha256(json.dumps(
             [prompt, chat_request], ensure_ascii=False, sort_keys=True,
         ).encode("utf-8")).hexdigest()
@@ -195,7 +190,6 @@ class RoutingModel:
             return Completion(**window["result"])
         if window.get("exhausted"):
             # 恢复必须保留可部分收尾的错误类型，不能把网络故障改成业务失败。
-            # 旧窗口没有类型时按预算耗尽收尾，仍保留已核实成果且不重新发送请求。
             failure_type = {
                 "ModelUnavailable": ModelUnavailable,
                 "ModelBudgetExhausted": ModelBudgetExhausted,
@@ -210,8 +204,6 @@ class RoutingModel:
                 failure.invocation_exhausted = True
             raise failure
         invocation_id = window.setdefault("invocation_id", str(uuid4()))
-        # 旧窗口的时间限制已取消；请求身份、次数和有效结果仍用于恢复。
-        window.pop("deadline_at", None)
         window.setdefault("requests", [])
         original_input = window.setdefault("input", {
             "prompt": prompt, "chat_request": chat_request,
@@ -226,10 +218,6 @@ class RoutingModel:
                 "total_timeout": c.total_timeout,
             } for c in self._candidates},
         })
-
-        # 旧候选快照只有间隔字段，不能从最新配置引入恢复前没有的总时限。
-        for settings in window["policy"]["candidates"].values():
-            settings.setdefault("total_timeout", None)
 
         async def persist():
             if self._invocation_store:
@@ -255,8 +243,7 @@ class RoutingModel:
         with bind_context(invocation_id=invocation_id):
             try:
                 completion = await self._invoke(
-                    prompt, chat_request, invocation_id, records, window, persist, validate,
-                    validate_input,
+                    prompt, chat_request, invocation_id, records, window, persist,
                 )
                 status = "ok"
                 return completion
@@ -336,7 +323,7 @@ class RoutingModel:
     async def _invoke(
         self, prompt: str, chat_request: dict | None, invocation_id: str,
         records: list[CallRecord],
-        window: dict, persist, validate=None, validate_input=None,
+        window: dict, persist,
     ) -> Completion:
         if not self._candidates:
             raise ModelCallFailed(
@@ -406,8 +393,6 @@ class RoutingModel:
                 )
                 if candidate is None:
                     break
-                if validate_input:
-                    validate_input(request_prompt)
                 # 每个实际请求（含换源、格式纠正、摘要）都先预占模块持久预算。
                 if self._before_request:
                     await self._before_request()
@@ -453,13 +438,6 @@ class RoutingModel:
                             if self._remaining_seconds
                             else None,
                         )
-                    if validate:
-                        try:
-                            validate(completion)
-                        except InvalidModelOutput as exc:
-                            exc.prompt_tokens = completion.prompt_tokens
-                            exc.completion_tokens = completion.completion_tokens
-                            raise
                 except asyncio.CancelledError:
                     await self._record_call(
                         replace(
@@ -555,7 +533,6 @@ class RoutingModel:
                                         "type": "human",
                                         "data": {
                                             "content": (
-                                                # 校验阶段也使用complete，不能混入旧action协议；
                                                 # 原生工具纠正保留具体缺项，避免相同坏响应循环。
                                                 "上次协议校验失败：" + detail
                                                 + "。请使用本次已提供的工具，"

@@ -22,7 +22,7 @@ def test_retry_keeps_drafts_reviews_and_ids_with_fresh_attempt_budget(finalized)
         book.finalize([row["id"]], "完成")
     previous = copy.deepcopy(book.state)
     tx = _RetryTx([{"id": 9, "status": "partial"}], book.state)
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
+    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
     service.retry_report(3, module_keys=[], mode="resume",
                          max_output_tokens=None, timeout_seconds=None)
     carried = tx.inserted[0]["state"]

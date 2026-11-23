@@ -50,8 +50,6 @@ def load_module_skill(snapshot: dict, key: str, *, categories: Sequence[str] = (
     paths.extend(ref_dir + category + "/extraction_rules.md"
                  for category in dict.fromkeys(categories) if category in CATEGORIES)
     rules = [_model_domain_rules(content), *(resources[p] for p in paths if p in resources)]
-    # 冻结资源的主题注释用于历史阶段筛选，模型只需要完整规则正文。
-    rules = [re.sub(r"(?m)[ \t]*<!-- topics: [^\n]*? -->[ \t]*$", "", rule) for rule in rules]
     output = resources.get(ref_dir + "output_format.md", "")
     return {
         "sha256": digest.hexdigest(),

@@ -140,35 +140,6 @@ export async function waitForJob(jobId: string, timeoutMs = 120_000): Promise<Jo
   throw new Error("任务仍在运行，请稍后刷新结果");
 }
 
-/**
- * 从 Content-Disposition 取文件名。
- *
- * 后端对中文名走 RFC 5987 的 filename*（见 api/storage.py 的 content_disposition），
- * 只读 filename= 会拿到被替换成下划线的名字，所以优先解析 filename*。
- */
-export function filenameFromDisposition(header: string | null): string | null {
-  if (header === null) return null;
-  const extended = /filename\*=UTF-8''([^;]+)/i.exec(header);
-  if (extended?.[1] !== undefined) {
-    try {
-      return decodeURIComponent(extended[1]);
-    } catch {
-      return null;
-    }
-  }
-  const plain = /filename="([^"]+)"/i.exec(header);
-  return plain?.[1] ?? null;
-}
-
-export function saveBlob(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
-
 /* ---------------------------------------------------------------------------
  * 项目与文件：列表页、文件管理页与工作台的项目入口。
  * ------------------------------------------------------------------------- */
@@ -292,10 +263,6 @@ export async function uploadProjectFiles(
   });
 }
 
-export async function loadJob(jobId: string): Promise<JobResponse> {
-  return getJson<JobResponse>("/api/v1/jobs/" + jobId);
-}
-
 /** 改文件元数据（显示名 / 角色 / 排序）。后端 PATCH 只改传了的字段。 */
 export async function patchProjectFile(
   projectId: number,
@@ -311,19 +278,6 @@ export async function deleteProjectFile(projectId: number, fileId: number): Prom
     { method: "DELETE" },
     "删除文件失败",
   );
-}
-
-/** 对已有版本重跑解析。force=true 表示即使已有解析结果也重跑。 */
-export async function parseVersion(
-  versionId: number,
-  options: { tier: ParseTier; ocrMode: "auto" | "txt" | "ocr"; force?: boolean; reason?: string },
-): Promise<{ job_id: string }> {
-  return postJson<{ job_id: string }>("/api/v1/versions/" + versionId + "/parse", {
-    tier: options.tier,
-    ocr_mode: options.ocrMode,
-    force: options.force ?? false,
-    reason: options.reason ?? null,
-  });
 }
 
 /** 章节树：解析产出的标题层级。没有解析结果时后端回空数组，不是错误。 */

@@ -18,7 +18,7 @@ from tender.worker.documents import tasks
 
 @pytest.mark.parametrize("element_count", [0, 2, 4096])
 def test_poll_parse_persists_elements_within_parameter_limit(monkeypatch, element_count):
-    repository = DocumentPipelineRepository(Mock(), Mock())
+    repository = DocumentPipelineRepository(Mock())
     monkeypatch.setattr(tasks, "_repository", repository)
     elements = [
         NormalizedElement(

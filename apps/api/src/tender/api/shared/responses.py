@@ -19,10 +19,6 @@ class IdStatusResponse(ApiResponse):
     test_id: int | None = None
 
 
-class ItemsResponse(ApiResponse):
-    items: list[Any]
-
-
 class ProjectResponse(ApiResponse):
     id: int
     company_id: int
@@ -547,7 +543,3 @@ class AnalysisContextResponse(ApiResponse):
     requirement_manifest: list[str]
     total_requirements: int
     next_offset: int | None
-
-
-class ReviewRowsResponse(ApiResponse):
-    items: list[dict[str, Any]]

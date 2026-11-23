@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # 本文件在 apps/api/src/tender/core/settings.py，向上四级即 apps/api，.env 与 pyproject 同级。
@@ -199,20 +200,20 @@ def llm_secret_keys() -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
-def mineru_bbox_origin() -> str | None:
+def mineru_bbox_origin() -> Literal["top_left", "bottom_left"] | None:
     """返回已实测的 MiddleJson bbox 原点；未配置时不生成位置坐标。"""
     value = _setting("MINERU_BBOX_ORIGIN") or "unknown"
     if value not in {"unknown", "top_left", "bottom_left"}:
         raise ValueError("MINERU_BBOX_ORIGIN 必须是 unknown、top_left 或 bottom_left")
-    return None if value == "unknown" else value
+    return None if value == "unknown" else cast(Literal["top_left", "bottom_left"], value)
 
 
-def mineru_bbox_rotation() -> str | None:
+def mineru_bbox_rotation() -> Literal["visual", "unrotated"] | None:
     """返回已实测的旋转坐标语义；未确认时只对 0 度页面写 bbox。"""
     value = _setting("MINERU_BBOX_ROTATION") or "unknown"
     if value not in {"unknown", "visual", "unrotated"}:
         raise ValueError("MINERU_BBOX_ROTATION 必须是 unknown、visual 或 unrotated")
-    return None if value == "unknown" else value
+    return None if value == "unknown" else cast(Literal["visual", "unrotated"], value)
 
 
 @dataclass(frozen=True)

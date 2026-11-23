@@ -80,10 +80,9 @@ class ParseTransaction:
 
 
 class ParseRepository:
-    def __init__(self, engine: Engine, company_id: int, configs: ConfigRegistry) -> None:
+    def __init__(self, engine: Engine, configs: ConfigRegistry) -> None:
         self.engine = engine
         self.configs = configs
-        self.company_id = company_id
 
     @contextmanager
     def transaction(self) -> Iterator[ParseTransaction]:

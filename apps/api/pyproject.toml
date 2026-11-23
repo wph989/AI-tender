@@ -75,6 +75,8 @@ files = [
     "src/tender/adapters/pg/repositories/llm/retrieval.py",
     "src/tender/application/knowledge/service.py",
     "src/tender/adapters/pg/repositories/knowledge/retrieval.py",
+    # 同时检查 Worker 的端口消费位置，避免只核对装配而漏掉未声明的实际调用。
+    "src/tender/worker/documents/tasks.py",
 ]
 mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
 python_version = "3.12"

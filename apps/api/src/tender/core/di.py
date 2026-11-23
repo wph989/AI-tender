@@ -13,9 +13,7 @@ from sqlalchemy import Engine, select
 
 from tender.adapters.analysis.file_archive import FileAnalysisArchive
 from tender.adapters.configuration.redis_cache import RedisConfigCache
-from tender.adapters.documents.gotenberg import GotenbergConverter
 from tender.adapters.documents.mineru import MinerUParser
-from tender.adapters.jobs.celery_queue import CeleryTaskQueue
 from tender.adapters.llm.openai_chat import OpenAIChatModel
 from tender.adapters.llm.openai_embedding import OpenAIEmbeddingModel
 from tender.adapters.llm.provider_image import ProviderImageModel
@@ -52,10 +50,8 @@ from tender.config.registry import ConfigRegistry
 from tender.core import settings
 from tender.core.secrets import decrypt_secret
 from tender.ports.configuration.registry import ConfigReader
-from tender.ports.documents.converter import OfficeConverter
 from tender.ports.documents.parser import DocumentParser
 from tender.ports.jobs.coordination import TaskLocks as TaskLocksPort
-from tender.ports.jobs.queue import TaskQueue
 from tender.ports.llm.chat import ChatGateway, ModelGateway
 from tender.ports.llm.cooldown import ProviderCooldown as ProviderCooldownPort
 from tender.ports.llm.embedding import EmbeddingModel
@@ -167,10 +163,6 @@ def create_blob_store_factory() -> Callable[[], BlobStore]:
 class ApiComponents:
     engine: Engine
     blobs: BlobStore
-    converter: OfficeConverter
-    # 任务投递本身走 beat（worker/dispatch.py）；这里保留队列装配点，
-    # 给 P3 的回归回放/抽检这类"从 API 主动排队"的入口用。
-    queue: TaskQueue
     model_gateway: ModelGateway
     configs: ConfigRegistry
 
@@ -180,25 +172,17 @@ class ApiComponents:
             return connection.execute(select(1)).scalar_one() == 1
 
     async def aclose(self) -> None:
-        await self.converter.aclose()
         self.blobs.close()
         self.configs.close()
         self.engine.dispose()
 
 
 def create_api_components() -> ApiComponents:
-    credentials = settings.gotenberg_credentials()
     blob_store_factory = create_blob_store_factory()
     engine = create_pg_engine()
     return ApiComponents(
         engine=engine,
         blobs=blob_store_factory(),
-        converter=GotenbergConverter(
-            settings.gotenberg_url(),
-            username=credentials[0] if credentials else None,
-            password=credentials[1] if credentials else None,
-        ),
-        queue=CeleryTaskQueue(),
         model_gateway=create_model_gateway,
         configs=ConfigRegistry(engine, RedisConfigCache()),
     )
@@ -219,7 +203,7 @@ def create_version_service(engine: Engine, company_id: int) -> VersionService:
 
 def create_parse_service(engine: Engine, company_id: int, configs: ConfigRegistry) -> ParseService:
     return ParseService(
-        ParseRepository(engine, company_id, configs),
+        ParseRepository(engine, configs),
         company_id,
         configs,
         VersionRepository(engine, company_id),
@@ -289,7 +273,6 @@ def create_analysis_service(
     return AnalysisService(
         store,
         company_id,
-        configs,
         create_embedding_gateway,
         create_knowledge_service(engine, company_id, configs, repository=store),
     )
@@ -312,7 +295,7 @@ def create_worker_config_reader() -> ConfigReader:
 
 def create_document_pipeline_repository(engine: Engine | None = None) -> DocumentPipelinePort:
     selected = engine if engine is not None else _worker_engine()
-    return DocumentPipelineRepository(selected, ConfigRegistry(selected))
+    return DocumentPipelineRepository(selected)
 
 
 def create_dispatch_repository(engine: Engine | None = None) -> DispatchPort:

@@ -171,7 +171,7 @@ def test_message_is_retried_after_database_commit_failure(database, monkeypatch)
     assert row["status"] == "pending" and row["dispatched_at"] is not None
 def test_persisted_attempt_blocks_early_duplicates(database):
     seed(database, "poll", status="running", stage="parsing", dispatched=True)
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     assert repository.claim_attempt("poll", ("parsing",))
     repository.schedule_attempt("poll", 60)
     assert not repository.claim_attempt("poll", ("parsing",))
@@ -193,7 +193,7 @@ def test_active_first_batch_does_not_starve_lost_message(database):
 
 def test_late_conversion_message_cannot_latch_undispatched_parse(database, monkeypatch):
     seed(database, "handoff", stage="submitting")
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     monkeypatch.setattr(tasks, "_repository", repository)
     monkeypatch.setattr(tasks, "_locks", TaskLocks(database))
     tasks.process_file.run("handoff")
@@ -213,7 +213,7 @@ def test_retry_count_survives_new_repository_and_message(database):
     seed(database, "retry", dispatched=True)
     for count in range(1, 4):
         # 每次均由新仓储/消息执行，不依赖 Celery Request.retries 或进程内计数。
-        repository = DocumentPipelineRepository(database, Mock())
+        repository = DocumentPipelineRepository(database)
         assert repository.claim_attempt("retry", ("submitting",))
         repository.schedule_attempt("retry", 0, retry=True)
         with database.connect() as connection:
@@ -247,7 +247,7 @@ def test_cancel_pending_job_finishes_without_dispatch(database):
 def test_local_parse_failure_retains_quota_until_remote_stops(database, code):
     run_id = seed_parse(database)
     seed(database, "next")
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     repository.set_job_failure("remote", code, "原始失败")
     payload = JobRepository(database, 1).payload("remote")
     assert payload["status"] == "draining" and payload["finished_at"] is None
@@ -280,7 +280,7 @@ def test_unknown_submission_failure_keeps_occupancy_and_original_error(database,
         seed_parse(database, stage="resubmitting")
     else:
         seed(database, "remote", status="submitting", dispatched=True, version_id=11)
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     repository.set_job_failure("remote", "parse_submission_unknown", "需人工核对远端")
     repository.set_job_failure("remote", "parse_timeout", "不能覆盖原始原因")
     payload = JobRepository(database, 1).payload("remote")
@@ -320,7 +320,7 @@ def test_cancel_poll_only_drains_remote_and_recovers(
     database, monkeypatch, remote_status, stopping,
 ):
     run_id = seed_parse(database)
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     if stopping == "canceling":
         JobRepository(database, 1).cancel("remote")
     else:
@@ -380,7 +380,7 @@ def test_cancel_poll_only_drains_remote_and_recovers(
 def test_cancel_during_submission_keeps_returned_remote_handle(database):
     seed(database, "submit", status="submitting", dispatched=True, version_id=11)
     JobRepository(database, 1).cancel("submit")
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     repository.save_submission("submit", 11, "fixture", "remote-id", {
         "tier": "advanced", "ocr_mode": "ocr",
     }, datetime.now(UTC))
@@ -396,7 +396,7 @@ def test_cancel_during_submission_keeps_returned_remote_handle(database):
 def test_cancel_submission_rejected_or_unknown(database, unknown):
     seed(database, "submit", status="submitting", dispatched=True)
     JobRepository(database, 1).cancel("submit")
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     if unknown:
         repository.set_job_failure("submit", "parse_submission_unknown", "需人工核对")
     else:
@@ -410,7 +410,7 @@ def test_cancel_submission_rejected_or_unknown(database, unknown):
 def test_cancel_during_conversion_does_not_create_version_or_handoff(database):
     seed(database, "convert", status="running", stage="converting", dispatched=True)
     JobRepository(database, 1).cancel("convert")
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     result = repository.finish_file_version(
         {"id": "convert", "config_snapshot": {}}, candidate=None,
         pdf_key="fixture", pdf_sha256="fixture", converter=None, converter_version=None,
@@ -426,7 +426,7 @@ def test_cancel_wins_against_completed_parse_write(database):
     JobRepository(database, 1).cancel("remote")
     with database.connect() as connection:
         row = connection.execute(select(Job).where(Job.id == "remote")).mappings().one()
-    repository = DocumentPipelineRepository(database, Mock())
+    repository = DocumentPipelineRepository(database)
     repository.complete_parse(
         "remote", row, [object()], terminal_status="completed", raw_middle_key=None,
         page_count=1, backend=None, schema_version=None, elapsed_ms=1,

@@ -58,7 +58,3 @@ export function derivePipeline(file: PipelineInput): FilePipelineView {
   else if (file.parse_status === "partial") headline = "部分解析完成";
   return { stages, tone, inFlight: stages.some((stage) => stage.state === "active"), headline };
 }
-
-export function needsReparse(file: PipelineInput): boolean {
-  return file.version_id !== null && (file.parse_status === null || DEAD.has(file.parse_status));
-}

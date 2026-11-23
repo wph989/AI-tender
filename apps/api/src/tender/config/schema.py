@@ -14,7 +14,6 @@ from typing import Any
 
 L1 = "L1"
 L2 = "L2"
-LAYERS: tuple[str, ...] = (L1, L2)
 
 # 谁能写哪一层（docs/质量/08-动态配置中心.md）：viewer/reviewer 只读，operator 只写 L1，admin 全写。
 WRITERS: dict[str, frozenset[str]] = {
@@ -22,8 +21,6 @@ WRITERS: dict[str, frozenset[str]] = {
     L2: frozenset({"admin"}),
 }
 READERS: frozenset[str] = frozenset({"viewer", "reviewer", "operator", "admin"})
-
-_VALUE_TYPES = frozenset({"int", "number", "bool", "string", "json", "secret"})
 
 
 @dataclass(frozen=True, slots=True)

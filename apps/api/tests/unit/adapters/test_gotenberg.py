@@ -359,26 +359,6 @@ def test_non_pdf_success_body_is_rejected(make_converter) -> None:
         run(converter.to_pdf(io.BytesIO(b"x"), filename="a.docx", trace_id="t"))
 
 
-def test_health_reflects_status_and_transport_errors(make_converter) -> None:
-    async def healthy(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"status": "up"})
-
-    converter, _ = make_converter(healthy)
-    assert run(converter.health()) is True
-
-    async def degraded(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, text="dependency not ready")
-
-    converter, _ = make_converter(degraded)
-    assert run(converter.health()) is False
-
-    async def unreachable(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused", request=request)
-
-    converter, _ = make_converter(unreachable)
-    assert run(converter.health()) is False
-
-
 def test_basic_auth_is_sent_only_when_credentials_are_configured(make_converter) -> None:
     seen: list[str | None] = []
 

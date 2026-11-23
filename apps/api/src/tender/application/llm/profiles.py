@@ -97,10 +97,6 @@ def profile(
         "default_capabilities": required + (["json_output"] if kind == "language" else []),
         "parameters": list(schema),
         "parameter_schema": schema,
-        "parameter_bounds": {
-            k: {bound: v[bound] for bound in ("min", "max") if bound in v}
-            for k, v in schema.items() if "min" in v
-        },
         "adapter_version": ADAPTER_VERSION,
     }
 
@@ -330,7 +326,7 @@ def test_capabilities(model: dict) -> list[str]:
 
 
 def required_kind(feature: str) -> str:
-    return feature if feature in {"embedding", "rerank", "image_generation"} else "language"
+    return feature if feature in {"embedding", "rerank"} else "language"
 
 
 def validate_base_url(value: str) -> str:

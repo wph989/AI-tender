@@ -3,11 +3,11 @@ import { OCR_MODES, PARSE_TIERS } from "@/lib/projects/parseOptions";
 // 这里只维护展示名称和用途；配置清单、默认值、权限和数值范围仍由服务端决定。
 const COPY: Record<string, [string, string]> = {
   "analysis.max_inflight": ["同时分析的专题数", "同一公司所有报告共用此上限。"],
-  "analysis.max_model_calls": ["每个专题的模型请求上限", "每次运行累计计数，包含重试和内容摘要。"],
-  "analysis.max_tool_calls": ["每个专题的工具调用上限", "限制检索、读取原文等操作的总次数。"],
+  "analysis.max_model_calls": ["每个专题的模型请求上限", "累计已确认成功的请求，包含内容摘要；失败重试不扣成功额度。"],
+  "analysis.max_tool_calls": ["每个专题的工具调用上限", "累计检索、读取原文等成功执行的次数。"],
   "analysis.max_evidence_blocks": ["每个专题保留的原文片段数", "限制分析时可以保留的原文依据数量。"],
   "analysis.similarity_threshold": ["检索最低相关度", "范围为 0 到 1；越高越严格，返回的材料可能越少。"],
-  "analysis.max_search_results": ["每次检索最多返回的片段数", "只返回达到最低相关度的原文片段。"],
+  "analysis.max_search_results": ["每次检索最多返回的片段数", "限制每页交付的原文片段数；向量候选按最低相关度过滤，关键词独立召回。"],
   "analysis.rate_limit_backoff_seconds": ["限流后首次等待时间（秒）", "模型服务未告知恢复时间时使用，后续等待逐次延长。"],
   "analysis.rate_limit_max_wait_seconds": ["每个专题的限流等待上限（秒）", "累计等待超过此时间后停止，可稍后继续分析。"],
   "analysis.max_subagent_retries": ["分析执行故障自动恢复次数", "专题执行发生可恢复故障时，最多自动恢复的次数。"],

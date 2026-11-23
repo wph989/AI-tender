@@ -38,16 +38,14 @@ def env():
         schema = "llm_test_" + uuid4().hex
         c.execute(text(f"CREATE SCHEMA {schema}"))
         c.execute(text(f"SET LOCAL search_path TO {schema}, public"))
-        # 全链迁移能发现多列 ALTER、部分唯一索引与新增测试表之间的真实兼容问题。
-        root = Path(__file__).resolve().parents[2] / "alembic" / "versions"
-        for path in sorted(root.glob("*.py")):
-            spec = importlib.util.spec_from_file_location(path.stem, path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            for statement in module._STATEMENTS:
-                # 0008 有显式 schema，测试必须重命名它，不能触碰业务 checkpoint 空间。
-                statement = statement.replace("SCHEMA agent_runtime", f"SCHEMA {schema}_agents")
-                c.execute(text(statement))
+        # 直接创建当前空库基线；显式命名的运行 schema 同样隔离，避免触碰测试库共享空间。
+        path = Path(__file__).resolve().parents[2] / "alembic/versions/0001_current_schema.py"
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for statement in module._STATEMENTS:
+            statement = statement.replace("SCHEMA agent_runtime", f"SCHEMA {schema}_agents")
+            c.execute(text(statement))
         facade = SimpleNamespace(connect=lambda: nullcontext(c), begin=lambda: nullcontext(c))
         request = SimpleNamespace(
             app=SimpleNamespace(
@@ -331,7 +329,7 @@ def test_complete_configuration_roundtrip_and_capability_proofs_are_independent(
     assert all(t["validity"] == "config_changed" for t in changed["capability_tests"].values())
 
 
-def test_image_model_binding_preview_history_and_cleanup(env, monkeypatch):
+def test_image_model_preview_history_and_cleanup_without_business_binding(env, monkeypatch):
     from tender.application.llm.probes import PROBE_IMAGE
 
     request, c = env
@@ -359,19 +357,19 @@ def test_image_model_binding_preview_history_and_cleanup(env, monkeypatch):
     assert "preview_data" not in test and test["result"]["preview_url"]
     assert llm.test_preview(result["test_id"], request).body == PROBE_IMAGE.data
     assert llm.list_calls(request, limit=25, offset=0)["items"][0]["image_count"] == 1
-    # 模型显式测试可用，不应把尚无业务消费者的绑定伪装成有效设置。
-    with pytest.raises(ApiProblem) as unavailable:
-        llm.replace_bindings(
-            "image_generation", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request
-        )
-    assert unavailable.value.code == "feature_unavailable"
-    inactive = next(
-        f for f in llm.list_features(request)["items"] if f["key"] == "image_generation"
-    )
-    assert inactive["binding_available"] is False
-    assert llm.replace_bindings(
-        "image_generation", llm.BindingsRequest(model_ids=[], revision=1), request
-    )["bindings"] == []
+    # 功能清单只登记实际业务消费者，模型生图测试独立于功能绑定。
+    assert {f["key"] for f in llm.list_features(request)["items"]} == {
+        "analysis", "knowledge_ask", "embedding", "rerank",
+    }
+    assert set(c.execute(text("SELECT key FROM llm_feature")).scalars()) == {
+        "analysis", "knowledge_ask", "embedding", "rerank",
+    }
+    for model_ids in ([m["id"]], []):
+        with pytest.raises(ApiProblem) as missing:
+            llm.replace_bindings(
+                "image_generation", llm.BindingsRequest(model_ids=model_ids, revision=1), request
+            )
+        assert missing.value.status_code == 404
     llm.update_model(
         m["id"], llm.ModelPatch(parameters={"quality": "medium"}, revision=m["revision"]), request
     )

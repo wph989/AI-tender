@@ -37,7 +37,6 @@ from tender.adapters.pg.models import (
 )
 from tender.adapters.pg.repositories.jobs.dispatch import DISPATCH_LEASE
 from tender.adapters.pg.repositories.jobs.tasks import finish_canceled_job
-from tender.config.registry import ConfigRegistry
 from tender.domain.documents.element import NormalizedElement
 from tender.domain.shared.errors import ParseFailed
 from tender.ports.documents.inspection import PdfInspection
@@ -48,9 +47,8 @@ def _jsonb(value: Any) -> Any:
 
 
 class DocumentPipelineRepository:
-    def __init__(self, engine: Engine, configs: ConfigRegistry) -> None:
+    def __init__(self, engine: Engine) -> None:
         self.engine = engine
-        self.configs = configs
 
     def claim_attempt(self, job_id: str, stages: tuple[str, ...]) -> bool:
         # 调用者已持有 job 会话锁；旧阶段消息不能恢复派发标记、绕过下一阶段配额。

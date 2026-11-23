@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from celery import Celery, Task
 
 from tender.adapters.jobs.celery_logging import install_publish_logging
@@ -87,19 +85,3 @@ def create_celery_app() -> Celery:
         worker_redirect_stdouts=False,
     )
     return app
-
-
-class CeleryTaskQueue:
-    def __init__(self, celery_app: Any | None = None) -> None:
-        self._app = celery_app or create_celery_app()
-
-    def enqueue(
-        self,
-        task_name: str,
-        args: tuple[object, ...],
-        *,
-        countdown: float = 0,
-    ) -> str | None:
-        result = self._app.send_task(task_name, args=list(args), countdown=countdown)
-        # 没有结果后端时 send_task 仍会生成任务 id；拿不到就返回 None，不编造一个。
-        return getattr(result, "id", None)

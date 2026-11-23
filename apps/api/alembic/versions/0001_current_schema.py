@@ -1104,9 +1104,6 @@ INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, max
 INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, max_total_requests, revision) VALUES ('rerank', '检索重排', 3, '对检索候选进行专用重排；未配置时保留混合检索顺序', now(), 6, 1);
     """.strip(),
     """
-INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, max_total_requests, revision) VALUES ('image_generation', '图片生成', 3, '图片模型管理、功能绑定与显式测试；不自动生成业务素材', now(), 6, 1);
-    """.strip(),
-    """
 SELECT pg_catalog.setval('agent_module_run_id_seq', 1, false);
     """.strip(),
     """

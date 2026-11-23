@@ -33,6 +33,7 @@ from tender.domain.shared.errors import (
     ParseUnavailable,
     ServiceRestarted,
 )
+from tender.ports.documents.converter import OfficeConverter
 from tender.ports.documents.parser import DocumentParser
 from tender.ports.storage.blob_store import BlobNotFound, BlobStore, BlobStoreError
 from tender.worker.celery_app import celery_app
@@ -106,7 +107,7 @@ def _verify_hash(content: bytes, expected: str, description: str) -> None:
 
 def _converter(
     *, remaining_seconds: float | None = None, extra_retries: int = 2
-) -> GotenbergConverter:
+) -> OfficeConverter:
     try:
         credentials = settings.gotenberg_credentials()
     except ValueError as exc:
@@ -590,9 +591,9 @@ def poll_parse(self: Any, job_id: str) -> None:
             _repository.set_job_failure(job_id, code, str(exc))
             return
     elapsed_ms = None
-    started_at = row.get("started_at")
-    if isinstance(started_at, datetime):
-        elapsed_ms = max(0, int((now - started_at).total_seconds() * 1000))
+    parse_started_at = row.get("started_at")
+    if isinstance(parse_started_at, datetime):
+        elapsed_ms = max(0, int((now - parse_started_at).total_seconds() * 1000))
     error_code = status.error_code
     error_message = status.error_message
     if terminal_status == "partial" and middle_json is None:

@@ -1,4 +1,4 @@
-"""LLM 管理模块的纯规则：优先级整表展开与转移深度夹取（docs/设计/12-LLM管理与模型路由.md）。
+"""LLM 管理模块的纯规则：功能清单与优先级整表展开（docs/设计/12-LLM管理与模型路由.md）。
 
 放在 application 而不是 api 里：这些规则同时约束接口写入与 worker 读取，
 只有一份实现，页面提交与任务执行才不会对"合法优先级"产生两种理解。
@@ -20,7 +20,6 @@ FEATURES: tuple[tuple[str, str], ...] = (
     ("knowledge_ask", "知识问答"),
     ("embedding", "向量索引与检索"),
     ("rerank", "检索重排"),
-    ("image_generation", "图片生成（未接入）"),
 )
 
 # 名称与用途跟随代码消费者更新，不能继续显示数据库种子中的旧流程说明。
@@ -35,10 +34,7 @@ FEATURE_DESCRIPTIONS = {
         "仅绑定一个向量模型，未配置时使用基础检索。"
     ),
     "rerank": "对专题解析和问答的检索候选重新排序；仅绑定一个重排模型，未配置时保留混合检索顺序。",
-    "image_generation": "图片生成尚未接入业务流程，请到模型列表测试；此处仅允许清理历史绑定。",
 }
-
-INACTIVE_FEATURES = frozenset({"image_generation"})
 
 
 def binding_rows(model_ids: Sequence[int]) -> list[tuple[int, int]]:
@@ -57,11 +53,3 @@ def binding_rows(model_ids: Sequence[int]) -> list[tuple[int, int]]:
     ):
         raise ValueError("model_ids 必须是正整数")
     return [(model_id, index + 1) for index, model_id in enumerate(model_ids)]
-
-
-def effective_limit(configured: int | None, bound_count: int) -> int:
-    """实际参与转移的候选数：夹到绑定数量以内，没配置时用默认 3。"""
-    if bound_count <= 0:
-        return 0
-    limit = configured if configured is not None else DEFAULT_FAILOVER_LIMIT
-    return max(1, min(limit, bound_count, MAX_FAILOVER_LIMIT))

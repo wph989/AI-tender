@@ -99,7 +99,7 @@ def test_refresh_writes_cache_and_broadcasts() -> None:
 def test_snapshot_without_active_release_is_skipped() -> None:
     """迁移没跑时任务仍要能创建：宁可不写快照，也不写一个错的 release_id。"""
     registry = ConfigRegistry(_EmptyEngine(), _FakeCache())  # type: ignore[arg-type]
-    assert registry.snapshot_for_job(None, company_id=1) is None  # type: ignore[arg-type]
+    assert registry.snapshot_for_job(None) is None  # type: ignore[arg-type]
 
 
 def test_close_closes_cache() -> None:

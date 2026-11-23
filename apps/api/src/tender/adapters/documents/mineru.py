@@ -79,14 +79,6 @@ class MinerUParser:
         """调用方在 Worker 退出时关闭连接池，避免滚动重启遗留连接。"""
         await self._client.aclose()
 
-    async def health(self) -> bool:
-        """健康探针只检查 HTTP 状态码；MinerU 的 503 代表模型未就绪。"""
-        try:
-            response = await self._client.get(_HEALTH_PATH)
-        except httpx.HTTPError:
-            return False
-        return response.status_code == 200
-
     async def submit(
         self,
         pdf_key: str,

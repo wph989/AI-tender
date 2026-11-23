@@ -175,7 +175,6 @@ class ProjectFileService:
         tier: str | None,
         ocr_mode: str | None,
         role: str | None,
-        actor: str,
     ) -> dict[str, Any]:
         self.ensure_project(project_id)
         validate_parse_config(tier, ocr_mode)
@@ -206,7 +205,6 @@ class ProjectFileService:
                     tier=tier,
                     ocr_mode=ocr_mode,
                     replaces_id=None,
-                    actor=actor,
                 )
             except (ServiceError, TenderError) as exc:
                 skipped.append({"name": item.name, "reason": str(exc)})
@@ -245,7 +243,6 @@ class ProjectFileService:
         tier: str | None,
         ocr_mode: str | None,
         replaces_id: int | None,
-        actor: str,
         sort_no: int | None = None,
         display_name: str | None = None,
     ) -> dict[str, object]:
@@ -345,7 +342,6 @@ class ProjectFileService:
         auto_parse: bool,
         tier: str | None,
         ocr_mode: str | None,
-        actor: str,
     ) -> dict[str, object]:
         validate_parse_config(tier, ocr_mode)
         old = self.require_file(project_id, file_id)
@@ -357,7 +353,6 @@ class ProjectFileService:
             tier=tier,
             ocr_mode=ocr_mode,
             replaces_id=file_id,
-            actor=actor,
             sort_no=int(old["sort_no"]),
             display_name=str(old["display_name"]),
         )

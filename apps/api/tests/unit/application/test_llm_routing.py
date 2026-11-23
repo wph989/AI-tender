@@ -37,12 +37,18 @@ class _ScriptedClient:
         action = self.script.pop(0) if self.script else ModelCallFailed("脚本用尽")
         if isinstance(action, Exception):
             raise action
+        if isinstance(action, Completion):
+            return action
         return Completion(
             content='{"ok": true}',
             model=self.model,
             prompt_tokens=3,
             completion_tokens=5,
         )
+
+    async def chat(self, messages: list[dict], tools: list[dict]) -> Completion:
+        # 原生消息沿用相同脚本，让请求身份与恢复回归覆盖生产使用的 chat 入口。
+        return await self.complete("\n".join(str(m["data"].get("content", "")) for m in messages))
 
     async def list_models(self) -> list[str]:
         return []
@@ -780,15 +786,17 @@ def test_agent_module_window_is_a_continuous_budget_for_the_current_request(monk
     assert [r.model_id for r in records] == [1]
 
 
-def test_recovery_ignores_old_window_deadline_without_resetting_attempts():
+def test_recovery_uses_frozen_timeouts_without_resetting_attempts():
     from copy import deepcopy
 
     class Store:
         value = {
-            "deadline_at": 1, "invocation_id": "legacy",
+            "invocation_id": "retained-call",
             "requests": [{"model": 1, "ordinal": 1}], "candidate_order": [1],
             "policy": {"failover_limit": 1, "max_total": 2, "rate_max_wait": 600,
-                       "rate_backoff": 30, "candidates": {"1": {"extra_retries": 1, "timeout": 1}}},
+                       "rate_backoff": 30, "candidates": {"1": {
+                           "extra_retries": 1, "timeout": 1, "total_timeout": None,
+                       }}},
         }
 
         def load_invocation(self, key):
@@ -801,16 +809,16 @@ def test_recovery_ignores_old_window_deadline_without_resetting_attempts():
     gateway = _ScriptedGateway({"a": [None]})
     router = RoutingModel("analysis", "test", [replace(_candidate("a", 1), total_timeout=0.01)],
                           gateway, records.append, invocation_store=store)
-    result = asyncio.run(router.complete_validated("测试", call_key="same"))
+    messages = [{"type": "human", "data": {"id": "checkpoint-1", "content": "测试"}}]
+    result = asyncio.run(router.chat(messages, []))
     assert result.model == "a"
-    assert "deadline_at" not in store.value
     assert len(store.value["requests"]) == 2
     assert records[-1].request_ordinal == 2
-    assert records[-1].invocation_id == "legacy"
-    # 有效回执恢复不再发送；旧快照也不能引入最新模型配置的总时限。
-    assert asyncio.run(router.complete_validated("测试", call_key="same")) == result
+    assert records[-1].invocation_id == "retained-call"
+    # 有效回执恢复不再发送；冻结快照不能引入最新模型配置的总时限。
+    assert asyncio.run(router.chat(messages, [])) == result
     assert gateway.prompts == ["测试"]
-    store.value = {"exhausted": True, "error": "原请求次数已耗尽", "deadline_at": 1}
+    store.value = {"exhausted": True, "error": "原请求次数已耗尽", "error_type": "ModelCallFailed"}
     with pytest.raises(ModelCallFailed, match="原请求次数已耗尽"):
-        asyncio.run(router.complete_validated("测试", call_key="same"))
+        asyncio.run(router.chat(messages, []))
     assert gateway.prompts == ["测试"]

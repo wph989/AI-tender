@@ -211,52 +211,6 @@ def prepare_report(db: ReportRepository, report: dict) -> tuple[dict, list[dict]
     return report, usable
 
 
-async def expand_evidence(
-    items: list[dict],
-    *,
-    seen: dict,
-    sources: list[dict],
-    read,
-) -> dict:
-    """校验要能看到引文在原文里的物理邻域，不能只看本模块读过的块。
-
-    章节标题（如前附表、第六章）往往没被模块读取，只给已读块会把正确归属判成无依据；
-    这里按引文所属资料补读整份原文用于取窗口。引文本身仍由 validate_items 限定为
-    已读块，所以不会放宽“只能引用读过的原文”这条底线。读不到时退回已读块，
-    校验仍可进行，只是归属证据更少。
-    """
-    wanted: set[object] = set()
-    for item in items:
-        for value in item.get("values", []):
-            for ref in value.get("citations", []):
-                if not isinstance(ref, dict):
-                    continue
-                source_id = ref.get("source_id")
-                if source_id is None:
-                    # 引文缺少 source_id 时用已读块回查所属资料。
-                    row = seen.get(str(ref.get("block_id")))
-                    source_id = row.get("source_id") if isinstance(row, dict) else None
-                if source_id is not None:
-                    wanted.add(source_id)
-    evidence = dict(seen)
-    for source in sources:
-        if source["source_id"] not in wanted:
-            continue
-        try:
-            rows = await read(source)
-        except Exception:
-            logger.warning(
-                "evidence.fail",
-                source_id=source["source_id"],
-                exc_info=True,
-                fallback="use_already_read_evidence",
-            )
-            continue
-        for row in rows:
-            evidence.setdefault(str(row["block_id"]), row)
-    return evidence
-
-
 def summarize(modules: list[dict]) -> list[dict]:
     """只合并等价的字段断言；不按上传时间裁决冲突，不同结论各自保留。"""
     grouped = {}
@@ -393,7 +347,6 @@ class AnalysisExecutor:
                 seen=prior.get("seen", {}),
                 events=prior.get("events", []),
                 tool_calls=prior.get("tool_calls", 0),
-                dependencies=prior.get("dependencies", {}),
             )
             model = await asyncio.to_thread(
                 self.model_factory,

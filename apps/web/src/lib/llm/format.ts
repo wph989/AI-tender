@@ -18,13 +18,6 @@ export function formatTime(value: string | null): string {
   });
 }
 
-/** `last_test_status` 是自由文本列，只认识这两种取值，其余原样显示。 */
-export function testLabel(status: string | null): string {
-  if (status === "ok") return "通过";
-  if (status === "error") return "失败";
-  if (status === null || status === "") return "未测";
-  return status;
-}
 export function validityLabel(state: string): string {
   return (
     (

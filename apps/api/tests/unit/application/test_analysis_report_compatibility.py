@@ -34,7 +34,7 @@ def test_report_compatibility_uses_snapshot_without_exposing_it(
     repository.collections_for_project.return_value = []
     repository.sources.return_value = []
     repository.execution_active.return_value = False
-    service = AnalysisService(repository, 1, Mock(), Mock(), Mock())
+    service = AnalysisService(repository, 1, Mock(), Mock())
     monkeypatch.setattr(service, "analysis_status", lambda _: {
         "sources": [], "analysis_category": "goods", "analysis_topics": [], "lots": [],
     })
@@ -58,7 +58,7 @@ def test_retired_report_requests_fail_without_reading_report_contents(runtime, p
         "id": 42, "runtime_version": runtime,
         "skill_snapshot": {"__analysis_flow_version__": protocol},
     }
-    service = AnalysisService(repository, 1, Mock(), Mock(), Mock())
+    service = AnalysisService(repository, 1, Mock(), Mock())
 
     with pytest.raises(Conflict) as error:
         service.get_report(42)

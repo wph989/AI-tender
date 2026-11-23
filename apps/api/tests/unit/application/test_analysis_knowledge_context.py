@@ -1,4 +1,4 @@
-"""检索单次交付完整条款，审查沿用同一依赖，并核对实时身份与容量。"""
+"""检索交付完整条款，显式补读核对实时身份与容量。"""
 
 import asyncio
 from dataclasses import replace
@@ -40,8 +40,6 @@ def test_search_delivers_each_original_id_and_clause_condition_in_one_tool_call(
         assert agent.tool_calls == 1
         assert result["page"]["limit"] == agent.limits.max_search_results
         assert all(agent.seen[r["block_id"]]["element_id"] == r["element_id"] for r in rows)
-        reviewed = await agent.review_context({rows[0]["block_id"]})
-        assert set(reviewed["dependencies"][rows[0]["block_id"]]) == set(agent.seen)
 
     asyncio.run(run())
 
@@ -62,7 +60,7 @@ def test_context_budget_preserves_anchor_and_reports_omitted_evidence():
 
 
 @pytest.mark.parametrize("invalid", [None, "content", "identity", "missing"])
-def test_review_large_chunk_revalidates_it_without_reading_unrelated_neighbours(invalid):
+def test_explicit_read_revalidates_large_chunk_without_reading_unrelated_neighbours(invalid):
     async def run():
         rows = [block() | {"block_id": f"s1r1g2c{i}", "offset": i,
                            "element_id": i + 1, "chunk_version": "2"}
@@ -89,10 +87,10 @@ def test_review_large_chunk_revalidates_it_without_reading_unrelated_neighbours(
         agent.read = read
         if invalid:
             with pytest.raises(PermissionError):
-                await agent.review_context({anchor})
+                await agent.read_evidence(anchor, before=0, after=0)
             assert set(agent.seen) == {anchor}
         else:
-            result = await agent.review_context({anchor})
+            result = await agent.read_evidence(anchor, before=0, after=0)
             assert result["dependencies"] == {anchor: [anchor]}
             assert set(agent.seen) == {anchor}
         assert calls == [(1, 1)]
@@ -122,6 +120,6 @@ def test_context_identity_change_or_incomplete_window_cannot_enter_evidence(inva
         agent.read = read
         agent.seen = {row["block_id"]: dict(row) for row in rows}
         with pytest.raises(PermissionError):
-            await agent.review_context({rows[0]["block_id"]})
+            await agent.read_evidence(rows[0]["block_id"], before=0, after=0)
 
     asyncio.run(run())

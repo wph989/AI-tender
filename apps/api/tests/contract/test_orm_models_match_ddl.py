@@ -2,7 +2,7 @@
 
 当前基线 SQL 是物理结构的权威；文档登记表与列，ORM只表达访问映射。
 前两跳由 test_ddl_matches_docs 守住，这里守最后一跳：Base.metadata 的
-表名、列名、可空性、列类型必须与把全部迁移顺序执行后的库完全一致。
+表名、列名、可空性、列类型必须与当前基线创建的库完全一致。
 
 只比对这四样：models 包刻意不复制默认值/索引/约束/外键行级行为（见包 docstring），
 在模型里再写一份等于制造第二事实源，两边都能自洽地漂移，反而没有测试抓得住。
@@ -22,15 +22,12 @@ from sqlalchemy.dialects import postgresql
 from tender.adapters.pg.models import Base
 
 _API_ROOT = Path(__file__).resolve().parents[2]
-_ALEMBIC_DIR = _API_ROOT / "alembic" / "versions"
+_BASELINE_PATH = _API_ROOT / "alembic" / "versions" / "0001_current_schema.py"
 
 # alembic 自己管理的版本表不归业务模型管
 _IGNORED_TABLES = frozenset({"alembic_version"})
 
 _CREATE_TABLE_RE = re.compile(r"^CREATE TABLE (\w+) \((.*?)^\s*\);", re.S | re.M)
-_ALTER_TABLE_RE = re.compile(r"^ALTER TABLE (\w+)\s+(.*?);", re.S | re.M)
-_ADD_COLUMN_RE = re.compile(r"ADD COLUMN\s+(\w+)\s+(.+)$", re.M)
-_ALTER_COLUMN_TYPE_RE = re.compile(r"ALTER COLUMN\s+(\w+)\s+TYPE\s+(.+)$", re.M)
 _TABLE_PK_RE = re.compile(r"^(?:CONSTRAINT\s+\w+\s+)?PRIMARY KEY\s*\(([^)]+)\)")
 _TYPE_RE = re.compile(
     r"^(DOUBLE PRECISION\[\]|DOUBLE PRECISION|TIMESTAMPTZ|TIMESTAMP WITH TIME ZONE"
@@ -56,18 +53,15 @@ def _norm(type_text: str) -> str:
 
 
 def _statement_text() -> str:
-    """按文件名顺序拼接全部迁移的 _STATEMENTS，等价于顺序执行到 head。"""
-    parts: list[str] = []
-    for path in sorted(_ALEMBIC_DIR.glob("[0-9]*.py")):
-        spec = importlib.util.spec_from_file_location(f"_orm_ddl_{path.stem}", path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        statements = getattr(module, "_STATEMENTS", None)
-        assert statements, f"{path.name} 没有 _STATEMENTS，迁移的书写形态变了"
-        parts.extend(statements)
-    assert len(parts) >= 12, "没有读到全部迁移：glob 模式或文件命名变了"
-    return "\n\n".join(parts)
+    """读取唯一的空库基线，ORM 与文档使用同一份物理结构。"""
+    assert sorted(_BASELINE_PATH.parent.glob("[0-9]*.py")) == [_BASELINE_PATH]
+    spec = importlib.util.spec_from_file_location("_orm_current_schema", _BASELINE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    statements = getattr(module, "_STATEMENTS", None)
+    assert statements and len(statements) >= 12, "当前基线缺少完整的 _STATEMENTS"
+    return "\n\n".join(statements)
 
 
 def _column_type(rest: str, label: str) -> tuple[str, bool]:
@@ -86,6 +80,10 @@ def _column_type(rest: str, label: str) -> tuple[str, bool]:
 
 def _parse_ddl_columns() -> dict[str, dict[str, tuple[str, bool]]]:
     sql = _statement_text()
+    # 基线列结构由 CREATE TABLE 直接定义；出现增删或改型时显式失败，避免漏比。
+    assert not re.search(
+        r"\b(?:ADD COLUMN|ALTER COLUMN\s+\w+\s+TYPE|DROP COLUMN|DROP TABLE)\b", sql,
+    )
     tables: dict[str, dict[str, tuple[str, bool]]] = {}
 
     for match in _CREATE_TABLE_RE.finditer(sql):
@@ -111,27 +109,6 @@ def _parse_ddl_columns() -> dict[str, dict[str, tuple[str, bool]]]:
         for column in pk_columns:
             columns[column] = (columns[column][0], False)
 
-    for match in _ALTER_TABLE_RE.finditer(sql):
-        table, body = match.group(1), match.group(2)
-        if table in _IGNORED_TABLES:
-            continue
-        for add in _ADD_COLUMN_RE.finditer(body):
-            column, rest = add.group(1), add.group(2).strip().rstrip(",")
-            tables.setdefault(table, {})[column] = _column_type(rest, f"{table}.{column}")
-        for change in _ALTER_COLUMN_TYPE_RE.finditer(body):
-            column, rest = change.group(1), change.group(2).strip().rstrip(",")
-            # 类型迁移不改变可空性；按正式迁移更新类型，避免仍拿初始DDL比较head模型。
-            assert column in tables[table], f"修改了未知列类型：{table}.{column}"
-            kind, _ = _column_type(rest, f"{table}.{column}")
-            tables[table][column] = kind, tables[table][column][1]
-
-    # 下线迁移仍保留在历史链中，但 head 的模型不再承载被移除的表和列。
-    for table, column in re.findall(r"ALTER TABLE (\w+) DROP COLUMN (\w+);", sql):
-        assert column in tables[table], f"删除了未知列：{table}.{column}"
-        del tables[table][column]
-    for table in re.findall(r"DROP TABLE (\w+);", sql):
-        assert table in tables, f"删除了未知表：{table}"
-        del tables[table]
     return tables
 
 

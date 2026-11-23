@@ -1,10 +1,10 @@
-"""优先级整表展开与转移深度夹取（设计文档 12 第 3、4 节）。"""
+"""优先级整表展开规则（docs/设计/12-LLM管理与模型路由.md）。"""
 
 from __future__ import annotations
 
 import pytest
 
-from tender.application.llm.registry import binding_rows, effective_limit
+from tender.application.llm.registry import binding_rows
 from tender.domain.shared.errors import PriorityLimitExceeded
 
 
@@ -36,21 +36,3 @@ def test_binding_rows_reject_duplicate_model() -> None:
 def test_binding_rows_reject_non_positive(value: object) -> None:
     with pytest.raises(ValueError):
         binding_rows([value])  # type: ignore[list-item]
-
-
-def test_effective_limit_defaults_to_three() -> None:
-    assert effective_limit(None, 10) == 3
-
-
-def test_effective_limit_clamps_to_bound_count() -> None:
-    """只绑了 2 个模型时"前 3 个有效"没有意义，夹到 2。"""
-    assert effective_limit(3, 2) == 2
-
-
-def test_effective_limit_clamps_to_ten_and_at_least_one() -> None:
-    assert effective_limit(99, 12) == 10
-    assert effective_limit(0, 5) == 1
-
-
-def test_effective_limit_without_bindings_is_zero() -> None:
-    assert effective_limit(3, 0) == 0

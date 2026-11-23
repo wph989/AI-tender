@@ -5,7 +5,6 @@ from unittest.mock import Mock
 import pytest
 from test_analysis_verification_degradation import _RetryStore, _RetryTx
 
-from tender.application.analysis.evidence import display_citation
 from tender.application.analysis.quality import refresh_input
 from tender.application.analysis.service import AnalysisService
 from tender.application.knowledge.content import source_signature, validate_items
@@ -18,10 +17,10 @@ def test_restart_discards_all_analysis_state_for_every_terminal_status(status, m
     previous = {"staged_items": [{"id": "old"}],
                 "research": {"seen": {"old": {}}, "tool_calls": 100}, "draft": {"fields": []}}
     tx = _RetryTx([{"id": 9, "status": status}], previous)
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
+    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
     service.retry_report(3, module_keys=["project_basic_info_parsing"],
                          max_output_tokens=None, timeout_seconds=None, mode=mode)
-    assert tx.reset is None and tx.pending == [9]
+    assert tx.pending == [9]
     assert tx.inserted[0]["state"] == {"execution_mode": "restart"}
     assert previous["research"]["tool_calls"] == 100
 
@@ -30,7 +29,7 @@ def test_confirmed_missing_input_does_not_restart_on_the_same_materials():
     tx = _RetryTx([{"id": 9, "status": "completed", "business_data": {
         "quality_status": "needs_input", "quality_input_signature": source_signature([]),
     }}], {})
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
+    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
     original = service.report_row(3) | {"source_snapshot": []}
     service.report_row = Mock(return_value=original)
     service.analysis_status = Mock(return_value={"sources": []})
@@ -71,7 +70,7 @@ def test_new_materials_interrupted_attempt_uses_its_own_quality(
     })
     store.sources = Mock(return_value=current)
     store.collections_for_project = Mock(return_value=[1])
-    service = AnalysisService(store, 1, Mock(), Mock(), Mock())
+    service = AnalysisService(store, 1, Mock(), Mock())
     service.analysis_status = Mock(return_value={"sources": current})
 
     if not can_resume:
@@ -109,7 +108,7 @@ def test_partial_restart_does_not_consume_another_modules_input_change():
     store.report = Mock(side_effect=lambda _: report)
     store.sources = Mock(return_value=current)
     store.collections_for_project = Mock(return_value=[1])
-    service = AnalysisService(store, 1, Mock(), Mock(), Mock())
+    service = AnalysisService(store, 1, Mock(), Mock())
     service.analysis_status = Mock(return_value={"sources": current})
     tx.update_report = lambda _, values: report.update(values)
     service.retry_report(3, module_keys=["project_basic_info_parsing"], mode="restart",
@@ -138,7 +137,7 @@ def test_unchanged_module_does_not_resume_only_because_report_snapshot_is_old():
     })
     store.sources = Mock(return_value=current)
     store.collections_for_project = Mock(return_value=[1])
-    service = AnalysisService(store, 1, Mock(), Mock(), Mock())
+    service = AnalysisService(store, 1, Mock(), Mock())
     service.analysis_status = Mock(return_value={"sources": current})
     with pytest.raises(Conflict, match="没有需要补跑"):
         service.retry_report(3, module_keys=[], mode="resume",
@@ -176,7 +175,7 @@ def test_resume_retains_unresolved_issue_for_same_agent_without_stage_switch():
         "detail": "需补读起算点", "action": "read"}], "issue")
     tx = _RetryTx([{"id": 9, "status": "completed", "business_data": {
         "quality_status": "needs_review"}}], book.state)
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock(), Mock())
+    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
     service.retry_report(3, module_keys=[], max_output_tokens=None,
                          timeout_seconds=None, mode="resume")
     carried = tx.inserted[0]["state"]
@@ -186,26 +185,6 @@ def test_resume_retains_unresolved_issue_for_same_agent_without_stage_switch():
 
 
 
-
-
-def test_code_builds_relevant_excerpt_without_changing_evidence_identity():
-    ref = {"block_id": "s1r1c1", "source_id": 1, "element_id": 2,
-           "quote": "采用网上开标，投标人必须使用证书签名，异常时按原文流程办理。预算为500万元。"}
-    selected = display_citation(ref, {"content": {"要求": "采用网上开标，投标人必须使用证书签名"}})
-    assert selected["block_id"] == ref["block_id"]
-    assert "异常时按原文流程办理" in selected["quote"]
-    assert "预算" not in selected["quote"]
-    fallback = display_citation(ref, {"content": {"要求": "摘要完全无法逐字匹配"}})
-    assert fallback["excerpt_status"] == "block_only" and fallback["quote"] == ""
-
-
-def test_excerpt_keeps_exception_and_separates_other_facts_and_wrong_numbers():
-    ref = {"block_id": "b1", "quote": "采用网上开标方式。若系统故障，应延后开标。"
-           "预算金额为500万元。服务期限为两年。"}
-    selected = display_citation(ref, {"content": {"要求": "采用网上开标方式"}})
-    assert selected["excerpts"] == ["采用网上开标方式。", "若系统故障，应延后开标。"]
-    wrong = display_citation(ref, {"content": {"要求": "预算金额为600万元"}})
-    assert wrong["excerpt_status"] == "block_only"
 
 
 def test_new_input_invalidates_confirmed_missing_cache_and_old_version_evidence():
