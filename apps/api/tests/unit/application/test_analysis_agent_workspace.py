@@ -45,6 +45,24 @@ def test_draft_and_review_never_publish_before_explicit_final():
     book.finalize([row["id"]], "已核对质保要求")
     assert len(published_items(book.state)) == 1
     assert book.state["draft"]["business_data"]["records"][0]["content"] == raw()["content"]
+    assert "fields" not in book.state["draft"]
+
+
+def test_final_selection_preserves_order_and_leaves_unselected_drafts_out():
+    book = workspace()
+    first = saved(book)
+    others = book.save_records([
+        raw(content={"字段": "交货", "内容": "十日内"}),
+        raw(content={"字段": "质保", "内容": "五年"}),
+    ], "others")["accepted"]
+    for receipt in [first, *others]:
+        approve(book, receipt)
+    ids = [others[1]["id"], first["id"]]
+    book.finalize(ids, "已核对选中事项")
+    assert [item["id"] for item in published_items(book.state)] == ids
+    assert [record["id"] for record in book.state["draft"]["business_data"]["records"]] == ids
+    assert len(book.state["staged_items"]) == 3
+    assert "fields" not in book.state["draft"]
 
 
 def test_missing_and_stale_review_rejected_then_same_agent_can_correct():
@@ -194,7 +212,7 @@ def test_deleted_mistake_can_be_closed_and_does_not_return_in_final():
         [], [{"id": issue["id"], "status": "resolved", "detail": "已删除误用条目"}], "close"
     )
     book.finalize([], "当前材料未规定质保要求")
-    assert book.state["draft"]["fields"] == []
+    assert published_items(book.state) == []
     assert any(event["event"] == "delete" for event in book.book["history"])
 
 
@@ -317,7 +335,7 @@ def test_parent_scope_accepts_known_lot_name_code_and_alias(lot):
     for receipt in [parent, *children]:
         approve(book, receipt)
     book.finalize([r["id"] for r in [parent, *children]], "完成")
-    assert len(book.state["draft"]["fields"]) == 3
+    assert len(published_items(book.state)) == 3
 
 
 @pytest.mark.parametrize("target_ref,allowed", [

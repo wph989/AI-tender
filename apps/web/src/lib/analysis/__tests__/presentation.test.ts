@@ -9,8 +9,7 @@ function item(id: string, overrides: Partial<BusinessRecord> = {}): AnalysisFiel
     id, field: id, group: "正文", sort_order: 0, note: "", verification: "supported", values: [],
     record: { id, key: id, kind: "requirement", title: id, text: id, module_key: "tech",
       scope: { kind: "common", lot_refs: [], lot_ids: [] }, structuring: "partial", verification: "supported",
-      citations: [], group: "正文", sort_order: 0, category: "other", materials: [], scoring: null,
-      conditions: { expression: "", logic: "text", terms: [], exceptions: [] }, ...overrides },
+      citations: [], group: "正文", sort_order: 0, ...overrides },
   };
 }
 
@@ -56,7 +55,7 @@ it("同专题同主题同范围说明去重，不合并不同主题、标段和�
   const base = { key: "1", detail: "缺少附件", code: "unresolved_reference", moduleKey: "tech", topicTitle: "迁移", scopeLabel: "A" };
   const groups = groupGaps([base, { ...base, key: "2" }, { ...base, key: "3", scopeLabel: "B" },
     { ...base, key: "4", topicTitle: "验收" }, { ...base, key: "5", recordId: "r1" },
-    { ...base, key: "6", code: "coverage_pending" }]);
+    { ...base, key: "6", code: "module_incomplete" }]);
   expect(groups).toHaveLength(5);
   expect(groups[0]?.gaps).toHaveLength(1);
   expect(groups.at(-1)?.category).toBe("分析尚未完成");
@@ -70,7 +69,7 @@ it("统计区分信息、要求、材料节点和关联", () => {
 });
 
 it("显示文案相同的未知标段缺口仍按原始范围区分", () => {
-  const base = { code: "coverage_pending", detail: "此主题尚未完成核对", moduleKey: "tech",
+  const base = { code: "scope_unknown", detail: "此主题范围尚未完成核对", moduleKey: "tech",
     topicTitle: "实施条件", scopeLabel: "归属待确认" };
   const gaps = ["A", "B", "A"].map((ref, index) => ({ ...base, key: String(index),
     scope: { kind: "unknown" as const, lot_refs: [ref], lot_ids: [] } }));

@@ -126,10 +126,6 @@ class RoutingModel:
                 return True
         return False
 
-    @property
-    def candidate_count(self) -> int:
-        return len(self._candidates)
-
     def _client(self, candidate: ModelCandidate) -> ChatGateway:
         client = self._clients.get(candidate)
         if client is None:

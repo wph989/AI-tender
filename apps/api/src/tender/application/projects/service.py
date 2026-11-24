@@ -9,7 +9,7 @@ from tender.ports.repository.projects.projects import ProjectRepository
 
 
 class ProjectService:
-    def __init__(self, repository: ProjectRepository, company_id: int) -> None:
+    def __init__(self, repository: ProjectRepository) -> None:
         self.repository = repository
 
     def create(

@@ -83,12 +83,10 @@ def reviewed_compilation(data: dict) -> dict:
                 k: v for k, v in record.items() if k not in {"superseded_in", "conflicts_in"}
             }
             if record["human_review_status"] == "corrected":
-                # 修正正文时机器抽出的条件与评分不再代表新结论，仍保留人工核对过的原文。
+                # 修正正文后原 content 不再代表新结论，保留已核对的原文并标记待结构化。
                 record = {
                     **record, "text": record["human_review"]["corrected_text"], "content": {},
-                    "conditions": {"expression": "", "logic": "text", "terms": [],
-                                   "exceptions": []},
-                    "materials": [], "scoring": None, "structuring": "partial",
+                    "structuring": "partial",
                 }
             result[bucket].append(record)
             approved_ids.add(record["id"])

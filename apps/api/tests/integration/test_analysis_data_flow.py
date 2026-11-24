@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import event, text
 from store import SqlStore
 from test_knowledge_flow import add_source
 from test_knowledge_flow import environment as environment
@@ -19,7 +19,6 @@ from tender.api.shared.errors import install_error_handlers
 from tender.application.analysis import service as analysis
 from tender.application.analysis.data import (
     BusinessRecord,
-    display_items,
     module_data,
     prepare_records,
 )
@@ -75,10 +74,10 @@ def basis(environment):
     })
     business = module_data(state)
     module_id = conn.execute(text("""INSERT INTO analysis_module
-        (report_id,module_key,title,status,items,business_data)
+        (report_id,module_key,title,status,business_data)
         VALUES (:report,'project_basic_info_parsing','项目概况','completed',
-                CAST(:items AS JSONB),CAST(:business AS JSONB)) RETURNING id"""), {
-            "report": created["id"], "items": encode(display_items(items)),
+                CAST(:business AS JSONB)) RETURNING id"""), {
+            "report": created["id"],
             "business": encode(business),
         }).scalar_one()
     db.execute("UPDATE analysis_report SET status='completed',finished_at=now() WHERE id=:id",
@@ -173,6 +172,40 @@ def test_independent_module_json_uses_separate_evidence_and_live_permissions(bas
     assert basis.client.get(basis.path + "/modules/unknown/records").status_code == 404
 
 
+def test_module_records_query_loads_one_topic_and_keeps_company_isolation(basis):
+    basis.db.execute("""INSERT INTO analysis_module
+        (report_id,module_key,title,status,business_data)
+        VALUES (:report,'tech_requirement_parsing','技术要求','completed',
+                CAST(:data AS JSONB))""", {
+        "report": basis.report_id,
+        "data": encode({"records": [], "evidence": {}, "research_summary": "其它专题"}),
+    })
+    statements = []
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        if statement.startswith("SELECT analysis_module."):
+            statements.append(statement)
+
+    # 捕获真实SQL，避免夹具用全报告过滤来掩盖仓储的单专题取数退化。
+    event.listen(basis.conn, "before_cursor_execute", capture)
+    try:
+        response = basis.client.get(
+            basis.path + "/modules/project_basic_info_parsing/records",
+        )
+    finally:
+        event.remove(basis.conn, "before_cursor_execute", capture)
+    assert response.status_code == 200 and len(response.json()["records"]) == 5
+    assert len(statements) == 1
+    assert "analysis_module.module_key =" in statements[0]
+    assert "analysis_module.report_id =" in statements[0]
+    assert "analysis_report.company_id =" in statements[0]
+    assert basis.db.report_module(basis.report_id, "missing") is None
+    assert SqlStore(basis.db.engine, 2).report_module(
+        basis.report_id, "project_basic_info_parsing",
+    ) is None
+    assert basis.client.get(basis.path + "/modules/missing/records").status_code == 404
+
+
 def test_terminal_snapshot_is_idempotent_and_context_is_single_lot(basis):
     assert basis.client.get(basis.path + "/data").status_code == 409
     basis.db.execute("UPDATE analysis_report SET status='running' WHERE id=:id",
@@ -213,20 +246,24 @@ def test_terminal_snapshot_is_idempotent_and_context_is_single_lot(basis):
 @pytest.mark.parametrize("staged", [False, True])
 def test_report_keeps_business_identity_and_never_exposes_internal_payload(basis, staged):
     if staged:
-        basis.db.execute("UPDATE analysis_module SET status='partial',items='[]' WHERE id=:id",
-                         {"id": basis.module_id})
+        basis.db.execute(
+            "UPDATE analysis_module SET status='partial',business_data='{}' WHERE id=:id",
+            {"id": basis.module_id},
+        )
         basis.conn.execute(text("""INSERT INTO agent_module_run
             (module_id,company_id,attempt,thread_id,status,limits,state)
             VALUES (:module,1,1,'business-stage','failed','{}',CAST(:state AS JSONB))"""), {
                 "module": basis.module_id, "state": encode(basis.state),
             })
     module = basis.client.get(basis.path).json()["modules"][0]
-    items = module["items"]
+    assert "items" not in module and "business_data" not in module
+    result = basis.client.get(basis.path + "/modules/project_basic_info_parsing/records").json()
+    items = result["records"]
     if staged:
-        assert not items and "business_data" not in module
+        assert not items
         return
-    assert len([item for item in items if item["field"] == "质保期"]) == 2
-    assert {item["record_id"] for item in items} == {r["id"] for r in basis.business["records"]}
+    assert len([item for item in items if item["title"] == "质保期"]) == 2
+    assert {item["id"] for item in items} == {r["id"] for r in basis.business["records"]}
     assert "business_data" not in module
     assert all("business" not in item for item in items)
 

@@ -42,12 +42,11 @@ it("逐条绑定校验失败只标记当前专题，其它有效专题仍正常�
   };
   const valid: ModuleRecords = { ...data, evidence: { source: ref }, records: [{
     id: "valid", key: "valid", title: "实施任务", text: "辅助正文", group: "技术方案要求",
-    sort_order: 0, module_key: data.module_key, kind: "requirement", category: "other",
+    sort_order: 0, module_key: data.module_key, kind: "requirement",
     content: { 要求摘要: "迁移与回退", 关键要求: ["实施迁移", "保留回退方案"] },
     content_evidence: { 要求摘要: [["source"]], 关键要求: [["source"], ["source"]] },
     evidence_ids: ["source"], scope: { kind: "common", lot_refs: [] },
-    verification: "supported", structuring: "complete", materials: [], scoring: null,
-    conditions: { expression: "", logic: "text", terms: [], exceptions: [] },
+    verification: "supported", structuring: "complete",
   }] };
   const invalid = structuredClone(valid);
   invalid.records[0]!.content_evidence!.关键要求 = [["source"]];
@@ -73,8 +72,7 @@ it("正文只用独立 content，Skill 列顺序及证据身份完整保留", ()
     text: "辅助文本", content: { 要求摘要: "结果摘要", 关键要求: ["要求一", "要求二"] },
     evidence_ids: ["evidence"], scope: { kind: "lots" as const, lot_refs: ["A标段"] },
     structuring: "partial" as const, module_key: data.module_key, verification: "supported" as const,
-    group: "技术方案要求", sort_order: 1, category: "other", materials: [], scoring: null,
-    conditions: { expression: "", logic: "text" as const, terms: [], exceptions: [] },
+    group: "技术方案要求", sort_order: 1,
   };
   const result = recordItems({ ...data, evidence: { evidence: ref }, records: [record] });
   expect(result[0]?.output?.content).toEqual(record.content);
@@ -98,8 +96,7 @@ it("逐条依据按正文位置解析，拒绝数量不符或借用其它事项�
     evidence_ids: ["first", "second"], scope: { kind: "common" as const, lot_refs: [] },
     content_evidence: { 要求摘要: [["first", "second"]], 关键要求: [["first"], ["second"]] },
     structuring: "complete" as const, module_key: data.module_key, verification: "supported" as const,
-    group: "技术方案要求", sort_order: 1, category: "other", materials: [], scoring: null,
-    conditions: { expression: "", logic: "text" as const, terms: [], exceptions: [] },
+    group: "技术方案要求", sort_order: 1,
   };
   const input = { ...data, evidence: { first, second, unrelated: second }, records: [record] };
   const result = recordItems(input)[0]!;

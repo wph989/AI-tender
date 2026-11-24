@@ -17,16 +17,11 @@ def test_capacity_never_goes_negative() -> None:
     assert capacity(2, 5) == 0
 
 
-def test_capacity_none_means_unlimited() -> None:
-    assert capacity(None, 99) is None
-
-
 def test_every_stream_has_a_task_and_stages() -> None:
     for stream in STREAMS:
         assert stream.stages, stream.name
         assert stream.task_name.startswith("tender.worker."), stream.name
-        if stream.limit_key is not None:
-            assert stream.limit_key.endswith(".max_inflight"), stream.limit_key
+        assert stream.limit_key.endswith(".max_inflight"), stream.limit_key
 
 
 def test_streams_only_dispatch_conversion_and_parsing() -> None:

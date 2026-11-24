@@ -19,7 +19,7 @@ def bbox(row: dict[str, Any]) -> list[float] | None:
 
 
 class VersionService:
-    def __init__(self, repository: VersionRepository, company_id: int) -> None:
+    def __init__(self, repository: VersionRepository) -> None:
         self.repository = repository
 
     def require_version(self, version_id: int) -> dict[str, Any]:

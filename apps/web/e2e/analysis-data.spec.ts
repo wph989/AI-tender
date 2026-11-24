@@ -12,10 +12,8 @@ const citation: Citation = {
 function record(key: string, text: string, lotId?: number): BusinessRecord {
   return {
     id: key, key, kind: "requirement", title: key, text,
-    module_key: "project_basic_info_parsing", group: "", category: "other", sort_order: 0,
+    module_key: "project_basic_info_parsing", group: "", sort_order: 0,
     verification: "supported", structuring: "complete", effective_status: "active",
-    conditions: { expression: "", logic: "text", terms: [], exceptions: [] },
-    materials: [], scoring: null,
     scope: lotId ? { kind: "lots", lot_ids: [lotId], lot_refs: [lotId === 1 ? "A" : "B"] }
       : { kind: "common", lot_ids: [], lot_refs: [] },
     citations: [{ ...citation, quote: text }],

@@ -80,8 +80,8 @@ def test_cleanup_failure_stops_controller_and_releases_waiters(
 def test_handled_module_failure_allows_other_modules_to_complete(controller, monkeypatch, executor):
     db, report, publish = controller
     rows = [
-        {"id": 930, "status": "pending", "items": []},
-        {"id": 931, "status": "pending", "items": []},
+        {"id": 930, "status": "pending"},
+        {"id": 931, "status": "pending"},
     ]
     db.report_modules.return_value = rows
 
@@ -95,7 +95,7 @@ def test_handled_module_failure_allows_other_modules_to_complete(controller, mon
     monkeypatch.setattr(executor, "execute_module", execute)
     asyncio.run(executor.analyze_report(report))
     db.finish_task.assert_not_called()
-    db.finish_report.assert_called_once_with(16, status="partial", summary=[], error=None)
+    db.finish_report.assert_called_once_with(16, status="partial", error=None)
     publish.assert_called_once_with(db, 16)
 
 

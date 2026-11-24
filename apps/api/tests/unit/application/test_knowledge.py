@@ -7,8 +7,6 @@ import pytest
 from tender.application.knowledge.answer_evidence import json_completion
 from tender.application.knowledge.content import (
     cosine,
-    fingerprint,
-    merge_field_entries,
     rank_chunks,
     validate_items,
 )
@@ -265,54 +263,6 @@ def test_same_value_and_location_are_deduped_within_a_field():
     )
     assert len(items[0]["values"]) == 1
     assert len(items[0]["values"][0]["citations"]) == 1
-
-
-def test_merge_field_entries_unions_values_and_locations():
-    """同一字段的多个已核实版本合并成一行；未核实版本保持独立，不能被并进结果。"""
-
-    def entry(order, pairs, verification="supported"):
-        return {
-            "id": "id" + str(order),
-            "field": "质保期",
-            "group": "质保",
-            "sort_order": order,
-            "values": [
-                {
-                    "value": value,
-                    "citations": [
-                        {
-                            "block_id": block_id,
-                            "source_id": 1,
-                            # 不同块在原库里对应不同元素；位置去重按元素身份区分，
-                            # 测试夹具必须照此建模，否则会被当成同一处原文合并。
-                            "element_id": int(block_id.rsplit("c", 1)[-1]) + 1,
-                            "page_no": 1,
-                            "quote": quote,
-                        }
-                    ],
-                }
-                for value, block_id, quote in pairs
-            ],
-            "note": "第" + str(order) + "批",
-            "verification": verification,
-        }
-
-    merged = merge_field_entries(
-        [
-            entry(1, [("质保三年", "s1r1c0", "质保三年")]),
-            entry(
-                2,
-                [("质保三年", "s1r1c1", "质保三年。"), ("质保五年", "s1r1c1", "质保五年")],
-            ),
-            entry(3, [("质保六年", "s1r1c2", "质保六年")], verification="pending"),
-        ]
-    )
-    assert len(merged) == 2
-    row = next(entry for entry in merged if entry["verification"] == "supported")
-    assert [value["value"] for value in row["values"]] == ["质保三年", "质保五年"]
-    assert len(row["values"][0]["citations"]) == 2
-    assert row["sort_order"] == 1
-    assert row["id"] == fingerprint([row["field"], row["values"]])[:20]
 
 
 def test_hybrid_retrieval_adds_semantic_match_without_keyword_match():

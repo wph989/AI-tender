@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type {
-  AnalysisField, AnalysisModule, AnalysisOutput, AnalysisReport, Citation, KnowledgeSource, ModuleRecords,
+  AnalysisField, AnalysisModule, AnalysisOutput, AnalysisReport, AnalysisReportDetail, Citation, KnowledgeSource, ModuleRecords,
 } from "../src/types/knowledge";
 import { mockApi, selectModule } from "./fixtures";
 
@@ -53,17 +53,15 @@ const modules: AnalysisModule[] = [
   },
 ];
 
-/**
- * 报告投影故意与独立记录不同，证明页面真的接入新接口；
- * 各用例只覆盖差异化字段，避免重复维护同一份骨架。
- */
-function report(id: number, overrides: Partial<AnalysisReport> = {}): AnalysisReport {
-  return {
+/** 夹具保留独立记录正文；HTTP详情按现行契约只返回状态，防止旧投影掩盖取数错误。 */
+function report(id: number, overrides: Partial<AnalysisReport> = {}): AnalysisReportDetail {
+  const result: AnalysisReport = {
     id, status: "completed", category: "goods", topics: [], coverage: {},
-    modules: modules.map((module) => ({ ...module, items: [] })), data_schema_version: "1",
+    modules, data_schema_version: "1",
     created_at: "2026-10-14T10:00:00Z", stale: false,
     error_message: null, ...overrides,
   };
+  return { ...result, modules: result.modules.map(({ items: _items, ...module }) => module) };
 }
 
 let errors: string[];
@@ -104,8 +102,6 @@ function records(module: AnalysisModule): ModuleRecords {
       content: item.output!.content, parent_key: item.output!.parent_key,
       node_type: item.output!.node_type, evidence_ids: ["source"],
       scope: { kind: "common", lot_refs: [] }, structuring: "complete", verification: "supported",
-      category: "other", materials: [], scoring: null,
-      conditions: { expression: "", logic: "text", terms: [], exceptions: [] },
     })),
   };
 }
@@ -654,14 +650,14 @@ test("未知 A、B 标段的相同缺口分别保留并显示原文指向", asyn
   await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({ json: {
     report_id: 1, snapshot_id: 1, revision: 1, schema_version: "1", stale: false,
     data: { schema_version: "1", lots: [], facts: [], requirements: [], format_nodes: [], relations: [], readiness: "partial",
-      gaps: ["A标段", "B标段", "A标段"].map((ref) => ({ code: "coverage_pending", detail: "此主题尚未完成核对",
+      gaps: ["A标段", "B标段", "A标段"].map((ref) => ({ code: "scope_unknown", detail: "此主题范围尚未完成核对",
         module_key: "tech_requirement_parsing", topic: "实施条件", scope: { kind: "unknown", lot_ids: [], lot_refs: [ref] } })),
     },
   } }));
   await page.reload();
   await page.getByRole("tab", { name: "待核对 · 2 组", exact: true }).click();
   const board = page.getByRole("region", { name: "待核对事项" });
-  await expect(board.getByText("此主题尚未完成核对", { exact: true })).toHaveCount(2);
+  await expect(board.getByText("此主题范围尚未完成核对", { exact: true })).toHaveCount(2);
   await expect(board).toContainText("A标段");
   await expect(board).toContainText("B标段");
 });
@@ -877,21 +873,17 @@ for (const module of [
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
-test("正文外的条件与证明材料保留补充依据，正文来源不重复集中展示", async ({ page }) => {
+test("逐条正文依据之外的补充原文可独立定位，正文来源不重复集中展示", async ({ page }) => {
   const data = records(modules[0]!);
   const second = { ...citation, element_id: 2, anchor: "p1b2", quote: "仅在业务低谷窗口实施，并提交审批记录。" };
   data.evidence = { source: citation, condition: second };
   data.records = [{ ...data.records[0]!, content: { 背景: ["实施平台迁移。"] },
     evidence_ids: ["source", "condition"], content_evidence: { 背景: [["source"]] },
-    conditions: { expression: "仅在业务低谷窗口实施。", logic: "text", terms: [], exceptions: [] },
-    materials: [{ name: "审批记录", requirement: "提交审批记录。" }],
   }];
   await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({ json: second }));
   await page.reload();
   const record = page.locator('[data-report-item="background"]');
-  await record.locator(".record-conditions > summary").click();
-  await expect(record.locator(".record-conditions")).toContainText("审批记录");
   await expect(record.locator(".result-points > li button")).toHaveCount(1);
   const extra = record.getByRole("group", { name: "补充依据", exact: true });
   await expect(extra.getByRole("button")).toHaveCount(1);
@@ -984,27 +976,28 @@ test.describe("每次分析的时间与原因", () => {
     await expect(page.getByRole("button", { name: "重新解析本模块", exact: true })).toBeDisabled();
   });
 
-  test("接口缺少成功统计时显示未记录，不能空白或用尝试数代替", async ({ page }) => {
+  test("每次运行分别展示结算成功次数，不能用尝试数代替", async ({ page }) => {
     const run = {
       id: 1, attempt: 4, status: "partial", thread_id: "run-4", started_at: "2026-11-08T08:25:22Z",
       finished_at: "2026-11-08T08:58:51Z", deadline_at: "2026-11-08T09:25:22Z",
       model_calls: 48, tool_calls: 39, prompt_tokens: 100, completion_tokens: 50,
+      successful_model_calls: 8, successful_tool_calls: 0,
       limits: { max_model_calls: 80, max_tool_calls: 100, timeout_seconds: 3600, max_output_tokens: 8192 },
-      error_message: "审查重复请求已提供上下文：dates",
+      error_message: "本次分析的模型请求预算已耗尽",
     };
     await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
       modules: [{ ...modules[0]!, items: [], runs: [
-        run, { ...run, id: 2, attempt: 5, successful_model_calls: 0, successful_tool_calls: null },
+        run, { ...run, id: 2, attempt: 5, successful_model_calls: 0, successful_tool_calls: 3 },
       ] }],
     }) }));
     await page.reload();
     await page.locator(".module-operations > summary").click();
     const history = page.getByRole("list", { name: "历次分析记录", exact: true });
-    const missing = history.getByRole("listitem", { name: "第 4 次分析", exact: true });
-    await expect(missing.locator(".run-summary")).toContainText("模型请求成功 未记录 · 工具执行成功 未记录");
-    await expect(missing.locator(".run-summary")).not.toContainText("48");
-    await expect(missing.locator(".run-summary")).not.toContainText("39");
+    const first = history.getByRole("listitem", { name: "第 4 次分析", exact: true });
+    await expect(first.locator(".run-summary")).toContainText("模型请求成功 8 次 · 工具执行成功 0 次");
+    await expect(first.locator(".run-summary")).not.toContainText("48");
+    await expect(first.locator(".run-summary")).not.toContainText("39");
     await expect(history.getByRole("listitem", { name: "第 5 次分析", exact: true }).locator(".run-summary"))
-      .toContainText("模型请求成功 0 次 · 工具执行成功 未记录");
+      .toContainText("模型请求成功 0 次 · 工具执行成功 3 次");
   });
 });

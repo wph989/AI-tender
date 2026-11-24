@@ -22,9 +22,6 @@ def _model_domain_rules(content: str) -> str:
     # 只剔除已由运行时提供的导航和通用协议；未知小节完整保留，不能按长度删业务规则。
     body = re.sub(r"\A---\s*\n.*?\n---\s*\n", "", content, count=1, flags=re.S)
     sections = re.split(r"(?=^## )", body, flags=re.M)
-    generic = ("按 coverage.json 核对业务内容，保留范围、条件、例外及完整清单。"
-               "研究与提交协议以运行时工具为准；本文件只定义本专题的业务判断。")
-    sections = [section.replace(generic, "") for section in sections]
     redundant = {"## 参考文件", "## 本项目的检索与输出"}
     return "\n\n".join(section.strip() for section in sections
                        if section.strip() and not (

@@ -7,7 +7,7 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
-from tender.application.knowledge.content import source_state
+from tender.application.knowledge.content import fingerprint, source_state
 from tender.application.knowledge.qa_agent import answer_with_agent
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
@@ -43,58 +43,93 @@ def dispatch_ready(db: KnowledgeDispatchRepository) -> list[tuple[str, int]]:
 def graph_expand(
     db: KnowledgeExecutionRepository, project_id: int, hits: list[dict], sources: list[dict]
 ) -> tuple[list[dict], list[dict]]:
-    source_runs = {(s["source_id"], s["parse_run_id"]) for s in sources}
-    relations = db.verified_relations(project_id)
-    relations = [
-        r
-        for r in relations
-        if r["citations"]
-        and all((ref["source_id"], ref["parse_run_id"]) in source_runs for ref in r["citations"])
-    ]
+    snapshot = db.relation_snapshot(project_id)
+    if snapshot is None:
+        return hits, []
+    data = snapshot["data"]
+    records = {row["id"]: row for bucket in ("facts", "requirements", "format_nodes")
+               for row in data[bucket]}
+    identity = ("source_id", "collection_id", "version_id", "parse_run_id")
+    source_runs = {tuple(s[k] for k in identity) for s in sources}
+    allowed = set(db.collections_for_project(project_id))
+    relations = []
+    for row in data["relations"]:
+        endpoints = [records.get(row[key]) for key in ("subject_id", "object_id")]
+        if (
+            row["verification"] != "supported" or row["scope"]["kind"] == "unknown"
+            or any(r is None or r["verification"] != "supported" for r in endpoints)
+            or not row["citations"]
+            or any(tuple(ref[k] for k in identity) not in source_runs
+                   or ref["collection_id"] not in allowed for ref in row["citations"])
+        ):
+            continue
+        relations.append(row)
     selected = []
     names = set()
-    text_hits = "\n".join(r["content"] for r in hits)
+    hit_ids = {r["block_id"] for r in hits}
+    # 权限和原文版本会变化；遍历前整条复核，避免失效边把第二跳关系带入上下文。
+    checked: dict[str, bool] = {}
     for _depth in range(2):
         next_names = set()
         for rel in relations:
             if rel in selected:
                 continue
+            # 原文名称和列举顺序仅供展示，遍历按已解析标段集合匹配同一范围。
+            scope_key = (rel["scope"]["kind"], frozenset(rel["scope"]["lot_ids"]))
             if (
-                rel["subject"] in text_hits
-                or rel["object"] in text_hits
-                or (
-                    (rel["subject"], rel["scope"]) in names
-                    or (rel["object"], rel["scope"]) in names
-                )
+                hit_ids.intersection(ref["block_id"] for ref in rel["citations"])
+                or (rel["subject_id"], scope_key) in names
+                or (rel["object_id"], scope_key) in names
             ):
+                for ref in rel["citations"]:
+                    key = fingerprint(ref)
+                    if key not in checked:
+                        try:
+                            db.resolve(ref)
+                            checked[key] = True
+                        except LookupError:
+                            checked[key] = False
+                if not all(checked[fingerprint(ref)] for ref in rel["citations"]):
+                    continue
                 selected.append(rel)
-                next_names.update(((rel["subject"], rel["scope"]), (rel["object"], rel["scope"])))
+                next_names.update((rel[key], scope_key)
+                                  for key in ("subject_id", "object_id"))
                 if len(selected) >= 24:
                     break
         if len(selected) >= 24:
             break
-        text_hits = ""
+        hit_ids = set()
         names = next_names
     if not selected:
         # 问答每次检索都会尝试扩展；无关联时无需反复读取全部资料。
         return hits, []
     seen = {r["block_id"] for r in hits}
-    # 只展开关系实际引用的资料；无关资料的整篇切分最终也会被过滤掉。
-    wanted: dict[int, set[int]] = {}
+    # 同一长元素可拆成多个块，只补读关系实际引用且尚未命中的块。
+    wanted: dict[int, set[str]] = {}
     for rel in selected:
         for ref in rel["citations"]:
-            wanted.setdefault(ref["source_id"], set()).add(ref["element_id"])
+            if ref["block_id"] not in seen:
+                wanted.setdefault(ref["source_id"], set()).add(ref["block_id"])
     for source in sources:
-        element_ids = wanted.get(source["source_id"])
-        if not element_ids:
-            continue
-        for block in db.readable_chunks(source):
-            if (block["element_id"] in element_ids or any(
-                    place["element_id"] in element_ids for place in block.get("locations", [])
-            )) and block["block_id"] not in seen:
-                hits.append(block)
-                seen.add(block["block_id"])
-    return hits, selected
+        # 按块序号保持原文顺序，不能把 c12 排在 c2 前面。
+        positions = sorted((int(key.rsplit("c", 1)[1]), key)
+                           for key in wanted.get(source["source_id"], set()))
+        for offset, block_id in positions:
+            # 已核验的稳定块ID包含序号；复用有界读取，索引缺失时也只读到目标块。
+            for block in db.read_chunk_window(source, offset, 1).rows:
+                if block["block_id"] == block_id and block_id not in seen:
+                    hits.append(block)
+                    seen.add(block_id)
+    # 问答展示关系摘要，节点关联仍由稳定记录ID决定，不能靠归纳文字猜同一身份。
+    predicates = {"supersedes": "替代", "conflicts": "冲突", "requires": "依赖", "contains": "包含"}
+    return hits, [{
+        "subject": records[rel["subject_id"]]["title"],
+        "predicate": predicates[rel["predicate"]],
+        "object": records[rel["object_id"]]["title"],
+        "scope": ("公共要求" if rel["scope"]["kind"] == "common"
+                  else "、".join(rel["scope"]["lot_refs"])),
+        "condition": rel["text"], "citations": rel["citations"],
+    } for rel in selected]
 
 
 def _log_failure(event: str, exc: Exception, **fields: Any) -> None:

@@ -92,7 +92,6 @@ class RoutingModelFactory:
         output_limit: int | None = None,
         on_call=None,
         remaining_seconds=None,
-        extra_retries_limit: int | None = None,
         rate_limit_backoff_seconds: float = 30,
         rate_limit_max_wait_seconds: float = 600,
         invocation_store=None,
@@ -101,11 +100,6 @@ class RoutingModelFactory:
 
         cooldown = self.cooldown
         candidates = self._load_candidates(feature_key, purpose)
-        if extra_retries_limit is not None:
-            candidates = [
-                replace(candidate, extra_retries=min(candidate.extra_retries, extra_retries_limit))
-                for candidate in candidates
-            ]
         policy = self.repository.policy(feature_key)
 
         def recheck(snapshot: ModelCandidate) -> ModelCandidate | None:

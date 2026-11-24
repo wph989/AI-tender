@@ -1,0 +1,147 @@
+# 官方 MinerU 4.x 编排（docker/compose.yaml），镜像由官方的本地标签 `mineru:4`
+# 换成可直接拉取的社区预构建镜像 mustangxu/mineru:4.0.12。
+# 原因：官方没有发布可拉取的 4.x 镜像，`mineru:4` 只能本地构建；该镜像的构建记录显示
+# 它按官方 Dockerfile 构建（mineru[torch]==4.0.12 + standard 档模型 + 官方 entrypoint）。
+# 如需回到官方方式：把各服务的 image 改回 `mineru:4`，并在本机准备好同名镜像。
+services:
+  mineru-openai-server:
+    image: ${MINERU_IMAGE:-mustangxu/mineru:4.0.12}
+    container_name: mineru-openai-server
+    restart: always
+    profiles: ["openai-server"]
+    ports:
+      - 30000:30000
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: ["mineru-kit"]
+    command:
+      - vlm-server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30000"
+      # --gpu-memory-utilization 0.5  # If encountering VRAM shortage, reduce the KV cache size by this parameter; if VRAM issues persist, try lowering it further to `0.4` or below.
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]  # Modify for multiple GPUs: ["0", "1"]
+              capabilities: [gpu]
+
+  mineru-api:
+    image: ${MINERU_IMAGE:-mustangxu/mineru:4.0.12}
+    container_name: mineru-api
+    restart: always
+    profiles: ["api"]
+    ports:
+      - 8000:8000
+    environment:
+      MINERU_MODEL_SOURCE: local
+      # mineru-vl-utils 2.0.7 的防重复处理器使用旧 Runner 接口，关闭 V2 以匹配 vLLM 0.31.0。
+      VLLM_USE_V2_MODEL_RUNNER: "0"
+    entrypoint: ["mineru-kit"]
+    command:
+      - api-server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      # 固定解析档位，避免客户端请求不带 tier 时落到别的档
+      - --tier
+      - standard
+      # 启用鉴权：请求需带 Authorization: Bearer <key>；默认值与 apps/api/.env 的
+      # MINERU_API_KEY 保持一致，生产环境请改成本机 .env / shell 里的强密钥
+      - --api-key
+      - ${MINERU_API_KEY:-123456}
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      # /v1/health 不需要鉴权，健康检查无需带 token
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/v1/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]  # Modify for multiple GPUs: ["0", "1"]
+              capabilities: [gpu]
+
+  mineru-router:
+    image: ${MINERU_IMAGE:-mustangxu/mineru:4.0.12}
+    container_name: mineru-router
+    restart: always
+    profiles: ["router"]
+    ports:
+      - 8002:8002
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: ["mineru-kit"]
+    command:
+      - router
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8002"
+      - --local-gpus
+      - auto
+      - --worker-tier
+      - standard
+      - --worker-concurrency
+      - "1"
+      # --preload-models  # Preload models in router-managed mineru-kit api-server workers.
+      # To aggregate existing mineru-api services instead of starting local workers:
+      # --local-gpus none
+      # --upstream-url http://mineru-api:8000
+      # --upstream-url http://mineru-api-2:8000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/v1/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]  # Modify for multiple GPUs: ["0", "1"]
+              capabilities: [gpu]
+
+  mineru-webui:
+    image: ${MINERU_IMAGE:-mustangxu/mineru:4.0.12}
+    container_name: mineru-webui
+    restart: always
+    profiles: ["webui"]
+    ports:
+      - 7860:7860
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: ["mineru-kit"]
+    command:
+      - webui
+      - --server-name
+      - 0.0.0.0
+      - --server-port
+      - "7860"
+      # --no-enable-api  # Disable the Gradio event API.
+      # --api-server-tier standard  # Configure the managed V1 API server capability tier.
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]  # Modify for multiple GPUs: ["0", "1"]
+              capabilities: [gpu]

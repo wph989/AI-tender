@@ -39,7 +39,7 @@ class Stream:
     name: str
     stages: tuple[str, ...]
     inflight_stages: tuple[str, ...]
-    limit_key: str | None
+    limit_key: str
     task_name: str
 
 
@@ -82,10 +82,8 @@ def registry() -> ConfigReader:
     return _registry
 
 
-def capacity(limit: int | None, inflight: int) -> int | None:
-    """这一轮还能派发几个；None 表示没有并发限制。"""
-    if limit is None:
-        return None
+def capacity(limit: int, inflight: int) -> int:
+    """这一轮还能派发几个；配置下调后暂停新派发，已有任务继续收尾。"""
     return max(0, int(limit) - max(0, int(inflight)))
 
 
@@ -102,7 +100,7 @@ def _deliver(
     return True
 
 
-def dispatch_stream(stream: Stream, limit: int | None, company_id: int) -> int:
+def dispatch_stream(stream: Stream, limit: int, company_id: int) -> int:
     """按差额派发一条线，返回实际投递数。
 
     消息在事务提交前发出：若提交失败，job 行上不会留下 dispatched_at，
@@ -154,7 +152,7 @@ def dispatch_pending(self: Any) -> dict[str, int]:
     _last_run_at = now
 
     for stream in STREAMS:
-        limit = None if stream.limit_key is None else int(resolved[stream.limit_key])
+        limit = int(resolved[stream.limit_key])
         count = dispatch_stream(stream, limit, company_id)
         if count:
             dispatched[stream.name] = count

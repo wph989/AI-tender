@@ -8,7 +8,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from tender.application.knowledge.content import (
-    normalized,
     validate_items,
 )
 from tender.domain.shared.errors import InvalidModelOutput, ModelOutputTruncated
@@ -109,36 +108,17 @@ class EvidenceWindows:
     def __init__(self, rows: Mapping[str, Mapping[str, Any]] | None) -> None:
         self.by_id: dict[str, Mapping[str, Any]] = {}
         self.by_source: dict[tuple[object, object], list[Mapping[str, Any]]] = {}
-        self.by_element: dict[tuple[object, object, object], list[Mapping[str, Any]]] = {}
         for row in (rows or {}).values():
             if not isinstance(row, Mapping) or "block_id" not in row:
                 continue
             self.by_id[str(row["block_id"])] = row
             owner = (row.get("source_id"), row.get("parse_run_id"))
             self.by_source.setdefault(owner, []).append(row)
-            element = (row.get("source_id"), row.get("parse_run_id"), row.get("element_id"))
-            self.by_element.setdefault(element, []).append(row)
         for siblings in self.by_source.values():
             siblings.sort(key=lambda item: item.get("offset") or 0)
 
     def find(self, ref: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        row = self.by_id.get(str(ref.get("block_id")))
-        if row is not None:
-            return row
-        # 旧 attempt 的引文没有块身份：按元素定位，并用引文原文在分块间消歧，避免张冠李戴。
-        element = (ref.get("source_id"), ref.get("parse_run_id"), ref.get("element_id"))
-        candidates = self.by_element.get(element) or []
-        if len(candidates) == 1:
-            return candidates[0]
-        quote = normalized(str(ref.get("quote", "")))
-        return next(
-            (
-                item
-                for item in candidates
-                if quote and quote in normalized(str(item.get("content", "")))
-            ),
-            None,
-        )
+        return self.by_id.get(str(ref.get("block_id")))
 
     def context(
         self,
@@ -441,8 +421,6 @@ async def verify_items(
             item["verification"] = "supported" if supported else "unsupported"
             # 问答仍可返回带提示的未支持条目，前端据此区分证据状态。
             item["verification_issues"] = issues
-            item["verification_claim_issues"] = issues
-            item["verification_references"] = []
 
 
 def validate_answer(command: dict, seen: dict) -> tuple[list[dict], list[dict]]:

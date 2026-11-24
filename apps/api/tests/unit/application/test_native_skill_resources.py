@@ -30,7 +30,7 @@ def business_record(record):
     from tender.application.knowledge.content import fingerprint
 
     DraftRecord.model_validate(record)
-    payload = {k: v for k, v in record.items() if k not in {"work_ids", "block_ids", "id"}}
+    payload = {k: v for k, v in record.items() if k not in {"block_ids", "id"}}
     name = payload["content"].get("要求摘要", next(iter(payload["content"].values())))
     payload.setdefault("title", ("；".join(name) if isinstance(name, list) else name)[:300])
     payload.setdefault("key", "example-" + fingerprint(record)[:24])
@@ -186,7 +186,7 @@ def test_example_rejects_unread_location_and_restores_original_quote():
     assert item["values"][0]["citations"][0]["quote"] == seen["example-1"]["content"]
 
 
-def test_fact_labels_cannot_be_parallel_arrays_in_new_snapshots():
+def test_fact_labels_cannot_be_parallel_arrays():
     from tender.application.analysis.output import record_output
 
     key = "project_basic_info_parsing"

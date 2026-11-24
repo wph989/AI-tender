@@ -143,6 +143,15 @@ def test_table_sets_match() -> None:
     assert not missing and not extra, f"模型缺表 {missing}，模型多表 {extra}"
 
 
+@pytest.mark.parametrize("column", ["successful_model_calls", "successful_tool_calls"])
+def test_run_success_counts_have_zero_defaults_in_baseline(column: str) -> None:
+    # ORM 不复制数据库默认值，必须直接约束部署使用的基线，防止新机器建库后又出现空计数。
+    body = next(match.group(2) for match in _CREATE_TABLE_RE.finditer(_statement_text())
+                if match.group(1) == "agent_module_run")
+    assert re.search(rf"^\s*{column}\s+integer\s+DEFAULT\s+0\s+NOT\s+NULL\s*,",
+                     body, re.I | re.M), f"agent_module_run.{column} 必须默认0且非空"
+
+
 @pytest.mark.parametrize("table", _ALL_TABLES)
 def test_columns_match(table: str) -> None:
     ddl = _DDL_COLUMNS.get(table)

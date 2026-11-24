@@ -58,7 +58,6 @@ export interface AnalysisField {
   values: FieldValue[];
   note: string;
   verification: string;
-  module_keys?: string[];
   output?: AnalysisOutput;
   // 展示保留业务身份；范围、修订和筛选不能从归纳文字中猜测。
   record?: ModuleRecord | BusinessRecord;
@@ -127,8 +126,8 @@ export interface AgentRun {
   finished_at: string | null;
   model_calls: number;
   tool_calls: number;
-  successful_model_calls?: number | null;
-  successful_tool_calls?: number | null;
+  successful_model_calls: number;
+  successful_tool_calls: number;
   stop_reason?: { code: string; stage: string; message: string } | null;
   prompt_tokens: number;
   completion_tokens: number;
@@ -150,15 +149,17 @@ export interface AnalysisReport {
   error_message: string | null;
   modules: AnalysisModule[];
   runtime_version?: string;
-  summary?: AnalysisField[];
   coverage: {
     mode?: string;
     partial?: boolean;
-    scanned_blocks?: number;
-    total_blocks?: number;
     files?: { source_id: number; name: string; state: string }[];
   };
 }
+
+/** 详情只传状态；正文在独立记录读取完成后组装为 AnalysisReport。 */
+export type AnalysisReportDetail = Omit<AnalysisReport, "modules"> & {
+  modules: Omit<AnalysisModule, "items">[];
+};
 
 export interface AnalysisScope {
   kind: "common" | "lots" | "unknown";
@@ -193,32 +194,12 @@ export interface BusinessRecord extends AnalysisReviewState {
   verification: "supported" | "unsupported" | "unavailable";
   group: string;
   sort_order: number;
-  category: string;
   parent_id?: string | null;
   parent_key?: string | null;
   parent_path?: string[];
   node_type?: "group" | "section" | null;
   requirement_ids?: string[];
   requirement_keys?: string[];
-  conditions: {
-    expression: string;
-    logic: "all" | "any" | "mixed" | "text";
-    terms: {
-      subject: string;
-      operator: "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "text";
-      value: string;
-      unit: string | null;
-      time_basis: string | null;
-    }[];
-    exceptions: string[];
-  };
-  materials: { name: string; requirement: string }[];
-  scoring: {
-    max_points: string | null;
-    formula: string;
-    tiers: { condition: string; points: string }[];
-    deductions: string[];
-  } | null;
   predicate?: "supersedes" | "conflicts" | "requires" | "contains" | null;
   subject_id?: string;
   object_id?: string;

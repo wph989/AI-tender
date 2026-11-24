@@ -37,7 +37,6 @@ from tender.adapters.pg.models.knowledge import (
     KnowledgeChunk,
     KnowledgeCollection,
     KnowledgeIndex,
-    KnowledgeRelation,
     KnowledgeSource,
     ProjectKnowledgeCollection,
 )
@@ -71,7 +70,6 @@ __all__ = [
     "KnowledgeChunk",
     "KnowledgeCollection",
     "KnowledgeIndex",
-    "KnowledgeRelation",
     "KnowledgeSource",
     "LlmCallLog",
     "LlmFeature",

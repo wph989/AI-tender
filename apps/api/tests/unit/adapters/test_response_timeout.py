@@ -401,6 +401,8 @@ def test_agent_responses_observes_raw_reasoning_before_sdk_conversion():
                           timeout=5, temperature=None, max_tokens=128, protocol="openai",
                           api_mode="responses", parameters={}, http_async_client=client)
         model.model.root_async_client._platform = "test"
+        # 本例衡量增量续期；先初始化 SDK 流资源，避免首次模块加载占用首包时限。
+        _ = model.model.root_async_client.responses.with_streaming_response
         try:
             result = await model.chat([message_to_dict(HumanMessage(content="测试"))], [])
             assert result.content == "完成"

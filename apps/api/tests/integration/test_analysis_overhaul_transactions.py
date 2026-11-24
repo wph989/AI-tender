@@ -42,15 +42,11 @@ def terminal_module(env, status):
         runtime.finish(status, state=old)
     finally:
         runtime.release()
-    summary = [{"field": "旧成果", "module_keys": [KEY], "values": []}]
-    env.db.execute("UPDATE analysis_module SET items=CAST(:items AS JSONB),"
-                   "business_data=CAST(:business AS JSONB) WHERE id=:id", {
-                       "id": runtime.run["module_id"], "items": json.dumps(summary),
-                       "business": json.dumps({"quality_status": "needs_review"}),
-                   })
-    env.db.execute("UPDATE analysis_report SET status=:status,summary=CAST(:summary AS JSONB) "
-                   "WHERE id=:id", {"id": runtime.report["id"], "status": status,
-                                    "summary": json.dumps(summary)})
+    env.db.execute("UPDATE analysis_module SET business_data=CAST(:business AS JSONB) "
+                   "WHERE id=:id", {"id": runtime.run["module_id"],
+                                    "business": json.dumps({"quality_status": "needs_review"})})
+    env.db.execute("UPDATE analysis_report SET status=:status WHERE id=:id",
+                   {"id": runtime.report["id"], "status": status})
     return runtime, old
 
 
@@ -68,9 +64,7 @@ def test_restart_keeps_formal_projection_and_history_until_final_in_real_postgre
     assert runs[-1]["state"] == {"execution_mode": "restart"}
     module = env.db.rows("SELECT * FROM analysis_module WHERE id=:id",
                          {"id": runtime.run["module_id"]})[0]
-    assert module["items"][0]["field"] == "旧成果"
     assert module["business_data"] == {"quality_status": "needs_review"}
-    assert env.db.report(runtime.report["id"])["summary"] == module["items"]
 
 
 def test_restart_rolls_back_cleanup_when_new_run_insert_fails(env, monkeypatch):
@@ -217,7 +211,6 @@ def test_new_attachment_interrupted_attempt_can_resume_its_reviewed_draft(env, s
     assert DraftWorkspace(carried, carried["research"]["seen"], KEY).review_current(accepted["id"])
     module = next(module for module in env.db.report_modules(report_id)
                   if module["id"] == module_id)
-    assert module["items"] == formal["items"]
     assert module["business_data"] == formal["business_data"]
 
 

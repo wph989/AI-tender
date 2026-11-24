@@ -17,14 +17,11 @@ from tender.ports.llm.chat import Completion
 @pytest.mark.parametrize(
     "title,text,refs",
     [
-        ("条款未约定", "文件未约定违约金", [(10, 1, "质保三年")]),
-        ("报价", "文件未明示税率", [(10, 1, "报价包含税费")]),
-        ("限价", "未划分标段，全项目适用", [(10, 1, "最高限价78万元")]),
         ("历史建议", "本项目三年，历史五年", [(20, 2, "历史五年")]),
-        ("交货期", "补充通知调整为45日", [(10, 2, "调整为45日")]),
+        ("无依据", "质保三年", []),
     ],
 )
-def test_unsupported_absence_reference_only_and_one_sided_revision_are_rejected(title, text, refs):
+def test_project_claims_require_project_evidence(title, text, refs):
     field = {
         "field": title,
         "values": [
@@ -286,7 +283,7 @@ def test_support_review_receives_block_text_and_neighbours_for_section_attributi
             ],
         },
         {
-            # 旧 attempt 的引文没有块身份，必须仍能按元素和原文回查上下文。
+            # 普通断言只核对当前块，章节归属断言才展开邻域。
             "field": "联合体",
             "values": [
                 {
@@ -295,6 +292,7 @@ def test_support_review_receives_block_text_and_neighbours_for_section_attributi
                         {
                             "source_id": 13,
                             "parse_run_id": 6,
+                            "block_id": "c134",
                             "element_id": "e134",
                             "quote": "1.4.2 是否接受联合体投标 ■不接受",
                         }
@@ -322,7 +320,7 @@ def test_support_review_receives_block_text_and_neighbours_for_section_attributi
     assert "1.4.2 是否接受联合体投标" in legacy_context["block"]
     # 没有章节/条号归属的条目只带同块原文，不展开邻近块。
     assert "before" not in legacy_context and "after" not in legacy_context
-    # 未传证据的调用（例如项目问答）保持原载荷，不能凭空出现上下文。
+    # 缺少证据时不构造原文上下文。
     plain = Reviewer()
     asyncio.run(verify_items(plain, items[:1]))
     assert "block_context" not in plain.batch[0]["values"][0]["citations"][0]

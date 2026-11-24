@@ -261,9 +261,9 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
               <div className="run-summary"><strong>第 {run.attempt} 次 · {STATE_LABELS[run.status] ?? run.status}</strong>
                 {run.mode && <span>{run.mode === "restart" ? "从零解析" : "补跑"}</span>}
                 {run.quality_status && run.quality_status !== "unknown" && <span>{QUALITY_LABELS[run.quality_status]}</span>}
-                {/* 保留成功计数的真实零值，缺失不能用尝试数冒充。 */}
-                <span>模型请求成功 {run.successful_model_calls == null ? "未记录" : `${run.successful_model_calls} 次`}
-                  {" · "}工具执行成功 {run.successful_tool_calls == null ? "未记录" : `${run.successful_tool_calls} 次`}</span>
+                {/* 成功次数来自结算账，不使用包含失败和未知请求的尝试次数。 */}
+                <span>模型请求成功 {run.successful_model_calls} 次
+                  {" · "}工具执行成功 {run.successful_tool_calls} 次</span>
               </div>
               <dl className="run-times">
                 <div><dt>开始时间</dt><dd><time dateTime={run.started_at ?? undefined}>{formatDateTime(run.started_at)}</time></dd></div>

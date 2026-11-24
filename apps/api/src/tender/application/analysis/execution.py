@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
-import json
 import random
 import time
 import traceback
@@ -16,12 +14,13 @@ from typing import Any
 from langsmith import tracing_context
 from psycopg import OperationalError
 
+from tender.application.analysis.data import published_items
 from tender.application.analysis.data_store import publish_data_snapshot
 from tender.application.analysis.quality import validate_project_claims
 from tender.application.analysis.runtime import AgentRuntime, check_report_access
 from tender.application.analysis.skill_agent import build_skill_agent
 from tender.application.analysis.skills import MODULES
-from tender.application.knowledge.content import encode, normalized, source_signature, source_state
+from tender.application.knowledge.content import encode, source_signature, source_state
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
 from tender.application.shared.agent_model import RoutedAgentModel
@@ -209,36 +208,6 @@ def prepare_report(db: ReportRepository, report: dict) -> tuple[dict, list[dict]
                 limits=report["runtime_settings"],
             )
     return report, usable
-
-
-def summarize(modules: list[dict]) -> list[dict]:
-    """只合并等价的字段断言；不按上传时间裁决冲突，不同结论各自保留。"""
-    grouped = {}
-    for module in modules:
-        # 部分完成的模块只含已核实条目，同样进入报告摘要并标注来源。
-        if module["status"] not in {"completed", "partial"}:
-            continue
-        for item in module["items"]:
-            key = (
-                normalized(item["field"]),
-                normalized(item.get("group", "")),
-                json.dumps(item.get("values", []), sort_keys=True, ensure_ascii=False, default=str),
-                normalized(item.get("note", "")),
-            )
-            if key not in grouped:
-                grouped[key] = copy.deepcopy(item) | {"module_keys": [module["module_key"]]}
-                continue
-            result = grouped[key]
-            if module["module_key"] not in result["module_keys"]:
-                result["module_keys"].append(module["module_key"])
-            # 同一字段的多个值按顺序一一对应，合并各自引用而不改动值本身。
-            for target, source in zip(result["values"], item["values"], strict=True):
-                for ref in source["citations"]:
-                    if ref not in target["citations"]:
-                        target["citations"].append(ref)
-            if item.get("verification") != "supported":
-                result["verification"] = item.get("verification", "unsupported")
-    return list(grouped.values())
 
 
 class AnalysisExecutor:
@@ -470,8 +439,8 @@ class AnalysisExecutor:
                     raise ValueError("子 Agent 结束但没有提交通过校验的分析")
                 draft = state["draft"]
                 # 最终正文由同一Agent确认；发布只复核引用权限，不另起语义审查。
-                validate_project_claims(draft["fields"], report["project_id"],
-                                        defer_semantics=True)
+                fields = published_items(state)
+                validate_project_claims(fields, report["project_id"])
                 await asyncio.to_thread(runtime.finish, "completed", draft=draft, state=state)
                 logger.info(
                     "module.result",
@@ -481,7 +450,7 @@ class AnalysisExecutor:
                     attempt=module.get("attempt"),
                     queue_ms=queue_ms,
                     duration_ms=int((time.monotonic() - started) * 1000),
-                    item_count=len(draft["fields"]),
+                    item_count=len(fields),
                     evidence_count=len(research.seen),
                     gap_count=len(state.get("business_gaps", [])),
                     model_calls=runtime.run["model_calls"],
@@ -615,7 +584,6 @@ class AnalysisExecutor:
             db.finish_report(
                 report["id"],
                 status=status,
-                summary=summarize(rows),
                 error="没有模块完成，请查看各模块错误并补跑" if not usable else None,
             )
             log = logger.info if status == "completed" else logger.warning

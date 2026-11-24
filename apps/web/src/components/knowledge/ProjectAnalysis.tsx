@@ -13,7 +13,7 @@ import {
 import { loadProject } from "@/lib/api/client";
 import { citationLocationKey, findCitationResult } from "@/lib/analysis/citations";
 import type {
-  AnalysisReport,
+  AnalysisReport, AnalysisReportDetail,
   AnalysisStatus,
   Citation,
   KnowledgeCollection,
@@ -77,7 +77,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       }
       const id = chosenReport.current ?? next.reports[0]?.id;
       if (id) {
-        const loaded = await knowledgeRequest<AnalysisReport>(
+        const loaded = await knowledgeRequest<AnalysisReportDetail>(
           "/analysis/reports/" + id,
           "GET", undefined, controller.signal,
         );

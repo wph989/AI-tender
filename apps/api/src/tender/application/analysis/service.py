@@ -12,7 +12,6 @@ from tender.application.analysis.data import (
     ContextError,
     ContextInput,
     build_context,
-    display_items,
     module_records,
 )
 from tender.application.analysis.data_store import (
@@ -40,7 +39,6 @@ from tender.application.analysis.skills import MODULES, skill_snapshot, skill_ve
 from tender.application.knowledge.content import (
     CATEGORIES,
     TOPICS,
-    merge_field_entries,
     source_signature,
 )
 from tender.application.knowledge.retrieval import retrieve_chunks
@@ -201,8 +199,7 @@ class AnalysisService:
         allowed = self.store.collections_for_project(report["project_id"])
         module_inputs = {}
         for module in modules:
-            # 工具日志只供服务端重放，不在产品界面暴露整段中间提示词。
-            module.pop("trace", None)
+            # 正文由独立记录接口读取，详情仅提取质量与运行信息。
             business = module.pop("business_data", None) or {}
             module_inputs[module["id"]] = {"quality_input_signature": business.get(
                 "quality_input_signature")}
@@ -217,17 +214,6 @@ class AnalysisService:
             progress = latest.get("agent_progress")
             if progress and progress.get("protocol") == FLOW_VERSION:
                 module["progress"] = progress
-            module["items"] = visible_items(
-                self.store,
-                display_items(
-                    merge_field_entries(
-                        module["items"],
-                        is_outline=module["module_key"] == "bid_format_outline_parsing",
-                    )
-                ),
-                allowed,
-            )
-        report["summary"] = visible_items(self.store, report["summary"], allowed)
         live = {source["source_id"]: source for source in self.store.sources(allowed)}
         current_sources = [source for source in live.values()
                            if source["project_id"] == report["project_id"]]
@@ -280,14 +266,7 @@ class AnalysisService:
 
     def get_module_records(self, report_id: int, module_key: str) -> dict[str, Any]:
         report = self.report_row(report_id)
-        module = next(
-            (
-                item
-                for item in self.store.report_modules(report_id)
-                if item["module_key"] == module_key
-            ),
-            None,
-        )
+        module = self.store.report_module(report_id, module_key)
         if module is None:
             raise NotFound("分析维度不存在")
         business = module.get("business_data") or {}

@@ -11,14 +11,18 @@ from data_schema import install_data_schema
 from langchain_core.messages import AIMessage, message_to_dict
 from sqlalchemy import create_engine, text
 
+from tender.adapters.pg.repositories.analysis.runtime import AgentRunStore
 from tender.adapters.pg.repositories.knowledge.store import KnowledgeStore, sync_sources
 from tender.api.analysis import routes as analysis_api
 from tender.api.knowledge import routes as knowledge
 from tender.api.projects import routes as projects
 from tender.api.shared.errors import ApiProblem
+from tender.application.analysis.data_store import publish_data_snapshot
+from tender.application.analysis.drafts import DraftWorkspace
 from tender.application.analysis.execution import prepare_report
+from tender.application.analysis.runtime import AgentRuntime
 from tender.application.knowledge import execution as knowledge_execution
-from tender.application.knowledge.content import fingerprint, validate_items
+from tender.application.knowledge.content import source_signature, validate_items
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.config.registry import ConfigRegistry
 from tender.core import di, settings
@@ -54,7 +58,6 @@ def environment(monkeypatch):
             "analysis_module",
             # 运行行必须与临时模块表一起隔离，不能引用真实库里碰巧同 ID 的历史模块。
             "agent_module_run",
-            "knowledge_relation",
             "knowledge_answer",
             "llm_feature_model",
             "llm_model",
@@ -208,33 +211,57 @@ def configure(request, pid):
     analysis_api.save_settings(pid, analysis_api.AnalysisSettings(category="engineering"), request)
 
 
-def attach_completed_module(connection, report_id, blocks):
-    """手工写入已完成模块：不跑解析，专测报告展示与关系检索如何处理既有证据。"""
-    items = validate_items(
-        [
-            {
-                "field": row["chapter"] or "原文要点",
-                "group": "",
-                "sort_order": index,
-                "values": [
-                    {
-                        "value": row["content"],
-                        "citations": [{"block_id": row["block_id"], "quote": row["content"]}],
-                    }
-                ],
-                "note": "",
-            }
-            for index, row in enumerate(blocks)
-        ],
-        {row["block_id"]: row for row in blocks},
-    )
-    module_id = connection.execute(
-        text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
-        VALUES (:report,'project_basic_info_parsing','项目概况','completed',CAST(:items AS JSONB))
-        RETURNING id"""),
-        {"report": report_id, "items": json.dumps(items, ensure_ascii=False)},
-    ).scalar_one()
-    return module_id, items
+def publish_relation(request, conn, report_id, blocks):
+    """走真实草稿、自查和发布入口，避免旧表夹具掩盖生产关系链路断开。"""
+    store = knowledge.knowledge_service(request).store
+    report = store.report(report_id)
+    key = "project_basic_info_parsing"
+    state = {
+        "output_schema": {"version": "1", "sections": [{
+            "title": "项目要求", "layout": "table", "columns": ["字段", "内容"],
+            "title_column": "字段",
+        }]},
+        "quality_input_signature": source_signature(
+            report["source_snapshot"] + report["reference_snapshot"]
+        ),
+    }
+    book = DraftWorkspace(state, {block["block_id"]: block for block in blocks}, key)
+    rows = []
+    for index, title in enumerate(("甲级资质", "履约保函")):
+        block = blocks[min(index, len(blocks) - 1)]
+        rows.append({
+            "key": f"node-{index}", "kind": "requirement", "group": "项目要求",
+            "content": {"字段": title, "内容": block["content"]},
+            "scope": {"kind": "common"}, "block_ids": [block["block_id"]],
+        })
+    rows.append({
+        "key": "link", "kind": "relation", "group": "项目要求", "predicate": "requires",
+        "subject_key": "node-0", "object_key": "node-1",
+        "content": {"字段": "依赖", "内容": "甲级资质要求关联履约保函提交要求"},
+        "scope": {"kind": "common"}, "block_ids": [block["block_id"] for block in blocks],
+    })
+    saved = book.save_records(rows, "draft-1")
+    assert saved["rejected"] == [], saved
+    receipts = saved["accepted"]
+    book.record_review([{
+        "record_id": row["id"], "version": row["version"], "status": "passed",
+        "reason": "已对照全部项目原文核对依赖关系与共同适用范围",
+        "block_ids": [block["block_id"] for block in blocks],
+    } for row in receipts], [], "review-1")
+    assert store.relation_snapshot(report["project_id"]) is None
+    book.finalize([row["id"] for row in receipts], "已核对项目要求及其依赖关系")
+    module_id = conn.execute(text("""INSERT INTO analysis_module
+        (report_id,module_key,title,status) VALUES (:report,:key,'项目概况','completed')
+        RETURNING id"""), {"report": report_id, "key": key}).scalar_one()
+    # 夹具共用事务连接，无需创建配额锁引擎；正式成果仍由运行仓储的原发布方法落库。
+    runtime_store = object.__new__(AgentRunStore)
+    runtime_store.run = {"module_id": module_id}
+    runtime_store._publish(conn, AgentRuntime._draft_payload(state["draft"]))
+    conn.execute(text("UPDATE analysis_report SET status='completed' WHERE id=:id"),
+                 {"id": report_id})
+    snapshot = publish_data_snapshot(store, report_id)
+    assert len(snapshot["data"]["relations"]) == 1
+    return snapshot
 
 
 def test_retired_report_is_hidden_from_application_but_history_is_preserved(environment):
@@ -288,8 +315,8 @@ def test_unfinished_module_does_not_show_saved_drafts(environment):
     )[0]
     item["verification"] = "supported"
     module_id = conn.execute(
-        text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
-        VALUES (:report,'project_basic_info_parsing','项目概况','running','[]'::jsonb)
+        text("""INSERT INTO analysis_module (report_id,module_key,title,status)
+        VALUES (:report,'project_basic_info_parsing','项目概况','running')
         RETURNING id"""),
         {"report": report["id"]},
     ).scalar_one()
@@ -312,113 +339,11 @@ def test_unfinished_module_does_not_show_saved_drafts(environment):
         if entry["id"] == module_id
     )
     assert module["status"] == "running"
-    assert module["items"] == []
-
-
-def test_report_merges_same_field_versions_and_dedupes_locations(environment):
-    """同一字段的多版本在展示时合成一行：值取并集去重、定位去重，历史报告也不重复铺行。"""
-    request, conn, pid = environment
-    add_source(conn, pid, "质保三年。质保五年。")
-    configure(request, pid)
-    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
-    store = KnowledgeStore(request.app.state.components.engine, 1)
-    collection = knowledge.project_knowledge(pid, request)["collection_id"]
-    block = store.readable_chunks(store.sources([collection])[0])[0]
-    items = validate_items(
-        [
-            {
-                "field": "质保期",
-                "group": "质保",
-                "sort_order": 2,
-                "values": [
-                    {
-                        "value": "质保三年",
-                        "citations": [{"block_id": block["block_id"], "quote": "质保三年"}],
-                    }
-                ],
-                "note": "",
-            },
-            {
-                "field": "质保期",
-                "group": "质保",
-                "sort_order": 2,
-                "values": [
-                    {
-                        "value": "质保三年",
-                        "citations": [{"block_id": block["block_id"], "quote": "质保三年"}],
-                    },
-                    {
-                        "value": "质保五年",
-                        "citations": [{"block_id": block["block_id"], "quote": "质保五年"}],
-                    },
-                ],
-                "note": "",
-            },
-        ],
-        {block["block_id"]: block},
-    )
-    for entry in items:
-        entry["verification"] = "supported"
-    # 模拟改造前的历史记录：值“质保五年”借用了同一元素里“质保三年”的摘录。
-    items[1]["values"][1]["citations"][0]["quote"] = "质保三年"
-    conn.execute(
-        text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
-        VALUES (:report,'project_basic_info_parsing','项目概况','completed',
-                CAST(:items AS JSONB))"""),
-        {"report": report["id"], "items": json.dumps(items, ensure_ascii=False)},
-    )
-    module = analysis_api.get_report(report["id"], request)["modules"][0]
-    assert [entry["field"] for entry in module["items"]] == ["质保期"]
-    assert [value["value"] for value in module["items"][0]["values"]] == ["质保三年", "质保五年"]
-    assert len(module["items"][0]["values"][0]["citations"]) == 1
-    # 展示时按值回查元素原文：错位的历史摘录收敛到值真正出现的位置。
-    located = module["items"][0]["values"][1]["citations"][0]["quote"]
-    assert "质保五年" in located
-
-
-@pytest.mark.parametrize("legacy_ids", [False, True])
-def test_report_preserves_outline_nodes_with_different_parent_paths(environment, legacy_ids):
-    """新报告和旧报告展示都不能把同名材料跨父级合并，避免编制要求失去归属。"""
-    request, conn, pid = environment
-    content = "商务标。甲标段营业执照须盖章。乙标段营业执照须签字。"
-    add_source(conn, pid, content)
-    configure(request, pid)
-    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
-    store = KnowledgeStore(request.app.state.components.engine, 1)
-    collection = knowledge.project_knowledge(pid, request)["collection_id"]
-    block = store.readable_chunks(store.sources([collection])[0])[0]
-    # 只构造旧报告的已存历史形状；兼容读取不应依赖已下线的旧格式生成器。
-    history = [
-        ("root", "商务标", "商务标", "无"),
-        ("lot-a", "甲标段", "甲标段", "商务标"),
-        ("license-a", "营业执照", "须盖章", "商务标 / 甲标段"),
-        ("lot-b", "乙标段", "乙标段", "商务标"),
-        ("license-b", "营业执照", "须签字", "商务标 / 乙标段"),
-    ]
-    items = validate_items([{
-        "field": name, "group": "商务标", "note": "上级路径：" + parent_path,
-        "sort_order": order, "values": [{
-            "value": value, "citations": [{"block_id": block["block_id"], "quote": content}],
-        }],
-    } for order, (_, name, value, parent_path) in enumerate(history)], {block["block_id"]: block})
-    for item, (node_id, _, _, _) in zip(items, history, strict=True):
-        item["verification"] = "supported"
-        item["id"] = fingerprint(["outline", node_id])[:20]
-        if legacy_ids:
-            item["id"] = fingerprint([item["field"], item["values"]])[:20]
-    conn.execute(
-        text("""INSERT INTO analysis_module (report_id,module_key,title,status,items)
-        VALUES (:report,'bid_format_outline_parsing','格式大纲','completed',
-                CAST(:items AS JSONB))"""),
-        {"report": report["id"], "items": json.dumps(items, ensure_ascii=False)},
-    )
-    displayed = analysis_api.get_report(report["id"], request)["modules"][0]["items"]
-    assert len(displayed) == 5
-    licenses = [item for item in displayed if item["field"] == "营业执照"]
-    assert [item["note"].split("上级路径：")[1] for item in licenses] == [
-        "商务标 / 甲标段", "商务标 / 乙标段"
-    ]
-    assert [item["values"][0]["value"] for item in licenses] == ["须盖章", "须签字"]
+    assert "items" not in module
+    records = analysis_api.get_module_records(
+        report["id"], "project_basic_info_parsing", request
+    )["records"]
+    assert records == []
 
 
 def test_retired_runtime_report_cannot_run_or_retry(environment):
@@ -480,13 +405,15 @@ def test_wait_for_missing_sources_or_explicit_partial_analysis(environment):
     configure(request, pid)
     report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
     with pytest.raises(ValueError, match="未完整解析"):
-        prepare_report(worker._store(), analysis_api.report_row(request, report["id"]))
+        prepare_report(
+            worker._store(), analysis_api.analysis_service(request).report_row(report["id"])
+        )
     analysis_api.cancel_report(report["id"], request)
     partial = analysis_api.start_analysis(
         pid, analysis_api.AnalysisInput(allow_partial=True), request
     )
     fixed, sources = prepare_report(
-        worker._store(), analysis_api.report_row(request, partial["id"])
+        worker._store(), analysis_api.analysis_service(request).report_row(partial["id"])
     )
     assert fixed["coverage"]["partial"] is True
     assert [source["file_name"] for source in sources] == ["材料1.pdf"]
@@ -502,25 +429,39 @@ def test_graph_expansion_rejects_old_parse_evidence(environment):
     sources = store.sources([collection])
     block = store.readable_chunks(sources[0])[0]
     report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
-    conn.execute(
-        text("UPDATE analysis_report SET status='completed' WHERE id=:id"), {"id": report["id"]}
-    )
-    module_id, items = attach_completed_module(conn, report["id"], [block])
-    conn.execute(
-        text("""INSERT INTO knowledge_relation
-        (report_id,module_id,subject,predicate,object,citations,verified)
-        VALUES (:r,:m,'甲级资质','需要','证书',CAST(:refs AS JSONB),true)"""),
-        {
-            "r": report["id"],
-            "m": module_id,
-            "refs": json.dumps(items[0]["values"][0]["citations"], ensure_ascii=False),
-        },
-    )
+    publish_relation(request, conn, report["id"], [block])
     _, relations = knowledge_execution.graph_expand(store, pid, [block], sources)
     assert len(relations) == 1
     changed_sources = [sources[0] | {"parse_run_id": sources[0]["parse_run_id"] + 1}]
     _, relations = knowledge_execution.graph_expand(store, pid, [block], changed_sources)
     assert not relations
+
+
+@pytest.mark.parametrize("change", ["pending", "new_report", "deleted_project", "company"])
+def test_graph_snapshot_requires_current_published_and_accessible_report(environment, change):
+    request, conn, pid = environment
+    add_source(conn, pid, "甲级资质应提供证书。")
+    configure(request, pid)
+    store = worker._store()
+    sources = store.sources(store.collections_for_project(pid))
+    blocks = store.readable_chunks(sources[0])
+    report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
+    snapshot = publish_relation(request, conn, report["id"], blocks)
+    assert store.relation_snapshot(pid)["id"] == snapshot["id"]
+    if change == "pending":
+        conn.execute(text("UPDATE analysis_report SET snapshot_pending=true WHERE id=:id"),
+                     {"id": report["id"]})
+    elif change == "new_report":
+        latest = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
+        conn.execute(text("UPDATE analysis_report SET status='completed' WHERE id=:id"),
+                     {"id": latest["id"]})
+    elif change == "deleted_project":
+        conn.execute(text("UPDATE project SET deleted_at=now() WHERE id=:id"), {"id": pid})
+    else:
+        store = KnowledgeStore(store.engine, 2)
+    assert store.relation_snapshot(pid) is None
+    hits, relations = knowledge_execution.graph_expand(store, pid, [blocks[0]], sources)
+    assert hits == [blocks[0]] and relations == []
 
 
 def test_collections_isolate_retrieval_and_answers(environment):
@@ -561,17 +502,7 @@ def test_question_agent_reads_graph_only_evidence(environment, monkeypatch):
     blocks = [row for source in sources for row in store.readable_chunks(source)]
     direct = next(row for row in blocks if "甲级资质" in row["content"])
     report = analysis_api.start_analysis(pid, analysis_api.AnalysisInput(), request)
-    conn.execute(
-        text("UPDATE analysis_report SET status='completed' WHERE id=:id"), {"id": report["id"]}
-    )
-    module_id, items = attach_completed_module(conn, report["id"], blocks)
-    refs = [ref for item in items for value in item["values"] for ref in value["citations"]]
-    conn.execute(
-        text("""INSERT INTO knowledge_relation
-        (report_id,module_id,subject,predicate,object,citations,verified)
-        VALUES (:r,:m,'甲级资质','需要','履约保函',CAST(:refs AS JSONB),true)"""),
-        {"r": report["id"], "m": module_id, "refs": json.dumps(refs, ensure_ascii=False)},
-    )
+    publish_relation(request, conn, report["id"], blocks)
 
     async def retrieve_direct(*args, **kwargs):
         # 普通检索只命中资质，保函只能通过数据库图谱扩展进入 Agent 的工具结果。

@@ -67,12 +67,9 @@ def record_output(record: dict, schema: dict) -> dict:
         issues.append(("group",
             "结果分类不符合当前 Skill 输出格式：group须填写分类："
             + "、".join(s["title"] for s in schema["sections"])
-            + "；category不能代替group"
         ))
-        # 只用可确定的候选分类诊断内容键，不能把category悄悄转换成有效group。
-        section = next((s for s in schema["sections"]
-                        if s["title"] == record.get("category")), None)
-        if section is None and len({tuple(s["columns"]) for s in schema["sections"]}) == 1:
+        # 各分类列相同时可一起诊断内容键，避免模型修正分类后再碰到内容错误。
+        if len({tuple(s["columns"]) for s in schema["sections"]}) == 1:
             section = schema["sections"][0]
     content = record.get("content") or {}
     if section is not None and (not content or set(content) - set(section["columns"])):
@@ -82,7 +79,7 @@ def record_output(record: dict, schema: dict) -> dict:
         ))
     if section is None:
         raise InputError(validation_message(issues), field_issues=issues)
-    # 两列各自的数组没有可靠配对语义；仅新快照声明单值列，旧报告保留原协议。
+    # 两列各自的数组没有可靠配对语义，声明为单值的列必须逐条提交。
     for column in section.get("scalar_columns", []):
         if column in content and not isinstance(content[column], str):
             issues.append(("content." + column,

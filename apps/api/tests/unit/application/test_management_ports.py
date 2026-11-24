@@ -87,7 +87,7 @@ def test_canceling_job_is_accepted_and_keeps_progress_stream_open():
     payload = {"id": "fixture", "status": "canceling", "finished_at": None}
     service = JobService(SimpleNamespace(
         cancel=lambda _: (True, "canceling"), payload=lambda _: payload,
-    ), 1)
+    ))
     assert service.cancel("fixture") == payload
     assert not service.is_terminal(payload)
     assert service.is_terminal(payload | {"status": "canceled"})

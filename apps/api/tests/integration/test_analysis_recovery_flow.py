@@ -127,7 +127,6 @@ def test_model_unavailable_exhaustion_finishes_partial_with_supported_items(env,
         "SELECT * FROM analysis_module WHERE id=:id", {"id": runtime.run["module_id"]}
     )[0]
     assert module["status"] == "partial"
-    assert module["items"] == []
     assert not module["business_data"].get("records")
     assert row[0]["state"]["staged_items"][0]["id"] == "keep"
 
@@ -266,6 +265,6 @@ def test_saved_business_update_resumes_graph_without_reapplying_or_resettling(
     assert row["successful_tool_calls"] == 8
     assert row["successful_tool_calls"] == sum(
         r["kind"] == "tool" and r["status"] == "ok" for r in attempts)
-    module = env.db.rows("SELECT items FROM analysis_module WHERE id=:id",
+    module = env.db.rows("SELECT business_data FROM analysis_module WHERE id=:id",
                          {"id": run["module_id"]})[0]
-    assert module["items"][0]["output"]["content"] == {"字段": "质保期限", "内容": "三年"}
+    assert module["business_data"]["records"][0]["content"] == {"字段": "质保期限", "内容": "三年"}

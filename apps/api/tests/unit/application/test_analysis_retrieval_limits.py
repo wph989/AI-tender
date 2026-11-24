@@ -384,6 +384,14 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
         }
         monkeypatch.setattr(execution, "AgentRuntime", lambda *_: runtime)
         research = None
+        selected = {"id": "selected", "values": [{"value": "本项目保证金要求",
+                    "citations": [block()]}]}
+        unselected = {"id": "reference", "values": [{"value": "参考项目要求",
+                      "citations": [block(2, 20)]}]}
+        validator = Mock(wraps=execution.validate_project_claims)
+        monkeypatch.setattr(execution, "validate_project_claims", validator)
+        log = Mock()
+        monkeypatch.setattr(execution, "logger", log)
 
         def build(**kwargs):
             nonlocal research
@@ -400,7 +408,10 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
                 offset = result["page"]["next_offset"]
             assert len(set(collected)) == page_size * limits.max_search_pages
             assert offset is None
-            state["draft"] = {"fields": [], "relations": [], "research_summary": "分页验收"}
+            # 发布只校验最终选择；未选中的参考草稿不能混入本项目校验或结果计数。
+            state["staged_items"] = [unselected, selected]
+            state["agent_workspace"] = {"finalized": True, "final_ids": [selected["id"]]}
+            state["draft"] = {"business_data": {}, "research_summary": "分页验收"}
 
         @asynccontextmanager
         async def saver():
@@ -428,6 +439,11 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
         runtime.abandon.assert_not_called()
         runtime.finish.assert_called_once()
         assert runtime.finish.call_args.args[0] == "completed"
+        validator.assert_called_once_with([selected], 10)
+        result_log = next(
+            call for call in log.info.call_args_list if call.args[0] == "module.result"
+        )
+        assert result_log.kwargs["item_count"] == 1
         store.search_candidates.assert_called_once()
         from tender.application.knowledge.content import source_signature
 
@@ -438,18 +454,16 @@ def test_executor_retrieves_full_configured_window_once(monkeypatch, page_size):
     asyncio.run(run())
 
 
-def test_compact_expansion_cannot_exceed_limit_or_bypass_scope_check():
+def test_answer_expansion_keeps_referenced_blocks_and_checks_selected_scope():
     async def run():
         research = session(rows(2), limits=AgentLimits(max_search_results=2))
-        research.compact_results = True
 
         async def expand(_sources, blocks):
             return blocks + rows(8)[2:], []
 
         research.expand = expand
         result = await research.search("投标保证金", "project")
-        assert len(result["blocks"]) == 2 and result["search_limited"] is True
-        assert len(research.seen) == 2
+        assert len(result["blocks"]) == 8 and len(research.seen) == 8
 
         async def forbidden(_sources, blocks):
             return blocks + [block(99, 99)], []

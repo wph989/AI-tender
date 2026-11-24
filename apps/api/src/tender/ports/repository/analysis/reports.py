@@ -191,11 +191,15 @@ class ReportRepository(SourceReader, RetrievalRepository, SchemaReader, TaskLife
         ...
 
     def report_modules(self, report_id: int) -> list[dict[str, Any]]:
-        """报告的全部模块（含成果与工具日志），按 id 升序。"""
+        """报告的全部模块及正式业务数据，按 id 升序。"""
+        ...
+
+    def report_module(self, report_id: int, module_key: str) -> dict[str, Any] | None:
+        """按报告和专题读取单模块；跨公司或模块不存在时返回 ``None``。"""
         ...
 
     def report_runs(self, report_id: int) -> list[dict[str, Any]]:
-        """报告的运行账及成功调用数（含尚未核实的暂存成果），按 attempt 升序。"""
+        """报告的运行账、进度及成功调用数，按 attempt 升序。"""
         ...
 
     def report_active_modules(self, report_id: int) -> list[dict[str, Any]]:
@@ -243,10 +247,9 @@ class ReportRepository(SourceReader, RetrievalRepository, SchemaReader, TaskLife
         report_id: int,
         *,
         status: str,
-        summary: list[Any],
         error: str | None,
     ) -> None:
-        """报告收口：写终态、汇总与结束时间，并清掉租约。"""
+        """报告收口：写终态与结束时间，并清掉租约。"""
         ...
 
     def agent_run_store(self, report: dict[str, Any], run: dict[str, Any]) -> AgentRunStore:

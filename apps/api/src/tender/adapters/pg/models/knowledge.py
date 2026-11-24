@@ -1,5 +1,5 @@
 """知识库：knowledge_collection / knowledge_source / knowledge_index / knowledge_chunk /
-knowledge_relation / knowledge_answer 与 project_knowledge_collection 关联表。"""
+knowledge_answer 与 project_knowledge_collection 关联表。"""
 
 from __future__ import annotations
 
@@ -78,21 +78,6 @@ class KnowledgeChunk(Base):
     # 检索上下文不覆盖原文，否则引用摘录与PDF坐标会失去逐块对应关系。
     locations: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
     embedding: Mapped[list[float] | None] = mapped_column(ARRAY(Double))
-
-
-class KnowledgeRelation(Base):
-    __tablename__ = "knowledge_relation"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    report_id: Mapped[int] = mapped_column(BigInteger)
-    module_id: Mapped[int] = mapped_column(BigInteger)
-    subject: Mapped[str] = mapped_column(Text)
-    predicate: Mapped[str] = mapped_column(Text)
-    object: Mapped[str] = mapped_column(Text)
-    scope: Mapped[str] = mapped_column(Text)
-    condition: Mapped[str] = mapped_column(Text)
-    citations: Mapped[list[Any]] = mapped_column(JSONB)
-    verified: Mapped[bool] = mapped_column(Boolean)
 
 
 class KnowledgeAnswer(Base):

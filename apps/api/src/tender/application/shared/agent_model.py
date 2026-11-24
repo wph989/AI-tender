@@ -28,13 +28,8 @@ register_harness_profile(
 
 
 def _model_messages(messages: Sequence[BaseMessage]) -> list[dict]:
-    # 估算和发送使用同一份消息，图内的原文索引不进入模型请求。
-    payload = []
-    for message in messages:
-        value = message_to_dict(message)
-        value["data"].get("additional_kwargs", {}).pop("analysis_evidence", None)
-        payload.append(value)
-    return payload
+    # 估算和发送使用同一份消息视图，避免上下文预算与实际请求不一致。
+    return [message_to_dict(message) for message in messages]
 
 
 class RoutedAgentModel(BaseChatModel):

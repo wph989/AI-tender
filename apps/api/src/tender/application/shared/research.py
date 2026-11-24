@@ -375,23 +375,17 @@ class ResearchSession:
             rows = candidates[offset:offset + page_size]
             # 即使本页因去重变少也按原始页大小推进游标，避免翻页卡死。
             has_more = offset + page_size < len(candidates)
+            search_limited = bool(info.get("candidate_limited"))
         else:
             retrieved, info = await self.retrieve(sources, query.strip())
             search_limited = bool(info.get("search_limited")) or len(retrieved) > page_size
             rows = retrieved[:page_size]
-        expanded_limited = False
-        if self.expand:
-            # 扩展必须处于同一次检索工具内，让 Agent 真正读到关联原文；范围仍是本次所选资料。
-            rows, relations = await self.expand(sources, rows)
-            if self.compact_results and len(rows) > page_size:
-                expanded_limited = True
+            if self.expand:
+                # 问答扩展在同一次检索内返回关联原文；专题解析只使用紧凑分页。
+                rows, relations = await self.expand(sources, rows)
         selected_sources = {s["source_id"] for s in sources}
         if any(r["source_id"] not in selected_sources for r in rows):
             raise PermissionError("检索返回了所选范围以外的资料，不能将参考资料混入本项目")
-        if self.compact_results:
-            # 扩展也不能绕过专题单次输出上限；未返回的关系证据不会登记进证据账。
-            rows = rows[:page_size]
-            search_limited = bool(info.get("candidate_limited")) or expanded_limited
         # 查询等待期间可能撤销关联，结果进入模型上下文前再次检查。
         await self.authorize()
         seen_before = set(self.seen)
@@ -424,7 +418,7 @@ class ResearchSession:
                 )
             elif search_limited:
                 result["search_hint"] = (
-                    "本次检索的候选窗口已到末尾或扩展结果被截断，仍可能有未返回内容；"
+                    "本次检索的候选窗口已到末尾，仍可能有未返回内容；"
                     "仅对具体未决条件拆分查询或限定 source_id；有未读相关条款时登记缺口。"
                 )
             elif not rows and offset:

@@ -74,17 +74,6 @@ def knowledge_service(request: Request) -> KnowledgeService:
 
 
 
-def project_collection(request: Request, project_id: int) -> int:
-    try:
-        return knowledge_service(request).project_collection(project_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
-
-
-def public_sources(request: Request, ids: list[int]) -> list[dict]:
-    return knowledge_service(request).public_sources(ids)
-
-
 @router.get("/knowledge/collections", response_model=KnowledgeCollectionListResponse,
             response_model_exclude_unset=True)
 def list_collections(request: Request) -> dict:

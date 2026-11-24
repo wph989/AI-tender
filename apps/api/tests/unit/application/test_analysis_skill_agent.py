@@ -189,7 +189,7 @@ def test_invalid_batch_type_is_feedback_then_same_agent_saves_and_finishes():
         )
         await invoke_module(graph, files, thread_id="bad-batch", task="分析")
         assert len(router.requests) == 4 and state["agent_workspace"]["finalized"]
-        assert state["draft"]["fields"] == []
+        assert state["draft"]["business_data"]["records"] == []
 
     asyncio.run(run())
 

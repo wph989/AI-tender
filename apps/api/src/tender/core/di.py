@@ -190,15 +190,15 @@ def create_api_components() -> ApiComponents:
 
 # 用例只接收端口；具体仓储和外部网关统一在这里装配，防止业务模块反向依赖实现。
 def create_project_service(engine: Engine, company_id: int) -> ProjectService:
-    return ProjectService(ProjectRepository(engine, company_id), company_id)
+    return ProjectService(ProjectRepository(engine, company_id))
 
 
 def create_job_service(engine: Engine, company_id: int) -> JobService:
-    return JobService(JobRepository(engine, company_id), company_id)
+    return JobService(JobRepository(engine, company_id))
 
 
 def create_version_service(engine: Engine, company_id: int) -> VersionService:
-    return VersionService(VersionRepository(engine, company_id), company_id)
+    return VersionService(VersionRepository(engine, company_id))
 
 
 def create_parse_service(engine: Engine, company_id: int, configs: ConfigRegistry) -> ParseService:

@@ -26,7 +26,6 @@ from tender.api.shared.responses import (
 from tender.application.analysis.data import ContextInput
 from tender.application.analysis.human_review import RecordReviewInput
 from tender.application.analysis.service import AnalysisService
-from tender.application.knowledge.service import visible_items as _visible_items
 from tender.application.shared.errors import ServiceError
 from tender.config.schema import field_bounds
 from tender.core import settings
@@ -103,32 +102,12 @@ def start_analysis(project_id: int, payload: AnalysisInput, request: Request) ->
         raise as_api_problem(exc) from exc
 
 
-def report_row(request: Request, report_id: int) -> dict:
-    try:
-        return analysis_service(request).report_row(report_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
-
-
-def visible_items(
-    db, items: list[dict], allowed_collections: list[int] | None = None
-) -> list[dict]:
-    return _visible_items(db, items, allowed_collections)
-
-
 @router.get("/analysis/reports/{report_id}", response_model=AnalysisReportResponse,
             response_model_exclude_unset=True)
 @throttle_access_log()
 def get_report(report_id: int, request: Request) -> dict:
     try:
         return analysis_service(request).get_report(report_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
-
-
-def data_snapshot(request: Request, report_id: int, snapshot_id: int | None = None) -> dict:
-    try:
-        return analysis_service(request).data_snapshot(report_id, snapshot_id)
     except ServiceError as exc:
         raise as_api_problem(exc) from exc
 
@@ -151,13 +130,6 @@ def get_analysis_data(
 ) -> dict:
     try:
         return analysis_service(request).get_analysis_data(report_id, snapshot_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
-
-
-def context_data(request: Request, report_id: int, snapshot: dict) -> tuple[dict, dict]:
-    try:
-        return analysis_service(request).context_data(report_id, snapshot)
     except ServiceError as exc:
         raise as_api_problem(exc) from exc
 

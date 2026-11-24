@@ -81,7 +81,6 @@ class DraftRecord(DataInput):
     title: str | None = Field(default=None, min_length=1, max_length=300)
     scope: DataScope
     block_ids: list[str] = Field(min_length=1, max_length=160)
-    work_ids: list[str] = Field(default_factory=list, max_length=50)
     code: str | None = None
     aliases: list[str] = Field(default_factory=list)
     node_type: Literal["group", "section"] | None = None
@@ -230,7 +229,7 @@ class DraftWorkspace:
                 # 新attempt可能再次收到call1，新增身份必须与沿用的草稿区分。
                 key = (old["business"]["key"] if old else
                        f"draft:{self.book.get('attempt_serial', 0)}:{call_id}:{index}")
-                value = row.model_dump(exclude={"id", "key", "version", "work_ids", "block_ids"})
+                value = row.model_dump(exclude={"id", "key", "version", "block_ids"})
                 if row.key and row.key in aliases:
                     raise InputError.for_field("key", "同批临时key不能重复")
                 for field in ("parent_key", "subject_key", "object_key"):
@@ -291,7 +290,6 @@ class DraftWorkspace:
                     draft_version=version,
                     draft_signature=semantic,
                     verification="pending",
-                    work_ids=row.work_ids,
                 )
                 changed = not old or old["draft_version"] != version
                 items[prepared["id"]] = prepared
@@ -495,9 +493,8 @@ class DraftWorkspace:
         ]
         for rid in ids:
             items[rid].update(verification="supported")
+        # 最终条目由 staged_items 与 final_ids 唯一确定，不再复制整份草稿到 fields。
         self.state["draft"] = {
-            "fields": [copy.deepcopy(items[rid]) for rid in ids],
-            "relations": [],
             "research_summary": summary,
         }
         self.state["draft"]["business_data"] = module_data(self.state)

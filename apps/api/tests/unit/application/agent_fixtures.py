@@ -43,7 +43,7 @@ def submitted_field(field, value, quote="质保三年", block_id="s1r1c0"):
 
 def raw(**overrides):
     return {"kind": "fact", "group": "项目基本信息", "content": {"字段": "质保", "内容": "三年"},
-            "scope": {"kind": "common"}, "block_ids": ["s1r1c0"], "work_ids": ["w1"],
+            "scope": {"kind": "common"}, "block_ids": ["s1r1c0"],
             **overrides}
 
 

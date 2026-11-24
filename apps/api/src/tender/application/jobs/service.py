@@ -9,7 +9,7 @@ from tender.ports.repository.jobs.tasks import TERMINAL_STATUSES, JobRepository
 
 
 class JobService:
-    def __init__(self, repository: JobRepository, company_id: int) -> None:
+    def __init__(self, repository: JobRepository) -> None:
         self.repository = repository
 
     def payload(self, job_id: str) -> dict[str, Any]:

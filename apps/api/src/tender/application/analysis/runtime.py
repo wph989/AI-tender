@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from tender.application.analysis.data import display_items
 from tender.application.shared.research import AgentLimits
 from tender.core.logging import get_logger
 from tender.ports.analysis.archive import AnalysisArchive
@@ -177,7 +176,5 @@ class AgentRuntime:
     @staticmethod
     def _draft_payload(draft: dict) -> dict:
         return {
-            "items": display_items(draft.get("fields", [])),
             "business": draft.get("business_data", {}),
-            "relations": draft.get("relations") or [],
         }

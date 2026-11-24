@@ -30,7 +30,6 @@ __all__ = [
     "encode",
     "fingerprint",
     "keywords",
-    "merge_field_entries",
     "plain_text",
     "rank_chunks",
     "source_signature",
@@ -311,44 +310,6 @@ def align_citation(
         return dict(ref)
     row, located = best[0]
     return citation(row, located[1])
-
-
-def merge_field_entries(entries: Sequence[dict], *, is_outline: bool = False) -> list[dict]:
-    """把同一“分组:字段名”的多个已核实版本合并成一行：值去重、引用去重、id 重算。
-
-    同一字段常在多批提交里被拆开或改写；按 id 并存会表现为重复行与重复定位。
-    只合并全部已核实的版本，未核实的保持独立，避免把待校验内容并进已通过结果。
-    """
-    # 大纲已按节点 id 累计更新；同组同名材料仍可能属于不同父级，不能按字段名再次归并。
-    # 展示历史大纲同样保留原节点，避免把不同父路径的要求拼到一起。
-    if is_outline:
-        return list(entries)
-    merged: dict[str, dict] = {}
-    others: list[dict] = []
-    for entry in entries:
-        if entry.get("business") or entry.get("record_id"):
-            # 同名展示字段不代表同一业务要求，必须保留各自的身份、条件与适用范围。
-            others.append(entry)
-            continue
-        if entry.get("verification") != "supported":
-            others.append(entry)
-            continue
-        label = str(entry.get("group", "")) + "\u0000" + str(entry.get("field", ""))
-        target = merged.get(label)
-        if target is None:
-            merged[label] = {**entry, "values": dedupe_values(list(entry.get("values") or []))}
-            continue
-        target["values"] = dedupe_values([*target["values"], *(entry.get("values") or [])])
-        target["sort_order"] = min(
-            int(target.get("sort_order") or 0), int(entry.get("sort_order") or 0)
-        )
-        notes = dict.fromkeys(
-            part for part in (target.get("note"), entry.get("note")) if part
-        )
-        target["note"] = "；".join(notes)[:600]
-        # id 用合并后的内容重算，与 validate_items 的取值公式一致，保证跨请求稳定。
-        target["id"] = fingerprint([target["field"], target["values"]])[:20]
-    return [*merged.values(), *others]
 
 
 def citation(row: Mapping[str, Any], quote: str) -> dict:

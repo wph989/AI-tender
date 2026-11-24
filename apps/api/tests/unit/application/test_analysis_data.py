@@ -12,16 +12,46 @@ from tender.application.analysis.data import (
     ContextInput,
     assemble_dataset,
     build_context,
-    display_items,
     module_data,
+    module_records,
     prepare_records,
 )
-from tender.application.knowledge.content import merge_field_entries
 
 KEY = "project_basic_info_parsing"
 COMMON = {"kind": "common", "lot_refs": []}
 LOTS = [{"lot_id": 1, "code": "A", "title": "A标段", "aliases": []},
         {"lot_id": 2, "code": "B", "title": "B标段", "aliases": []}]
+
+
+@pytest.mark.parametrize("evidence_ids", [None, [], ["valid", "missing"]])
+def test_incomplete_evidence_cannot_fall_back_to_inline_citations(evidence_ids):
+    record = {"id": "r", "verification": "supported", "citations": [{"quote": "旧内联引用"}]}
+    if evidence_ids is not None:
+        record["evidence_ids"] = evidence_ids
+    data = {"records": [record], "evidence": {"valid": {"quote": "独立证据"}}}
+    original = copy.deepcopy(data)
+    result = module_records(data)
+    assert result[0]["citations"] == [] and result[0]["verification"] == "unavailable"
+    assert data == original
+
+
+def test_empty_hydrated_result_is_reused_and_missing_module_is_projected(monkeypatch):
+    from tender.application.analysis import data
+
+    calls = []
+    original = data.module_records
+
+    def project(business):
+        calls.append(business)
+        return original(business)
+
+    monkeypatch.setattr(data, "module_records", project)
+    modules = [{"module_key": key, "title": key, "status": "completed",
+                "business_data": {"records": [], "marker": key}}
+               for key in ("hydrated", "missing")]
+    result = assemble_dataset(modules, [], {"hydrated": []})
+    assert [business["marker"] for business in calls] == ["missing"]
+    assert result["readiness"] == "unavailable"
 
 
 def record(key="r", text="质保三年", scope=None, **kwargs):
@@ -119,25 +149,6 @@ def test_lot_specific_addendum_does_not_replace_other_lots_common_requirement():
     assert [r["key"] for r in a["requirements"]] == ["new"]
     assert [r["key"] for r in b["requirements"]] == ["old"]
     assert data == original
-
-
-def test_display_projection_keeps_same_title_records_in_different_lots():
-    items = prepare_records([
-        record("a", title="质保", scope={"kind": "lots", "lot_refs": ["A"]}),
-        record("b", title="质保", scope={"kind": "lots", "lot_refs": ["B"]}),
-    ], {}, {"s1r1c0": block() | {"content": "A：质保三年\nB：质保三年"}}, KEY)
-    for item in items:
-        item["verification"] = "supported"
-    projected = display_items(items)
-    assert all("business" not in item for item in projected)
-    assert len(merge_field_entries(projected)) == 2
-    assert {item["record_id"] for item in projected} == {item["id"] for item in items}
-
-
-
-
-
-
 
 
 def test_relation_scope_cannot_suppress_requirements_in_an_unrelated_lot():

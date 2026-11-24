@@ -10,6 +10,10 @@ from tender.ports.repository.knowledge.sources import SourceReader
 
 
 class KnowledgeExecutionRepository(SourceReader, RetrievalRepository, TaskLifecycle, Protocol):
+    def relation_snapshot(self, project_id: int) -> dict[str, Any] | None:
+        """最近完成报告的最新正式快照；发布尚未结束时返回 None，避免读取混合版本。"""
+        ...
+
     def answer(self, answer_id: int) -> dict[str, Any] | None:
         """取问答记录；跨公司时返回 ``None``。"""
         ...

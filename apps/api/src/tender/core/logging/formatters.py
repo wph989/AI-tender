@@ -111,13 +111,6 @@ def make_formatter(
             "skill_path", "sha256",
         ):
             event.pop(key, None)
-        # 只省略事件已表达的核验阶段和约定的默认值，模型调用阶段及其他 False 仍有意义。
-        name = event.get("event")
-        if name in ("review.result", "review.fail", "record.reject"):
-            if event.get("agent_phase") == "verification":
-                event.pop("agent_phase")
-        if name == "review.result" and event.get("needs_correction") is False:
-            event.pop("needs_correction")
         if not include_exception and (trace := event.pop("exception", None)):
             # 普通日志只显示错误摘要；完整堆栈由同目录的文本错误文件承载。
             lines = str(trace).rstrip().splitlines()

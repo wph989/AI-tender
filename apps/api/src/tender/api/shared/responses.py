@@ -379,7 +379,6 @@ class AnalysisModuleResponse(ApiResponse):
     module_key: str
     title: str
     status: str
-    items: list[AnalysisFieldResponse]
     error_message: str | None = None
     quality_status: Literal[
         "self_check_passed", "needs_review", "needs_input", "unknown",
@@ -403,7 +402,6 @@ class AnalysisReportResponse(ApiResponse):
     data_schema_version: str | None = None
     quality_status: str
     modules: list[AnalysisModuleResponse]
-    summary: list[dict[str, Any]]
     coverage: dict[str, Any]
     error_message: str | None = None
 

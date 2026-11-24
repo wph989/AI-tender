@@ -1,17 +1,20 @@
 """正文逐条选证经过真实校验入口，并随独立业务 JSON 保存，不能借整项来源冒充绑定。"""
 
 import copy
+import json
+from unittest.mock import Mock
 
 import pytest
 from test_analysis_research import block
 
 from tender.application.analysis.data import (
     SynthesisRecord,
-    display_items,
     module_data,
     prepare_records,
 )
+from tender.application.analysis.service import AnalysisService
 from tender.application.knowledge.service import visible_items
+from tender.domain.analysis.contract import FLOW_VERSION, FLOW_VERSION_KEY, RUNTIME_VERSION
 
 
 def prepared(*, alternate=False):
@@ -52,7 +55,6 @@ def bind_content(item, seen, groups):
 def test_content_citations_round_trip_without_conflicting_values():
     state, items, seen = prepared()
     bind_content(items[0], seen, [["budget"], ["term"], ["budget", "term"]])
-    assert len(display_items(items)[0]["values"]) == 1
 
     data = module_data(state)
     record = data["records"][0]
@@ -98,21 +100,42 @@ def test_formatted_summary_keeps_original_quotes_and_per_cell_bindings():
     ]
 
 
-def test_revoked_content_only_citation_hides_public_projection_without_mutating_verified_item():
-    _, items, seen = prepared(alternate=True)
+def test_revoked_content_only_citation_hides_records_without_mutating_verified_item():
+    state, items, seen = prepared(alternate=True)
     bind_content(items[0], seen, [["alternate"], ["term"], ["budget", "term"]])
     original = copy.deepcopy(items)
 
     class Store:
-        def resolve(self, ref, *, with_content):
+        def report(self, report_id):
+            return {
+                "project_id": 10, "source_snapshot": [], "reference_snapshot": [],
+                "runtime_version": RUNTIME_VERSION,
+                "skill_snapshot": {FLOW_VERSION_KEY: FLOW_VERSION,
+                    "tech_requirement_parsing/references/output_schema.json":
+                        json.dumps(state["output_schema"])},
+            }
+
+        def report_module(self, report_id, module_key):
+            return {"module_key": module_key, "status": "completed",
+                    "business_data": module_data(state)}
+
+        def report_modules(self, report_id):
+            raise AssertionError("正文读取不应加载所有专题")
+
+        def collections_for_project(self, project_id):
+            return [1, 2]
+
+        def sources(self, collection_ids):
+            return []
+
+        def resolve(self, ref, *, with_content=False):
             if ref["block_id"] == "alternate":
                 raise LookupError("原文已不可访问")
             return ref
 
-    projected = display_items(items)
-    result = visible_items(Store(), projected)[0]
-    assert result["verification"] == "unavailable"
-    assert result["values"] == [] and "output" not in result
+    service = AnalysisService(Store(), 1, Mock(), Mock())
+    result = service.get_module_records(1, "tech_requirement_parsing")
+    assert result["records"] == [] and result["evidence"] == {}
     assert items == original
 
 

@@ -370,6 +370,10 @@ if (Get-NetTCPConnection -State Listen -LocalPort $ApiPort -ErrorAction Silently
 }
 
 
+# .tmp 被 gitignore，全新工作区没有该目录；PID 记录和 beat 的 schedule 都放在这里。
+# 必须在启动进程之前创建，否则写 PID 文件与 beat 初始化 schedule 都会失败。
+New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+
 $started = New-Object System.Collections.Generic.List[object]
 
 Write-Host '正在启动后端三个进程……' -ForegroundColor Cyan

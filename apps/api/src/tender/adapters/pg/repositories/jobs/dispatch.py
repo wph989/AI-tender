@@ -12,7 +12,7 @@ from tender.adapters.pg.models import Job
 DISPATCH_LEASE = timedelta(seconds=60)
 
 
-def pending_jobs(stages: tuple[str, ...], company_id: int, limit: int | None):
+def pending_jobs(stages: tuple[str, ...], company_id: int, limit: int):
     # 候选只取当前可派发数量，锁住行后再投递，避免重复扫描同一批任务。
     return (
         select(Job.id)
@@ -51,7 +51,7 @@ class DispatchTransaction:
             ).scalar_one()
         )
 
-    def pending(self, stages: tuple[str, ...], company_id: int, limit: int | None) -> list[str]:
+    def pending(self, stages: tuple[str, ...], company_id: int, limit: int) -> list[str]:
         return list(self.connection.execute(pending_jobs(stages, company_id, limit)).scalars())
 
     def mark_dispatched(self, job_id: str) -> None:

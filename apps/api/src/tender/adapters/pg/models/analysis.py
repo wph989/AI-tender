@@ -40,7 +40,6 @@ class AnalysisReport(Base):
     runtime_version: Mapped[str] = mapped_column(Text)
     runtime_settings: Mapped[dict[str, Any]] = mapped_column(JSONB)
     reference_snapshot: Mapped[list[Any]] = mapped_column(JSONB)
-    summary: Mapped[list[Any]] = mapped_column(JSONB)
     derived_lot_ids: Mapped[list[int]] = mapped_column(ARRAY(BigInteger))
     snapshot_pending: Mapped[bool] = mapped_column(Boolean)
 
@@ -53,8 +52,6 @@ class AnalysisModule(Base):
     module_key: Mapped[str] = mapped_column(Text)
     title: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text)
-    items: Mapped[list[Any]] = mapped_column(JSONB)
-    trace: Mapped[list[Any]] = mapped_column(JSONB)
     error_message: Mapped[str | None] = mapped_column(Text)
     business_data: Mapped[dict[str, Any]] = mapped_column(JSONB)
 
@@ -77,8 +74,9 @@ class AgentModuleRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     model_calls: Mapped[int] = mapped_column(Integer)
     tool_calls: Mapped[int] = mapped_column(Integer)
-    successful_model_calls: Mapped[int | None] = mapped_column(Integer)
-    successful_tool_calls: Mapped[int | None] = mapped_column(Integer)
+    # 成功计数不可为空，否则结算增量对空值相加会丢失计数；默认值由建库基线定义。
+    successful_model_calls: Mapped[int] = mapped_column(Integer)
+    successful_tool_calls: Mapped[int] = mapped_column(Integer)
     prompt_tokens: Mapped[int] = mapped_column(BigInteger)
     completion_tokens: Mapped[int] = mapped_column(BigInteger)
     limits: Mapped[dict[str, Any]] = mapped_column(JSONB)

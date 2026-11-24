@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, Engine, delete, func, insert, literal, select, text, update
+from sqlalchemy import Connection, Engine, func, insert, literal, select, text, update
 from sqlalchemy.dialects.postgresql import INTERVAL
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.pool import NullPool
@@ -27,7 +27,6 @@ from tender.adapters.pg.models import (
     AgentRunEvent,
     AnalysisModule,
     AnalysisReport,
-    KnowledgeRelation,
     LlmCallLog,
 )
 from tender.adapters.pg.models.analysis import AgentCallAttempt, AgentModelInvocation
@@ -540,17 +539,6 @@ class AgentRunStore:
                 .where(AgentModuleRun.id == self.run["id"])
                 .values(state=state)
             )
-            if state.get("loaded_skill") and not previous.get("loaded_skill"):
-                skill_key = "skill:" + state["loaded_skill"]["sha256"]
-                attempt_key = state.get("tool_call_keys", {}).get(skill_key, skill_key)
-                self._settle(conn, "tool", attempt_key, "ok", {"name": "load_skill"})
-                conn.execute(
-                    insert(AgentRunEvent).values(
-                        run_id=self.run["id"],
-                        kind="skill_loaded",
-                        detail=state["loaded_skill"],
-                    )
-                )
             for call_id in (
                 (state.get("tool_results", {}).keys() - previous.get("tool_results", {}).keys())
                 | (state.get("tool_outcomes", {}).keys() - previous.get("tool_outcomes", {}).keys())
@@ -694,34 +682,12 @@ class AgentRunStore:
             self._refresh_counts()
 
     def _publish(self, conn: Connection, publish: dict[str, Any]) -> None:
-        """发布通过校验的成果与关系；单独成方法以便在 savepoint 内失败即回滚。"""
+        """发布通过校验的业务成果；单独成方法以便在 savepoint 内失败即回滚。"""
         conn.execute(
             update(AnalysisModule)
             .where(AnalysisModule.id == self.run["module_id"])
-            .values(items=publish["items"], business_data=publish["business"])
+            .values(business_data=publish["business"])
         )
-        relations = publish.get("relations")
-        if relations is None:
-            return
-        conn.execute(
-            delete(KnowledgeRelation).where(
-                KnowledgeRelation.module_id == self.run["module_id"]
-            )
-        )
-        for rel in relations:
-            conn.execute(
-                insert(KnowledgeRelation).values(
-                    report_id=self.report["id"],
-                    module_id=self.run["module_id"],
-                    subject=rel["subject"],
-                    predicate=rel["predicate"],
-                    object=rel["object"],
-                    scope=rel["scope"],
-                    condition=rel["condition"],
-                    citations=rel["citations"],
-                    verified=True,
-                )
-            )
 
     def release(self) -> None:
         conn, self.lock_connection = self.lock_connection, None

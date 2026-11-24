@@ -147,8 +147,10 @@ def test_single_agent_can_search_after_review_and_budget_never_publishes_draft(
                         "reason": "原文质保三年，核对期限与范围", "block_ids": [bid],
                     }]}
                 elif self.calls == 5:
-                    observed.append(env.db.rows("SELECT items FROM analysis_module WHERE id=:id",
-                                    {"id": runtime.run["module_id"]})[0]["items"])
+                    observed.append(env.db.rows(
+                        "SELECT business_data FROM analysis_module WHERE id=:id",
+                        {"id": runtime.run["module_id"]},
+                    )[0]["business_data"].get("records", []))
                     name, args = "search_document", {"query": "采购数量"}
                 else:
                     name, args = "submit_analysis", {"final": True,
@@ -173,7 +175,7 @@ def test_single_agent_can_search_after_review_and_budget_never_publishes_draft(
     assert len(stored["state"]["staged_items"]) == 1
     if max_calls < 6:
         assert module["status"] == "partial"
-        assert not module["items"] and not module["business_data"].get("records")
+        assert not module["business_data"].get("records")
         assert not stored["state"]["agent_workspace"]["finalized"]
         return
     assert module["status"] == "completed" and observed == [[]]

@@ -79,7 +79,6 @@ def visible_items(
             if accessible
             else {
                 "id": item["id"],
-                **({"record_id": item["record_id"]} if item.get("record_id") else {}),
                 "field": item.get("field", "来源已不可用"),
                 "group": item.get("group", ""),
                 "sort_order": item.get("sort_order", 0),

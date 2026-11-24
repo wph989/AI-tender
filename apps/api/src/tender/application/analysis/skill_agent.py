@@ -258,7 +258,6 @@ def build_skill_agent(
     state["business_topics"] = json.loads(snapshot.get(key + "/references/coverage.json", "[]"))
     state["authorized_sources"] = copy.deepcopy(research.sources)
     state["topic_lots"] = list(lots)
-    state["business_protocol"] = True
     research.compact_results = True
     book = DraftWorkspace(state, research.seen, key)
 

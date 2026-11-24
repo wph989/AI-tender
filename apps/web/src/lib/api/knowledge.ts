@@ -1,4 +1,4 @@
-import type { AnalysisReport, Citation, ModuleRecords } from "@/types/knowledge";
+import type { AnalysisReport, AnalysisReportDetail, Citation, ModuleRecords } from "@/types/knowledge";
 import { recordItems } from "@/lib/analysis/records";
 import { message } from "@/lib/errors";
 import { requestJson } from "@/lib/api/request";
@@ -21,7 +21,7 @@ export function resolveCitation(ref: Citation, signal?: AbortSignal): Promise<Ci
 }
 
 /** 专题独立读取记录；失败时清除本专题缓存正文，避免继续展示已撤销的依据。 */
-export function loadReportRecords(report: AnalysisReport, signal?: AbortSignal): Promise<AnalysisReport> {
+export function loadReportRecords(report: AnalysisReportDetail, signal?: AbortSignal): Promise<AnalysisReport> {
   // 请求成功后仍可能在逐条绑定校验中失败，必须与请求错误一起隔离在当前专题。
   const modules = report.modules.map((module) =>
     knowledgeRequest<ModuleRecords>(

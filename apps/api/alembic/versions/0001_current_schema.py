@@ -56,8 +56,9 @@ CREATE TABLE agent_module_run (
     limits jsonb NOT NULL,
     state jsonb DEFAULT '{}'::jsonb NOT NULL,
     error_message text,
-    successful_model_calls integer,
-    successful_tool_calls integer,
+    -- 成功结算直接累加，新项目与补跑必须从非空零值开始。
+    successful_model_calls integer DEFAULT 0 NOT NULL,
+    successful_tool_calls integer DEFAULT 0 NOT NULL,
     CONSTRAINT agent_module_run_attempt_check CHECK ((attempt > 0)),
     CONSTRAINT agent_module_run_model_calls_check CHECK ((model_calls >= 0)),
     CONSTRAINT agent_module_run_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'running'::text, 'completed'::text, 'failed'::text, 'canceled'::text, 'partial'::text]))),
@@ -128,8 +129,6 @@ CREATE TABLE analysis_module (
     module_key text NOT NULL,
     title text NOT NULL,
     status text DEFAULT 'pending'::text NOT NULL,
-    items jsonb DEFAULT '[]'::jsonb NOT NULL,
-    trace jsonb DEFAULT '[]'::jsonb NOT NULL,
     error_message text,
     business_data jsonb DEFAULT '{}'::jsonb NOT NULL
 );
@@ -191,7 +190,6 @@ CREATE TABLE analysis_report (
     runtime_version text DEFAULT 'deepagents-0.7.22-v6-records'::text NOT NULL,
     runtime_settings jsonb DEFAULT '{}'::jsonb NOT NULL,
     reference_snapshot jsonb DEFAULT '[]'::jsonb NOT NULL,
-    summary jsonb DEFAULT '[]'::jsonb NOT NULL,
     derived_lot_ids bigint[] DEFAULT '{}'::bigint[] NOT NULL,
     snapshot_pending boolean DEFAULT false NOT NULL
 );
@@ -520,31 +518,6 @@ CREATE SEQUENCE knowledge_index_id_seq
     """.strip(),
     """
 ALTER SEQUENCE knowledge_index_id_seq OWNED BY knowledge_index.id;
-    """.strip(),
-    """
-CREATE TABLE knowledge_relation (
-    id bigint NOT NULL,
-    report_id bigint NOT NULL,
-    module_id bigint NOT NULL,
-    subject text NOT NULL,
-    predicate text NOT NULL,
-    object text NOT NULL,
-    scope text DEFAULT ''::text NOT NULL,
-    condition text DEFAULT ''::text NOT NULL,
-    citations jsonb NOT NULL,
-    verified boolean DEFAULT false NOT NULL
-);
-    """.strip(),
-    """
-CREATE SEQUENCE knowledge_relation_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-    """.strip(),
-    """
-ALTER SEQUENCE knowledge_relation_id_seq OWNED BY knowledge_relation.id;
     """.strip(),
     """
 CREATE TABLE knowledge_source (
@@ -981,9 +954,6 @@ ALTER TABLE knowledge_collection ALTER COLUMN id SET DEFAULT nextval('knowledge_
 ALTER TABLE knowledge_index ALTER COLUMN id SET DEFAULT nextval('knowledge_index_id_seq'::regclass);
     """.strip(),
     """
-ALTER TABLE knowledge_relation ALTER COLUMN id SET DEFAULT nextval('knowledge_relation_id_seq'::regclass);
-    """.strip(),
-    """
 ALTER TABLE knowledge_source ALTER COLUMN id SET DEFAULT nextval('knowledge_source_id_seq'::regclass);
     """.strip(),
     """
@@ -1155,9 +1125,6 @@ SELECT pg_catalog.setval('knowledge_collection_id_seq', 1, false);
 SELECT pg_catalog.setval('knowledge_index_id_seq', 1, false);
     """.strip(),
     """
-SELECT pg_catalog.setval('knowledge_relation_id_seq', 1, false);
-    """.strip(),
-    """
 SELECT pg_catalog.setval('knowledge_source_id_seq', 1, false);
     """.strip(),
     """
@@ -1314,10 +1281,6 @@ ALTER TABLE knowledge_index
     ADD CONSTRAINT knowledge_index_pkey PRIMARY KEY (id);
     """.strip(),
     """
-ALTER TABLE knowledge_relation
-    ADD CONSTRAINT knowledge_relation_pkey PRIMARY KEY (id);
-    """.strip(),
-    """
 ALTER TABLE knowledge_source
     ADD CONSTRAINT knowledge_source_pkey PRIMARY KEY (id);
     """.strip(),
@@ -1449,9 +1412,6 @@ CREATE INDEX ix_knowledge_collection_company ON knowledge_collection USING btree
     """.strip(),
     """
 CREATE INDEX ix_knowledge_index_source ON knowledge_index USING btree (source_id, id DESC);
-    """.strip(),
-    """
-CREATE INDEX ix_knowledge_relation_report ON knowledge_relation USING btree (report_id);
     """.strip(),
     """
 CREATE INDEX ix_llm_call_created ON llm_call_log USING btree (created_at DESC);
@@ -1613,14 +1573,6 @@ ALTER TABLE knowledge_index
     """
 ALTER TABLE knowledge_index
     ADD CONSTRAINT knowledge_index_version_id_fkey FOREIGN KEY (version_id) REFERENCES document_version(id);
-    """.strip(),
-    """
-ALTER TABLE knowledge_relation
-    ADD CONSTRAINT knowledge_relation_module_id_fkey FOREIGN KEY (module_id) REFERENCES analysis_module(id) ON DELETE CASCADE;
-    """.strip(),
-    """
-ALTER TABLE knowledge_relation
-    ADD CONSTRAINT knowledge_relation_report_id_fkey FOREIGN KEY (report_id) REFERENCES analysis_report(id) ON DELETE CASCADE;
     """.strip(),
     """
 ALTER TABLE knowledge_source

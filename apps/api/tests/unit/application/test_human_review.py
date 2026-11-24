@@ -11,8 +11,7 @@ def record(record_id: str, kind: str = "requirement", **values):
         "id": record_id, "module_key": "module-a", "kind": kind, "title": record_id,
         "text": "机器抽取正文", "scope": {"kind": "common", "lot_refs": []},
         "citations": [{"block_id": "block-a"}], "review_status": "current",
-        "human_review_status": "pending", "conditions": {"terms": ["旧条件"]},
-        "materials": [{"name": "旧材料"}], "content": {"旧字段": "旧值"}, **values,
+        "human_review_status": "pending", "content": {"原字段": "原值"}, **values,
     }
 
 
@@ -49,8 +48,7 @@ def test_corrected_record_retains_original_citation_but_drops_machine_structure(
     result = reviewed_compilation(data)
     assert result["requirements"][0]["text"] == "人工修正正文"
     assert result["requirements"][0]["citations"] == target["citations"]
-    assert result["requirements"][0]["conditions"]["terms"] == []
-    assert result["requirements"][0]["materials"] == []
+    assert result["requirements"][0]["structuring"] == "partial"
     assert result["requirements"][0]["content"] == {}
 
 

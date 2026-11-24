@@ -49,38 +49,6 @@ class DataScope(DataInput):
         return self
 
 
-class ConditionTerm(DataInput):
-    subject: str = Field(min_length=1)
-    operator: Literal["=", "!=", ">", ">=", "<", "<=", "in", "text"]
-    value: str = Field(min_length=1)
-    unit: str | None = None
-    time_basis: str | None = None
-
-
-class Conditions(DataInput):
-    expression: str = ""
-    logic: Literal["all", "any", "mixed", "text"] = "text"
-    terms: list[ConditionTerm] = Field(default_factory=list)
-    exceptions: list[str] = Field(default_factory=list)
-
-
-class Material(DataInput):
-    name: str = Field(min_length=1)
-    requirement: str = Field(min_length=1)
-
-
-class ScoreTier(DataInput):
-    condition: str = Field(min_length=1)
-    points: str = Field(min_length=1)
-
-
-class Scoring(DataInput):
-    max_points: str | None = None
-    formula: str = ""
-    tiers: list[ScoreTier] = Field(default_factory=list)
-    deductions: list[str] = Field(default_factory=list)
-
-
 class RecordContent(DataInput):
     """模型表达的业务内容；生成字段留在内部记录契约，避免模型重复填写。"""
 
@@ -96,13 +64,9 @@ class RecordContent(DataInput):
         min_length=1, description="总结所依据的已读块定位，只填写block_id，无需摘抄原文",
     )
     group: str = Field(
-        default="", description="展示分类，填写当前Skill输出格式的title；不能用category代替",
+        default="", description="展示分类，填写当前Skill输出格式的title",
     )
-    category: str = Field(default="other", description="可选业务标签；展示分类填写group")
     structuring: Literal["complete", "partial"] = "partial"
-    conditions: Conditions = Field(default_factory=Conditions)
-    materials: list[Material] = Field(default_factory=list)
-    scoring: Scoring | None = None
     code: str | None = None
     aliases: list[str] = Field(default_factory=list)
     node_type: Literal["group", "section"] | None = None
@@ -266,14 +230,12 @@ def module_records(data: dict) -> list[dict]:
     result = copy.deepcopy(data.get("records", []))
     evidence = data.get("evidence", {})
     for record in result:
-        if "evidence_ids" in record:
-            # 证据表写入后只读消费，回填引用不需要再次深拷贝。
-            record["citations"] = [dict(evidence[key])
-                                   for key in record["evidence_ids"] if key in evidence]
-            if not record["evidence_ids"] or any(key not in evidence
-                                                 for key in record["evidence_ids"]):
-                # 少一处证据就可能丢失修订或条件，不能拿剩余引用冒充完整依据。
-                record.update(citations=[], verification="unavailable")
+        evidence_ids = record.get("evidence_ids", [])
+        # 证据表写入后只读消费，回填引用不需要再次深拷贝。
+        record["citations"] = [dict(evidence[key]) for key in evidence_ids if key in evidence]
+        if not evidence_ids or any(key not in evidence for key in evidence_ids):
+            # 少一处证据就可能丢失修订或条件，内联引用也不能替代独立证据表。
+            record.update(citations=[], verification="unavailable")
     return result
 
 
@@ -322,37 +284,6 @@ def module_data(state: dict) -> dict:
         "gaps": copy.deepcopy(state.get("business_gaps", [])),
         "research_summary": state.get("draft", {}).get("research_summary", ""),
     }
-
-
-def display_items(items: list[dict]) -> list[dict]:
-    """校验单元包含内部业务属性，页面只接收展示投影和可回查的记录身份。"""
-    result = []
-    for item in items:
-        business = item.get("business")
-        rendered = {k: v for k, v in item.items() if k != "business"}
-        if bindings := (item.get("output") or {}).get("citations"):
-            # 逐条选中的额外出处也要经过既有可见性检查，避免整体出处可读时漏检局部引用。
-            values = list(rendered["values"])
-            refs = [*values[0]["citations"], *(
-                ref for groups in bindings.values() for group in groups for ref in group
-            )]
-            values[0] = {
-                **values[0], "citations": list({fingerprint(ref): ref for ref in refs}.values()),
-            }
-            rendered["values"] = values
-        if business:
-            scope = business["scope"]
-            label = {"common": "公共要求", "unknown": "归属待确认"}.get(scope["kind"])
-            label = label or "、".join(scope["lot_refs"])
-            # 同名事项仍需让人看出适用差异，避免展示层再次抹去已核实的标段范围。
-            note = "适用范围：" + label
-            if business.get("structuring") == "partial":
-                note += "；部分条件待核对"
-            rendered.update(record_id=item["id"], note="；".join(
-                part for part in (rendered.get("note", ""), note) if part
-            ))
-        result.append(rendered)
-    return result
 
 
 def resolve_scope(scope: dict, lots: list[dict]) -> dict:
@@ -446,7 +377,9 @@ def assemble_dataset(
         data = module.get("business_data") or {}
         key = module["module_key"]
         available = []
-        for record in (hydrated or {}).get(key) or module_records(data):
+        # 已投影的空结果也有效，不能因列表为空再次解析业务数据。
+        rows = hydrated[key] if hydrated is not None and key in hydrated else module_records(data)
+        for record in rows:
             # 必要证据缺失的记录整条不可用，只登记缺口，不能让剩余引用冒充完整依据。
             if record.get("verification") == "unavailable":
                 result["gaps"].append(data_gap(

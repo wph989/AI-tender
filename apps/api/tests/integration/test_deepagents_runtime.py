@@ -26,6 +26,7 @@ from tender.application.analysis import execution as worker
 from tender.application.analysis import runtime as agent_runtime
 from tender.application.analysis.skills import MODULES
 from tender.application.knowledge.content import source_signature
+from tender.application.knowledge.service import visible_items
 from tender.application.llm.routing import CallRecord
 from tender.config.registry import ConfigRegistry
 from tender.core import settings
@@ -60,7 +61,6 @@ def env(monkeypatch):
         "knowledge_chunk",
         "analysis_report",
         "analysis_module",
-        "knowledge_relation",
         "knowledge_answer",
         "llm_feature_model",
         "llm_model",
@@ -152,7 +152,7 @@ def report(env):
         project["id"], analysis_api.AnalysisSettings(category="goods"), env.request
     )
     created = analysis_api.start_analysis(project["id"], analysis_api.AnalysisInput(), env.request)
-    return analysis_api.report_row(env.request, created["id"])
+    return analysis_api.analysis_service(env.request).report_row(created["id"])
 
 
 def prepared_runtime(env):
@@ -390,7 +390,7 @@ def test_claim_backoff_does_not_starve_later_modules(env, monkeypatch):
     async def invoke(graph, files, *, state=None, **kwargs):
         # 每个模块占用配额片刻，后两个必然经历等待与退避轮询。
         await asyncio.sleep(0.2)
-        state["draft"] = {"fields": [], "relations": [], "business_data": {}}
+        state["draft"] = {"business_data": {}}
 
     monkeypatch.setattr(worker, "invoke_module", invoke)
 
@@ -429,7 +429,9 @@ def test_resume_preserves_budget_evidence_and_deadline(env):
     deadline = first.run["deadline_at"]
     first.release()
     # 恢复等待配额的旧线程应显示排队，但不能重置已经消耗的预算和时限。
-    worker.prepare_report(env.db, analysis_api.report_row(env.request, first.report["id"]))
+    worker.prepare_report(
+        env.db, analysis_api.analysis_service(env.request).report_row(first.report["id"])
+    )
     run = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", {"id": first.run["id"]})[0]
     assert run["status"] == "pending"
     resumed = agent_runtime.AgentRuntime(env.db, first.report, run, first.sources)
@@ -461,13 +463,14 @@ def test_report_runs_counts_confirmed_successes_per_run_without_counting_failure
             runtime.reserve("model")
             runtime.store.record_call({"status": status})
         runtime.reserve("model")
-        for call_key in ("success", "failed", "skill:fixture", "pending"):
+        for call_key in ("success", "failed", "second_success", "pending"):
             runtime.reserve("tool", call_key)
-        state = {"loaded_skill": {"path": "/skills/example/SKILL.md", "sha256": "fixture"},
-                 "tool_results": {
+        state = {"tool_results": {
             call_id: message_to_dict(ToolMessage(
                 content="工具回执", name="read_document", tool_call_id=call_id, status=status,
-            )) for call_id, status in (("success", "success"), ("failed", "error"))
+            )) for call_id, status in (
+                ("success", "success"), ("second_success", "success"), ("failed", "error"),
+            )
         }}
         runtime.save(state)
         runtime.save(state)
@@ -483,16 +486,15 @@ def test_report_runs_counts_confirmed_successes_per_run_without_counting_failure
         runtime.release()
 
 
-def test_historical_run_without_success_records_stays_unknown(env):
+def test_new_run_success_counts_start_at_zero_without_result_events(env):
     runtime = prepared_runtime(env)
-    env.db.execute("""UPDATE agent_module_run SET successful_model_calls=NULL,
-        successful_tool_calls=NULL,model_calls=99,tool_calls=99 WHERE id=:id""",
+    env.db.execute("""UPDATE agent_module_run SET model_calls=99,tool_calls=99 WHERE id=:id""",
         {"id": runtime.run["id"]})
     current = next(row for row in env.db.report_runs(runtime.report["id"])
                    if row["id"] == runtime.run["id"])
-    # 历史缺少结果事件时显示未记录；99次尝试不能推算为0次或99次成功。
-    assert current["successful_model_calls"] is None
-    assert current["successful_tool_calls"] is None
+    # 尝试数不能冒充成功次数；未结算成功请求时仍返回建库初始化的零值。
+    assert current["successful_model_calls"] == 0
+    assert current["successful_tool_calls"] == 0
     assert current["model_calls"] == current["tool_calls"] == 99
 
 
@@ -543,7 +545,9 @@ def test_resume_settles_saved_valid_result_and_releases_unknown_only_after_owner
                            "status": "ok", "prompt_tokens": 8, "completion_tokens": 2},
     })
     first.release()
-    worker.prepare_report(env.db, analysis_api.report_row(env.request, first.report["id"]))
+    worker.prepare_report(
+        env.db, analysis_api.analysis_service(env.request).report_row(first.report["id"])
+    )
     run = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", {"id": first.run["id"]})[0]
     resumed = agent_runtime.AgentRuntime(env.db, first.report, run, first.sources)
     try:
@@ -567,7 +571,9 @@ def test_unknown_tool_reexecution_uses_a_new_attempt_and_settles_saved_result_on
     assert first.claim()
     first.reserve("tool", "read-call")
     first.release()
-    worker.prepare_report(env.db, analysis_api.report_row(env.request, first.report["id"]))
+    worker.prepare_report(
+        env.db, analysis_api.analysis_service(env.request).report_row(first.report["id"])
+    )
     row = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", {"id": first.run["id"]})[0]
     resumed = agent_runtime.AgentRuntime(env.db, first.report, row, first.sources)
     try:
@@ -608,7 +614,9 @@ def test_expired_recovery_settles_saved_results_and_closes_orphan_attempts(env):
         conn.execute(text("UPDATE agent_module_run SET deadline_at=now()-interval '1 second' "
                           "WHERE id=:id"), {"id": first.run["id"]})
     first.release()
-    worker.prepare_report(env.db, analysis_api.report_row(env.request, first.report["id"]))
+    worker.prepare_report(
+        env.db, analysis_api.analysis_service(env.request).report_row(first.report["id"])
+    )
     run = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id", {"id": first.run["id"]})[0]
     resumed = agent_runtime.AgentRuntime(env.db, first.report, run, first.sources)
     try:
@@ -760,11 +768,11 @@ def test_selected_evidence_resolves_only_retained_id_after_review(env, monkeypat
     module = env.db.rows("SELECT * FROM analysis_module WHERE id=:id", {"id": run["module_id"]})[0]
     assert module["status"] == "completed", module["error_message"]
     assert resolved_ids == selected and len(selected) == 1
-    refs = module["items"][0]["values"][0]["citations"]
+    business = module["business_data"]["records"][0]
+    refs = [module["business_data"]["evidence"][key] for key in business["evidence_ids"]]
     assert len(refs) == 1 and refs[0]["block_id"] == selected[0]
     assert refs[0]["bbox"] == [0.2, 0.3, 0.9, 0.4]
-    business = module["business_data"]["records"][0]
-    assert business["id"] == module["items"][0]["record_id"]
+    assert business["id"]
     assert business["verification"] == "supported"
     assert "citations" not in business
     assert [module["business_data"]["evidence"][key] for key in business["evidence_ids"]] == refs
@@ -888,8 +896,8 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
         "tool_calls": 1,
     }
     runtime.save(saved_state)
-    assert not env.db.rows("SELECT items FROM analysis_module WHERE id=:id",
-                          {"id": runtime.run["module_id"]})[0]["items"]
+    assert not env.db.rows("SELECT business_data FROM analysis_module WHERE id=:id",
+                          {"id": runtime.run["module_id"]})[0]["business_data"].get("records")
     runtime.finish("failed", "故障注入")
     runtime.release()
     env.db.execute(
@@ -978,7 +986,6 @@ def test_partial_finish_keeps_drafts_without_publishing(env):
     )[0]
     assert run["status"] == "partial"
     assert [item["id"] for item in run["state"]["staged_items"]] == ["keep", "drop"]
-    assert module["items"] == []
     assert not module["business_data"].get("records")
 
 
@@ -1036,7 +1043,7 @@ def test_report_with_all_partial_modules_is_partial(env, monkeypatch):
     assert len(result["modules"]) == 13
     assert all(module["status"] == "partial" for module in result["modules"])
     assert all(
-        not module["items"]
+        "items" not in module
         for module in result["modules"]
     )
     snapshot = env.db.rows(
@@ -1091,10 +1098,12 @@ def test_retry_before_modules_created_persists_new_limits(env):
         analysis_api.RetryInput(max_output_tokens=12345, timeout_seconds=4321),
         env.request,
     )
-    persisted = analysis_api.report_row(env.request, row["id"])["runtime_settings"]
+    persisted = analysis_api.analysis_service(env.request).report_row(row["id"])["runtime_settings"]
     assert persisted["max_output_tokens"] == 12345
     assert persisted["timeout_seconds"] == 4321
-    prepared, _ = worker.prepare_report(env.db, analysis_api.report_row(env.request, row["id"]))
+    prepared, _ = worker.prepare_report(
+        env.db, analysis_api.analysis_service(env.request).report_row(row["id"])
+    )
     run = env.db.rows(
         """SELECT a.limits FROM agent_module_run a JOIN analysis_module m ON m.id=a.module_id
         WHERE m.report_id=:id ORDER BY a.id LIMIT 1""",
@@ -1195,7 +1204,8 @@ def test_explicit_retry_reparses_completed_module_from_scratch(env):
         "note": "",
         "verification": "supported",
     }
-    draft = {"fields": [field], "relations": [], "research_summary": "已经检索"}
+    draft = {"business_data": {"records": [], "evidence": {}},
+             "research_summary": "已经检索"}
     runtime.save({"staged_items": [field], "draft": draft})
     runtime.finish("completed", draft=draft)
     runtime.release()
@@ -1263,7 +1273,7 @@ def test_dynamic_reference_revocation_stops_tool_and_hides_existing_result(env):
             "values": [{"value": "五年", "citations": [{"collection_id": cid}]}],
             "note": "",
         }
-        shown = analysis_api.visible_items(
+        shown = visible_items(
             env.db, [item], env.db.collections_for_project(runtime.report["project_id"])
         )
         assert shown[0]["verification"] == "unavailable"
@@ -1302,7 +1312,7 @@ def test_retry_uses_live_config_and_keeps_report_snapshot_untouched(env):
     assert runs[-1]["limits"]["max_tool_calls"] == 48
     # 报告创建时的快照保持原值，只作为历史记录，不被补跑改写。
     assert (
-        analysis_api.report_row(env.request, runtime.report["id"])["runtime_settings"][
+        analysis_api.analysis_service(env.request).report_row(runtime.report["id"])["runtime_settings"][
             "max_model_calls"
         ]
         == 40
@@ -1356,7 +1366,7 @@ def test_publish_failure_still_records_terminal_run_state(env, monkeypatch):
         assert runtime.claim()
         # 成果发布在运行账实现的 savepoint 内，故障点必须注在真正执行发布的仓储上。
         monkeypatch.setattr(run_store.AgentRunStore, "_publish", broken_publish)
-        runtime.finish("completed", draft={"fields": [], "business_data": {}, "relations": []})
+        runtime.finish("completed", draft={"business_data": {}})
         run = env.db.rows(
             """SELECT status, error_message, lease_until, finished_at
             FROM agent_module_run WHERE id=:id""",

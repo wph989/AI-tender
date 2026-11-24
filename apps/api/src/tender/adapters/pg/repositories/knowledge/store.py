@@ -49,7 +49,6 @@ from tender.adapters.pg.models import (
     KnowledgeChunk,
     KnowledgeCollection,
     KnowledgeIndex,
-    KnowledgeRelation,
     KnowledgeSource,
     Lot,
     ParseRun,
@@ -669,32 +668,32 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
             )
         return dict(row) if row is not None else None
 
-    def verified_relations(self, project_id: int) -> list[dict[str, Any]]:
-        """最近一次完成/部分完成报告里已核实的知识关系，供图谱扩展。"""
+    def relation_snapshot(self, project_id: int) -> dict[str, Any] | None:
+        """问答复用正式快照；最新报告尚未发布时不回退到更早的关系。"""
         latest = (
             select(func.max(AnalysisReport.id))
             .where(
                 AnalysisReport.project_id == project_id,
                 AnalysisReport.company_id == self.company_id,
                 AnalysisReport.status.in_(("completed", "partial")),
+                current_protocol(),
             )
             .scalar_subquery()
         )
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(KnowledgeRelation)
-                .join(AnalysisReport, AnalysisReport.id == KnowledgeRelation.report_id)
+            row = connection.execute(
+                select(AnalysisDataSnapshot)
+                .join(AnalysisReport, AnalysisReport.id == AnalysisDataSnapshot.report_id)
                 .join(Project, Project.id == AnalysisReport.project_id)
                 .where(
-                    AnalysisReport.project_id == project_id,
-                    AnalysisReport.company_id == self.company_id,
+                    AnalysisReport.id == latest,
+                    AnalysisReport.snapshot_pending.is_(False),
                     Project.deleted_at.is_(None),
-                    KnowledgeRelation.verified,
-                    KnowledgeRelation.report_id == latest,
                 )
-            ).mappings()
-            return [dict(row) for row in rows]
-
+                .order_by(AnalysisDataSnapshot.id.desc())
+                .limit(1)
+            ).mappings().first()
+        return dict(row) if row is not None else None
 
     # —— 数据库结构门禁 ——
     def schema_columns(self, tables: Sequence[str]) -> set[tuple[str, str]]:
@@ -745,17 +744,15 @@ class KnowledgeStore(ReportQueries, RetrievalModelQueries):
         report_id: int,
         *,
         status: str,
-        summary: list[Any],
         error: str | None,
     ) -> None:
-        """报告收口：写终态、汇总与结束时间，并清掉租约。"""
+        """报告收口：写终态与结束时间，并清掉租约。"""
         with self.engine.begin() as connection:
             connection.execute(
                 update(AnalysisReport)
                 .where(AnalysisReport.id == report_id, AnalysisReport.status == "running")
                 .values(
                     status=status,
-                    summary=summary,
                     error_message=error,
                     finished_at=func.now(),
                     lease_until=None,
@@ -1244,8 +1241,6 @@ class KnowledgeSession:
         self._session.execute(
             pg_insert(AgentModuleRun)
             .values(
-                successful_model_calls=0,
-                successful_tool_calls=0,
                 module_id=module_id,
                 company_id=company_id,
                 attempt=1,
@@ -1568,8 +1563,6 @@ class KnowledgeSession:
                 thread_id=thread_id,
                 limits=limits,
                 state=state,
-                successful_model_calls=0,
-                successful_tool_calls=0,
             )
         )
 

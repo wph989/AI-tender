@@ -1,8 +1,133 @@
 # 架构清理交接
 
-更新：2026-11-23。已读取并续接会话 `01a1fda4-e125-7eb2-a4ef-a1f5cb59b3c3`，完成架构清理、前端修复、补件后中断续跑修复和自动化验收。当前分支 `simplify/backend-cleanup`，最新提交以 Git 记录为准。
+更新：2026-11-24。已读取并续接会话 `01a1fda4-e125-7eb2-a4ef-a1f5cb59b3c3`，完成架构清理、前端修复、补件后中断续跑修复和自动化验收。当前分支 `simplify/backend-cleanup`，最新提交以 Git 记录为准。
 
-## 本轮方法、参数与配置清理（2026-11-23）
+## 本轮审查问题修复（2026-11-24）
+
+- 修复问答关系第二跳因标段名称、别名或列举顺序不同而漏扩展：范围键统一使用 `kind` 与 `lot_ids` 集合，加入和匹配遍历节点使用同一键；原文范围继续用于展示。
+- 新增3项顺序、名称及别名回归和2项不同标段集合回归，测试数据由真实 `resolve_scope` 生成。修复前3项失败、2项通过，修复后关系扩展文件16项全部通过；公共范围与标段范围、不同标段及包含关系的范围继续隔离。
+- 设计13同步范围判定规则。统一后端入口最终重跑的Ruff、5项分层、63个mypy目标、996项离线测试及OpenAPI漂移检查全部通过，离线测试耗时212.69秒。UTF-8检查日志为 `C:/Users/wph98/AppData/Local/Temp/ai-tender-scope-check-20261124-2248.log`；本轮修改文件编码、Python语法及差异空白检查通过。
+
+## 本轮精确取数与冗余状态清理（2026-11-24，已实施）
+
+用户已授权继续优化，本轮六项清理已完成：
+
+- 问答关系按稳定 `block_id` 精确补读，跳过已命中块，复用 `read_chunk_window(source, offset, 1)`；块按整数序号排列，保留关系、端点、来源和权限核验。
+- 报告正文改用带公司过滤的 `report_module(report_id, module_key)` 单模块查询，保留正文权限和冻结输入检查。
+- 分析最终草稿删除重复的 `draft.fields`，发布检查和日志计数统一读取 `published_items(state)`；问答草稿的 `fields` 仍有用途。
+- 正式模块统一读取独立 `evidence/evidence_ids`，缺失证据使整条记录不可用，内联引用不能回退；已投影的空列表直接复用。
+- 删除专题紧凑分页与图谱扩展的未装配组合分支，普通问答继续扩展；删除不可读条目的旧 `record_id` 别名透传，保留缺口和人工裁定的有效字段。
+- 清理恢复夹具的重复断言和取值，修正报告仓储注释，同步设计13、14及相关测试。
+
+实测：13个专题请求取回模块行由169份降至13份；8条记录工作区由53,021字节降至39,761字节，减少13,260字节；长元素8块中唯一关系引用已经命中时，不再补读来源。
+
+验证及现场状态：
+
+- 相关6个单测文件89项通过，正常导入运行；统一后端入口最终重跑的Ruff、5项分层、63个mypy目标、991项离线测试及OpenAPI漂移检查全部通过，离线测试耗时266.69秒。mypy禁用增量缓存，保留真实协议与装配检查。
+- 首轮完整离线测试990项通过、1项流增量超时测试失败；单独复测通过。测试准备阶段先初始化SDK流资源，防止首次加载占用首包时限，保留原5秒时限和全部断言；该文件49项通过。
+- 从空库执行当前基线后，236项完整PostgreSQL集成测试通过，耗时425.53秒，覆盖单模块查询、权限、发布和恢复。
+- 收尾发现 `test_analysis_recovery_flow.py` 的实际内容读成无关渲染文档并含NUL；按既有验证记录的SHA-256核对恢复材料后还原，恢复链路10项重新通过，耗时133.49秒。597个Git管理的文本文件完成编码和Python语法扫描，更新本交接前的88个既有修改文件均与验证摘要一致；恢复后Ruff及差异空白检查通过。旧 `.cache` 材料也曾出现无关内容，后续使用前须核对内容及摘要。
+- 本轮临时数据库位于系统临时目录 `ai-tender-validation-20261124-c67adb3a/data`，测试库为 `tender_validation_20261124_test`。核对进程31580、数据目录及零客户端连接后正常关闭，55478释放。当前用户API、Worker、Beat入口进程为36132、23116、27136，仍在运行。
+
+用户明确反对自行备份，后续不得创建备份。本轮更改的提交状态以Git记录为准；用户已授权一并提交既有环境、Compose、部署、启动脚本及docker/mineru修改。
+
+## 本轮六项清理的实施前分析依据（2026-11-24）
+
+以下保留实施前的分析与探针依据，对应清理已在上方记录完成：
+
+- 问答关系扩展仍按element_id展开：唯一引用块已经命中时，现行语义块探针仍完整读取来源，从1块扩成8块，额外7块没有被关系引用。应按block_id精确展开并跳过已命中块，缺失块复用有界原文读取，保留遍历前的引用与权限核验。
+- 专题正文接口每次先report_modules取全报告再按module_key筛选；前端逐专题请求使13个专题取回169份模块行。建议在现有报告仓储/端口中按report_id、module_key单查，继续逐请求核验正文权限与冻结输入。
+- 分析最终提交的draft.fields是staged_items中final_ids所选记录的完整深拷贝，生产仅用于最终本项目引用检查和计数。8条记录探针删除此副本可把工作区从53,021字节降到39,761字节；可从published_items(state)取同一结果，保留正式business_data。
+- module_records仍兼容无evidence_ids的内联引用形态，现行正式写入统一为独立evidence/evidence_ids；应统一证据读取并保留缺证据拒绝。
+- ResearchSession中compact_results与expand同时启用的扩展截断分支只由测试构造；专题只用紧凑分页，问答只在普通模式扩展。可清理未装配的组合分支，保留两条现行路径。
+- visible_items的条目record_id旧别名透传已无生产写入者；旧display_items删除后正文统一用id。同名缺口和人工裁定字段仍有用途，不能一并删除。
+
+局部附带项：assemble_dataset对已预计算的空列表用or再次投影，13个空专题额外调用13次module_records；恢复集成夹具有完全重复断言和重复取值；报告端口/查询仍有“模块含工具日志”“运行账含暂存成果”的过时注释。
+
+3个纯数据测试文件38项通过。离线图谱探针直接执行现行函数源码，其余使用真实草稿、正文用例和投影。6文件检查在第三方SDK导入阶段等待过长、尚未执行测试，已结束并转用纯数据验证；本轮未启动数据库或调用模型。静态候选中的框架回调、流接口、独立排名算法、坐标契约及PID缓存继续保留。
+
+实施前材料：`.cache/next-cleanup-analysis-20261124.md`、`.cache/next-cleanup-probe-proof-20261124.json`、`.cache/next-cleanup-static-candidates-20261124.json`、`.cache/next-cleanup-data-tests-20261124.log`。完整验证结果以上方实施记录为准。
+
+## 本轮新机器空库部署计数验证（2026-11-24）
+
+- 用户明确要求其他机器从空库部署时正确，继续保留唯一的 `0001_current_schema` 基线。两个成功计数字段为 `integer DEFAULT 0 NOT NULL`，新增中文原因注释；ORM保持非空映射，首次运行与补跑均使用数据库默认值。
+- 增加2项离线基线契约，防止零默认值或非空定义被删除；新增 `tests/integration/test_database_baseline.py`，直接从空命名空间执行完整基线，调用真实首次运行、补跑及 `_settle` 实现，覆盖初始化为0、成功递增、失败和重复回执不计数、拒绝NULL。
+- 在现有PostgreSQL实例创建独立空测试库 `tender_new_deploy_20261124_7a381e57_test`，实际执行部署入口 `alembic upgrade head`，版本为 `0001_current_schema`，两个字段均为NO/0。新增3项及原有2项成功计数集成回归通过，ORM/基线与配置契约共41项通过；相关文件Ruff、UTF-8和差异空白检查通过。现场业务库未参与本轮测试，独立测试库保留。
+- 验证脚本为 `.cache/verify-new-deployment-counters-20261124.py`，凭据为 `.cache/new-deployment-counters-20261124-proof.json`；工程17补充新机计数字段验收查询。统一后端入口尝试记录在 `.cache/new-deployment-counters-backend-20261124.log`，当前受其他清理改动的13项Ruff错误阻挡，包括 `test_knowledge_flow.py` 的旧夹具 `attach_completed_module` 引用；未改动这些文件。
+
+## 本轮重复投影与问答关系链路清理（2026-11-24）
+
+用户已授权实施上一轮追加分析确认的清理，现已完成：
+
+- 正式模块只保存 `business_data`，删除模块 `items`、`trace` 和报告 `summary` 的ORM、当前空库基线、写入与响应。详情只返回执行、质量与运行信息；正文从独立records接口读取，引用在正文读取时按实时权限核对。
+- 问答关系改接最近completed/partial当前协议报告的最新正式业务快照，删除旧 `knowledge_relation` 表、ORM、读写接口及空关系发布载荷。首跳由命中原文块触发，第二跳按稳定记录ID及同一适用范围展开，最多24条。关系与端点须已核实，全部引用在遍历前复核所选来源、解析版本、集合关联和原文可读性；失效边不能带出第二跳，相同引文复用一次核验。
+- 删除空转的 `merge_field_entries`、`display_items`、`summarize`，闲置模型工厂 `extra_retries_limit`、RoutingModel候选数量属性、无block_id引文回退、固定跳过的语义启发式及 `defer_semantics`。本项目引用要求、现行草稿自查、模型配置的实际重试预算继续生效。
+- 删除6个未注册的API辅助包装，测试直接使用现有用例装配。前端同步详情类型，删除无发送者的扫描计数与旧摘要专题角标；OpenAPI类型及设计03、05、13、14同步。
+- 两个图谱集成用例改走真实草稿、自查、最终提交、运行仓储发布和统一快照，验证保函原文经关系进入问答；不再通过直接写旧关系表掩盖生产链路失效。新增8项关系遍历单测和4项快照可见性集成回归。
+
+验证完成：
+
+- `.cache/cleanup-followup-backend-20261124.log`：统一后端入口的Ruff、5项分层、63个mypy目标、983项离线测试和OpenAPI漂移检查通过；最终夹具同步后另有10项控制器生命周期回归通过，Ruff及生成漂移复核通过。
+- 前端TypeScript额外开启未使用变量、参数检查通过，10个文件、60项单测通过；`.cache/cleanup-followup-web-build-20261124.log`记录生产构建通过。构建在 `.cache/web-followup-20261124` 源码副本执行，103个前端源码文件与工作区逐字节一致，避免覆盖用户开发缓存。
+- `.cache/cleanup-followup-e2e-20261124.log`：既有系统Edge desktop/mobile项目的88项报告与编制回归通过；详情夹具彻底移除items后，`.cache/cleanup-followup-wire-e2e-20261124.log`另有10项取数、轮询、报告切换及成功次数复测通过。临时前端服务已退出，54383释放。
+- `.cache/cleanup-followup-postgres-20261124.log`：235项完整PostgreSQL集成测试通过，耗时381.63秒。独立空库为 `tender_followup_cleanup_20261124_test`；基线版本、删除字段与旧表、23项配置、4项业务功能种子及成功计数的非空零默认值均已核对，凭据为 `.cache/cleanup-followup-baseline-proof-20261124.json`。
+- `.cache/cleanup-followup-source-proof-20261124.json`记录当前修改文件的UTF-8、Python语法及内容摘要，差异空白检查通过。原始目标文件备份为 `.cache/followup-cleanup-before-20261124/`，仅供本轮差异复核，不是全工作区快照。
+- 核对本轮临时PostgreSQL进程29832、可执行文件、数据目录、55478端口及零客户端连接后正常关闭；postmaster.pid消失、端口释放，数据目录和测试库保留。日志为 `.cache/cleanup-followup-postgres-server-20261124.log`。用户API、Worker、Beat进程31208、34048、30748仍在运行，现场成功调用次数修复保留。
+
+本轮改动尚未提交。用户原有环境示例、Compose、部署文档、启动脚本和docker/mineru修改保留；按既定策略仅修改当前空库基线，未改写现场业务库。
+
+## 本轮成功调用次数恢复（2026-11-24）
+
+- 页面成功次数空白来自现场业务库：`agent_module_run.successful_model_calls` 与 `successful_tool_calls` 仍可空、没有默认值，13条现存运行记录均为NULL。现行 `0001_current_schema` 已定义 `DEFAULT 0 NOT NULL`，但现场库虽然记录同一基线版本，列定义仍停留在旧状态；`NULL + 1` 导致成功结算无法累加。
+- 在单事务内短暂锁定运行表，按 `agent_call_attempt` 中 `status='ok'` 的幂等回执恢复空计数，再同步两个字段的零默认值与非空约束。恢复时运行1为模型成功35次、工具成功24次，其余12条等待记录为0；后续结算继续正常递增。
+- 验证13条运行的计数与真实成功回执全部一致，报告API返回整数；独立无头Edge读取真实项目页面，实际显示“模型请求成功39次 · 工具执行成功26次”。现场修复脚本为 `.cache/repair-success-counters-20261124.py`，修复前后凭据为 `.cache/success-counters-repair-20261124-proof.json`，页面截图为 `.cache/success-counters-live-20261124.png`。
+
+## 本轮追加代码分析依据（2026-11-24，已实施）
+
+以下记录实施前的分析与探针结果；对应清理和验证已在上方“本轮重复投影与问答关系链路清理”完成。分析阶段核对草稿、正式成果、报告页面、问答及模型工厂的生产读写链路，确认以下候选：
+
+- 问答图谱读取链路失效：DraftWorkspace.finalize 将关系保存在 business_data.records，draft.relations 固定为空；AgentRuntime._draft_payload 继续传空 relations，AgentRunStore._publish 只删除 knowledge_relation、不插入关系。KnowledgeStore.verified_relations 与 graph_expand 仍读旧表。真实草稿、自查、最终提交探针得到1条现行业务关系，发布语句只有模块更新和旧关系删除；现有两个图谱集成用例直接向旧表插入关系，未覆盖现行发布入口。建议改接现行正式业务快照，复用权限、来源及版本核对，再删除旧关系表与空转发布载荷，保留带证据的业务关系能力。
+- 报告仍重复保存和读取展示投影：AnalysisReport.summary 由 summarize 复制模块 items，get_report 再对模块和 summary 分别做 visible_items。ProjectAnalysis 丢弃详情中的 items，loadReportRecords 始终从独立 records 接口重建正文；页面未消费 report.summary。3条记录共用1块引文的离线探针中，get_report 解析引文2次，records 接口再解析1次。建议清理 summary 和已被独立记录替代的模块展示链路，同步响应模型、前端类型及直接验证旧投影的夹具；正式 business_data 和快照仍为下游来源。
+- merge_field_entries 在唯一生产调用上空转：现行持久 items 均经 display_items 带 record_id，普通专题逐条跳过合并，格式专题直接返回原列表。探针确认3条记录的内容、顺序及对象身份全部不变；问答没有调用该合并器。可删除合并器及专用旧字段合并用例。
+- 模型工厂 extra_retries_limit 只有 test_model_routing.py:47 传入，生产调用未使用；RoutingModel.candidate_count 属性无消费者。可删除闲置入口，保留 _invoke 中实际控制候选数量的同名局部变量及模型配置的 extra_retries。
+- EvidenceWindows.find 的 by_element 回退只为无 block_id 的旧引文准备；当前问答唯一生产调用先经 validate_answer/validate_items，citation 总会保留 block_id。探针确认现行引用不访问元素回退；相应用例仍显式制造旧 attempt 无块身份。可删除该回退索引，保留同块、邻域、续句及章节核对。
+- validate_project_claims 唯一生产调用固定 defer_semantics=True，当前最终字段均有 business，旧缺席措辞和双来源修订启发式被全部跳过；对应测试仍用默认参数和旧字段夹具验证未运行分支。可删除启发式与失效开关，保留实际执行的本项目来源约束，并继续覆盖当前 Agent 自查与修订端点校验。
+- analysis_module.trace 无生产写入者，仅建库默认空数组、ORM字段和 get_report.pop；运行审计已使用 Agent 状态、事件与归档。可同步删除空列及文档字段。前端 coverage.scanned_blocks/total_blocks 无现行发送者，跨专题 module_keys 角标只服务已闲置的 summary，可随报告投影一起清理。
+- API辅助包装器未注册路由：analysis.routes 的 report_row、visible_items 仅测试调用，data_snapshot、context_data 无调用；knowledge.routes 的 project_collection、public_sources 无调用。服务层对应方法仍有现行消费者，清理仅针对API重复包装，集成夹具应改用既有用例装配。
+
+补充判断：退役协议过滤与拒绝用例可按既定空库策略另行评估，不能把协议版本、Skill指纹和工作区结构核验一并视为无用；当前冻结输入和检查点恢复仍依赖版本身份。模型及检查点的有界自动恢复、前端 contextOnly 和人工修正后的 partial 均有生产用途。
+
+验证凭据：`.cache/cleanup-followup-analysis-20261124.py`（离线探针）、`.cache/cleanup-followup-analysis-proof-20261124.json`（行为结果、SQL与关键源码摘要）。相关6个测试文件共50项离线测试通过；分析阶段未启动数据库或改变用户运行进程。
+
+## 本轮现行运行契约清理（2026-11-24）
+
+- 删除当前草稿入口无法生成的 conditions、materials、scoring、category 字段及5个专用模型；前端类型、空转展示、样式和夹具同步。条件、材料及评分内容继续由各专题 content 表达，人工修正后的 structuring 和标段缺口保留。
+- 删除无消费者的 work_ids、business_protocol，以及退役的 loaded_skill 结算分支、analysis_evidence 清理分支、旧模板文本剔除、覆盖检查问题码和问答重复附带字段。
+- 报告查询直接读取运行账的成功次数，删除审计事件聚合回退。当前建库基线将两个成功计数设为 DEFAULT 0 NOT NULL，ORM同步非空映射；首次运行和补跑都复用基线初始化，结算仍在既有事务中幂等递增。
+- 文件派发只保留有整数配额的转换、解析两条线，删除无限并发支持并同步端口、仓储和测试。
+- 删除已无发送者的旧审查日志处理；工程20、22同步当前模型日志及工具审计的保存位置。浏览器补充依据回归改用实际正文与证据契约，继续验证独立原文定位。
+
+验证完成：
+
+- `.cache/cleanup-current-runtime-backend-20261124.log`：统一后端入口的 Ruff、5项分层、63个 mypy 目标、981项离线测试及 OpenAPI 漂移检查全部通过。
+- 前端 TypeScript 额外开启 noUnusedLocals、noUnusedParameters 后通过，10个文件、60项单测通过；`.cache/cleanup-current-runtime-web-build-20261124.log` 记录生产构建通过。
+- `.cache/cleanup-current-runtime-e2e-20261124.log`：系统Edge既有 desktop/mobile 项目共88项报告与编制回归通过。临时前端服务已关闭，54383释放，临时浏览器配置已删除。
+- `.cache/cleanup-current-runtime-postgres-20261124.log`：231项完整PostgreSQL集成测试通过，耗时370.25秒。测试库为 tender_runtime_cleanup_20261124_test，由当前空库基线新建；两个成功计数的非空零默认值、23项配置和4项业务功能种子已核对，凭据见 `.cache/cleanup-current-runtime-baseline-proof-20261124.json`。
+- `.cache/cleanup-current-runtime-source-proof-20261124.json`：45个现存修改文件 UTF-8、28个Python文件语法检查通过；查询表达式确认报告取数不再关联审计事件或聚合，草稿不再携带旧字段。差异空白检查通过。
+- 核对临时PostgreSQL可执行文件、数据目录、进程33020和零客户端连接后正常关闭实例，55478释放，测试库与数据目录保留；日志为 `.cache/cleanup-current-runtime-postgres-server-20261124.log`。
+
+本轮更改尚未提交；用户原有环境示例、Compose、部署文档、启动脚本、docker/mineru及上一轮身份参数修改保留。
+
+## 上一轮闲置身份参数清理（2026-11-24）
+
+- 删除 ProjectService、JobService、VersionService 从未使用的 company_id 构造参数，装配和现有任务取消测试同步；三个仓储仍接收 company_id 并负责公司隔离。
+- 本轮扫描覆盖后端函数、常量、构造参数、实例字段及前端导出。框架回调签名、坐标契约辅助和分析归档的 PID 缓存参数都有实际用途，继续保留。
+- `.cache/cleanup-unused-identity-backend-20261124.log`：统一后端入口的 Ruff、5项分层、63个 mypy 目标、982项离线测试及 OpenAPI 漂移检查全部通过。
+- 本轮 Python 修改文件 UTF-8、语法和差异空白检查通过；原有环境示例、Compose、部署文档、启动脚本及 docker/mineru 修改已按内容摘要核对保留。
+
+本轮更改尚未提交；上一轮清理提交为 `52234be`。
+
+## 上一轮方法、参数与配置清理（2026-11-23）
 
 - 删除分析服务、文档流水线仓储和解析仓储的闲置构造参数及字段，装配不再为文档流水线额外创建配置注册表。
 - 删除配置快照的闲置公司参数、项目上传和替换的闲置身份参数，以及仓储补跑的无效参数传递；用例内明确指定专题的有效判断仍保留。

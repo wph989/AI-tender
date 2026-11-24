@@ -15,6 +15,10 @@
 #
 #   没有 NVIDIA GPU 的机器：docker compose up -d --scale mineru=0（跳过 MinerU，其余依赖照常）
 #
+#   MinerU 官方没有发布可直接拉取的 4.x 镜像：本机需先有 mineru:4（从部署过的机器
+#   docker save/load，或按官方仓库的 docker/china/Dockerfile 构建一次）。没有镜像时
+#   用 --scale mineru=0 跳过，改把 MINERU_URL 指向已有的 MinerU 服务。
+#
 # Gotenberg 不在这份文件里：它单独一条编排（docker/gotenberg/docker-compose.yml，自带自建镜像与副本入口
 #   gotenberg-lb，配置全在那一个文件里），交付时只拷 docker/gotenberg 一个目录过去。
 #   分开的原因是转换是重资源服务，和 api / 数据库分机部署很常见（见 docs/调研/02 第 5 节）。
@@ -188,7 +192,10 @@ services:
   # 它默认随 up 一起起（没有 GPU 的机器用 --scale mineru=0 跳过）；已有独立部署时把
   # MINERU_URL / MINERU_API_KEY 指过去即可，不需要这个服务。
   mineru:
-    image: ${MINERU_IMAGE:-mineru:4.0.7-cu121}
+    # 官方没有发布可直接 docker pull 的 4.x 镜像，这里改用社区预构建镜像
+    # mustangxu/mineru:4.0.12（构建记录显示按官方 Dockerfile 生成，含 standard 档模型）。
+    # 有官方方式构建/导入的 mineru:4 时，把 MINERU_IMAGE 设为 mineru:4 即可切回。
+    image: ${MINERU_IMAGE:-mustangxu/mineru:4.0.12}
     restart: unless-stopped
     command:
       - mineru-kit
@@ -204,8 +211,15 @@ services:
     environment:
       MINERU_TABLE_DEVICE: ${MINERU_TABLE_DEVICE:-auto}
       MINERU_HOME: /data/mineru
+      # 只用镜像内预置的模型；镜像需在构建时已下载模型并固化进去
+      MINERU_MODEL_SOURCE: local
       # 运行时禁止联网：模型必须预置进镜像，避免下载失败与隐私外泄
       HF_HUB_OFFLINE: "1"
+    # vLLM 的进程间共享内存与栈上限；与 docker/mineru 那份一致
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
     volumes:
       - minerudata:/data
     ports:

@@ -18,7 +18,7 @@ function category(code = "") {
   if (["unresolved_reference", "missing_source"].includes(code)) return "待补充材料";
   if (["scope_unknown", "lot_catalog_unknown"].includes(code)) return "适用范围待确认";
   if (code === "conflict") return "条款冲突";
-  if (["module_incomplete", "coverage_pending", "coverage_unchecked", "search_exhausted"].includes(code)) return "分析尚未完成";
+  if (["module_incomplete", "search_exhausted"].includes(code)) return "分析尚未完成";
   if (code === "incomplete_structure") return "结构化待完善";
   return "条款内容待核对";
 }

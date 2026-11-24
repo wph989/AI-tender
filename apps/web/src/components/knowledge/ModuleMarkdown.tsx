@@ -85,12 +85,7 @@ export function ModuleMarkdown({
                     <span className="module-field-name">
                       {renderInline(item.field)}
                     </span>
-                    {/* 只在综合字段里标注跨专题来源；模块视图每行本来就属于同一专题。 */}
-                    {(item.module_keys?.length ?? 0) > 1 && (
-                      <span className="module-keys">
-                        {item.module_keys?.length} 个专题
-                      </span>
-                    )}
+
                   </th>
                   <td>
                     <ul className="field-values">
@@ -227,21 +222,6 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
         </button>)}
     </div>;
   };
-  const details = (item: AnalysisField) => {
-    const record = item.record;
-    if (!record) return null;
-    const conditions = record.conditions;
-    if (!conditions?.expression && !conditions?.terms.length && !conditions?.exceptions.length
-      && !record.materials?.length) return null;
-    return <details className="record-conditions"><summary>条件与证明材料</summary>
-      {conditions.expression && <p>{conditions.expression}</p>}
-      {!!conditions.terms.length && <ul>{conditions.terms.map((term, index) =>
-        <li key={index}>{term.subject} {term.operator} {term.value}{term.unit} {term.time_basis}</li>)}</ul>}
-      {!!conditions.exceptions.length && <div>例外条件{content(conditions.exceptions)}</div>}
-      {!!record.materials.length && <ul>{record.materials.map((material, index) =>
-        <li key={index}><strong>{material.name}</strong>：{material.requirement}</li>)}</ul>}
-    </details>;
-  };
   const heading = (item: AnalysisField) => <header className="result-record-heading">
     <div><h5>{renderInline(item.field)}</h5>{scope(item)}</div>
   </header>;
@@ -265,7 +245,7 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
         }}>
         <summary><strong>{renderInline(item.field)}</strong>{scope(item)}</summary>
         <div className="module-markdown-body">{fields(item)}</div>
-        {details(item)}{relationLinks(item)}{references(item)}
+        {relationLinks(item)}{references(item)}
         {tree(item.output!.key, new Set([...path, item.output!.key]))}
       </details>
     </li>)}
@@ -292,7 +272,7 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
                 {content(pair.value, item, "内容", pair.contentIndex) || <span className="text-slate-400">未提供内容</span>}
               </div>
                 {index === pairs.length - 1 && <div className="result-kv-context">
-                  {scope(item)}{details(item)}{relationLinks(item)}{references(item)}
+                  {scope(item)}{relationLinks(item)}{references(item)}
                   {unpairedFields(item) && <p className="record-attention">字段与内容数量不一致，请核对缺失项后重新解析。</p>}
                 </div>}
               </td>
@@ -310,11 +290,11 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
                 {content(item.output?.content[column], item, column) || <span className="text-slate-400">本项未提供</span>}
               </div>
               {column === (output.title_column ?? output.columns[0]) && <>{scope(item)}{relationLinks(item)}</>}
-              {index === output.columns.length - 1 && <>{details(item)}{references(item)}</>}
+              {index === output.columns.length - 1 && references(item)}
             </td>)}
           </tr>)}</tbody>
         </table></div> : <div className="module-result-list">{rows.map((item) => <article key={item.id} {...identity(item)}>
-          {heading(item)}{fields(item)}{details(item)}{relationLinks(item)}{references(item)}
+          {heading(item)}{fields(item)}{relationLinks(item)}{references(item)}
         </article>)}</div>}
       </section>;
     })}

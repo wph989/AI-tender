@@ -104,7 +104,6 @@
 .module-markdown-item { padding: 16px 0; border-bottom: 1px solid #edf0f4; font-size: 14px; overflow-wrap: anywhere; }
 .module-markdown-heading { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .module-markdown-heading h4 { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
-.module-keys { font-size: 10px; color: #2563eb; background: #ebf1fa; border-radius: 5px; padding: 2px 6px; white-space: nowrap; }
 .module-group-title { font-size: 14px; font-weight: 600; color: #2563eb; margin: 20px 0 10px; }
 .field-values { display: grid; gap: 12px; list-style: none; }
 .field-value { display: grid; gap: 6px; }
@@ -617,9 +616,6 @@
 .result-kv-context { margin-top: 6px; }
 .result-kv-context > .result-scope { font-size: 11px; }
 .record-attention { padding: 9px 12px; border-radius: 6px; background: var(--color-amber-50); color: #865e1c; font-size: 12px; line-height: 1.7; }
-.record-conditions { margin-top: 10px; font-size: 12px; line-height: 1.8; color: #475569; }
-.record-conditions summary { cursor: pointer; width: fit-content; color: #2563eb; }
-.record-conditions ul { padding-left: 18px; list-style: disc; }
 .record-extra-evidence { margin-top: 8px; font-size: 12px; color: #64748b; }
 .result-relations { display: grid; gap: 6px; margin: 10px 0; padding: 8px 10px; border-radius: 6px; background: var(--color-amber-50); font-size: 12px; color: #865e1c; }
 .result-relations button { text-align: left; color: #2563eb; }
