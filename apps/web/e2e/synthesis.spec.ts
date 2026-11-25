@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
+import { createHash } from "node:crypto";
 import type {
   AnalysisField, AnalysisModule, AnalysisOutput, AnalysisReport, AnalysisReportDetail, Citation, KnowledgeSource, ModuleRecords,
 } from "../src/types/knowledge";
@@ -25,7 +26,8 @@ const modules: AnalysisModule[] = [
   {
     id: 1, title: "技术要求", module_key: "tech_requirement_parsing", status: "completed",
     error_message: null, research_summary: "已核对主文件、技术附件与全部技术主题。",
-    research_gaps: [{ key: "reference:0", detail: "附件B未提供，兼容性细则待核对。" }],
+    quality_issues: [{ issue_id: "missing-attachment-b", kind: "reference", action: "provide_input",
+      topic: "附件B", target: "兼容性细则", detail: "附件B未提供，兼容性细则待核对。" }],
     items: [
       item("background", "建设目标", "项目背景", "list", ["背景"], { 背景: "完成现有平台升级与迁移。" }),
       item("migration", "平台迁移任务", "技术方案要求", "list", ["章节来源", "要求摘要", "关键要求"], {
@@ -56,7 +58,8 @@ const modules: AnalysisModule[] = [
 /** 夹具保留独立记录正文；HTTP详情按现行契约只返回状态，防止旧投影掩盖取数错误。 */
 function report(id: number, overrides: Partial<AnalysisReport> = {}): AnalysisReportDetail {
   const result: AnalysisReport = {
-    id, status: "completed", category: "goods", topics: [], coverage: {},
+    id, project_id: 1, allow_partial: false, quality_status: "self_check_passed",
+    runtime_version: "agent-led-v1", status: "completed", category: "goods", topics: [], coverage: {},
     modules, data_schema_version: "1",
     created_at: "2026-10-14T10:00:00Z", stale: false,
     error_message: null, ...overrides,
@@ -75,9 +78,7 @@ test("单Agent进度展示草稿与自查，保留上一轮正文", async ({ pag
     status: "partial", modules: [{ ...selected, items: [] }],
   }) }));
   // records接口仍是上一轮正式数据，不能覆盖报告携带的最新工作进度。
-  await page.route("**/api/v1/analysis/reports/1/modules/*/records", (route) => route.fulfill({
-    json: records(selected),
-  }));
+  await mockRecords(page, 1, records(selected));
   await page.goto("/projects/1");
   await selectModule(page, 1);
   await expect(page.getByText(/已保存 4 条草稿.*当前版本已自查 3 条/)).toBeVisible();
@@ -90,6 +91,7 @@ test("单Agent进度展示草稿与自查，保留上一轮正文", async ({ pag
 function records(module: AnalysisModule): ModuleRecords {
   return {
     schema_version: "1", module_key: module.module_key, status: module.status,
+    quality_status: module.quality_status ?? "self_check_passed", quality_issues: module.quality_issues ?? [],
     evidence: { source: citation },
     output_schema: { version: "1", sections: module.items.map((item) => ({
       title: item.output!.layout === "tree" ? "*" : item.group,
@@ -106,6 +108,29 @@ function records(module: AnalysisModule): ModuleRecords {
   };
 }
 
+async function mockRecords(
+  page: Page, reportId: number,
+  value: ModuleRecords | ((key: string) => ModuleRecords | { error: string }
+    | Promise<ModuleRecords | { error: string }>),
+  onlyKey?: string,
+) {
+  await page.route(`**/api/v1/analysis/reports/${reportId}/records`, async (route) => {
+    const payload = route.request().postDataJSON() as {
+      module_keys: string[]; versions: Record<string, string>;
+    };
+    const updates = await Promise.all(payload.module_keys.map(async (key) => {
+      const data = onlyKey && key !== onlyKey ? records(modules.find((module) => module.module_key === key)!)
+        : typeof value === "function" ? await value(key) : value;
+      if ("error" in data) return { module_key: key, error: data.error };
+      const body = { ...data, module_key: key };
+      // 模拟服务端核验后按完整响应生成版本，轮询用例实际经历省略与刷新正文。
+      const version = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+      return { module_key: key, version, ...(payload.versions[key] === version ? {} : { data: body }) };
+    }));
+    await route.fulfill({ json: { modules: updates } });
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -119,10 +144,7 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({
     status: 409, json: { error: { message: "快照未就绪" } },
   }));
-  await page.route("**/api/v1/analysis/reports/1/modules/*/records", (route) => {
-    const key = route.request().url().split("/").at(-2);
-    return route.fulfill({ json: records(modules.find((module) => module.module_key === key)!) });
-  });
+  await mockRecords(page, 1, (key) => records(modules.find((module) => module.module_key === key)!));
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({ json: citation }));
   await page.route("**/api/v1/versions/1/pages", (route) => route.fulfill({ json: { pages: [
     { page_no: 1, width_pt: 595, height_pt: 842, rotation: 0, has_text_layer: true },
@@ -134,6 +156,163 @@ test.beforeEach(async ({ page }) => {
 });
 test.afterEach(() => expect(errors).toEqual([]));
 
+for (const failedStep of ["status", "report"] as const) {
+  test(`${failedStep}前置读取失败清除旧正文与缓存，恢复后重新读取完整结果`, async ({ page }) => {
+    await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+    let failed = true;
+    await page.route("**/api/v1/projects/1/analysis", (route) =>
+      failed && failedStep === "status"
+        ? route.fulfill({ status: 403, json: { error: { message: "分析状态不可访问" } } })
+        : route.fulfill({ json: {
+          analysis_category: "goods", analysis_topics: [], lots: [], sources: [],
+          reports: [{ id: 1, status: "completed" }], categories: { goods: "货物" }, topics: {},
+        } }));
+    await page.route("**/api/v1/analysis/reports/1", (route) =>
+      failed && failedStep === "report"
+        ? route.fulfill({ status: 404, json: { error: { message: "报告不可访问" } } })
+        : route.fulfill({ json: report(1) }));
+    await page.getByRole("button", { name: "刷新结果", exact: true }).click();
+    await expect(page.getByRole("alert").filter({
+      has: page.getByRole("button", { name: "刷新状态", exact: true }),
+    })).toContainText("不可访问");
+    await expect(page.locator('[data-report-item="background"]')).toHaveCount(0);
+    failed = false;
+    const recovered = page.waitForRequest("**/api/v1/analysis/reports/1/records");
+    await page.getByRole("button", { name: "刷新状态", exact: true }).click();
+    expect((await recovered).postDataJSON().versions).toEqual({});
+    await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+  });
+}
+
+for (const message of ["服务暂时无法处理请求", "关联资料保存失败"]) {
+  test(`关联操作失败提示不被刷新恢复清除：${message}`, async ({ page }) => {
+    await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+    let readFailed = true;
+    await page.route("**/api/v1/analysis/reports/1", (route) => readFailed
+      ? route.fulfill({ status: 500, json: { error: { message: "服务暂时无法处理请求" } } })
+      : route.fulfill({ json: report(1) }));
+    await page.getByRole("button", { name: "刷新结果", exact: true }).click();
+    const alert = page.getByRole("alert").filter({
+      has: page.getByRole("button", { name: "刷新状态", exact: true }),
+    });
+    await expect(alert).toContainText("服务暂时无法处理请求");
+    await expect(page.locator('[data-report-item="background"]')).toHaveCount(0);
+    readFailed = false;
+    let writes = 0;
+    await page.route("**/api/v1/projects/1/knowledge/collections", (route) => {
+      writes += 1;
+      return route.fulfill({ status: 500, json: { error: { message } } });
+    });
+    const checkbox = page.getByLabel("测试知识库", { exact: true });
+    // 保存失败会恢复受控复选框，不能用check()假定这次操作已经成功。
+    await checkbox.click();
+    await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+    await expect(alert).toContainText(message);
+    await expect(checkbox).not.toBeChecked();
+    expect(writes).toBe(1);
+  });
+}
+
+for (const scenario of [
+  { step: "status", work: "analysis", network: false },
+  { step: "report", work: "analysis", network: false },
+  { step: "status", work: "analysis", network: true },
+  { step: "report", work: "files", network: false },
+] as const) {
+  test(`${scenario.work}/${scenario.step}/${scenario.network}临时失败清除正文后自动恢复轮询`, async ({ page }) => {
+    let failed = false;
+    await page.route("**/api/v1/projects/1/analysis", (route) => {
+      if (failed && scenario.step === "status") {
+        return scenario.network ? route.abort("failed") : route.fulfill({ status: 503,
+          json: { error: { message: "网关暂时不可用" } } });
+      }
+      return route.fulfill({ json: {
+        analysis_category: "goods", analysis_topics: [], lots: [],
+        sources: scenario.work === "files" ? [{ ...citation, state: "processing",
+          index_status: null, index_error: null, error_message: null, embedding_model_id: null }] : [],
+        reports: [{ id: 1, status: scenario.work === "analysis" ? "running" : "completed" }],
+        categories: { goods: "货物" }, topics: {},
+      } });
+    });
+    await page.route("**/api/v1/analysis/reports/1", (route) =>
+      failed && scenario.step === "report"
+        ? route.fulfill({ status: 503, json: { error: { message: "网关暂时不可用" } } })
+        : route.fulfill({ json: report(1, { status: scenario.work === "analysis" ? "running" : "completed" }) }));
+    await page.reload();
+    await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+    failed = true;
+    await page.getByRole("button", { name: "刷新结果", exact: true }).click();
+    const error = page.getByRole("alert").filter({
+      has: page.getByRole("button", { name: "刷新状态", exact: true }),
+    });
+    await expect(error).toBeVisible();
+    await expect(page.locator('[data-report-item="background"]')).toHaveCount(0);
+    failed = false;
+    // 不触发用户操作，只有仍在运行的定时器才能发起恢复请求。
+    const recovered = await page.waitForRequest("**/api/v1/analysis/reports/1/records", { timeout: 10000 });
+    expect(recovered.postDataJSON().versions).toEqual({});
+    await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+    await expect(error).toHaveCount(0);
+  });
+}
+
+test("运行中遇到永久访问错误停止轮询并清除正文", async ({ page }) => {
+  await page.route("**/api/v1/projects/1/analysis", (route) => route.fulfill({ json: {
+    analysis_category: "goods", analysis_topics: [], lots: [], sources: [],
+    reports: [{ id: 1, status: "running" }], categories: { goods: "货物" }, topics: {},
+  } }));
+  await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, { status: "running" }) }));
+  await page.reload();
+  await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+  let rejected = 0;
+  await page.route("**/api/v1/projects/1/analysis", (route) => {
+    rejected += 1;
+    return route.fulfill({ status: 403, json: { error: { message: "项目访问已撤销" } } });
+  });
+  await page.getByRole("button", { name: "刷新结果", exact: true }).click();
+  await expect(page.locator('[data-report-item="background"]')).toHaveCount(0);
+  await page.waitForTimeout(3500);
+  expect(rejected).toBe(1);
+});
+
+test("状态列表已无报告时清除旧正文", async ({ page }) => {
+  await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+  await page.route("**/api/v1/projects/1/analysis", (route) => route.fulfill({ json: {
+    analysis_category: "goods", analysis_topics: [], lots: [], sources: [],
+    reports: [],
+    categories: { goods: "货物" }, topics: {},
+  } }));
+  await page.getByRole("button", { name: "刷新结果", exact: true }).click();
+  await expect(page.locator('[data-report-item="background"]')).toHaveCount(0);
+});
+
+test("一次刷新合并全部专题，未变化正文只返回版本并保留跨专题结果", async ({ page }) => {
+  await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+  const requests: string[] = [];
+  page.on("request", (request) => {
+    const path = new URL(request.url()).pathname;
+    if (/^\/api\/v1\/(projects\/1\/analysis|analysis\/reports\/1(?:\/records)?)$/.test(path)) {
+      requests.push(path);
+    }
+  });
+  const first = page.waitForResponse("**/api/v1/analysis/reports/1/records");
+  await page.reload();
+  expect((await (await first).json()).modules).toHaveLength(3);
+  await expect(page.locator('[data-report-item="background"]')).toBeVisible();
+  expect(requests.filter((path) => path.endsWith("/records"))).toHaveLength(1);
+  // 开发模式首次挂载可能取消一次状态请求；统计完成初始化后的手动刷新。
+  requests.length = 0;
+  const next = page.waitForResponse("**/api/v1/analysis/reports/1/records");
+  await page.getByRole("button", { name: "刷新结果", exact: true }).click();
+  const unchanged = await (await next).json();
+  expect(unchanged.modules.every((module: { data?: unknown }) => module.data === undefined)).toBe(true);
+  expect(requests).toHaveLength(3);
+  await selectModule(page, 2);
+  await expect(page.locator('[data-report-item="score"]')).toContainText("同类项目业绩");
+  await selectModule(page, 3);
+  await expect(page.locator('[data-report-item="technical"]')).toContainText("独立编制技术文件");
+});
+
 test("执行完成与资料质量分别展示，缺件在材料未变化时不重复补跑", async ({ page }) => {
   const selected = { ...modules[0]!, quality_status: "needs_input" as const, quality_issues: [{
     issue_id: "missing-announcement", kind: "reference", action: "provide_input" as const,
@@ -142,10 +321,8 @@ test("执行完成与资料质量分别展示，缺件在材料未变化时不�
   await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
     status: "completed", quality_status: "needs_input", modules: [{ ...selected, items: [] }],
   }) }));
-  await page.route("**/api/v1/analysis/reports/1/modules/*/records", (route) => route.fulfill({
-    json: { ...records(selected), quality_status: selected.quality_status,
-      quality_issues: selected.quality_issues },
-  }));
+  await mockRecords(page, 1, { ...records(selected), quality_status: selected.quality_status,
+      quality_issues: selected.quality_issues });
   await page.reload();
   await expect(page.locator(".results-report-bar")).toContainText("已完成");
   await expect(page.locator(".results-report-bar")).toContainText("资料待核对");
@@ -158,8 +335,7 @@ test("执行完成与资料质量分别展示，缺件在材料未变化时不�
 test("无可靠摘录时仍直接打开真实原文块，不展示空摘录或切片选择器", async ({ page }) => {
   const data = records(modules[0]!);
   data.evidence.source = { ...citation, quote: "", excerpts: [], excerpt_status: "block_only" };
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) =>
-    route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.reload();
   await page.locator('[data-report-item="background"]').getByRole("button", { name: /^定位/ }).click();
   const viewer = page.getByRole("region", { name: "引用原文", exact: true });
@@ -171,8 +347,7 @@ test("无可靠摘录时仍直接打开真实原文块，不展示空摘录或�
 test("逐条依据校验失败只阻断当前专题，仍能切换到其它有效专题", async ({ page }) => {
   const invalid = records(modules[0]!);
   invalid.records[0]!.content_evidence = { 背景: [] };
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) =>
-    route.fulfill({ json: invalid }));
+  await mockRecords(page, 1, invalid, "tech_requirement_parsing");
   await page.reload();
   await selectModule(page, 1);
   await expect(page.getByRole("region", { name: "技术要求", exact: true }))
@@ -195,7 +370,7 @@ test("点击合并定位后可打开当前事项的全部摘录，切换事项�
     { ...data.records[0]!, id: "another", key: "another", title: "质保事项", content: { 背景: "质保说明" },
       evidence_ids: ["unrelated"], content_evidence: { 背景: [["unrelated"]] } },
   ];
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   // 正式 resolve 只返回位置身份，摘录应继续来自当前事项，不能被其它事项的同位置引用替代。
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => {
     const { quote: _quote, ...resolved } = route.request().postDataJSON().element_id === 2 ? next : first;
@@ -377,9 +552,8 @@ test("格式专题保留三层材料结构，项目提供文档预览入口", as
 
 test("独立结果读取失败只影响本专题，重新加载后恢复", async ({ page }) => {
   let failed = true;
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) =>
-    failed ? route.fulfill({ status: 503, json: { error: { message: "专题接口暂时不可用" } } })
-      : route.fulfill({ json: records(modules[0]!) }));
+  await mockRecords(page, 1, () => failed ? { error: "专题接口暂时不可用" }
+    : records(modules[0]!), "tech_requirement_parsing");
   await page.reload();
   await selectModule(page, 1);
   await expect(page.getByText("专题接口暂时不可用", { exact: true })).toBeVisible();
@@ -395,11 +569,11 @@ test("运行中的维度通过轮询显示新保存的记录，依据撤销后�
     json: report(1, { status: "running", created_at: "2026-10-16T10:00:00Z" }),
   }));
   let reads = 0;
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => {
+  await mockRecords(page, 1, () => {
     const data = records(modules[0]!);
     if (withdrawn || ++reads === 1) data.records = [];
-    return route.fulfill({ json: data });
-  });
+    return data;
+  }, "tech_requirement_parsing");
   await page.reload();
   await selectModule(page, 1);
   await expect(page.getByText("制定分阶段迁移方案并说明回退与服务保障。", { exact: true })).toBeVisible({ timeout: 12000 });
@@ -417,19 +591,19 @@ test("切换报告时延迟的旧维度结果不能覆盖新报告", async ({ pa
     json: report(2, { modules: [{ ...modules[0]!, items: [] }] }),
   }));
   await page.route("**/api/v1/analysis/reports/2/data", (route) => route.fulfill({ status: 409, json: {} }));
-  await page.route("**/api/v1/analysis/reports/2/modules/*/records", (route) => {
+  await mockRecords(page, 2, () => {
     const data = records(modules[0]!);
     data.records = [data.records[1]!];
     data.records[0]!.content = { 要求摘要: "新报告独立结果", 关键要求: ["新报告要求"] };
-    return route.fulfill({ json: data });
+    return data;
   });
   let release!: () => void;
   const delayed = new Promise<void>((resolve) => { release = resolve; });
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", async (route) => {
+  await mockRecords(page, 1, async () => {
     await delayed;
-    await route.fulfill({ json: records(modules[0]!) });
-  });
-  const pending = page.waitForRequest("**/analysis/reports/1/modules/tech_requirement_parsing/records");
+    return records(modules[0]!);
+  }, "tech_requirement_parsing");
+  const pending = page.waitForRequest("**/analysis/reports/1/records");
   await page.reload();
   await pending;
   await page.getByRole("combobox", { name: "选择报告版本", exact: true }).click();
@@ -452,7 +626,7 @@ test("KV 表格逐行对应，单字段保留多条内容，数量不符可从�
     { ...data.records[0]!, id: "incomplete", key: "incomplete", kind: "fact", group: "项目信息",
       title: "地点与工期", content: { 字段: ["地点", "工期"], 内容: ["浙江省内"] } },
   ];
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.reload();
   const single = page.locator('[data-report-item="single"]');
   const table = page.getByRole("table", { name: "项目信息", exact: true });
@@ -489,7 +663,7 @@ test("KV 每行仅显示定位图标，拆行后仍定位本行原文", async ({
     content: { 字段: ["项目预算", "服务期限"], 内容: ["2130万元", "三年"] }, evidence_ids: ["source", "term"],
     content_evidence: { 字段: [["source"], ["term"]], 内容: [["source"], ["term"]] },
   }];
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({ json: second }));
   await page.reload();
   const table = page.getByRole("table", { name: "项目基本信息", exact: true });
@@ -516,7 +690,7 @@ test("多处同页依据分别直接定位，去重后仍能准确定位第二�
   const second = { ...citation, element_id: 2, anchor: "p1b2", quote: "第二处完整依据：例外条件仍须保留。" };
   data.evidence = { source: citation, duplicate: citation, second };
   data.records[1]!.evidence_ids = ["source", "duplicate", "second"];
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({ json: second }));
   await page.reload();
   const locators = page.locator('[data-report-item="migration"]').getByRole("button", { name: /^定位：/ });
@@ -553,7 +727,7 @@ test("标段筛选含公共要求且排除未知范围，修订入口清除筛�
     { ...base, id: "revision", key: "revision", title: "期限修订关系", kind: "relation",
       predicate: "supersedes", subject_key: "new", object_key: "old", scope: { kind: "lots", lot_refs: ["A"] } },
   ];
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   // 明确的修订跳转以已通过范围与端点校验的快照为准。
   const resolved = data.records.map((record) => ({ ...record, citations: [citation],
     scope: { ...record.scope, lot_ids: record.scope.lot_refs.map((ref) => ref === "A" ? 1 : 2) } }));
@@ -629,7 +803,7 @@ test("未决关系保留正文与依据，但不按旧 key 连接已更新条款
     { ...base, id: "relation", key: "relation", title: "旧修订关系", kind: "relation",
       content: { 要求摘要: "服务两年替代服务一年" }, predicate: "supersedes", subject_key: "new", object_key: "old" },
   ];
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.route("**/api/v1/analysis/reports/1/data", (route) => route.fulfill({ json: {
     report_id: 1, snapshot_id: 1, revision: 1, schema_version: "1", stale: false,
     data: { schema_version: "1", lots: [], facts: [], requirements: [], format_nodes: [], relations: [], readiness: "partial",
@@ -666,7 +840,7 @@ test("重复点击同一原文角标仍滚回已选结果", async ({ page }, inf
   const data = records(modules[0]!);
   data.records = Array.from({ length: 16 }, (_, index) => ({ ...data.records[1]!, id: `item-${index}`, key: `item-${index}`,
     title: `任务 ${index}`, content: { 要求摘要: `任务 ${index} 的要求` } }));
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.reload();
   const target = page.locator('[data-report-item="item-0"]');
   await target.getByRole("button", { name: /^定位：/ }).click();
@@ -688,7 +862,7 @@ test("重复点击同一原文角标仍滚回已选结果", async ({ page }, inf
 test("父子材料同时命中关键词时展开全部命中节点", async ({ page }) => {
   const data = records(modules[2]!);
   for (const record of data.records) record.content = { 编制要求: `共同关键词：${record.title}的编制要求` };
-  await page.route("**/api/v1/analysis/reports/1/modules/bid_format_outline_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "bid_format_outline_parsing");
   await page.reload();
   await selectModule(page, 3);
   await page.getByRole("button", { name: "收起全部材料" }).click();
@@ -706,10 +880,7 @@ test("模块标签和三种重解析操作直接可用，提交范围互不混�
     status: "partial", modules: retryModules.map((module) => ({ ...module, items: [] })),
   }) }));
   // 页面以记录接口的最新状态更新按钮，两个接口需描述同一次运行。
-  await page.route("**/api/v1/analysis/reports/1/modules/*/records", (route) => {
-    const key = route.request().url().split("/").at(-2);
-    return route.fulfill({ json: records(retryModules.find((module) => module.module_key === key)!) });
-  });
+  await mockRecords(page, 1, (key) => records(retryModules.find((module) => module.module_key === key)!));
   await page.route("**/api/v1/analysis/reports/1/retry", (route) => {
     requests.push(route.request().postDataJSON());
     return route.fulfill({ json: { id: 1, status: "pending" } });
@@ -746,7 +917,7 @@ test("正文同一事项的位置跨条去重，不同出处直接定位且原�
   // 同一原文块的摘录不同也只显示一个图标，完整摘录仍保留，定位请求使用真实原始引用。
   const duplicate = { ...first, quote: "同一预算原文块中的另一段摘录。" };
   data.evidence = { source: first, duplicate, term: second };
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({
     json: route.request().postDataJSON().element_id === 2 ? second : first,
   }));
@@ -807,7 +978,7 @@ test("跨页切换定位只显示当前页的一个框，缺失坐标保留页�
   data.evidence = { source: citation, next, pageOnly };
   data.records = [{ ...data.records[0]!, content: { 背景: ["第一页依据。", "第二页依据。", "第二页无块坐标。"] },
     evidence_ids: ["source", "next", "pageOnly"], content_evidence: { 背景: [["source"], ["next"], ["pageOnly"]] } }];
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.route("**/api/v1/versions/1/pages", (route) => route.fulfill({ json: { pages: [1, 2].map((page_no) =>
     ({ page_no, width_pt: 595, height_pt: 842, rotation: 0, has_text_layer: true })) } }));
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({
@@ -848,7 +1019,7 @@ for (const module of [
       [column, (Array.isArray(value) ? value : [value]).map((_, index) => [index ? "second" : "source"])]));
   }
   await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, { modules: [{ ...module, items: [] }] }) }));
-  await page.route(`**/api/v1/analysis/reports/1/modules/${module.module_key}/records`, (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, module.module_key);
   await page.reload();
   if (module.module_key === "bid_format_outline_parsing") await page.getByRole("button", { name: "展开全部材料" }).click();
   const first = page.locator(`[data-report-item="${module.items[0]!.id}"]`);
@@ -880,7 +1051,7 @@ test("逐条正文依据之外的补充原文可独立定位，正文来源不�
   data.records = [{ ...data.records[0]!, content: { 背景: ["实施平台迁移。"] },
     evidence_ids: ["source", "condition"], content_evidence: { 背景: [["source"]] },
   }];
-  await page.route("**/api/v1/analysis/reports/1/modules/tech_requirement_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "tech_requirement_parsing");
   await page.route("**/api/v1/knowledge/citations/resolve", (route) => route.fulfill({ json: second }));
   await page.reload();
   const record = page.locator('[data-report-item="background"]');
@@ -906,7 +1077,7 @@ test("字段名和补充条件的同位置摘录合并到正文图标，完整�
     content_evidence: { 字段: [["label"]], 内容: [["source"]] },
   };
   await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, { modules: [{ ...module, items: [] }] }) }));
-  await page.route("**/api/v1/analysis/reports/1/modules/project_basic_info_parsing/records", (route) => route.fulfill({ json: data }));
+  await mockRecords(page, 1, data, "project_basic_info_parsing");
   await page.reload();
   const record = page.locator('[data-report-item="project-name"]');
   await expect(record.locator(".result-kv-value button")).toHaveCount(1);

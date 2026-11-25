@@ -36,10 +36,8 @@ def _payload(request: Request, job_id: str) -> dict[str, object] | None:
 # 前端等待解析时每秒查询，只压缩重复访问摘要。
 @throttle_access_log()
 def get_job(job_id: str, request: Request) -> dict[str, object]:
-    try:
-        return _service(request).payload(job_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    # 普通查询和建流前核验共用权限与错误转换，避免两处口径漂移。
+    return _payload_or_raise(request, job_id)
 
 
 @router.get("/{job_id}/events", response_model=None)

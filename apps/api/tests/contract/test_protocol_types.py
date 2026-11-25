@@ -1,5 +1,6 @@
 """在常规离线测试中检查真实装配，并证明类型检查没有将实现降级成 Any。"""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +10,9 @@ API_ROOT = Path(__file__).resolve().parents[2]
 
 def _mypy(*paths: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "mypy", "--config-file", "pyproject.toml", *paths],
+        # 与统一入口一样直接读取实现签名，不依赖可能损坏的持久缓存。
+        [sys.executable, "-m", "mypy", "--config-file", "pyproject.toml",
+         "--no-incremental", "--cache-dir", os.devnull, *paths],
         cwd=API_ROOT,
         capture_output=True,
         text=True,

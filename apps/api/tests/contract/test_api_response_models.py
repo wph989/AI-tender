@@ -1,9 +1,11 @@
 """所有 JSON API 成功响应都进入 Pydantic/OpenAPI 契约。"""
 
+import pytest
 from fastapi.routing import APIRoute
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from tender.api.app import app
+from tender.api.shared.responses import AnalysisModuleRecordResponse, AnalysisRecordResponse
 
 BODYLESS_ROUTES = {
     ("DELETE", "/api/v1/projects/{project_id}"),
@@ -41,4 +43,36 @@ def test_openapi_exposes_liveness_readiness_and_quality_contracts():
     progress = schema["components"]["schemas"]["AgentProgressResponse"]["properties"]
     assert set(progress) == {
         "protocol", "activity", "draft_count", "reviewed_count", "unresolved_issues",
+    }
+    assert {"input_changed", "research_summary", "runs"} <= quality["properties"].keys()
+    assert "research_gaps" not in quality["properties"]
+
+
+@pytest.mark.parametrize("missing", ["content", "scope", "evidence_ids"])
+def test_module_response_rejects_missing_content_and_evidence_identity(missing):
+    record = {
+        "id": "r", "key": "r", "kind": "requirement", "title": "质保要求",
+        "text": "内容：质保三年", "content": {"内容": "质保三年"},
+        "scope": {"kind": "common", "lot_refs": []}, "evidence_ids": ["proof"],
+        "module_key": "project_basic_info_parsing", "group": "项目基本信息",
+        "sort_order": 0, "structuring": "complete", "verification": "supported",
+    }
+    del record[missing]
+    with pytest.raises(ValidationError) as caught:
+        AnalysisModuleRecordResponse.model_validate(record)
+    assert missing in {issue["loc"][0] for issue in caught.value.errors()}
+
+
+def test_snapshot_response_requires_resolved_scope_and_its_own_citations():
+    record = {
+        "id": "r", "key": "r", "kind": "requirement", "title": "质保要求",
+        "text": "内容：质保三年", "content": {"内容": "质保三年"},
+        "scope": {"kind": "common", "lot_refs": []}, "evidence_ids": ["proof"],
+        "module_key": "project_basic_info_parsing", "group": "项目基本信息",
+        "sort_order": 0, "structuring": "complete", "verification": "supported",
+    }
+    with pytest.raises(ValidationError) as caught:
+        AnalysisRecordResponse.model_validate(record)
+    assert {issue["loc"] for issue in caught.value.errors()} >= {
+        ("scope", "lot_ids"), ("citations",),
     }

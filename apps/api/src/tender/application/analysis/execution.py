@@ -436,7 +436,7 @@ class AnalysisExecutor:
                             await asyncio.sleep(delay)
                 await authorize()
                 if "draft" not in state:
-                    raise ValueError("子 Agent 结束但没有提交通过校验的分析")
+                    raise ValueError("专题Agent结束但没有提交通过校验的分析")
                 draft = state["draft"]
                 # 最终正文由同一Agent确认；发布只复核引用权限，不另起语义审查。
                 fields = published_items(state)

@@ -166,6 +166,12 @@ class ReportRepository(SourceReader, RetrievalRepository, SchemaReader, TaskLife
         """worker 侧取报告以判断能否执行；项目已删除时返回 ``None``。"""
         ...
 
+    def report_view(
+        self, report_id: int, module_keys: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """展示所需报告字段；Skill 只读取协议和所选专题的输出声明。"""
+        ...
+
     def accessible_report_status(self, report_id: int) -> str | None:
         """报告状态；权限已撤销时返回 ``None``。
 
@@ -190,12 +196,18 @@ class ReportRepository(SourceReader, RetrievalRepository, SchemaReader, TaskLife
         """项目最近 30 份分析报告的概要。"""
         ...
 
-    def report_modules(self, report_id: int) -> list[dict[str, Any]]:
-        """报告的全部模块及正式业务数据，按 id 升序。"""
+    def report_modules(
+        self, report_id: int, module_keys: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """按专题范围读取正式业务数据；None读取全部，空列表不读取模块。"""
         ...
 
     def report_module(self, report_id: int, module_key: str) -> dict[str, Any] | None:
         """按报告和专题读取单模块；跨公司或模块不存在时返回 ``None``。"""
+        ...
+
+    def report_module_summaries(self, report_id: int) -> list[dict[str, Any]]:
+        """专题状态、质量与研究说明，不加载记录正文和证据。"""
         ...
 
     def report_runs(self, report_id: int) -> list[dict[str, Any]]:
@@ -222,6 +234,10 @@ class ReportRepository(SourceReader, RetrievalRepository, SchemaReader, TaskLife
 
     def snapshot_state(self, report_id: int) -> dict[str, Any] | None:
         """报告状态 + 运行账 + 模块成果，一次读出以判断快照是否仍然有效。"""
+        ...
+
+    def latest_snapshot_id(self, report_id: int) -> int | None:
+        """只读取最新正式快照ID，用于正文读取后的当前版本复核。"""
         ...
 
     def snapshot_pending(self, report_id: int) -> bool: ...

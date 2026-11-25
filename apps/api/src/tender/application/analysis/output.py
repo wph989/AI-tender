@@ -11,7 +11,7 @@ from tender.application.shared.validation import InputError, validation_message
 OUTPUT_VERSION = "1"
 
 
-class _OutputSection(BaseModel):
+class OutputSection(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     title: Annotated[str, Field(pattern=r"\S")]
@@ -32,11 +32,13 @@ class _OutputSection(BaseModel):
         return self
 
 
-class _OutputSchema(BaseModel):
+class OutputSchema(BaseModel):
+    """冻结Skill声明的统一结构；应用读取和HTTP响应复用同一约束。"""
+
     model_config = ConfigDict(extra="forbid", strict=True)
 
     version: Literal["1"]
-    sections: list[_OutputSection] = Field(min_length=1)
+    sections: list[OutputSection] = Field(min_length=1)
 
     @model_validator(mode="after")
     def unique_sections(self):
@@ -51,7 +53,7 @@ def output_schema(snapshot: dict, module_key: str) -> dict:
     if path not in snapshot:
         raise ValueError("模块缺少冻结的 JSON 输出声明：" + module_key)
     try:
-        return _OutputSchema.model_validate_json(snapshot[path]).model_dump(exclude_unset=True)
+        return OutputSchema.model_validate_json(snapshot[path]).model_dump(exclude_unset=True)
     except ValueError as exc:
         # 声明损坏时停止执行，避免格式规则与最终展示出现两套口径。
         raise ValueError("模块 Skill JSON 输出声明无效：" + module_key) from exc

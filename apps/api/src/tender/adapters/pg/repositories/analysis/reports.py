@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import Any
 
-from sqlalchemy import Connection, Engine, exists, func, literal, select
+from sqlalchemy import Connection, Engine, Text, column, exists, func, literal, select, true
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import aliased
 
@@ -72,6 +72,35 @@ class ReportQueries:
             )
         return dict(row) if row is not None else None
 
+    def report_view(
+        self, report_id: int, module_keys: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        # 展示只消费输出声明；完整工作方法仍由 Worker 和正式发布读取。
+        paths = [FLOW_VERSION_KEY, *(key + "/references/output_schema.json"
+                                    for key in dict.fromkeys(module_keys or []))]
+        # 与模块摘要一样一次解析所需字段，避免重复解压或展开其余工作方法。
+        skill = func.jsonb_to_record(AnalysisReport.skill_snapshot).table_valued(
+            *(column(path, JSONB) for path in paths),
+        ).render_derived(name="skill", with_types=True)
+        snapshot = func.jsonb_build_object(
+            *(part for path in paths for part in (literal(path), skill.c[path])),
+            type_=JSONB,
+        ).label("skill_snapshot")
+        columns = [column for column in AnalysisReport.__table__.c
+                   if column.key != "skill_snapshot"]
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(*columns, snapshot)
+                .join(Project, Project.id == AnalysisReport.project_id)
+                .join(skill, true())
+                .where(
+                    AnalysisReport.id == report_id,
+                    AnalysisReport.company_id == self.company_id,
+                    Project.deleted_at.is_(None),
+                )
+            ).mappings().first()
+        return dict(row) if row is not None else None
+
     def analysis_settings(
         self, project_id: int, *, bound: Connection | None = None,
     ) -> dict[str, Any] | None:
@@ -135,14 +164,23 @@ class ReportQueries:
             ).mappings()
             return [dict(row) for row in rows]
 
-    def report_modules(self, report_id: int) -> list[dict[str, Any]]:
-        """报告的全部模块及正式业务数据，按 id 升序。"""
+    def report_modules(
+        self, report_id: int, module_keys: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """直接限定所选专题，避免为部分刷新加载整份报告正文。"""
+        if module_keys == []:
+            return []
+        statement = (
+            select(AnalysisModule)
+            .join(AnalysisReport, AnalysisReport.id == AnalysisModule.report_id)
+            .where(AnalysisModule.report_id == report_id,
+                   AnalysisReport.company_id == self.company_id)
+            .order_by(AnalysisModule.id)
+        )
+        if module_keys is not None:
+            statement = statement.where(AnalysisModule.module_key.in_(module_keys))
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(AnalysisModule)
-                .where(AnalysisModule.report_id == report_id)
-                .order_by(AnalysisModule.id)
-            ).mappings()
+            rows = connection.execute(statement).mappings()
             return [dict(row) for row in rows]
 
     def report_module(self, report_id: int, module_key: str) -> dict[str, Any] | None:
@@ -158,6 +196,30 @@ class ReportQueries:
                 )
             ).mappings().first()
             return dict(row) if row is not None else None
+
+    def report_module_summaries(self, report_id: int) -> list[dict[str, Any]]:
+        fields = ("research_summary", "quality_status", "quality_issues", "quality_input_signature")
+        # 一次解压提取摘要字段，不反复访问包含全部正文和证据的 JSON。
+        summary = func.jsonb_to_record(AnalysisModule.business_data).table_valued(
+            column("research_summary", Text), column("quality_status", Text),
+            column("quality_issues", JSONB), column("quality_input_signature", Text),
+        ).render_derived(name="summary", with_types=True)
+        business = func.jsonb_build_object(
+            *(part for key in fields for part in (literal(key), summary.c[key])),
+            type_=JSONB,
+        ).label("business_data")
+        columns = [column for column in AnalysisModule.__table__.c
+                   if column.key != "business_data"]
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(*columns, business)
+                .join(AnalysisReport, AnalysisReport.id == AnalysisModule.report_id)
+                .join(summary, true())
+                .where(AnalysisModule.report_id == report_id,
+                       AnalysisReport.company_id == self.company_id)
+                .order_by(AnalysisModule.id)
+            ).mappings()
+            return [dict(row) for row in rows]
 
     def report_runs(self, report_id: int) -> list[dict[str, Any]]:
         """报告的全部模块运行账与进度，按 attempt 升序。"""
@@ -269,6 +331,19 @@ class ReportQueries:
                 .first()
             )
         return dict(row) if row is not None else None
+
+    def latest_snapshot_id(self, report_id: int) -> int | None:
+        # 版本检查只需要ID，避免再次传输和解码整份业务快照。
+        with self.engine.connect() as connection:
+            return connection.execute(
+                select(AnalysisDataSnapshot.id)
+                .join(AnalysisReport, AnalysisReport.id == AnalysisDataSnapshot.report_id)
+                .join(Project, Project.id == AnalysisReport.project_id)
+                .where(AnalysisDataSnapshot.report_id == report_id,
+                       AnalysisReport.company_id == self.company_id,
+                       Project.deleted_at.is_(None))
+                .order_by(AnalysisDataSnapshot.id.desc()).limit(1)
+            ).scalar_one_or_none()
 
     def snapshot_pending(self, report_id: int) -> bool:
         with self.engine.connect() as connection:

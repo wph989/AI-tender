@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tender.application.analysis.output import OutputSchema
+
 
 class ApiResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -340,33 +342,172 @@ class AnalysisStartResponse(ApiResponse):
     status: str
 
 
-class AnalysisRecordResponse(ApiResponse):
-    id: str
+class AnalysisResponse(BaseModel):
+    # 响应只交付已声明的字段，仓储内部状态不再通过额外字段进入 HTTP。
+    model_config = ConfigDict(extra="ignore")
+
+
+class AnalysisEvidenceResponse(AnalysisResponse):
+    source_id: int
+    collection_id: int
+    project_id: int
+    project_file_id: int
+    version_id: int
+    parse_run_id: int
+    element_id: int
+    anchor: str
+    page_no: int
+    bbox: tuple[float, float, float, float] | None
+    file_name: str
+    purpose: str
+    quote: str
+    block_id: str | None = None
+    excerpts: list[str] | None = None
+    excerpt_status: Literal["matched", "block_only"] | None = None
+    locations: list[dict[str, Any]] | None = None
+
+
+class AnalysisModuleScopeResponse(AnalysisResponse):
+    kind: Literal["common", "lots", "unknown"]
+    lot_refs: list[str]
+
+
+class AnalysisScopeResponse(AnalysisModuleScopeResponse):
+    lot_ids: list[int]
+
+
+class AnalysisQualityIssueResponse(AnalysisResponse):
+    issue_id: str
+    kind: str
+    action: Literal["read", "repair", "provide_input"]
+    topic: str
+    target: str
+    detail: str
+    scope: AnalysisScopeResponse | None = None
+    id: str | None = None
+    status: Literal["open", "resolved"] | None = None
+    topics: list[str] | None = None
+    record_ids: list[str] | None = None
+    block_ids: list[str] | None = None
+    evidence_ids: list[str] | None = None
+    missing_input: dict[str, Any] | None = None
     module_key: str | None = None
-    key: str | None = None
-    kind: str | None = None
-    title: str | None = None
-    text: str | None = None
-    verification: str | None = None
+
+
+class AnalysisRecordContentResponse(AnalysisResponse):
+    # 原始模块和正式快照共享内容，证据与标段身份分别由各自响应模型约束。
+    id: str
+    key: str
+    kind: Literal["fact", "requirement", "lot", "format_node", "relation"]
+    title: str
+    text: str
+    content: dict[str, str | list[str]]
+    module_key: str
+    group: str
+    sort_order: int
+    structuring: Literal["complete", "partial"]
+    verification: Literal["supported", "unsupported", "unavailable"]
+    code: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    parent_key: str | None = None
+    parent_path: list[str] = Field(default_factory=list)
+    node_type: Literal["group", "section"] | None = None
+    requirement_keys: list[str] = Field(default_factory=list)
+    predicate: Literal["supersedes", "conflicts", "requires", "contains"] | None = None
+    subject_key: str | None = None
+    object_key: str | None = None
+    subject_text: str | None = None
+    object_text: str | None = None
+
+
+class AnalysisModuleRecordResponse(AnalysisRecordContentResponse):
+    scope: AnalysisModuleScopeResponse
+    evidence_ids: list[str] = Field(min_length=1)
+    content_evidence: dict[str, list[list[str]]] | None = None
+
+
+class AnalysisRecordReviewResponse(AnalysisResponse):
+    id: int
+    actor: str
+    decision: Literal["confirmed", "corrected", "rejected"]
+    note: str
+    corrected_text: str | None
+    created_at: datetime
+
+
+class AnalysisRecordResponse(AnalysisRecordContentResponse):
+    scope: AnalysisScopeResponse
+    citations: list[AnalysisEvidenceResponse]
+    parent_id: str | None = None
+    requirement_ids: list[str] = Field(default_factory=list)
+    subject_id: str | None = None
+    object_id: str | None = None
+    effective_status: Literal["active", "unknown"] | None = None
+    superseded_in: list[AnalysisScopeResponse] = Field(default_factory=list)
+    conflicts_in: list[AnalysisScopeResponse] = Field(default_factory=list)
     human_review_status: Literal[
         "pending", "confirmed", "corrected", "rejected", "outdated",
     ] | None = None
-    human_review: dict[str, Any] | None = None
+    human_review: AnalysisRecordReviewResponse | None = None
 
 
-class AnalysisFieldResponse(ApiResponse):
-    id: str
-    field: str
-    group: str
-    sort_order: int
-    values: list[dict[str, Any]]
-    note: str
-    verification: str
-    record: AnalysisRecordResponse | None = None
-    output: dict[str, Any] | None = None
+class AnalysisLotResponse(AnalysisRecordResponse):
+    lot_id: int
 
 
-class AgentProgressResponse(ApiResponse):
+class AnalysisGapResponse(AnalysisResponse):
+    code: str
+    detail: str
+    scope: AnalysisScopeResponse
+    issue_id: str | None = None
+    action: Literal["read", "repair", "provide_input"] | None = None
+    record_id: str | None = None
+    key: str | None = None
+    topic: str | None = None
+    module_key: str | None = None
+    target: str | None = None
+    evidence_ids: list[str] | None = None
+    missing_input: dict[str, Any] | None = None
+
+
+class AgentStopReasonResponse(AnalysisResponse):
+    code: str
+    message: str
+
+
+class AgentRunResponse(AnalysisResponse):
+    id: int
+    attempt: int
+    status: str
+    thread_id: str
+    started_at: datetime | None
+    deadline_at: datetime | None
+    finished_at: datetime | None
+    model_calls: int
+    tool_calls: int
+    successful_model_calls: int
+    successful_tool_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    limits: AgentLimitsResponse
+    error_message: str | None
+    mode: Literal["restart", "resume"] | None = None
+    quality_status: Literal[
+        "self_check_passed", "needs_review", "needs_input", "unknown",
+    ] | None = None
+    stop_reason: AgentStopReasonResponse | None = None
+    agent_progress: AgentProgressResponse | None = None
+
+
+class AgentLimitsResponse(AnalysisResponse):
+    # 页面消费这四项，其余执行配额仍留在运行账，不重复暴露配置快照。
+    max_model_calls: int
+    max_tool_calls: int
+    timeout_seconds: int
+    max_output_tokens: int
+
+
+class AgentProgressResponse(AnalysisResponse):
     protocol: Literal["skill-agent-v1"]
     activity: str | None = None
     draft_count: int
@@ -374,7 +515,7 @@ class AgentProgressResponse(ApiResponse):
     unresolved_issues: int
 
 
-class AnalysisModuleResponse(ApiResponse):
+class AnalysisModuleResponse(AnalysisResponse):
     id: int
     module_key: str
     title: str
@@ -383,12 +524,26 @@ class AnalysisModuleResponse(ApiResponse):
     quality_status: Literal[
         "self_check_passed", "needs_review", "needs_input", "unknown",
     ] | None = None
-    quality_issues: list[dict[str, Any]] = Field(default_factory=list)
-    runs: list[dict[str, Any]] = Field(default_factory=list)
+    quality_issues: list[AnalysisQualityIssueResponse] = Field(default_factory=list)
+    runs: list[AgentRunResponse] = Field(default_factory=list)
     progress: AgentProgressResponse | None = None
+    input_changed: bool = False
+    research_summary: str = ""
 
 
-class AnalysisReportResponse(ApiResponse):
+class AnalysisCoverageFileResponse(AnalysisResponse):
+    source_id: int
+    name: str
+    state: str
+
+
+class AnalysisCoverageResponse(AnalysisResponse):
+    mode: str | None = None
+    partial: bool | None = None
+    files: list[AnalysisCoverageFileResponse] = Field(default_factory=list)
+
+
+class AnalysisReportResponse(AnalysisResponse):
     id: int
     project_id: int
     status: str
@@ -400,24 +555,36 @@ class AnalysisReportResponse(ApiResponse):
     stale: bool
     runtime_version: str
     data_schema_version: str | None = None
-    quality_status: str
+    quality_status: Literal["self_check_passed", "needs_review", "needs_input", "unknown"]
     modules: list[AnalysisModuleResponse]
-    coverage: dict[str, Any]
+    coverage: AnalysisCoverageResponse
+    canceling: bool = False
     error_message: str | None = None
 
 
-class ModuleRecordsResponse(ApiResponse):
+class ModuleRecordsResponse(AnalysisResponse):
     schema_version: str
     module_key: str
     status: str
-    quality_status: str
-    quality_issues: list[dict[str, Any]]
-    records: list[AnalysisRecordResponse]
-    evidence: dict[str, Any]
-    output_schema: dict[str, Any]
+    quality_status: Literal["self_check_passed", "needs_review", "needs_input", "unknown"]
+    quality_issues: list[AnalysisQualityIssueResponse]
+    records: list[AnalysisModuleRecordResponse]
+    evidence: dict[str, AnalysisEvidenceResponse]
+    output_schema: OutputSchema
 
 
-class AnalysisDataResponse(ApiResponse):
+class ModuleRecordsUpdateResponse(AnalysisResponse):
+    module_key: str
+    version: str | None = None
+    data: ModuleRecordsResponse | None = None
+    error: str | None = None
+
+
+class ReportRecordsResponse(AnalysisResponse):
+    modules: list[ModuleRecordsUpdateResponse]
+
+
+class AnalysisDataResponse(AnalysisResponse):
     report_id: int
     snapshot_id: int
     revision: int
@@ -426,20 +593,19 @@ class AnalysisDataResponse(ApiResponse):
     data: AnalysisDatasetResponse
 
 
-class AnalysisDatasetResponse(ApiResponse):
+class AnalysisDatasetResponse(AnalysisResponse):
     schema_version: str
-    lots: list[dict[str, Any]]
+    lots: list[AnalysisLotResponse]
     facts: list[AnalysisRecordResponse]
     requirements: list[AnalysisRecordResponse]
     format_nodes: list[AnalysisRecordResponse]
     relations: list[AnalysisRecordResponse]
-    gaps: list[dict[str, Any]]
+    gaps: list[AnalysisGapResponse]
     quality_status: Literal[
         "self_check_passed", "needs_review", "needs_input", "unknown",
     ]
-    quality_issues: list[dict[str, Any]] = Field(default_factory=list)
-    readiness: str
-    references: list[dict[str, Any]] = Field(default_factory=list)
+    quality_issues: list[AnalysisQualityIssueResponse] = Field(default_factory=list)
+    readiness: Literal["usable", "partial", "unavailable"]
 
 
 class AnalysisEventsResponse(ApiResponse):
@@ -525,19 +691,26 @@ class ModelImportResponse(ApiResponse):
     skipped: int
 
 
-class AnalysisContextResponse(ApiResponse):
+class AnalysisContextResponse(AnalysisResponse):
     schema_version: str
     snapshot_id: int
-    purpose: str
+    purpose: Literal["outline", "content", "check"]
     lot_id: int | None
-    facts: list[dict[str, Any]]
-    requirements: list[dict[str, Any]]
-    format_nodes: list[dict[str, Any]]
-    unresolved: list[dict[str, Any]]
-    relations: list[dict[str, Any]]
-    gaps: list[dict[str, Any]]
-    readiness: str
-    references: list[dict[str, Any]]
+    facts: list[AnalysisRecordResponse]
+    requirements: list[AnalysisRecordResponse]
+    format_nodes: list[AnalysisRecordResponse]
+    unresolved: list[AnalysisRecordResponse]
+    relations: list[AnalysisRecordResponse]
+    gaps: list[AnalysisGapResponse]
+    readiness: Literal["usable", "partial", "unavailable"]
+    references: list[AnalysisReferenceResponse]
+    reference_warning: str | None = None
     requirement_manifest: list[str]
     total_requirements: int
     next_offset: int | None
+
+
+class AnalysisReferenceResponse(AnalysisResponse):
+    purpose: Literal["company", "history"]
+    text: str
+    citation: AnalysisEvidenceResponse

@@ -12,7 +12,6 @@ from tender.application.analysis.output import record_output
 from tender.application.analysis.quality import aggregate_quality, quality_status
 from tender.application.knowledge.content import (
     dedupe_citations,
-    fingerprint,
     match_text,
     normalized,
     validate_items,
@@ -22,6 +21,7 @@ from tender.application.shared.validation import (
     allowed_values,
     validation_message,
 )
+from tender.domain.shared.digest import fingerprint
 
 DATA_VERSION = "1"
 
@@ -136,21 +136,18 @@ def prepare_records(
         for item in state.get("staged_items", []) if item.get("business")
     }
     outputs = {}
-    if state.get("output_schema"):
-        # 同批关系可先于端点；必须先生成整批文本，避免关系复制尚未生成的空文本。
-        for entry in records:
-            output = record_output(entry, state["output_schema"])
-            entry["content"] = output["content"]
-            # 展示与业务上下文来自同一份已校验 JSON，避免另写 text 又退回原文摘录。
-            entry["text"] = "\n".join(
-                f"{name}：" + ("\n".join(value) if isinstance(value, list) else value)
-                for name, value in entry["content"].items()
-            )
-            outputs[entry["key"]] = output
+    # 先生成整批正文，关系复制端点文本时使用同一份已核验的内容。
+    for entry in records:
+        output = record_output(entry, state["output_schema"])
+        entry["content"] = output["content"]
+        entry["text"] = "\n".join(
+            f"{name}：" + ("\n".join(value) if isinstance(value, list) else value)
+            for name, value in entry["content"].items()
+        )
+        outputs[entry["key"]] = output
     combined = existing | {entry["key"]: entry for entry in records}
     result = []
     for entry in records:
-        output = outputs.get(entry["key"])
         if entry["kind"] == "lot" and module_key != "project_basic_info_parsing":
             raise InputError.for_field("kind",
                                        "标段目录由项目概况模块提交；其它模块填写 scope.lot_refs")
@@ -218,11 +215,18 @@ def prepare_records(
                 for ref in missing
             ]
             raise InputError(validation_message(errors), field_issues=errors)
-        item.update(id=entry["id"], business=entry)
-        if output is not None:
-            item["output"] = output
+        item.update(id=entry["id"], business=entry, output=outputs[entry["key"]])
         result.append(item)
     return result
+
+
+def record_citations(record: dict, evidence: dict) -> list[dict]:
+    """统一独立证据的完整性判断，展示筛选与内部投影使用同一规则。"""
+    evidence_ids = record.get("evidence_ids", [])
+    if not evidence_ids or any(key not in evidence for key in evidence_ids):
+        # 少一处就可能丢失条件，旧内联引用不能替代缺失的独立证据。
+        return []
+    return [dict(evidence[key]) for key in evidence_ids]
 
 
 def module_records(data: dict) -> list[dict]:
@@ -230,11 +234,9 @@ def module_records(data: dict) -> list[dict]:
     result = copy.deepcopy(data.get("records", []))
     evidence = data.get("evidence", {})
     for record in result:
-        evidence_ids = record.get("evidence_ids", [])
         # 证据表写入后只读消费，回填引用不需要再次深拷贝。
-        record["citations"] = [dict(evidence[key]) for key in evidence_ids if key in evidence]
-        if not evidence_ids or any(key not in evidence for key in evidence_ids):
-            # 少一处证据就可能丢失修订或条件，内联引用也不能替代独立证据表。
+        record["citations"] = record_citations(record, evidence)
+        if not record["citations"]:
             record.update(citations=[], verification="unavailable")
     return result
 

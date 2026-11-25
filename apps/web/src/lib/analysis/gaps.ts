@@ -1,17 +1,18 @@
+import type { AnalysisGap } from "@/types/knowledge";
 import type { ScopeText } from "./scope";
 
 export interface DisplayGap {
   key: string;
   detail: string;
   code?: string;
-  issueId?: string;
-  action?: "read" | "repair" | "provide_input";
-  moduleKey?: string;
+  issueId?: AnalysisGap["issue_id"];
+  action?: AnalysisGap["action"];
+  moduleKey?: AnalysisGap["module_key"];
   moduleTitle?: string;
-  topicTitle?: string;
+  topicTitle?: AnalysisGap["topic"];
   scopeLabel?: string;
-  scope?: ScopeText;
-  recordId?: string;
+  scope?: ScopeText | null;
+  recordId?: AnalysisGap["record_id"];
 }
 
 function category(code = "") {

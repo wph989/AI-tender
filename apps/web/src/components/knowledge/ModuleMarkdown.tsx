@@ -212,10 +212,12 @@ function StructuredModule({ items, onLocate, activeId, relatedItems, resolvedRel
             ? "修订条款" : "原条款") : "关联条款",
       }));
     });
-    if (!links.length && !record.superseded_in?.length && !record.conflicts_in?.length) return null;
+    // 范围效力来自正式快照；原始模块记录只有端点 key。
+    const snapshot = "citations" in record ? record : undefined;
+    if (!links.length && !snapshot?.superseded_in?.length && !snapshot?.conflicts_in?.length) return null;
     return <div className="result-relations">
-      {Boolean(record.superseded_in?.length) && <span>部分适用范围已有修订</span>}
-      {Boolean(record.conflicts_in?.length) && <span>存在待核对冲突</span>}
+      {Boolean(snapshot?.superseded_in?.length) && <span>部分适用范围已有修订</span>}
+      {Boolean(snapshot?.conflicts_in?.length) && <span>存在待核对冲突</span>}
       {[...new Map(links.map((link) => [link.id, link])).values()].map((link) =>
         <button type="button" key={link.id} onClick={() => onRevealItem?.(link.id)}>
           {link.label}：{link.title}

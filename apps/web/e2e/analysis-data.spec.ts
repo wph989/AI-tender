@@ -11,7 +11,7 @@ const citation: Citation = {
 
 function record(key: string, text: string, lotId?: number): BusinessRecord {
   return {
-    id: key, key, kind: "requirement", title: key, text,
+    id: key, key, kind: "requirement", title: key, text, content: { 内容: text },
     module_key: "project_basic_info_parsing", group: "", sort_order: 0,
     verification: "supported", structuring: "complete", effective_status: "active",
     scope: lotId ? { kind: "lots", lot_ids: [lotId], lot_refs: [lotId === 1 ? "A" : "B"] }
@@ -24,7 +24,7 @@ function snapshot(reportId = 1): AnalysisDataSnapshot {
   return {
     report_id: reportId, snapshot_id: reportId * 10, revision: 1, schema_version: "1", stale: false,
     data: {
-      schema_version: "1", readiness: "partial",
+      schema_version: "1", readiness: "partial", quality_status: "needs_review",
       lots: [
         { ...record("lot-a", "A标段"), kind: "lot", lot_id: 1, code: "A", title: "A标段", aliases: [] },
         { ...record("lot-b", "B标段"), kind: "lot", lot_id: 2, code: "B", title: "B标段", aliases: [] },

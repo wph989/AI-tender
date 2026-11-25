@@ -15,7 +15,8 @@ try {
     # 用同一解释器启用 UTF-8，避免 Windows 控制台把中文契约名称输出成乱码。
     & $PythonExe -X utf8 -c 'from importlinter.cli import lint_imports_command; lint_imports_command()' --config pyproject.toml
     if ($LASTEXITCODE -ne 0) { throw '架构导入检查失败' }
-    & $PythonExe -X utf8 -m mypy --config-file pyproject.toml
+    # Windows 上旧 SQLite 缓存损坏会使检查器内部崩溃，统一从源码检查且不读写缓存。
+    & $PythonExe -X utf8 -m mypy --config-file pyproject.toml --no-incremental --cache-dir nul
     if ($LASTEXITCODE -ne 0) { throw '后端静态类型检查失败' }
     & $PythonExe -X utf8 -m pytest tests/unit tests/contract -q
     if ($LASTEXITCODE -ne 0) { throw '离线测试或协议类型检查失败' }

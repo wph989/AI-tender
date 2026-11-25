@@ -81,14 +81,10 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
         topicTitle: module?.items.find((item) => item.id === gap.record_id)?.field ?? gap.topic,
         scopeLabel: scopeLabel(gap.scope, (id) => data.lots.find((lot) => lot.lot_id === id)?.title),
       };
-    }) : modules.flatMap((module) => module.quality_issues?.length
-      ? module.quality_issues.map((issue) => ({ key: issue.issue_id, issueId: issue.issue_id,
+    }) : modules.flatMap((module) => (module.quality_issues ?? [])
+      .map((issue) => ({ key: issue.issue_id, issueId: issue.issue_id,
         action: issue.action, code: issue.kind, detail: issue.detail, scope: issue.scope,
-        moduleKey: module.module_key, moduleTitle: module.title }))
-      : (module.research_gaps ?? []).map((gap) => ({
-      ...gap, key: `${module.id}:${gap.key}`, moduleKey: module.module_key, moduleTitle: module.title,
-      code: gap.key.startsWith("reference:") ? "unresolved_reference" : "search_exhausted",
-    })));
+        moduleKey: module.module_key, moduleTitle: module.title })));
     for (const module of modules) for (const item of module.items) if (unpairedFields(item)) {
       existing.push({ key: `pair:${item.id}`, code: "unpaired_fields", recordId: item.id,
         moduleKey: module.module_key, moduleTitle: module.title, topicTitle: item.field,

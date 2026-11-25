@@ -543,8 +543,13 @@ def test_answer_failure_does_not_replay_raw_sdk_credential(options, monkeypatch)
     model = RoutingModel("knowledge_ask", "knowledge_ask", [candidate], gateway, calls.append)
     db = Mock()
     db.answer.return_value = {
-        "status": "pending", "collection_ids": [], "project_id": None,
-        "snapshot": {"sources": []}, "question": "测试问题",
+        "status": "pending", "collection_ids": [1], "project_id": None,
+        # 问答必须先有可读资料；合法快照才能实际进入供应商错误脱敏链路。
+        "snapshot": {"sources": [{
+            "source_id": 1, "collection_id": 1, "project_id": 10, "project_file_id": 1,
+            "version_id": 1, "parse_run_id": 1, "file_name": "日志测试.pdf", "purpose": "tender",
+            "is_parseable": True, "parse_status": "completed", "active_job_id": None,
+        }]}, "question": "测试问题",
     }
     monkeypatch.setattr(knowledge, "_store", lambda: db)
     from tender.core.di import create_knowledge_executor
@@ -1105,9 +1110,8 @@ def test_only_frontend_polling_routes_enable_access_log_throttling():
         "/jobs/{job_id}", "/projects/{project_id}",
         "/knowledge/collections/{collection_id}", "/knowledge/answers/{answer_id}",
         "/projects/{project_id}/analysis", "/analysis/reports/{report_id}",
-        "/analysis/reports/{report_id}/modules/{module_key}/records",
         "/llm/settings", "/llm/providers", "/llm/models", "/llm/features",
-    )}
+    )} | {("POST", "/api/v1/analysis/reports/{report_id}/records")}
 
 
 def test_access_log_window_survives_many_distinct_paths_and_cleans_expired_keys(

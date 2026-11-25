@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import Field
@@ -21,6 +21,7 @@ from tender.api.shared.responses import (
     CancelReportResponse,
     HumanReviewResponse,
     ModuleRecordsResponse,
+    ReportRecordsResponse,
     RetriedReportResponse,
 )
 from tender.application.analysis.data import ContextInput
@@ -59,6 +60,13 @@ class RetryInput(StrictModel):
         default=None, **field_bounds("analysis.max_output_tokens")
     )
     timeout_seconds: int | None = Field(default=None, **field_bounds("analysis.timeout_seconds"))
+
+
+class ReportRecordsInput(StrictModel):
+    module_keys: list[Annotated[str, Field(min_length=1, max_length=120)]] = Field(max_length=13)
+    versions: dict[str, Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]] = Field(
+        default_factory=dict, max_length=13,
+    )
 
 
 def analysis_service(request: Request) -> AnalysisService:
@@ -114,10 +122,21 @@ def get_report(report_id: int, request: Request) -> dict:
 
 @router.get("/analysis/reports/{report_id}/modules/{module_key}/records",
             response_model=ModuleRecordsResponse, response_model_exclude_unset=True)
-@throttle_access_log()
 def get_module_records(report_id: int, module_key: str, request: Request) -> dict:
     try:
         return analysis_service(request).get_module_records(report_id, module_key)
+    except ServiceError as exc:
+        raise as_api_problem(exc) from exc
+
+
+@router.post("/analysis/reports/{report_id}/records", response_model=ReportRecordsResponse,
+             response_model_exclude_unset=True)
+@throttle_access_log()
+def get_report_records(report_id: int, payload: ReportRecordsInput, request: Request) -> dict:
+    try:
+        return analysis_service(request).get_report_records(
+            report_id, payload.module_keys, payload.versions,
+        )
     except ServiceError as exc:
         raise as_api_problem(exc) from exc
 

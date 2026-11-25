@@ -30,7 +30,7 @@ def test_encoded_array_error_explains_invalid_inner_json_without_echoing_body():
     assert "私密正文" not in message
 
 
-def test_context_places_source_after_each_draft_and_pages_full_text_once():
+def test_context_places_source_after_each_draft_and_pages_full_text_once(monkeypatch):
     async def run():
         from tender.application.analysis.drafts import DraftWorkspace
 
@@ -51,7 +51,18 @@ def test_context_places_source_after_each_draft_and_pages_full_text_once():
             checkpointer=InMemorySaver(), reserve_tool=noop, save=noop,
         )
         tool = graph.nodes["tools"].bound.tools_by_name["get_research_context"]
+        from tender.application.analysis import skill_agent
+
+        serialized = []
+        original_encode = skill_agent.encode
+
+        def encode_once(value):
+            serialized.append(value)
+            return original_encode(value)
+
+        monkeypatch.setattr(skill_agent, "encode", encode_once)
         result = await tool.ainvoke({"limit": 6})
+        first_page_calls = len(serialized)
         assert result["units"][0]["kind"] == "draft"
         assert result["units"][1]["kind"] == "evidence"
         units = list(result["units"])
@@ -62,6 +73,58 @@ def test_context_places_source_after_each_draft_and_pages_full_text_once():
         assert len({u["start"] for u in parts}) == len(parts)
         assert json.loads("".join(u["text"] for u in parts))["content"] == source["content"]
         assert len([u for u in units if u["kind"] == "draft" and u["start"] == 0]) == 7
+        assert len(serialized) == first_page_calls == 8
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("changed", ["draft", "evidence", "note", "review"])
+def test_context_cache_refreshes_in_place_changes(changed, monkeypatch):
+    async def run():
+        from tender.application.analysis import skill_agent
+        from tender.application.analysis.drafts import DraftWorkspace
+
+        state = {"output_schema": schema()}
+        source = block()
+        research = session([source])
+        research.seen = {source["block_id"]: source}
+        book = DraftWorkspace(state, research.seen, KEY)
+        receipt = book.save_records([raw()], "draft")
+        rid = receipt["accepted"][0]["id"]
+        book.book["notes"]["note"] = {"detail": "原笔记"}
+        book.book["reviews"][rid] = {"status": "failed", "detail": "原复核说明"}
+        frozen = skill_snapshot() | {
+            KEY + "/references/output_schema.json": json.dumps(schema(), ensure_ascii=False),
+        }
+        graph, _ = build_skill_agent(
+            key=KEY, model=RoutedAgentModel(router=ScriptedRouter([])),
+            research=research, state=state, snapshot=frozen,
+            checkpointer=InMemorySaver(), reserve_tool=noop, save=noop,
+        )
+        tool = graph.nodes["tools"].bound.tools_by_name["get_research_context"]
+        calls = []
+        original = skill_agent.encode
+
+        def count(value):
+            calls.append(value)
+            return original(value)
+
+        monkeypatch.setattr(skill_agent, "encode", count)
+        await tool.ainvoke({"limit": 12})
+        first = len(calls)
+        await tool.ainvoke({"offset": 1, "limit": 1})
+        assert len(calls) == first
+        if changed == "draft":
+            book.items()[rid]["business"]["content"]["内容"] = "最新内容"
+        elif changed == "evidence":
+            source["content"] = "最新内容"
+        elif changed == "note":
+            book.book["notes"]["note"]["detail"] = "最新内容"
+        else:
+            book.book["reviews"][rid]["detail"] = "最新内容"
+        refreshed = await tool.ainvoke({"limit": 12})
+        assert len(calls) == first + 1
+        assert "最新内容" in "".join(unit["text"] for unit in refreshed["units"])
 
     asyncio.run(run())
 

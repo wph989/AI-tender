@@ -88,6 +88,21 @@ async def answer(client, research, **options):
     )
 
 
+def test_qa_denies_other_files_and_can_continue_with_authorized_sources():
+    client = Client([
+        call("read_file", {"file_path": "/private.txt"}, 1),
+        call("search_document", {"query": "质保"}, 2),
+        submit(3, [submitted_field("质保", "质保三年")], final=True),
+    ])
+    draft, _ = asyncio.run(answer(client, session([block()])))
+    denied = next(
+        message["data"]["content"] for message in client.requests[1]
+        if message["type"] == "tool" and message["data"]["tool_call_id"] == "call_1"
+    )
+    assert "permission denied for read" in denied
+    assert draft["fields"][0]["values"][0]["value"] == "质保三年"
+
+
 def test_citation_feedback_allows_rereading_with_the_qa_tool_parameters():
     client = Client([
         call("search_document", {"query": "质保"}, 1),

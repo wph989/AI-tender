@@ -188,7 +188,7 @@ def test_new_attachment_interrupted_attempt_can_resume_its_reviewed_draft(env, s
             "record_id": accepted["id"], "version": accepted["version"], "status": "passed",
             "reason": "已对照新附件核对开标日期", "block_ids": [evidence["block_id"]],
         }], [], "review")
-        assert book.review_current(accepted["id"])
+        assert book.current_reviews()[accepted["id"]]
         if status == "partial":
             current_state["quality_status"] = "needs_review"
         current.save(current_state)
@@ -208,7 +208,8 @@ def test_new_attachment_interrupted_attempt_can_resume_its_reviewed_draft(env, s
     assert carried["staged_items"] == current_state["staged_items"]
     assert carried["agent_workspace"]["reviews"] == current_state["agent_workspace"]["reviews"]
     assert not carried["agent_workspace"]["finalized"]
-    assert DraftWorkspace(carried, carried["research"]["seen"], KEY).review_current(accepted["id"])
+    restored = DraftWorkspace(carried, carried["research"]["seen"], KEY)
+    assert restored.current_reviews()[accepted["id"]]
     module = next(module for module in env.db.report_modules(report_id)
                   if module["id"] == module_id)
     assert module["business_data"] == formal["business_data"]

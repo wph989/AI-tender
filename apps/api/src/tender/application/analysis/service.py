@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Callable
 from pathlib import PurePosixPath
 from typing import Any, Literal
@@ -12,7 +13,7 @@ from tender.application.analysis.data import (
     ContextError,
     ContextInput,
     build_context,
-    module_records,
+    record_citations,
 )
 from tender.application.analysis.data_store import (
     accessible_data,
@@ -30,7 +31,6 @@ from tender.application.analysis.human_review import (
 from tender.application.analysis.output import output_schema
 from tender.application.analysis.quality import (
     aggregate_quality,
-    input_changed,
     quality_status,
     refresh_input,
 )
@@ -57,6 +57,7 @@ from tender.domain.analysis.contract import (
     RUNTIME_VERSION,
     is_current_report,
 )
+from tender.domain.shared.digest import fingerprint
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.repository.analysis.reports import ReportRepository
 
@@ -182,7 +183,17 @@ class AnalysisService:
             )
 
     def report_row(self, report_id: int) -> dict[str, Any]:
-        report = self.store.report(report_id)
+        return self._current_report(self.store.report(report_id))
+
+    def _view_report(
+        self, report_id: int, module_keys: list[str] | None = None,
+    ) -> dict[str, Any]:
+        # 专题键会成为PG输出声明的列名，仅让登记的键进入SQL投影。
+        keys = None if module_keys is None else [key for key in module_keys if key in MODULES]
+        return self._current_report(self.store.report_view(report_id, keys))
+
+    @staticmethod
+    def _current_report(report: dict | None) -> dict[str, Any]:
         if report is None:
             raise NotFound("报告不存在")
         if not is_current_report(report):
@@ -193,20 +204,18 @@ class AnalysisService:
         return report
 
     def get_report(self, report_id: int) -> dict[str, Any]:
-        report = self.report_row(report_id)
+        report = self._view_report(report_id)
         report.pop("skill_snapshot", None)
-        modules = self.store.report_modules(report_id)
+        modules = self.store.report_module_summaries(report_id)
         allowed = self.store.collections_for_project(report["project_id"])
-        module_inputs = {}
+        module_signatures = {}
         for module in modules:
             # 正文由独立记录接口读取，详情仅提取质量与运行信息。
             business = module.pop("business_data", None) or {}
-            module_inputs[module["id"]] = {"quality_input_signature": business.get(
-                "quality_input_signature")}
-            module["research_summary"] = business.get("research_summary", "")
-            module["research_gaps"] = business.get("gaps", [])
+            module_signatures[module["id"]] = business.get("quality_input_signature")
+            module["research_summary"] = business.get("research_summary") or ""
             module["quality_status"] = quality_status(business)
-            module["quality_issues"] = business.get("quality_issues", [])
+            module["quality_issues"] = business.get("quality_issues") or []
         runs = self.store.report_runs(report_id)
         for module in modules:
             module["runs"] = [run for run in runs if run["module_id"] == module["id"]]
@@ -219,10 +228,11 @@ class AnalysisService:
                            if source["project_id"] == report["project_id"]]
         current_references = [source for source in live.values()
                               if source["project_id"] != report["project_id"]]
+        current_signature = source_signature(current_sources + current_references)
         for module in modules:
             # 页面入口与补跑事务共用专题输入判断，报告快照已更新也不能禁用其他专题。
-            module["input_changed"] = input_changed(
-                module_inputs[module["id"]], current_sources + current_references,
+            module["input_changed"] = (
+                module_signatures[module["id"]] != current_signature
             )
         if any(
             source["source_id"] not in live
@@ -235,7 +245,6 @@ class AnalysisService:
             # 检索说明也可能包含已撤销资料的内容，不能只隐藏条目正文而留下说明旁路。
             for module in modules:
                 module["research_summary"] = ""
-                module["research_gaps"] = []
                 module["quality_issues"] = []
                 module.pop("progress", None)
                 for run in module["runs"]:
@@ -258,26 +267,69 @@ class AnalysisService:
         }
 
     def data_snapshot(self, report_id: int, snapshot_id: int | None = None) -> dict:
-        self.report_row(report_id)
+        self._view_report(report_id)
         snapshot = self.store.data_snapshot(report_id, snapshot_id)
         if snapshot is None:
             raise Conflict("正式业务数据快照尚未就绪", code="data_not_ready")
         return snapshot
 
     def get_module_records(self, report_id: int, module_key: str) -> dict[str, Any]:
-        report = self.report_row(report_id)
+        report = self._view_report(report_id, [module_key])
         module = self.store.report_module(report_id, module_key)
         if module is None:
             raise NotFound("分析维度不存在")
-        business = module.get("business_data") or {}
         allowed = self.store.collections_for_project(report["project_id"])
+        return self._module_records(report, module, allowed)
+
+    def get_report_records(
+        self, report_id: int, module_keys: list[str], versions: dict[str, str],
+    ) -> dict:
+        keys = list(dict.fromkeys(module_keys))
+        report = self._view_report(report_id, keys)
+        if not keys:
+            return {"modules": []}
+        modules = {module["module_key"]: module
+                   for module in self.store.report_modules(report_id, keys)}
+        allowed = self.store.collections_for_project(report["project_id"])
+        # 同一 HTTP 请求共享引文解析和冻结输入核验，下一轮从当前权限重新计算。
+        resolved: dict[tuple[str, bool], dict | None] = {}
+        inputs_accessible = None
+        updates = []
+        for key in keys:
+            module = modules.get(key)
+            if module is None:
+                updates.append({"module_key": key, "error": "分析维度不存在"})
+                continue
+            if (inputs_accessible is None
+                    and (module.get("business_data") or {}).get("quality_issues")):
+                inputs_accessible = self.progress_accessible(report, allowed)
+            try:
+                data = self._module_records(report, module, allowed, resolved, inputs_accessible)
+            except ValueError:
+                updates.append({"module_key": key, "error": "专题输出声明无效，请重新解析本模块"})
+                continue
+            # 版本取自权限过滤后的完整响应；原文撤销、正文和质量变化都使缓存失效。
+            version = fingerprint(data)
+            update: dict[str, Any] = {"module_key": key, "version": version}
+            if versions.get(key) != version:
+                update["data"] = data
+            updates.append(update)
+        return {"modules": updates}
+
+    def _module_records(
+        self, report: dict, module: dict, allowed: list[int],
+        resolved: dict[tuple[str, bool], dict | None] | None = None,
+        inputs_accessible: bool | None = None,
+    ) -> dict[str, Any]:
+        module_key = module["module_key"]
+        business = module.get("business_data") or {}
         stored_evidence = business.get("evidence", {})
-        candidates = [
-            record
-            for record in module_records(business)
-            if record.get("evidence_ids")
-            and all(key in stored_evidence for key in record["evidence_ids"])
-        ]
+        # 投影已整条判定证据完整性，正文只消费有完整引用的记录。
+        candidates = []
+        for record in business.get("records", []):
+            refs = record_citations(record, stored_evidence)
+            if refs:
+                candidates.append((record, refs))
         visible = visible_items(
             self.store,
             [
@@ -285,32 +337,37 @@ class AnalysisService:
                     "id": record["id"],
                     "field": record.get("title", ""),
                     "output": True,
-                    "values": [{"value": "", "citations": record["citations"]}],
+                    "values": [{"value": "", "citations": refs}],
                 }
-                for record in candidates
+                for record, refs in candidates
             ],
             allowed,
+            resolved_elements=resolved,
         )
         records, evidence = [], {}
-        for record, result in zip(candidates, visible, strict=True):
+        for (record, _refs), result in zip(candidates, visible, strict=True):
             if result.get("verification") == "unavailable":
                 continue
-            data = {
+            # 先确认可见性再复制正文；返回结果的原地修改仍与持久数据隔离。
+            data = copy.deepcopy({
                 key: value
                 for key, value in record.items()
                 if key not in {"citations", "evidence_ids"}
-            }
+            })
             data["evidence_ids"] = list(record["evidence_ids"])
             evidence.update({key: stored_evidence[key] for key in data["evidence_ids"]})
             records.append(data)
-        inputs_accessible = self.progress_accessible(report, allowed)
+        issues = business.get("quality_issues") or []
+        # 空问题没有可回显内容，不需要为决定返回空列表扫描全部来源。
+        if issues and not (inputs_accessible if inputs_accessible is not None
+                           else self.progress_accessible(report, allowed)):
+            issues = []
         return {
             "schema_version": DATA_VERSION,
             "module_key": module_key,
             "status": module["status"],
             "quality_status": quality_status(business),
-            "quality_issues": (business.get("quality_issues", [])
-                               if inputs_accessible else []),
+            "quality_issues": issues,
             "records": records,
             "evidence": evidence,
             "output_schema": output_schema(report["skill_snapshot"], module_key),
@@ -343,8 +400,12 @@ class AnalysisService:
         }
 
     def _current_snapshot_state(self, report: dict, snapshot: dict) -> dict | None:
-        if (report["stale"] or report["status"] in {"waiting", "pending", "running"}
-                or self.data_snapshot(report["id"])["id"] != snapshot["id"]):
+        if report["stale"] or report["status"] in {"waiting", "pending", "running"}:
+            return None
+        latest_id = self.store.latest_snapshot_id(report["id"])
+        if latest_id is None:
+            raise Conflict("正式业务数据快照尚未就绪", code="data_not_ready")
+        if latest_id != snapshot["id"]:
             return None
         return matching_snapshot_state(self.store.snapshot_state, snapshot)
 
@@ -495,7 +556,7 @@ class AnalysisService:
         return context
 
     def cancel_report(self, report_id: int) -> dict[str, Any]:
-        self.report_row(report_id)
+        self._view_report(report_id)
         with self.store.transaction() as tx:
             status = tx.report_status(report_id, lock=True)
             if status in {"waiting", "pending", "running", "canceled"}:
@@ -513,7 +574,7 @@ class AnalysisService:
         after: int,
         limit: int,
     ) -> dict[str, Any]:
-        self.report_row(report_id)
+        self._view_report(report_id)
         if not self.store.run_belongs_to_report(run_id, report_id):
             raise NotFound("模块运行记录不存在")
         rows = self.store.run_events(run_id, after=after, limit=limit)

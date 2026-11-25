@@ -53,7 +53,7 @@ export const capabilityLabel: Record<string, string> = {
   multimodal_embedding: "图文嵌入",
 };
 
-/** 页面只执行服务端下发的范围；旧接口未返回元数据时由服务端完成最终校验。 */
+/** 页面按服务端范围提前反馈错误；未指定范围时仍检查数值及整数类型。 */
 export function withinNumericRule(
   value: number, rule?: import("@/types/llm").ParameterSchema,
 ): boolean {

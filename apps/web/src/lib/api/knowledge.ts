@@ -1,4 +1,4 @@
-import type { AnalysisReport, AnalysisReportDetail, Citation, ModuleRecords } from "@/types/knowledge";
+import type { AnalysisReport, AnalysisReportDetail, Citation, ReportRecords } from "@/types/knowledge";
 import { recordItems } from "@/lib/analysis/records";
 import { message } from "@/lib/errors";
 import { requestJson } from "@/lib/api/request";
@@ -21,19 +21,59 @@ export function resolveCitation(ref: Citation, signal?: AbortSignal): Promise<Ci
 }
 
 /** 专题独立读取记录；失败时清除本专题缓存正文，避免继续展示已撤销的依据。 */
-export function loadReportRecords(report: AnalysisReportDetail, signal?: AbortSignal): Promise<AnalysisReport> {
-  // 请求成功后仍可能在逐条绑定校验中失败，必须与请求错误一起隔离在当前专题。
-  const modules = report.modules.map((module) =>
-    knowledgeRequest<ModuleRecords>(
-      `/analysis/reports/${report.id}/modules/${encodeURIComponent(module.module_key)}/records`,
-      "GET", undefined, signal,
-    ).then(
-      (data) => ({ ...module, status: data.status,
-        quality_status: data.quality_status, quality_issues: data.quality_issues,
-        items: recordItems(data), records_error: undefined, records_loading: false }),
-    ).catch((reason: unknown) => ({
+export async function loadReportRecords(
+  report: AnalysisReportDetail, signal?: AbortSignal, previous?: AnalysisReport | null,
+): Promise<AnalysisReport> {
+  const cached = new Map(previous?.id === report.id
+    ? previous.modules.map((module) => [module.module_key, module]) : []);
+  const versions = Object.fromEntries(report.modules.flatMap((module) => {
+    const saved = cached.get(module.module_key);
+    return saved?.id === module.id && saved.records_version && !saved.records_error
+      ? [[module.module_key, saved.records_version]] : [];
+  }));
+  let response: ReportRecords;
+  try {
+    response = await knowledgeRequest<ReportRecords>(
+      `/analysis/reports/${report.id}/records`, "POST",
+      { module_keys: report.modules.map((module) => module.module_key), versions }, signal,
+    );
+  } catch (reason: unknown) {
+    if (signal?.aborted) throw reason;
+    // 整批核验失败时清除正文和版本，下一次成功必须重新获取完整数据。
+    return { ...report, modules: report.modules.map((module) => ({
       ...module, items: [], records_loading: false,
+      records_version: undefined,
       records_error: message(reason, "专题结果读取失败，请重试"),
-    })));
-  return Promise.all(modules).then((loaded) => ({ ...report, modules: loaded }));
+    })) };
+  }
+  const updates = new Map(response.modules.map((update) => [update.module_key, update]));
+  const modules = report.modules.map((module) => {
+    try {
+      const update = updates.get(module.module_key);
+      if (!update || update.error || !update.version) {
+        throw new Error(update?.error || "专题结果读取失败，请重试");
+      }
+      if (update.data) {
+        const data = update.data;
+        return { ...module, status: data.status,
+          quality_status: data.quality_status, quality_issues: data.quality_issues,
+          items: recordItems(data), records_version: update.version,
+          records_error: undefined, records_loading: false };
+      }
+      const saved = cached.get(module.module_key);
+      if (saved?.id !== module.id || saved.records_version !== update.version || saved.records_error) {
+        throw new Error("专题缓存已失效，请刷新结果");
+      }
+      // 服务端已重新核验权限；仅复用正文，最新执行进度仍取报告详情。
+      return { ...module, status: saved.status,
+        quality_status: saved.quality_status, quality_issues: saved.quality_issues,
+        items: saved.items, records_version: update.version,
+        records_error: undefined, records_loading: false };
+    } catch (reason: unknown) {
+      return { ...module, items: [], records_loading: false,
+        records_version: undefined,
+        records_error: message(reason, "专题结果读取失败，请重试") };
+    }
+  });
+  return { ...report, modules };
 }

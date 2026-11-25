@@ -31,7 +31,6 @@ from tender.application.analysis.drafts import (
 )
 from tender.application.analysis.output import output_schema
 from tender.application.analysis.policy import load_module_skill
-from tender.application.knowledge.content import fingerprint
 from tender.application.shared.agent_model import BudgetedSummarization, context_size
 from tender.application.shared.research import (
     EvidenceBudgetError,
@@ -39,6 +38,7 @@ from tender.application.shared.research import (
     ToolArgumentError,
 )
 from tender.application.shared.validation import InputError, schema_feedback
+from tender.domain.shared.digest import fingerprint
 
 WORKFLOW_PATH = "analysis_workflow/SKILL.md"
 
@@ -139,14 +139,15 @@ class WorkspaceMiddleware(AgentMiddleware):
 
     async def awrap_model_call(self, request, handler):
         self.book.seen = self.research.seen
-        current = self.book.progress()
+        reviews = self.book.current_reviews()
+        current = self.book.progress(reviews=reviews)
         current["budget"] = self.budget() if self.budget else {}
         current["drafts"] = [
             {
                 "id": i["id"],
                 "version": i["draft_version"],
                 "title": i["business"]["title"],
-                "review_current": self.book.review_current(i["id"]),
+                "review_current": reviews[i["id"]],
             }
             for i in self.book.items().values()
         ]
@@ -225,7 +226,8 @@ class WorkspaceMiddleware(AgentMiddleware):
                 # 状态与回执通过既有仓储一起结算，恢复不会重新执行已保存的修改。
                 await self.save(state)
                 if self.event:
-                    self.event("agent_activity", self.book.progress())
+                    # 事件描述本次已保存的进度，避免再遍历自查记录和原文。
+                    self.event("agent_activity", dict(state["agent_progress"]))
             return result
 
 
@@ -349,6 +351,7 @@ def build_skill_agent(
                 raise InputError.for_field("final", "先保存并自查修改后的草稿，再单独最终提交")
             await research.authorize()
             selected = book.items()
+            resolved: set[str] = set()
             for rid in record_ids or []:
                 if rid not in selected:
                     raise InputError.for_field("record_ids", "请选择已有草稿ID")
@@ -357,9 +360,16 @@ def build_skill_agent(
                     raise InputError.for_field("block_ids", "正式结果须引用本项目原文")
                 if resolve_citation:
                     for ref in refs:
-                        await resolve_citation(ref)
+                        # 同次提交按完整身份与引文复用核验，下一次提交重新检查。
+                        identity = fingerprint(ref)
+                        if identity not in resolved:
+                            await resolve_citation(ref)
+                            resolved.add(identity)
             return book.finalize(record_ids or [], summary)
         return book.save_records(records or [], state["active_tool_call_id"], delete_ids)
+
+    # 仅在当前图内复用文本，权限核验仍逐次执行；不把分页缓存写进检查点。
+    context_cache: dict[tuple[str, str], tuple[dict, str]] = {}
 
     async def get_research_context(
         record_ids: list[str] | None = None,
@@ -371,6 +381,7 @@ def build_skill_agent(
         if offset < 0 or not 1 <= limit <= 12:
             raise InputError.for_field("offset/limit", "offset非负，limit为1到12")
         items = book.items()
+        reviews = book.current_reviews()
         if record_ids is not None and set(record_ids) - items.keys():
             raise InputError.for_field("record_ids", "请选择当前草稿ID")
         chosen = list(items) if record_ids is None else record_ids
@@ -380,10 +391,25 @@ def build_skill_agent(
         if evidence:
             book._blocks(list(evidence))
         units = []
+        total = 0
+        end = offset + limit
+        cache_keys: set[tuple[str, str]] = set()
 
         def add(kind, identity, value):
-            text = encode(value)
-            for start in range(0, len(text), 5000):
+            nonlocal total
+            key = kind, identity
+            cache_keys.add(key)
+            cached = context_cache.get(key)
+            if cached is None or cached[0] != value:
+                text = encode(value)
+                # 独立快照能发现笔记、原文和自查凭据的原地修改，避免返回旧内容。
+                context_cache[key] = copy.deepcopy(value), text
+            else:
+                text = cached[1]
+            count = (len(text) + 4999) // 5000
+            # 总数按全部文本计算，只为当前窗口创建分段，翻页不复制其它页的正文。
+            for index in range(max(0, offset - total), min(count, end - total)):
+                start = index * 5000
                 units.append(
                     {
                         "kind": kind,
@@ -393,6 +419,7 @@ def build_skill_agent(
                         "text": text[start : start + 5000],
                     }
                 )
+            total += count
 
         emitted_evidence: set[str] = set()
 
@@ -419,7 +446,7 @@ def build_skill_agent(
                                       for ref in items[rid]["business"]["citations"]],
                     },
                     "review": book.book["reviews"].get(rid),
-                    "review_current": book.review_current(rid),
+                    "review_current": reviews[rid],
                 },
             )
             # 草稿紧邻其完整原文，避免默认首页全被草稿占满，使自查只看到二手摘要。
@@ -431,12 +458,14 @@ def build_skill_agent(
         for kind, values in (("note", book.book["notes"]), ("issue", book.book["issues"])):
             for identity, value in values.items():
                 add(kind, identity, value)
-        end = offset + limit
+        # 删除或取消选中的对象不继续占用内存，缓存容量随当前回读集合收敛。
+        for key in context_cache.keys() - cache_keys:
+            del context_cache[key]
         return {
-            "units": units[offset:end],
-            "total": len(units),
-            "next_offset": end if end < len(units) else None,
-            "progress": book.progress(),
+            "units": units,
+            "total": total,
+            "next_offset": end if end < total else None,
+            "progress": book.progress(reviews=reviews),
         }
 
     tools = [

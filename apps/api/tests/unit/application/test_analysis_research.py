@@ -69,7 +69,8 @@ def test_retrieval_is_autonomous_without_mandatory_fulltext_scan():
 
 def test_source_and_evidence_reads_request_bounded_windows():
     async def run():
-        rows = [block() | {"offset": index, "block_id": f"s1r1c{index}"} for index in range(20)]
+        rows = [block() | {"offset": index, "element_id": index + 1,
+                           "block_id": f"s1r1c{index}"} for index in range(20)]
         research = session(rows)
         requests = []
         original = research.read
@@ -82,9 +83,10 @@ def test_source_and_evidence_reads_request_bounded_windows():
         result = await research.read_source(1, 10, 1)
         assert requests == [(10, 1)]
         assert result["total"] == 20 and result["next_offset"] == 11
+        research.compact_results = True
         result = await research.read_evidence("s1r1c10", before=2, after=1)
         assert requests[-1] == (8, 4)
-        assert [row["offset"] for row in result["blocks"]] == [8, 9, 10, 11]
+        assert [row["id"] for row in result["blocks"]] == [f"s1r1c{i}" for i in (8, 9, 10, 11)]
 
     asyncio.run(run())
 

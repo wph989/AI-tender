@@ -11,6 +11,7 @@ import {
   knowledgeRequest, loadReportRecords, resolveCitation,
 } from "@/lib/api/knowledge";
 import { loadProject } from "@/lib/api/client";
+import { ApiError } from "@/lib/api/request";
 import { citationLocationKey, findCitationResult } from "@/lib/analysis/citations";
 import type {
   AnalysisReport, AnalysisReportDetail,
@@ -32,7 +33,14 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const [lots, setLots] = useState<AnalysisStatus["lots"]>([]);
   const [allowPartial, setAllowPartial] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setErrorState] = useState<string | null>(null);
+  const errorRevision = useRef(0);
+  const setError = useCallback((message: string | null) => {
+    // 每次设置错误都有独立身份，同文案的操作失败不能被旧刷新清除。
+    const revision = ++errorRevision.current;
+    setErrorState(message);
+    return revision;
+  }, []);
   useFeedback(error);
   const [tab, setTab] = useState<"report" | "ask">("report");
   // 模块标签页：用户要求按解析模块切换结果，默认停留在第一个已完成模块；无完成时回落到全部模块。
@@ -56,18 +64,39 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
   const initialized = useRef(false);
   const locateAbort = useRef<AbortController | null>(null);
   const reportAbort = useRef<AbortController | null>(null);
+  const loadedReport = useRef<AnalysisReport | null>(null);
+  const polling = useRef<{ active: boolean; errorRevision: number | null }>({
+    active: false, errorRevision: null,
+  });
+  const [retryingRefresh, setRetryingRefresh] = useState(false);
+  const setRefreshError = useCallback((message: string) => {
+    polling.current.errorRevision = setError(message);
+  }, [setError]);
+
+  const clearReport = useCallback(() => {
+    loadedReport.current = null;
+    locateAbort.current?.abort();
+    setReport(null);
+    setSelected(null);
+    setSelectedQuotes([]);
+    activateItem();
+  }, [activateItem]);
 
   const reload = useCallback(async () => {
     // 新一轮刷新直接取消上一轮在途请求：abort 信号就是唯一的"过期"判据。
     reportAbort.current?.abort();
     const controller = new AbortController();
     reportAbort.current = controller;
+    let active = polling.current.active;
     try {
       const next = await knowledgeRequest<AnalysisStatus>(
         "/projects/" + projectId + "/analysis",
         "GET", undefined, controller.signal,
       );
       if (controller.signal.aborted) return;
+      const statusActive = next.reports.some((row) => isActive(row.status))
+        || next.sources.some((source) => source.state === "processing");
+      active ||= statusActive;
       setState(next);
       if (!initialized.current) {
         setCategory(next.analysis_category ?? "");
@@ -76,12 +105,15 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
         initialized.current = true;
       }
       const id = chosenReport.current ?? next.reports[0]?.id;
+      let reportActive = false;
       if (id) {
         const loaded = await knowledgeRequest<AnalysisReportDetail>(
           "/analysis/reports/" + id,
           "GET", undefined, controller.signal,
         );
         if (controller.signal.aborted) return;
+        reportActive = Boolean(loaded.canceling) || isActive(loaded.status);
+        active ||= reportActive;
         // 同一报告的轮询结果不重置为加载态，否则每三秒都会清空已显示正文。
         setReport((previous) => {
           if (previous?.id === loaded.id) return previous;
@@ -91,21 +123,49 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
             })),
           };
         });
-        const complete = await loadReportRecords(loaded, controller.signal);
-        if (!controller.signal.aborted) setReport(complete);
+        const complete = await loadReportRecords(loaded, controller.signal, loadedReport.current);
+        if (!controller.signal.aborted) {
+          loadedReport.current = complete;
+          setReport(complete);
+        }
+      } else if (loadedReport.current) {
+        clearReport();
+      } else {
+        // 尚无报告时只清空报告视图，保留用户独立打开的问答原文。
+        setReport(null);
+      }
+      if (controller.signal.aborted) return;
+      // 活动状态独立于可见正文；完整读取成功后才确认是否停止轮询。
+      const refreshErrorRevision = polling.current.errorRevision;
+      polling.current = { active: statusActive || reportActive, errorRevision: null };
+      setRetryingRefresh(false);
+      if (refreshErrorRevision !== null && refreshErrorRevision === errorRevision.current) {
+        setError(null);
       }
     } catch (caught) {
       // 切报告或轮询替代了旧请求属于正常取消，不能弹成加载失败。
-      if (!controller.signal.aborted) throw caught;
+      if (!controller.signal.aborted) {
+        // 前置读取失败也无法确认旧依据可访问，正文、缓存和在途定位一起失效。
+        clearReport();
+        setState(null);
+        const temporary = !(caught instanceof ApiError)
+          || caught.status >= 500 || caught.status === 408 || caught.status === 429;
+        polling.current = {
+          active: active && temporary,
+          errorRevision: null,
+        };
+        setRetryingRefresh(polling.current.active);
+        throw caught;
+      }
     } finally {
       if (reportAbort.current === controller) reportAbort.current = null;
     }
-  }, [projectId]);
+  }, [projectId, clearReport, setError]);
 
   // 手动刷新与轮询共用同一失败口径，避免各调用点各写一份 catch 而漏掉非 Error 兜底。
   const refresh = useCallback(
-    () => void reload().catch((caught) => setError(errorMessage(caught, "刷新失败，请重试"))),
-    [reload],
+    () => void reload().catch((caught) => setRefreshError(errorMessage(caught, "刷新失败，请重试"))),
+    [reload, setRefreshError],
   );
 
   useEffect(() => {
@@ -130,7 +190,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       reportAbort.current?.abort();
       locateAbort.current?.abort();
     };
-  }, [projectId, reload]);
+  }, [projectId, reload, setError]);
   const canceling = Boolean(report?.canceling);
   const running = canceling ||
     // 详情可能先于列表更新，逐条结果刷新不能只依赖列表里的旧终态。
@@ -144,13 +204,13 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     version_id: firstDocument.version_id, file_name: firstDocument.file_name,
   } : null);
   useEffect(() => {
-    if (!running && !processingFiles) return;
+    if (!running && !processingFiles && !retryingRefresh) return;
     const timer = setInterval(() => {
       // 慢请求完成后再刷新，避免三秒轮询不断取消仍在加载的独立结果。
       if (!reportAbort.current) refresh();
     }, 3000);
     return () => clearInterval(timer);
-  }, [running, processingFiles, refresh]);
+  }, [running, processingFiles, retryingRefresh, refresh]);
 
   // 最终提交后的成果可直接定位；失败或取消时保留正式成果，便于继续核对原文。
   const refs = useMemo(
@@ -185,7 +245,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
       if (!controller.signal.aborted)
         setError(e instanceof Error ? e.message : "原文无法打开");
     }
-  }, [activateItem, report, answerRefs]);
+  }, [activateItem, report, answerRefs, setError]);
   const perform = async (action: () => Promise<unknown>) => {
     if (busy) return;
     setBusy(true);
@@ -193,7 +253,7 @@ export function ProjectAnalysis({ projectId }: { projectId: number }) {
     try {
       await action();
       await reload().catch(() =>
-        setError("操作已提交，刷新状态失败，请重试刷新。"),
+        setRefreshError("操作已提交，刷新状态失败，请重试刷新。"),
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "操作失败");

@@ -27,7 +27,7 @@ def examples(path):
 
 
 def business_record(record):
-    from tender.application.knowledge.content import fingerprint
+    from tender.domain.shared.digest import fingerprint
 
     DraftRecord.model_validate(record)
     payload = {k: v for k, v in record.items() if k not in {"block_ids", "id"}}

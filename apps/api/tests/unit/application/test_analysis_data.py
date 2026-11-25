@@ -60,13 +60,21 @@ def record(key="r", text="质保三年", scope=None, **kwargs):
         text = "、".join(scope["lot_refs"]) + "：" + text
     return BusinessRecord(
         key=key, title=kwargs.pop("title", key), text=text,
+        content={"内容": text},
         kind=kwargs.pop("kind", "requirement"), scope=scope or COMMON,
         citations=[{"block_id": "s1r1c0"}], structuring="complete", **kwargs,
     )
 
 
+def data_state():
+    # 此处只验证范围和依赖算法，使用合法输出声明，正文仍走生产生成规则。
+    return {"output_schema": {"version": "1", "sections": [
+        {"title": "*", "layout": "tree", "columns": ["内容"]},
+    ]}}
+
+
 def dataset(records, *, topics=None, gaps=None, lots=None, key=KEY):
-    state = {}
+    state = data_state()
     content = "\n".join(r.text for r in records)
     seen = {"s1r1c0": block() | {"content": content}}
     items = prepare_records(records, state, seen, key)
@@ -194,7 +202,7 @@ def test_incomplete_catalog_does_not_auto_select_the_only_known_lot():
 
 @pytest.mark.parametrize("change", ["cycle", "renamed_parent", "unverified_parent_path"])
 def test_snapshot_excludes_invalid_format_paths_after_partial_rollback(change):
-    key, state = "bid_format_outline_parsing", {}
+    key, state = "bid_format_outline_parsing", data_state()
     records = [record(k, text=f"材料{k}", kind="format_node", node_type="section", parent_key=p)
                for k, p in (("a", None), ("b", "a"), ("c", "b"))]
     seen = {"s1r1c0": block() | {"content": "材料a 材料b 材料c"}}

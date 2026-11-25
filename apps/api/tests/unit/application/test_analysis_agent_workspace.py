@@ -36,6 +36,32 @@ def approve(book, receipt):
     )
 
 
+def test_review_checks_share_evidence_within_operation_and_refresh_next_time(monkeypatch):
+    from tender.application.analysis import drafts
+
+    book = workspace()
+    rows = book.save_records([
+        raw(content={"字段": f"事项{i}", "内容": "质保三年"}) for i in range(40)
+    ], "batch")["accepted"]
+    for row in rows:
+        approve(book, row)
+    calls = []
+    original = drafts.evidence_version
+
+    def count_version(evidence):
+        calls.append(evidence["block_id"])
+        return original(evidence)
+
+    monkeypatch.setattr(drafts, "evidence_version", count_version)
+    reviews = book.current_reviews()
+    assert all(reviews.values()) and len(reviews) == 40
+    assert book.progress(reviews=reviews)["reviewed_count"] == 40
+    assert calls == ["s1r1c0"]
+    book.seen["s1r1c0"]["content"] = "质保五年"
+    assert not any(book.current_reviews().values())
+    assert calls == ["s1r1c0", "s1r1c0"]
+
+
 def test_draft_and_review_never_publish_before_explicit_final():
     book = workspace()
     row = saved(book)
@@ -143,7 +169,7 @@ def test_dependency_change_invalidates_review_but_unrelated_evidence_does_not():
     approve(book, parent)
     approve(book, child)
     book.seen["s2r1c0"] = block(2)
-    assert book.review_current(child["id"])
+    assert book.current_reviews()[child["id"]]
     book.save_records(
         [
             raw(
@@ -155,7 +181,7 @@ def test_dependency_change_invalidates_review_but_unrelated_evidence_does_not():
         ],
         "edit-parent",
     )
-    assert not book.review_current(child["id"])
+    assert not book.current_reviews()[child["id"]]
     with pytest.raises(InputError, match="自查"):
         book.finalize([parent["id"], child["id"]], "完成")
 

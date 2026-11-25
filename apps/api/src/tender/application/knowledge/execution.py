@@ -7,12 +7,13 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
-from tender.application.knowledge.content import fingerprint, source_state
+from tender.application.knowledge.content import source_state
 from tender.application.knowledge.qa_agent import answer_with_agent
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.routing import RoutingModel
 from tender.core.logging import get_logger
 from tender.domain.knowledge.text import CHUNK_VERSION
+from tender.domain.shared.digest import fingerprint
 from tender.domain.shared.errors import TenderError
 from tender.ports.llm.embedding import EmbeddingModel
 from tender.ports.llm.rerank import RerankModel
@@ -244,6 +245,8 @@ class KnowledgeExecutor:
             project_id = answer["project_id"]
             if project_id is None and sources:
                 project_id = sources[0]["project_id"]
+            if project_id is None:
+                raise ValueError("问答缺少有效资料来源，请重新提问")
             draft, research = await answer_with_agent(
                 model_factory=lambda **limits: self.model_factory(
                     "knowledge_ask", "knowledge_ask", **limits

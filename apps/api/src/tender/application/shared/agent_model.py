@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
 from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain_core.exceptions import ContextOverflowError
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, message_to_dict, messages_from_dict
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    MessageLikeRepresentation,
+    convert_to_messages,
+    message_to_dict,
+    messages_from_dict,
+)
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import Field
@@ -58,14 +65,16 @@ class RoutedAgentModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
-def context_size(messages: Sequence[BaseMessage], *, tools=None) -> int:
+def context_size(messages: Iterable[MessageLikeRepresentation], *, tools=None) -> int:
     """按同一消息视图估算请求体，工具定义也计入上下文预算。"""
-    serialized = json.dumps(_model_messages(messages), ensure_ascii=False)
+    # SDK允许消息生成器和简写格式，先归一化再按实际发送的消息视图计量。
+    prepared = convert_to_messages(messages)
+    serialized = json.dumps(_model_messages(prepared), ensure_ascii=False)
     if tools:
         definitions = [convert_to_openai_tool(tool) for tool in tools]
         serialized += json.dumps(definitions, ensure_ascii=False)
     ascii_count = sum(ord(char) < 128 for char in serialized)
-    return len(serialized) - ascii_count + (ascii_count + 2) // 3 + 8 * len(messages)
+    return len(serialized) - ascii_count + (ascii_count + 2) // 3 + 8 * len(prepared)
 
 
 class BudgetedSummarization(SummarizationMiddleware):
@@ -76,11 +85,9 @@ class BudgetedSummarization(SummarizationMiddleware):
         *args,
         context_tokens: int | None,
         output_tokens: int,
-        on_context_changed: Callable[[], None] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.on_context_changed = on_context_changed
         self.input_limit = (
             None if context_tokens is None else max(0, context_tokens * 95 // 100 - output_tokens)
         )
@@ -93,12 +100,6 @@ class BudgetedSummarization(SummarizationMiddleware):
 
     async def awrap_model_call(self, request, handler):
         try:
-            result = await super().awrap_model_call(request, handler)
+            return await super().awrap_model_call(request, handler)
         except ContextOverflowError as exc:
             raise ModelBudgetExhausted("完整模型请求超过上下文预算") from exc
-        update = getattr(getattr(result, "command", None), "update", {}) or {}
-        if self.on_context_changed and (
-            "_summarization_event" in update or "messages" in update
-        ):
-            self.on_context_changed()
-        return result

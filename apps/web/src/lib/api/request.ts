@@ -1,13 +1,22 @@
 /** HTTP JSON 错误协议只在这里解析，业务客户端保留各自的请求路径和方法。 */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 export function apiErrorFromBody(body: unknown, status: number, fallback: string): Error {
   if (typeof body === "object" && body !== null && "error" in body) {
     const problem = body.error;
     if (
       typeof problem === "object" && problem !== null && "message" in problem &&
       typeof problem.message === "string"
-    ) return new Error(problem.message);
+    ) return new ApiError(problem.message, status);
   }
-  return new Error(fallback + " 返回 " + status);
+  return new ApiError(fallback + " 返回 " + status, status);
 }
 
 async function responseError(response: Response, fallback: string | ((status: number) => string)) {

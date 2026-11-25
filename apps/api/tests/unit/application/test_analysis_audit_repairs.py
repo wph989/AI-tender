@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import (
+    HumanMessage,
     SystemMessage,
 )
 
@@ -13,6 +14,12 @@ from tender.application.shared.agent_model import (
 )
 from tender.application.shared.agent_model import RoutedAgentModel, context_size
 from tender.domain.shared.errors import ModelBudgetExhausted
+
+
+def test_context_count_accepts_sdk_message_forms_and_one_pass_iterables():
+    canonical = [SystemMessage(content="规则"), HumanMessage(content="问题")]
+    shorthand = [{"role": "system", "content": "规则"}, ("user", "问题")]
+    assert context_size(iter(shorthand)) == context_size(canonical)
 
 
 def test_tool_schema_is_counted_and_irreducible_request_stops_before_model_call():

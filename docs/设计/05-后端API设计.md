@@ -81,6 +81,7 @@
 | `PUT` | `/api/v1/projects/{project_id}/analysis/settings` | Save Settings |
 | `GET` | `/api/v1/analysis/reports/{report_id}` | Get Report |
 | `GET` | `/api/v1/analysis/reports/{report_id}/modules/{module_key}/records` | Get Module Records |
+| `POST` | `/api/v1/analysis/reports/{report_id}/records` | Get Report Records |
 | `GET` | `/api/v1/analysis/reports/{report_id}/data` | Get Analysis Data |
 | `POST` | `/api/v1/analysis/reports/{report_id}/context` | Get Analysis Context |
 | `POST` | `/api/v1/analysis/reports/{report_id}/cancel` | Cancel Report |
@@ -90,6 +91,8 @@
 
 ## 状态与错误
 
-报告详情返回执行、质量与运行信息；专题正文由 `/modules/{module_key}/records` 独立读取，引用在正文读取时按实时权限核对。报告执行、机器自查和人工裁定分别表达。协议与当前运行不匹配的报告读取或补跑返回 `runtime_retired`；工作区草稿与正式数据快照按不同生命周期维护。错误响应保留稳定代码和具体原因。
+报告详情返回执行、质量与运行信息。单专题正文由 `/modules/{module_key}/records` 读取；分析页通过 `POST /analysis/reports/{report_id}/records` 合并读取全部专题，传入 `module_keys` 与上次成功读取的 `versions`。每次读取先按实时权限与版本核验引用，再对完整可见响应生成版本；未变化的专题只返回 `module_key/version`，变化时附带 `data`，单专题读取错误通过 `error` 返回。每批最多13个专题，整批失败时页面清除全部缓存正文和版本。报告执行、机器自查和人工裁定分别表达。协议与当前运行不匹配的报告读取或补跑返回 `runtime_retired`；工作区草稿与正式数据快照按不同生命周期维护。错误响应保留稳定代码和具体原因。
+
+分析响应只序列化明确声明的字段。原始模块记录通过 `evidence_ids/content_evidence` 关联独立证据，范围保留 `lot_refs`；正式快照记录携带经过解析的 `lot_ids`、完整引用和人工裁定。正文、范围、来源身份、质量问题及运行计数均进入 OpenAPI，前端从生成类型派生展示状态。专题待办读取 `quality_issues`，跨专题汇总读取快照 `gaps`。 输出声明复用应用中的 `OutputSchema`，版本、分类和列约束只维护一份。
 
 文件下载支持HTTP Range，原件与PDF通过同一存储端口读取。`/api/v1/healthz`为存活信号，`/api/v1/readyz`核对PostgreSQL、Redis与所选存储；外部模型和解析供应商不作为就绪门槛。

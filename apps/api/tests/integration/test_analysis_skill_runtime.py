@@ -44,11 +44,12 @@ def test_merged_batch_read_uses_bounded_postgres_windows(env):
     async def forbidden(*args):
         raise AssertionError("已知锚点补读无需重新检索")
 
-    research = ResearchSession(sources, row["project_id"], forbidden, read, authorize)
+    research = ResearchSession(sources, row["project_id"], forbidden, read, authorize,
+                               compact_results=True)
     research.seen = {r["block_id"]: r for r in anchors}
     result = run_async(research.read_evidence([r["block_id"] for r in anchors], 2, 8))
     assert reads == [(0, 12), (12, 4)]
-    assert [r["offset"] for r in result["blocks"]] == list(range(16))
+    assert [research.seen[r["id"]]["offset"] for r in result["blocks"]] == list(range(16))
     assert research.tool_calls == 1 and len(research.seen) == 16
     assert research.events[-1]["action"] == "read_result"
 
@@ -183,6 +184,6 @@ def test_single_agent_can_search_after_review_and_budget_never_publishes_draft(
     state = stored["state"]
     book = DraftWorkspace(state, state["research"]["seen"], run["module_key"])
     rid = state["staged_items"][0]["id"]
-    assert book.review_current(rid)
+    assert book.current_reviews()[rid]
     book.seen[next(iter(book.seen))]["content"] += "补遗修改质保期限"
-    assert not book.review_current(rid)
+    assert not book.current_reviews()[rid]

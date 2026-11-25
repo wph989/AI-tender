@@ -25,11 +25,13 @@ def visible_items(
     store: KnowledgeRepository,
     items: list[dict],
     allowed_collections: list[int] | None = None,
+    *,
+    resolved_elements: dict[tuple[str, bool], dict | None] | None = None,
 ) -> list[dict]:
     result = []
     # 同一引文可被多条事项引用；本次读取共用解析结果，下次请求仍重新核对权限。
     # 用完整引文和正文读取模式作键，不能把另一页、另一范围的定位结果混用。
-    resolved_elements: dict[tuple, dict | None] = {}
+    resolved_elements = {} if resolved_elements is None else resolved_elements
     for item in items:
         accessible = True
         values: list[dict] = []

@@ -11,8 +11,9 @@ from tender.application.analysis.data import (
     data_gap,
     module_records,
 )
-from tender.application.knowledge.content import fingerprint, source_signature, source_state
+from tender.application.knowledge.content import source_signature, source_state
 from tender.domain.analysis.contract import is_current_report
+from tender.domain.shared.digest import fingerprint
 from tender.ports.repository.analysis.reports import ReportRepository
 
 

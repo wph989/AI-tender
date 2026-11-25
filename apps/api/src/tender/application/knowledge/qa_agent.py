@@ -11,7 +11,9 @@ from deepagents.backends import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain.agents.middleware import AgentMiddleware, hook_config
+from langchain.agents.middleware.types import InputAgentState
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool, ToolException
 from langsmith import tracing_context
 from typing_extensions import TypedDict
@@ -151,7 +153,7 @@ async def answer_with_agent(
     *,
     model_factory: Callable[..., Any],
     sources: list[dict],
-    project_id: int | None,
+    project_id: int,
     question: str,
     retrieve: Callable[[list[dict], str], Awaitable[tuple[list[dict], dict]]],
     read: Read,
@@ -280,7 +282,7 @@ async def answer_with_agent(
     permissions = [
         FilesystemPermission(operations=["read"], paths=["/conversation_history/**"], mode="allow"),
         FilesystemPermission(
-            operations=["read", "write", "edit", "ls", "glob", "grep"], paths=["/**"], mode="deny"
+            operations=["read", "write"], paths=["/**"], mode="deny"
         ),
     ]
     model = model_factory(
@@ -289,33 +291,32 @@ async def answer_with_agent(
         output_limit=limits.max_output_tokens,
     )
     try:
+        # 两个中间件共用同一路由，模型、摘要和支持性核对扣同一份实际请求预算。
+        agent_model = RoutedAgentModel(router=model)
+        middleware: list[AgentMiddleware[Any, Any, Any]] = [
+            FilesystemMiddleware(
+                backend=backend, tools=["read_file"], _permissions=permissions,
+                tool_token_limit_before_evict=None,
+            ),
+            SummarizationMiddleware(
+                agent_model, backend=backend,
+                trigger=("tokens", max(1, limits.context_tokens * 4 // 5)),
+                keep=("messages", 4), token_counter=context_size,
+                trim_tokens_to_summarize=limits.context_tokens,
+            ),
+            _QuestionTools(research, state, reserve_tool),
+        ]
         # 路由限制单次等待；外层截止时间同时覆盖检索、工具与整个多轮图执行。
         async with asyncio.timeout_at(deadline):
             graph = create_deep_agent(
-                model=RoutedAgentModel(router=model),
+                model=agent_model,
                 name="knowledge_qa",
                 tools=tools,
                 backend=backend,
                 checkpointer=None,
                 permissions=permissions,
                 system_prompt=QA_CONTRACT,
-                middleware=[
-                    FilesystemMiddleware(
-                        backend=backend,
-                        tools=["read_file"],
-                        _permissions=permissions,
-                        tool_token_limit_before_evict=None,
-                    ),
-                    SummarizationMiddleware(
-                        RoutedAgentModel(router=model),
-                        backend=backend,
-                        trigger=("tokens", max(1, limits.context_tokens * 4 // 5)),
-                        keep=("messages", 4),
-                        token_counter=context_size,
-                        trim_tokens_to_summarize=limits.context_tokens,
-                    ),
-                    _QuestionTools(research, state, reserve_tool),
-                ],
+                middleware=middleware,
             )
             task = (
                 "回答问题：" + question + "。先列出可用资料并检索相关证据，"
@@ -323,10 +324,10 @@ async def answer_with_agent(
             )
             with tracing_context(enabled=False):
                 await graph.ainvoke(
-                    {"messages": [("user", task)], "files": {}},
-                    config={"recursion_limit": max(
+                    InputAgentState(messages=[HumanMessage(content=task)]),
+                    config=RunnableConfig(recursion_limit=max(
                         128, 4 * (limits.max_model_calls + limits.max_tool_calls)
-                    )},
+                    )),
                 )
             return state["draft"], research
     except TimeoutError as exc:

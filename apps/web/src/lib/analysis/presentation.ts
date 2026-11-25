@@ -40,7 +40,8 @@ export function keyValueRows(item: AnalysisField) {
 export function needsAttention(item: AnalysisField, gaps: AnalysisGap[] = []): boolean {
   const record = item.record;
   return unpairedFields(item) || item.verification !== "supported"
-    || record?.scope.kind === "unknown" || Boolean(record?.conflicts_in?.length)
+    || record?.scope.kind === "unknown"
+    || Boolean(record && "citations" in record && record.conflicts_in?.length)
     || gaps.some((gap) => gap.record_id === item.id && gap.code !== "incomplete_structure");
 }
 

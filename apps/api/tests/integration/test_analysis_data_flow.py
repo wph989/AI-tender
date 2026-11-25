@@ -23,6 +23,8 @@ from tender.application.analysis.data import (
     prepare_records,
 )
 from tender.application.analysis.data_store import publish_data_snapshot
+from tender.application.analysis.output import output_schema
+from tender.application.analysis.runtime import limits_snapshot
 from tender.application.knowledge.content import encode, source_signature
 
 pytestmark = pytest.mark.skipif(
@@ -50,13 +52,15 @@ def basis(environment):
     def record(key, title, content, *, kind="requirement", lot=None, code=None):
         return BusinessRecord(
             key=key, title=title, text=content, kind=kind, code=code,
+            group="分标信息" if kind == "lot" else "项目基本信息",
+            content={"字段": title, "内容": content},
             scope={"kind": "lots", "lot_refs": [lot]} if lot else COMMON,
             structuring="complete",
             citations=[{"block_id": block["block_id"]}],
         )
 
-    state = {}
     report = db.report(created["id"])
+    state = {"output_schema": output_schema(report["skill_snapshot"], "project_basic_info_parsing")}
     state["quality_input_signature"] = source_signature(
         report["source_snapshot"] + report["reference_snapshot"]
     )
@@ -109,18 +113,20 @@ def confirm_snapshot_records(basis, snapshot):
 
 
 def test_lot_without_original_code_publishes_and_resolves_by_verified_name(basis):
-    state = {}
     report = basis.db.report(basis.report_id)
+    state = {"output_schema": output_schema(report["skill_snapshot"], "project_basic_info_parsing")}
     state["quality_input_signature"] = source_signature(
         report["source_snapshot"] + report["reference_snapshot"]
     )
     records = [
         BusinessRecord(
             key="named-lot", title="A标段", text="A标段", kind="lot", scope=COMMON,
+            group="分标信息", content={"字段": "A标段", "内容": "A标段"},
             citations=[{"block_id": basis.block["block_id"]}],
         ),
         BusinessRecord(
             key="warranty", title="质保要求", text="A标段质保三年", kind="requirement",
+            group="项目基本信息", content={"字段": "质保要求", "内容": "A标段质保三年"},
             scope={"kind": "lots", "lot_refs": ["A标段"]}, structuring="complete",
             citations=[{"block_id": basis.block["block_id"]}],
         ),
@@ -206,6 +212,140 @@ def test_module_records_query_loads_one_topic_and_keeps_company_isolation(basis)
     assert basis.client.get(basis.path + "/modules/missing/records").status_code == 404
 
 
+def test_display_queries_keep_protocol_and_schema_without_loading_private_rules(basis):
+    key = "project_basic_info_parsing"
+    full = basis.db.report(basis.report_id)
+    overview = basis.db.report_view(basis.report_id)
+    view = basis.db.report_view(basis.report_id, [key])
+    assert overview["skill_snapshot"] == {
+        analysis.FLOW_VERSION_KEY: full["skill_snapshot"][analysis.FLOW_VERSION_KEY],
+    }
+    assert output_schema(view["skill_snapshot"], key) == output_schema(full["skill_snapshot"], key)
+    assert len(view["skill_snapshot"]) == 2
+    assert basis.db.report(basis.report_id) == full
+    summary = basis.db.report_module_summaries(basis.report_id)[0]
+    assert summary["id"] == basis.module_id
+    assert "records" not in summary["business_data"] and "evidence" not in summary["business_data"]
+    assert summary["business_data"]["quality_input_signature"] == basis.business[
+        "quality_input_signature"
+    ]
+    other_company = SqlStore(basis.db.engine, 2)
+    assert other_company.report_view(basis.report_id, [key]) is None
+    assert other_company.report_module_summaries(basis.report_id) == []
+
+
+def test_batch_record_refresh_reuses_only_current_visible_content(basis):
+    key = "project_basic_info_parsing"
+    path = basis.path + "/records"
+    payload = {"module_keys": [key], "versions": {}}
+    first = basis.client.post(path, json=payload)
+    assert first.status_code == 200, first.text
+    update = first.json()["modules"][0]
+    assert update["data"] == basis.client.get(basis.path + f"/modules/{key}/records").json()
+    payload["versions"][key] = update["version"]
+    assert basis.client.post(path, json=payload).json()["modules"] == [
+        {"module_key": key, "version": update["version"]},
+    ]
+    # 有旧版本也必须重新核验；原文撤销后返回新的空正文供页面清除缓存。
+    basis.db.execute("DELETE FROM knowledge_source WHERE id=:id", {"id": basis.source["source_id"]})
+    hidden = basis.client.post(path, json=payload).json()["modules"][0]
+    assert hidden["version"] != update["version"]
+    assert hidden["data"]["records"] == [] and hidden["data"]["evidence"] == {}
+
+
+def test_batch_refresh_isolates_missing_topic_and_limits_request_size(basis):
+    key = "project_basic_info_parsing"
+    path = basis.path + "/records"
+    response = basis.client.post(path, json={"module_keys": [key, "missing"], "versions": {}})
+    assert response.status_code == 200, response.text
+    updates = response.json()["modules"]
+    assert len(updates[0]["data"]["records"]) == 5
+    assert updates[1] == {"module_key": "missing", "error": "分析维度不存在"}
+    assert basis.client.post(path, json={"module_keys": [key] * 14}).status_code == 400
+    invalid = basis.client.post(path, json={"module_keys": [key], "versions": {key: "bad"}})
+    assert invalid.status_code == 400
+    assert basis.client.post(basis.path.replace(str(basis.report_id), "999999") + "/records",
+                             json={"module_keys": [key]}).status_code == 404
+
+
+@pytest.mark.parametrize("prefix", ["x" * 64, "甲" * 22])
+def test_long_unknown_keys_return_topic_errors_without_sql_identifier_collision(basis, prefix):
+    key = "project_basic_info_parsing"
+    unknown = [prefix + "a", prefix + "b"]
+    response = basis.client.post(basis.path + "/records", json={"module_keys": [key, *unknown]})
+    assert response.status_code == 200, response.text
+    updates = response.json()["modules"]
+    assert len(updates[0]["data"]["records"]) == 5
+    assert updates[1:] == [
+        {"module_key": module_key, "error": "分析维度不存在"} for module_key in unknown
+    ]
+    assert basis.client.get(basis.path + f"/modules/{unknown[0]}/records").status_code == 404
+
+
+def test_partial_batch_filters_modules_in_sql_and_preserves_full_read(basis):
+    key = "project_basic_info_parsing"
+    for module_key in analysis.MODULES:
+        if module_key != key:
+            basis.db.execute("""INSERT INTO analysis_module
+                (report_id,module_key,title,status,business_data)
+                VALUES (:id,:key,:key,'completed',CAST(:data AS JSONB))""", {
+                "id": basis.report_id, "key": module_key, "data": encode(basis.business),
+            })
+    assert len(basis.db.report_modules(basis.report_id)) == 13
+    statements = []
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        if statement.startswith("SELECT analysis_module."):
+            statements.append(statement)
+
+    event.listen(basis.conn, "before_cursor_execute", capture)
+    try:
+        selected = basis.db.report_modules(basis.report_id, [key])
+        assert [module["module_key"] for module in selected] == [key]
+        assert len(statements) == 1 and "analysis_module.module_key IN" in statements[0]
+        statements.clear()
+        assert basis.db.report_modules(basis.report_id, []) == []
+        assert statements == []
+        response = basis.client.post(basis.path + "/records", json={"module_keys": [key]})
+        assert response.status_code == 200, response.text
+        assert len(response.json()["modules"]) == 1
+        assert len(statements) == 1 and "analysis_module.module_key IN" in statements[0]
+    finally:
+        event.remove(basis.conn, "before_cursor_execute", capture)
+    assert SqlStore(basis.db.engine, 2).report_modules(basis.report_id, [key]) == []
+    assert SqlStore(basis.db.engine, 2).report_modules(basis.report_id) == []
+
+
+def test_latest_snapshot_check_reads_only_id_and_detects_new_revision(basis):
+    snapshot = publish_data_snapshot(basis.db, basis.report_id)
+    statements = []
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        if statement.startswith("SELECT analysis_data_snapshot.id"):
+            statements.append(statement)
+
+    event.listen(basis.conn, "before_cursor_execute", capture)
+    try:
+        assert basis.db.latest_snapshot_id(basis.report_id) == snapshot["id"]
+    finally:
+        event.remove(basis.conn, "before_cursor_execute", capture)
+    assert len(statements) == 1
+    assert "analysis_data_snapshot.data" not in statements[0]
+    assert "analysis_data_snapshot.input_snapshot" not in statements[0]
+    assert SqlStore(basis.db.engine, 2).latest_snapshot_id(basis.report_id) is None
+    changed = copy.deepcopy(basis.business)
+    changed["research_summary"] = "本轮新增核对结果"
+    basis.db.execute("UPDATE analysis_module SET business_data=CAST(:data AS JSONB) WHERE id=:id", {
+        "id": basis.module_id, "data": encode(changed),
+    })
+    newer = publish_data_snapshot(basis.db, basis.report_id)
+    assert newer["id"] != snapshot["id"]
+    assert basis.db.latest_snapshot_id(basis.report_id) == newer["id"]
+    historical = basis.client.get(basis.path + f"/data?snapshot_id={snapshot['id']}")
+    assert historical.status_code == 200, historical.text
+    assert historical.json()["stale"]
+
+
 def test_terminal_snapshot_is_idempotent_and_context_is_single_lot(basis):
     assert basis.client.get(basis.path + "/data").status_code == 409
     basis.db.execute("UPDATE analysis_report SET status='running' WHERE id=:id",
@@ -252,8 +392,10 @@ def test_report_keeps_business_identity_and_never_exposes_internal_payload(basis
         )
         basis.conn.execute(text("""INSERT INTO agent_module_run
             (module_id,company_id,attempt,thread_id,status,limits,state)
-            VALUES (:module,1,1,'business-stage','failed','{}',CAST(:state AS JSONB))"""), {
+            VALUES (:module,1,1,'business-stage','failed',CAST(:limits AS JSONB),
+                    CAST(:state AS JSONB))"""), {
                 "module": basis.module_id, "state": encode(basis.state),
+                "limits": encode(limits_snapshot(basis.db)),
             })
     module = basis.client.get(basis.path).json()["modules"][0]
     assert "items" not in module and "business_data" not in module
@@ -272,15 +414,16 @@ def test_new_revision_preserves_history_and_rejects_old_or_foreign_snapshot(basi
     first = publish_data_snapshot(basis.db, basis.report_id)
     business = copy.deepcopy(basis.business)
     corrected = next(r for r in business["records"] if r["key"] == "a")
-    corrected["text"] = "A标段质保四年"
-    business["evidence"][corrected["evidence_ids"][0]]["quote"] = corrected["text"]
+    corrected["content"]["内容"] = "A标段质保四年"
+    corrected["text"] = "字段：质保期\n内容：A标段质保四年"
+    business["evidence"][corrected["evidence_ids"][0]]["quote"] = "A标段质保四年"
     basis.db.execute("UPDATE analysis_module SET business_data=CAST(:data AS JSONB) WHERE id=:id",
                      {"data": encode(business), "id": basis.module_id})
     second = publish_data_snapshot(basis.db, basis.report_id)
     assert second["revision"] == first["revision"] + 1
     historic = basis.client.get(basis.path + f"/data?snapshot_id={first['id']}").json()
     assert next(r for r in historic["data"]["requirements"] if r["key"] == "a")["text"] == (
-        "A标段质保三年"
+        "字段：质保期\n内容：A标段质保三年"
     )
     assert corrected["id"] in {r["id"] for r in second["data"]["requirements"]}
     response = basis.client.post(basis.path + "/context", json={

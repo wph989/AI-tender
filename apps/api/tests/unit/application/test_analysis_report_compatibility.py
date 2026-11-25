@@ -28,8 +28,8 @@ def test_report_compatibility_uses_snapshot_without_exposing_it(
                                     "private_rule": "私有提示词"}
     repository = MagicMock(spec=ReportRepository)
     # 真实仓储每次反序列化新对象，重复读取不能影响保存的协议快照。
-    repository.report.side_effect = lambda _: copy.deepcopy(stored)
-    repository.report_modules.return_value = []
+    repository.report_view.side_effect = lambda _, module_keys=None: copy.deepcopy(stored)
+    repository.report_module_summaries.return_value = []
     repository.report_runs.return_value = []
     repository.collections_for_project.return_value = []
     repository.sources.return_value = []
@@ -54,7 +54,7 @@ def test_report_compatibility_uses_snapshot_without_exposing_it(
 ])
 def test_retired_report_requests_fail_without_reading_report_contents(runtime, protocol):
     repository = MagicMock(spec=ReportRepository)
-    repository.report.return_value = {
+    repository.report_view.return_value = {
         "id": 42, "runtime_version": runtime,
         "skill_snapshot": {"__analysis_flow_version__": protocol},
     }
@@ -64,5 +64,5 @@ def test_retired_report_requests_fail_without_reading_report_contents(runtime, p
         service.get_report(42)
 
     assert error.value.code == "runtime_retired"
-    repository.report_modules.assert_not_called()
+    repository.report_module_summaries.assert_not_called()
     repository.report_runs.assert_not_called()

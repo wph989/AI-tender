@@ -7,7 +7,7 @@ import type { AnalysisField, AnalysisGap, BusinessRecord } from "@/types/knowled
 function item(id: string, overrides: Partial<BusinessRecord> = {}): AnalysisField {
   return {
     id, field: id, group: "正文", sort_order: 0, note: "", verification: "supported", values: [],
-    record: { id, key: id, kind: "requirement", title: id, text: id, module_key: "tech",
+    record: { id, key: id, kind: "requirement", title: id, text: id, content: { 内容: id }, module_key: "tech",
       scope: { kind: "common", lot_refs: [], lot_ids: [] }, structuring: "partial", verification: "supported",
       citations: [], group: "正文", sort_order: 0, ...overrides },
   };

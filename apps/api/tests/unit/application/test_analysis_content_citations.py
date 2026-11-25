@@ -106,7 +106,7 @@ def test_revoked_content_only_citation_hides_records_without_mutating_verified_i
     original = copy.deepcopy(items)
 
     class Store:
-        def report(self, report_id):
+        def report_view(self, report_id, module_keys=None):
             return {
                 "project_id": 10, "source_snapshot": [], "reference_snapshot": [],
                 "runtime_version": RUNTIME_VERSION,

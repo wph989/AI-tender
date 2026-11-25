@@ -1,34 +1,14 @@
 import type { ApiSchemas } from "@/types/api.generated";
 
-export type QualityStatus = "self_check_passed" | "needs_review" | "needs_input" | "unknown";
-export interface QualityIssue {
-  scope?: AnalysisScope;
-  issue_id: string; kind: string; action: "read" | "repair" | "provide_input";
-  topic: string; topics?: string[]; detail: string; target: string;
-}
+export type QualityStatus = NonNullable<ApiSchemas["AnalysisModuleResponse"]["quality_status"]>;
+export type QualityIssue = ApiSchemas["AnalysisQualityIssueResponse"];
 export const QUALITY_LABELS: Record<QualityStatus, string> = {
   self_check_passed: "机器自查通过", needs_review: "结论待复核",
   needs_input: "资料待核对", unknown: "质量未记录",
 };
 
 /** 引用保留全部来源身份，避免切文件或重新解析后误用同名锚点。 */
-export interface Citation {
-  excerpts?: string[];
-  excerpt_status?: "matched" | "block_only";
-  source_id: number;
-  collection_id: number;
-  project_id: number;
-  project_file_id: number;
-  version_id: number;
-  parse_run_id: number;
-  element_id: number;
-  anchor: string;
-  page_no: number;
-  bbox: [number, number, number, number] | null;
-  file_name: string;
-  purpose: string;
-  quote: string;
-}
+export type Citation = ApiSchemas["AnalysisEvidenceResponse"];
 
 export interface FieldValue {
   value: string;
@@ -94,190 +74,32 @@ export interface KnowledgeCollection {
   embedding_model?: string | null;
 }
 
-export interface AnalysisModule {
-  input_changed?: boolean;
-  quality_status?: QualityStatus;
-  quality_issues?: QualityIssue[];
-  id: number;
-  module_key: string;
-  title: string;
-  status: string;
+/** 专题界面只增加正文加载状态；接口字段直接跟随生成契约。 */
+export type AnalysisModule = ApiSchemas["AnalysisModuleResponse"] & {
   items: AnalysisField[];
-  error_message: string | null;
-  runs?: AgentRun[];
-  research_summary?: string;
-  research_gaps?: { key: string; detail: string }[];
   records_loading?: boolean;
   records_error?: string;
-  progress?: AgentProgress;
-}
-
-export type AgentProgress = ApiSchemas["AgentProgressResponse"];
-
-export interface AgentRun {
-  mode?: "restart" | "resume";
-  quality_status?: QualityStatus;
-  id: number;
-  attempt: number;
-  status: string;
-  thread_id: string;
-  started_at: string | null;
-  deadline_at: string | null;
-  finished_at: string | null;
-  model_calls: number;
-  tool_calls: number;
-  successful_model_calls: number;
-  successful_tool_calls: number;
-  stop_reason?: { code: string; stage: string; message: string } | null;
-  prompt_tokens: number;
-  completion_tokens: number;
-  limits: { max_model_calls: number; max_tool_calls: number; timeout_seconds: number; max_output_tokens: number };
-  error_message: string | null;
-}
-
-export interface AnalysisReport {
-  quality_status?: QualityStatus;
-  canceling?: boolean;
-  id: number;
-  status: string;
-  category: string;
-  topics: string[];
-  created_at: string;
-  finished_at?: string | null;
-  data_schema_version?: string | null;
-  stale: boolean;
-  error_message: string | null;
-  modules: AnalysisModule[];
-  runtime_version?: string;
-  coverage: {
-    mode?: string;
-    partial?: boolean;
-    files?: { source_id: number; name: string; state: string }[];
-  };
-}
-
-/** 详情只传状态；正文在独立记录读取完成后组装为 AnalysisReport。 */
-export type AnalysisReportDetail = Omit<AnalysisReport, "modules"> & {
-  modules: Omit<AnalysisModule, "items">[];
+  records_version?: string;
 };
 
-export interface AnalysisScope {
-  kind: "common" | "lots" | "unknown";
-  lot_ids: number[];
-  lot_refs: string[];
-}
+export type AgentProgress = ApiSchemas["AgentProgressResponse"];
+export type AgentRun = ApiSchemas["AgentRunResponse"];
+export type AnalysisReportDetail = ApiSchemas["AnalysisReportResponse"];
 
-export interface AnalysisReviewState {
-  human_review_status?: "pending" | "confirmed" | "corrected" | "rejected" | "outdated";
-  human_review?: {
-    id: number;
-    actor: string;
-    decision: "confirmed" | "corrected" | "rejected";
-    note: string;
-    corrected_text: string | null;
-    created_at: string;
-  } | null;
-}
+/** 独立记录读取完成后补上展示条目，不再维护另一套报告字段。 */
+export type AnalysisReport = Omit<AnalysisReportDetail, "modules"> & {
+  modules: AnalysisModule[];
+};
 
-/** 正式业务记录与展示字段分离，编制任务固定快照和记录身份。 */
-export interface BusinessRecord extends AnalysisReviewState {
-  id: string;
-  key: string;
-  kind: "fact" | "requirement" | "lot" | "format_node" | "relation";
-  title: string;
-  text: string;
-  content?: Record<string, string | string[]>;
-  scope: AnalysisScope;
-  structuring: "complete" | "partial";
-  citations: Citation[];
-  module_key: string;
-  verification: "supported" | "unsupported" | "unavailable";
-  group: string;
-  sort_order: number;
-  parent_id?: string | null;
-  parent_key?: string | null;
-  parent_path?: string[];
-  node_type?: "group" | "section" | null;
-  requirement_ids?: string[];
-  requirement_keys?: string[];
-  predicate?: "supersedes" | "conflicts" | "requires" | "contains" | null;
-  subject_id?: string;
-  object_id?: string;
-  subject_key?: string;
-  object_key?: string;
-  effective_status?: "active" | "unknown";
-  superseded_in?: AnalysisScope[];
-  conflicts_in?: AnalysisScope[];
-}
-
-/** 维度原始业务记录未解析标段目录，引用通过独立证据集合关联。 */
-export interface ModuleRecord extends Omit<BusinessRecord, "citations" | "scope"> {
-  evidence_ids: string[];
-  content_evidence?: Record<string, string[][]>;
-  scope: Omit<AnalysisScope, "lot_ids">;
-}
-
-export interface ModuleRecords {
-  quality_status?: QualityStatus;
-  quality_issues?: QualityIssue[];
-  // 协议版本与执行状态由服务端提供，界面从独立记录组装正文。
-  schema_version: string;
-  module_key: string;
-  status: string;
-  records: ModuleRecord[];
-  evidence: Record<string, Citation>;
-  output_schema: {
-    version: string;
-    sections: { title: string; layout: AnalysisOutput["layout"]; columns: string[]; title_column?: string }[];
-  };
-}
-
-export interface AnalysisGap {
-  issue_id?: string;
-  action?: "read" | "repair" | "provide_input";
-  code: string;
-  detail: string;
-  scope: AnalysisScope;
-  record_id?: string;
-  key?: string;
-  topic?: string;
-  module_key?: string;
-}
-
-export interface AnalysisDataset {
-  quality_status?: QualityStatus;
-  quality_issues?: QualityIssue[];
-  schema_version: string;
-  lots: (BusinessRecord & { lot_id: number; code: string | null; aliases: string[] })[];
-  facts: BusinessRecord[];
-  requirements: BusinessRecord[];
-  format_nodes: BusinessRecord[];
-  relations: BusinessRecord[];
-  gaps: AnalysisGap[];
-  readiness: "usable" | "partial" | "unavailable";
-}
-
-export interface AnalysisDataSnapshot {
-  report_id: number;
-  snapshot_id: number;
-  revision: number;
-  schema_version: string;
-  stale: boolean;
-  data: AnalysisDataset;
-}
-
-export interface AnalysisContext extends Omit<AnalysisDataset, "lots" | "schema_version"> {
-  schema_version: string;
-  snapshot_id: number;
-  purpose: "outline" | "content" | "check";
-  lot_id: number | null;
-  unresolved: BusinessRecord[];
-  requirement_manifest: string[];
-  total_requirements: number;
-  next_offset: number | null;
-  references: { purpose: "company" | "history"; text: string; citation: Citation }[];
-  reference_warning?: string | null;
-}
+export type AnalysisScope = ApiSchemas["AnalysisScopeResponse"];
+export type BusinessRecord = ApiSchemas["AnalysisRecordResponse"];
+export type ModuleRecord = ApiSchemas["AnalysisModuleRecordResponse"];
+export type ModuleRecords = ApiSchemas["ModuleRecordsResponse"];
+export type ReportRecords = ApiSchemas["ReportRecordsResponse"];
+export type AnalysisGap = ApiSchemas["AnalysisGapResponse"];
+export type AnalysisDataset = ApiSchemas["AnalysisDatasetResponse"];
+export type AnalysisDataSnapshot = ApiSchemas["AnalysisDataResponse"];
+export type AnalysisContext = ApiSchemas["AnalysisContextResponse"];
 
 export interface AnalysisStatus {
   analysis_category: string | null;
