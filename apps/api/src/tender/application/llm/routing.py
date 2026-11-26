@@ -13,7 +13,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from uuid import uuid4
 
-from tender.core.error_details import error_detail
+from tender.core.error_details import MAX_ERROR_LENGTH, error_detail, model_error_details
 from tender.core.logging import bind_context, get_logger
 from tender.domain.shared.errors import (
     InvalidModelOutput,
@@ -80,7 +80,7 @@ class RoutingModel:
         on_call: Callable[[CallRecord], None],
         *,
         failover_limit: int = 3,
-        max_total_requests: int = 6,
+        load_route: Callable[[], tuple[Sequence[ModelCandidate], int]] | None = None,
         recheck: Callable[[ModelCandidate], ModelCandidate | None] | None = None,
         reserve: Callable[[CallRecord], None] | None = None,
         retry_base_seconds: float = 1,
@@ -97,7 +97,8 @@ class RoutingModel:
         self._feature_key, self._purpose = feature_key, purpose
         self._candidates = tuple(candidates)
         self._gateway, self._on_call = gateway, on_call
-        self._failover_limit, self._max_total = failover_limit, max_total_requests
+        self._failover_limit = failover_limit
+        self._load_route = load_route
         self._recheck, self._reserve = recheck, reserve
         self._retry_base = retry_base_seconds
         self._before_request = before_request
@@ -108,6 +109,7 @@ class RoutingModel:
         self._remaining_seconds = remaining_seconds
         self._rate_backoff = rate_limit_backoff_seconds
         self._rate_max_wait = rate_limit_max_wait_seconds
+        self._rate_waited = 0.0
         self._invocation_store = invocation_store
         self._before_call = before_call
 
@@ -205,32 +207,44 @@ class RoutingModel:
             "prompt": prompt, "chat_request": chat_request,
         })
         prompt, chat_request = original_input["prompt"], original_input["chat_request"]
+        # 同一专题复用路由器，每个新窗口仍从已保存的功能绑定创建候选。
+        candidates, failover_limit = (
+            await asyncio.to_thread(self._load_route) if self._load_route
+            else (self._candidates, self._failover_limit)
+        )
         # 冻结非密钥执行策略；恢复时仍重查启用状态和凭证，但不能换取新的重试额度。
         window.setdefault("policy", {
-            "failover_limit": self._failover_limit, "max_total": self._max_total,
+            "failover_limit": failover_limit,
             "rate_max_wait": self._rate_max_wait, "rate_backoff": self._rate_backoff,
             "candidates": {str(c.registry_model_id or c.model): {
                 "extra_retries": c.extra_retries, "timeout": c.timeout,
                 "total_timeout": c.total_timeout,
-            } for c in self._candidates},
+            } for c in candidates},
         })
 
         async def persist():
             if self._invocation_store:
-                writing = asyncio.create_task(asyncio.to_thread(
+                await self._finish_write(asyncio.to_thread(
                     self._invocation_store.save_invocation, key, window,
                 ))
-                try:
-                    await asyncio.shield(writing)
-                except asyncio.CancelledError:
-                    # 不能让旧写入在恢复后的新窗口之后落库。
-                    while not writing.done():
-                        with suppress(asyncio.CancelledError):
-                            await asyncio.shield(writing)
-                    writing.result()
-                    raise
 
-        await persist()
+        async def settle_failure(
+            record: CallRecord, failure: dict, cooldown: tuple[ModelCandidate, float] | None,
+        ) -> None:
+            # 先结算真实回执，再保存摘要；取消不能停在两次写入之间。
+            await self._record_call(record, records)
+            window.setdefault("failures", []).append(failure)
+            await persist()
+            if cooldown is not None and self._defer_provider:
+                await asyncio.to_thread(self._defer_provider, *cooldown)
+
+        if self._invocation_store:
+            # 跨窗口累计等待经运行账读取，Worker 重新领取运行后也沿用已用额度。
+            self._rate_waited = await asyncio.to_thread(
+                self._invocation_store.other_invocation_wait, key,
+            ) + window.get("rate_waited", sum(
+                state.get("waited", 0.0) for state in window.get("rate_state", {}).values()
+            ))
         records: list[CallRecord] = []
         started = time.monotonic()
         status = "error"
@@ -239,7 +253,8 @@ class RoutingModel:
         with bind_context(invocation_id=invocation_id):
             try:
                 completion = await self._invoke(
-                    prompt, chat_request, invocation_id, records, window, persist,
+                    prompt, chat_request, invocation_id, records,
+                    window, persist, candidates, settle_failure,
                 )
                 status = "ok"
                 return completion
@@ -283,6 +298,19 @@ class RoutingModel:
         records.append(record)
         await asyncio.to_thread(self._on_call, record)
 
+    @staticmethod
+    async def _finish_write(operation: Awaitable[None]) -> None:
+        writing = asyncio.ensure_future(operation)
+        try:
+            await asyncio.shield(writing)
+        except asyncio.CancelledError:
+            # 已开始的写入必须先落定，避免旧执行者释放所有权后仍在写账。
+            while not writing.done():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.shield(writing)
+            writing.result()
+            raise
+
     async def _reserve_call(self, record: CallRecord, records: list[CallRecord]) -> None:
         if self._reserve is None and self._before_call is None:
             return
@@ -319,9 +347,9 @@ class RoutingModel:
     async def _invoke(
         self, prompt: str, chat_request: dict | None, invocation_id: str,
         records: list[CallRecord],
-        window: dict, persist,
+        window: dict, persist, candidates: Sequence[ModelCandidate], settle_failure,
     ) -> Completion:
-        if not self._candidates:
+        if not candidates and not window.get("candidate_order"):
             raise ModelCallFailed(
                 f"功能 {self._feature_key} 没有可用模型，请在模型管理中配置并绑定"
             )
@@ -333,13 +361,13 @@ class RoutingModel:
         attempted_models = {r["model"] for r in window["requests"]}
         candidate_count = len(attempted_models)
         first_error: TenderError | None = None
-        unavailable_only = True
+        unavailable_only = all(f.get("unavailable", True) for f in window.get("failures", []))
         policy = window["policy"]
-        failover_limit, max_total = policy["failover_limit"], policy["max_total"]
+        failover_limit = policy["failover_limit"]
         candidates = tuple(replace(c, **policy["candidates"][str(c.registry_model_id or c.model)])
-                           for c in self._candidates
+                           for c in candidates
                            if str(c.registry_model_id or c.model) in policy["candidates"])
-        if failover_limit == 1:
+        if failover_limit == 1 and "candidate_order" not in window:
             # 禁止降级时先固定最高优先级的启用模型；限流排序和429重试不能偷换成后备模型。
             # 管理员停用的候选仍可跳过，但选定后只等待/重试该模型。
             selected = []
@@ -348,14 +376,17 @@ class RoutingModel:
                     selected.append(candidate)
                     break
             candidates = tuple(selected)
-        # 允许降级时先用可用供应商；全在冷却时等待最早恢复者，等待不占请求预算。
-        delays = {candidate: await self._remaining(candidate) for candidate in candidates}
-        candidates = sorted(candidates, key=delays.__getitem__)
-        # 首次选定的候选顺序随调用保存，恢复不能因冷却排序变化重新获得候选额度。
+        # 仓储已按用户保存的优先级排序；冷却只影响能否发送，不重排候选。
+        # 顺序随调用保存，恢复不能换取新的候选或重试额度。
         order = window.setdefault("candidate_order", [c.registry_model_id or c.model
                                                       for c in candidates])
-        candidates = sorted(candidates, key=lambda c: order.index(c.registry_model_id or c.model))
+        by_key = {c.registry_model_id or c.model: c for c in candidates}
+        candidates = tuple(by_key[model_key] for model_key in order if model_key in by_key)
         await persist()
+        rate_waited = window.get("rate_waited", sum(
+            state.get("waited", 0.0) for state in window.get("rate_state", {}).values()
+        ))
+        blocked_by_time = False
         for position, snapshot in enumerate(candidates):
             model_key = snapshot.registry_model_id or snapshot.model
             if model_key in window.get("finished_candidates", []):
@@ -366,29 +397,57 @@ class RoutingModel:
             feedback = window.get("feedback", {}).get(str(model_key), {})
             request_prompt = feedback.get("prompt", prompt)
             native_request = feedback.get("chat_request", chat_request)
-            rate_state = window.setdefault("rate_state", {}).setdefault(
-                str(model_key), {"waited": 0.0, "round": 0, "until": 0.0},
-            )
-            rate_waited, rate_round = rate_state["waited"], rate_state["round"]
+            rate_state = window.setdefault("rate_state", {}).setdefault(str(model_key), {})
             retry = sum(r["model"] == model_key for r in window["requests"])
             while retry <= snapshot.extra_retries:
-                if request_count >= max_total or time.monotonic() >= deadline:
-                    raise budget_error("模型调用已达到总请求次数或模块时间上限，请查看调用记录")
-                delay = max(await self._remaining(snapshot), rate_state["until"] - time.time())
-                if delay and await self._has_available(candidates[position + 1 :]):
+                if time.monotonic() >= deadline:
+                    raise budget_error(self._failure_message(
+                        window, "模块总时限已到，不能继续请求模型",
+                    ))
+                delay = max(
+                    await self._remaining(snapshot), rate_state.get("until", 0.0) - time.time(),
+                )
+                if (delay and not attempted
+                        and await self._has_available(candidates[position + 1 :])):
+                    window.setdefault("skipped", {})[str(model_key)] = (
+                        f"{snapshot.display_name}：供应商仍在限流冷却，剩余{delay:.1f}秒"
+                    )
+                    await persist()
                     break
                 while delay > 0:
-                    if time.monotonic() + delay >= deadline:
-                        raise budget_error("模型调用时间预算不足以等待供应商限流恢复")
+                    module_remaining = max(0, deadline - time.monotonic())
+                    remaining_wait = max(0, policy["rate_max_wait"] - self._rate_waited)
+                    if delay > remaining_wait or delay >= module_remaining:
+                        blocked_by_time |= delay >= module_remaining
+                        window.setdefault("skipped", {})[str(model_key)] = (
+                            f"{snapshot.display_name}：上游限流需等待{delay:.1f}秒，"
+                            f"模块剩余{module_remaining:.1f}秒，"
+                            f"限流等待额度剩余{remaining_wait:.1f}秒"
+                        )
+                        break
                     # 短等待便于取消；跨worker新收到的429可以继续延长当前等待。
-                    await asyncio.sleep(min(delay, 1))
-                    delay = max(await self._remaining(snapshot), rate_state["until"] - time.time())
+                    pause = min(delay, 1)
+                    rate_waited += pause
+                    self._rate_waited += pause
+                    if self._invocation_store:
+                        window["rate_waited"] = rate_waited
+                        await persist()
+                    await asyncio.sleep(pause)
+                    delay = max(
+                        await self._remaining(snapshot), rate_state.get("until", 0.0) - time.time(),
+                    )
+                if delay > 0:
+                    break
                 # 每次发送重新检查启用和凭证；配置读取失败会停止，不能绕过管理页面。
                 candidate = (
                     await asyncio.to_thread(self._recheck, snapshot) if self._recheck else snapshot
                 )
                 if candidate is None:
                     break
+                # 启用状态和凭证实时核验，执行参数仍使用本次调用冻结的模型配置。
+                candidate = replace(candidate, timeout=snapshot.timeout,
+                                    total_timeout=snapshot.total_timeout,
+                                    extra_retries=snapshot.extra_retries)
                 # 每个实际请求（含换源、格式纠正、摘要）都先预占模块持久预算。
                 if self._before_request:
                     await self._before_request()
@@ -449,55 +508,48 @@ class RoutingModel:
                         exc = ModelUnavailable("模块总时间预算已耗尽，供应商执行结果未知")
                     unavailable = isinstance(exc, ModelUnavailable)
                     unavailable_only = unavailable_only and unavailable
-                    await self._record_call(
-                        replace(
-                            record,
-                            status="unknown"
-                            if exc.http_status is None and unavailable
-                            else "error",
-                            http_status=exc.http_status,
-                            latency_ms=int((time.monotonic() - started) * 1000),
-                            prompt_tokens=getattr(exc, "prompt_tokens", None),
-                            completion_tokens=getattr(exc, "completion_tokens", None),
-                            error_message=error_detail(str(exc), api_key=candidate.api_key),
-                        ), records,
+                    # 同一调用恢复后仍能展示此前每个模型的真实失败，避免被最后一次错误覆盖。
+                    failure = {
+                        "model_key": str(model_key), "model": candidate.display_name,
+                        "provider": candidate.provider_name, "ordinal": request_count,
+                        "unavailable": unavailable,
+                        "message": error_detail(str(exc), api_key=candidate.api_key),
+                    }
+                    failed_record = replace(
+                        record,
+                        status="unknown" if exc.http_status is None and unavailable else "error",
+                        http_status=exc.http_status,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        prompt_tokens=getattr(exc, "prompt_tokens", None),
+                        completion_tokens=getattr(exc, "completion_tokens", None),
+                        error_message=failure["message"],
                     )
-                    first_error = first_error or exc
+
+                    cooldown = None
                     if exc.http_status == 429:
                         # 等待不增加尝试；每次真实429仍使用原窗口的请求及候选重试额度。
                         hint = float(getattr(exc, "retry_after", 0) or 0)
                         # 首次信任供应商给的恢复时间；重复限流说明它偏小，按倍数递增。
+                        rate_round = rate_state.get("round", 0)
                         escalated = min(
                             policy["rate_backoff"] * 2**min(rate_round, 5), policy["rate_max_wait"]
                         )
                         delay = hint if rate_round == 0 and hint else max(hint, escalated)
-                        remaining_wait = policy["rate_max_wait"] - rate_waited
-                        if remaining_wait <= 0:
-                            # 等待额度用完就停止重发，落回原有不可用收尾以保留上游详情；
-                            # 调用方按「可补跑」处理，不会把已核实成果丢掉。
-                            break
-                        if time.monotonic() + min(delay, remaining_wait) >= deadline:
-                            if await self._has_available(candidates[position + 1 :]):
-                                break
-                            raise budget_error(
-                                "模型调用时间预算不足以等待供应商限流恢复"
-                            ) from exc
-                        delay = min(delay, remaining_wait)
-                        rate_waited += delay
-                        rate_round += 1
-                        rate_state.update(waited=rate_waited, round=rate_round,
-                                          until=time.time() + delay)
-                        await persist()
                         key = (
                             candidate.provider_id
                             if candidate.provider_id is not None
                             else candidate.base_url
                         )
-                        self._rate_limited_until[key] = time.monotonic() + delay
-                        if self._defer_provider:
-                            await asyncio.to_thread(self._defer_provider, candidate, delay)
-                        if await self._has_available(candidates[position + 1 :]):
-                            break
+                        # 最后一次失败也登记供应商冷却，切换同供应商模型不能绕过429。
+                        self._rate_limited_until[key] = max(
+                            self._rate_limited_until.get(key, 0.0), time.monotonic() + delay,
+                        )
+                        rate_state.update(round=rate_round + 1, until=time.time() + delay)
+                        cooldown = (candidate, delay)
+
+                    await self._finish_write(settle_failure(failed_record, failure, cooldown))
+                    first_error = first_error or exc
+                    if exc.http_status == 429:
                         # 每次真实发送占一个尝试和候选重试；等待本身不占次数。
                         retry += 1
                         continue
@@ -510,10 +562,9 @@ class RoutingModel:
                         isinstance(exc, InvalidModelOutput)
                         and not isinstance(exc, ModelOutputTruncated)
                         and retry < snapshot.extra_retries
-                        and request_count < max_total
                     ):
                         # 在换候选前纠正已收到的坏格式，避免主模型的可修正问题被后备网络故障掩盖。
-                        # 纠正也计入原有总次数和时间预算，不重发未知结果或明确拒绝。
+                        # 纠正也计入该模型重试次数和模块预算，不重发未知结果或明确拒绝。
                         detail = (error_detail(str(exc), api_key=candidate.api_key)
                                   or "模型响应不符合当前协议")[:1800]
                         request_prompt = prompt + (
@@ -548,7 +599,6 @@ class RoutingModel:
                     if (
                         unavailable
                         and retry < snapshot.extra_retries
-                        and request_count < max_total
                     ):
                         delay = max(
                             random.uniform(0, min(30, self._retry_base * 2**retry)),
@@ -557,7 +607,13 @@ class RoutingModel:
                         if time.monotonic() + delay >= deadline:
                             if await self._has_available(candidates[position + 1 :]):
                                 break
-                            raise budget_error("模型调用时间预算不足以再次请求") from exc
+                            raise budget_error(
+                                self._failure_message(
+                                    window,
+                                    f"{candidate.display_name}：重试需等待{delay:.1f}秒，模块剩余"
+                                    f"{max(0, deadline - time.monotonic()):.1f}秒",
+                                )
+                            ) from exc
                         await asyncio.sleep(delay)
                         retry += 1
                         continue
@@ -585,21 +641,24 @@ class RoutingModel:
             await persist()
         # 首候选的渠道故障不能掩盖后备的余额／权限错误；只使用已脱敏的调用账摘要。
         # 同模型多次重试按原因去重，避免前端堆积相同堆栈或回显凭证。
-        failures = list(dict.fromkeys(
-            (record.model_name_snapshot, record.error_message)
-            for record in records if record.error_message
-        ))
-        if len({name for name, _ in failures}) > 1:
-            message = "所有已尝试模型均未完成请求：\n" + "\n".join(
-                f"{name}：{detail}" for name, detail in failures
-            )
-        else:
-            message = (failures[-1][1] if failures else
-                       "当前模型均已停用或不可调用")
+        message = self._failure_message(window) or "配置的模型在请求前已停用或不再可调用"
         message = error_detail(message) or "当前模型均不可调用"
-        if unavailable_only and first_error:
+        if blocked_by_time and unavailable_only:
+            raise budget_error(message)
+        if unavailable_only and (first_error or window.get("failures") or window.get("skipped")):
             raise ModelUnavailable(message)
         raise ModelCallFailed(message)
+
+    @staticmethod
+    def _failure_message(window: dict, reason: str = "") -> str:
+        notes = [*window.get("skipped", {}).values(), reason]
+        notes = [note for note in notes if note]
+        reserved = sum(len(note) + 2 for note in notes)
+        failures = model_error_details(
+            window.get("failures", []), limit=MAX_ERROR_LENGTH - reserved,
+        )
+        details = [failures, *notes]
+        return "\n\n".join(detail for detail in details if detail)
 
     async def aclose(self) -> None:
         for client in self._clients.values():

@@ -17,7 +17,9 @@ def test_restart_discards_all_analysis_state_for_every_terminal_status(status, m
     previous = {"staged_items": [{"id": "old"}],
                 "research": {"seen": {"old": {}}, "tool_calls": 100}, "draft": {"fields": []}}
     tx = _RetryTx([{"id": 9, "status": status}], previous)
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
+    service = AnalysisService(
+        _RetryStore(tx), 1, Mock(), Mock(public_sources=Mock(return_value=[])),
+    )
     service.retry_report(3, module_keys=["project_basic_info_parsing"],
                          max_output_tokens=None, timeout_seconds=None, mode=mode)
     assert tx.pending == [9]
@@ -29,7 +31,9 @@ def test_confirmed_missing_input_does_not_restart_on_the_same_materials():
     tx = _RetryTx([{"id": 9, "status": "completed", "business_data": {
         "quality_status": "needs_input", "quality_input_signature": source_signature([]),
     }}], {})
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
+    service = AnalysisService(
+        _RetryStore(tx), 1, Mock(), Mock(public_sources=Mock(return_value=[])),
+    )
     original = service.report_row(3) | {"source_snapshot": []}
     service.report_row = Mock(return_value=original)
     service.analysis_status = Mock(return_value={"sources": []})
@@ -175,7 +179,9 @@ def test_resume_retains_unresolved_issue_for_same_agent_without_stage_switch():
         "detail": "需补读起算点", "action": "read"}], "issue")
     tx = _RetryTx([{"id": 9, "status": "completed", "business_data": {
         "quality_status": "needs_review"}}], book.state)
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
+    service = AnalysisService(
+        _RetryStore(tx), 1, Mock(), Mock(public_sources=Mock(return_value=[])),
+    )
     service.retry_report(3, module_keys=[], max_output_tokens=None,
                          timeout_seconds=None, mode="resume")
     carried = tx.inserted[0]["state"]

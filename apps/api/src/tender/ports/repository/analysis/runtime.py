@@ -12,8 +12,10 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from tender.ports.llm.chat import ModelInvocationStore
 
-class AgentRunStore(Protocol):
+
+class AgentRunStore(ModelInvocationStore, Protocol):
     """一次 ``agent_module_run`` 的状态机入口；由 ``KnowledgeStore.agent_run_store`` 取得。"""
 
     run: dict[str, Any]
@@ -42,10 +44,6 @@ class AgentRunStore(Protocol):
     def reserve(self, kind: str, call_key: str | None = None) -> str:
         """预占一次模型或工具调用；预算耗尽时抛 ``ValueError``。``kind`` 取 model/tool。"""
         ...
-
-    def load_invocation(self, key: str) -> dict: ...
-
-    def save_invocation(self, key: str, value: dict) -> None: ...
 
     def record_call(self, record: dict[str, Any]) -> None:
         """累计一次模型调用的 token 用量并记一条审计事件（``record`` 已序列化为字典）。"""

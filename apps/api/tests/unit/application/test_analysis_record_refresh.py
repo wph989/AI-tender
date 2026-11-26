@@ -15,10 +15,13 @@ from test_analysis_agent_workspace import approve
 from test_analysis_research import block, session
 
 from tender.application.analysis import drafts
+from tender.application.analysis.data import assemble_dataset
+from tender.application.analysis.data_store import accessible_data, snapshot_manifest
 from tender.application.analysis.drafts import DraftWorkspace
 from tender.application.analysis.service import AnalysisService
 from tender.application.analysis.skill_agent import WorkspaceMiddleware, build_skill_agent
 from tender.application.analysis.skills import skill_snapshot
+from tender.application.knowledge.content import source_signature
 from tender.application.shared.agent_model import RoutedAgentModel
 from tender.application.shared.errors import Conflict, NotFound
 from tender.domain.analysis.contract import FLOW_VERSION, FLOW_VERSION_KEY, RUNTIME_VERSION
@@ -128,9 +131,17 @@ class RecordStore:
 
     def report_view(self, report_id, module_keys=None):
         self.calls["report_view"] += 1
-        return {"project_id": 10, "runtime_version": RUNTIME_VERSION,
+        return {"id": report_id, "project_id": 10, "runtime_version": RUNTIME_VERSION,
+                "status": "completed", "category": "goods", "topics": [],
+                "lot_settings": [], "derived_lot_ids": [],
                 "source_snapshot": [self.source], "reference_snapshot": [],
                 "skill_snapshot": self.snapshot}
+
+    def analysis_settings(self, project_id):
+        return {"analysis_category": "goods", "analysis_topics": []}
+
+    def project_lots(self, project_id):
+        return []
 
     def report_module(self, report_id, module_key):
         return next(module for module in self.modules if module["module_key"] == module_key)
@@ -276,9 +287,6 @@ def test_latest_snapshot_check_reads_id_without_loading_full_data_twice(latest):
     store.snapshot_state = Mock(return_value=None)
     store.record_reviews = Mock(return_value={})
     app = AnalysisService(store, 1, Mock(), Mock())
-    app.get_report = Mock(return_value={
-        "id": 1, "project_id": 10, "status": "completed", "stale": False,
-    })
     if latest is None:
         with pytest.raises(Conflict) as error:
             app.get_analysis_data(1)
@@ -288,3 +296,111 @@ def test_latest_snapshot_check_reads_id_without_loading_full_data_twice(latest):
     store.data_snapshot.assert_called_once_with(1, None)
     store.latest_snapshot_id.assert_called_once_with(1)
     assert store.snapshot_state.call_count == int(latest == 1)
+
+
+def snapshot_reader():
+    store = RecordStore()
+    report = store.report_view(1) | {"skill_version": "fixture", "snapshot_pending": False}
+    modules = [{**module, "id": i, "title": module["module_key"]}
+               for i, module in enumerate(store.modules, 1)]
+    inputs = {key: report[key] for key in (
+        "runtime_version", "source_snapshot", "reference_snapshot", "category", "topics",
+        "lot_settings", "skill_version",
+    )}
+    snapshot = {
+        "report_id": 1, "id": 1, "revision": 1, "schema_version": "1",
+        "input_snapshot": inputs | {"module_input_signatures": {
+            module["module_key"]: source_signature([store.source]) for module in modules
+        }}, "data": assemble_dataset(modules, []),
+        "manifest_hash": snapshot_manifest(report, modules),
+    }
+    store.report_view = Mock(side_effect=lambda *args: copy.deepcopy(report))
+    store.data_snapshot = Mock(side_effect=lambda *args: copy.deepcopy(snapshot))
+    store.latest_snapshot_id = Mock(return_value=1)
+    store.snapshot_state = Mock(side_effect=lambda *args: copy.deepcopy(
+        report | {"modules": modules, "runs": []},
+    ))
+    store.record_reviews = Mock(return_value={})
+    # 正式数据应只读取自身所需的状态，页面摘要与展示运行账不参与这条路径。
+    store.report_module_summaries = Mock(side_effect=AssertionError("额外读取页面摘要"))
+    store.report_runs = Mock(side_effect=AssertionError("额外读取展示运行账"))
+    store.calls.clear()
+    return store, snapshot
+
+
+@pytest.mark.parametrize("context", [False, True])
+def test_formal_data_reads_inputs_once_without_page_projection_and_rechecks_access(context):
+    store, snapshot = snapshot_reader()
+    service = AnalysisService(store, 1, Mock(), Mock())
+    data = (service.context_data(1, snapshot)[1] if context
+            else service.get_analysis_data(1)["data"])
+    assert data["facts"] and store.calls["sources"] == 1
+    store.report_view.assert_called_once()
+    store.latest_snapshot_id.assert_called_once_with(1)
+    store.snapshot_state.assert_called_once_with(1)
+    assert store.data_snapshot.call_count == int(not context)
+    data["facts"][0]["content"]["内容"] = "修改展示正文"
+    assert snapshot["data"]["facts"][0]["content"]["内容"] != "修改展示正文"
+    store.revoked = True
+    if context:
+        with pytest.raises(Conflict) as caught:
+            service.context_data(1, snapshot)
+        assert caught.value.code == "source_unavailable"
+    else:
+        hidden = service.get_analysis_data(1)
+        assert hidden["stale"] and hidden["data"]["facts"] == []
+
+
+@pytest.mark.parametrize("context", [False, True])
+@pytest.mark.parametrize("during", ["snapshot_state", "record_reviews", "resolve"])
+def test_snapshot_hides_content_when_collection_is_unlinked_during_read(context, during):
+    store, snapshot = snapshot_reader()
+    read = getattr(store, during)
+    allowed = [store.source["collection_id"]]
+    store.collections_for_project = lambda project_id: allowed.copy()
+
+    def unlink_during_read(*args, **kwargs):
+        result = read(*args, **kwargs)
+        # 公司仍能读取原文，撤销项目与知识库的关联只能由项目授权校验发现。
+        allowed.clear()
+        return result
+
+    setattr(store, during, unlink_during_read)
+    service = AnalysisService(store, 1, Mock(), Mock())
+    if context:
+        with pytest.raises(Conflict) as failure:
+            service.context_data(1, snapshot)
+        assert failure.value.code == "source_unavailable"
+    else:
+        result = service.get_analysis_data(1)
+        assert result["stale"] and result["data"]["facts"] == []
+
+
+@pytest.mark.parametrize("mode", ["visible", "revoked", "mixed"])
+def test_snapshot_copies_only_final_visible_records_and_preserves_original(mode, monkeypatch):
+    store, snapshot = snapshot_reader()
+    data = snapshot["data"]
+    if mode == "revoked":
+        store.revoked = True
+    elif mode == "mixed":
+        data["facts"][0]["citations"] = [
+            ref | {"collection_id": 2} for ref in data["facts"][0]["citations"]
+        ]
+    original = copy.deepcopy(data)
+    copies = 0
+    copy_dict = copy._deepcopy_dispatch[dict]
+
+    def counted(value, memo):
+        nonlocal copies
+        if value.get("id") and value.get("content"):
+            copies += 1
+        return copy_dict(value, memo)
+
+    monkeypatch.setitem(copy._deepcopy_dispatch, dict, counted)
+    visible = accessible_data(store, data, [1])
+    expected = len(data["facts"]) - int(mode == "mixed") if mode != "revoked" else 0
+    assert len(visible["facts"]) == copies == expected
+    if visible["facts"]:
+        visible["facts"][0]["content"]["内容"] = "改写返回正文"
+        visible["facts"][0]["citations"][0]["quote"] = "改写返回引文"
+    assert data == original

@@ -2,7 +2,12 @@
 
 import pytest
 
-from tender.core.error_details import MAX_ERROR_LENGTH, error_detail, quota_window
+from tender.core.error_details import (
+    MAX_ERROR_LENGTH,
+    error_detail,
+    model_error_details,
+    quota_window,
+)
 
 
 @pytest.mark.parametrize("body", [
@@ -31,6 +36,20 @@ def test_long_body_keeps_more_than_500_characters_and_marks_truncation():
     assert len(result) == MAX_ERROR_LENGTH
     assert result.endswith("[上游响应过长，已截断]")
     assert error_detail(result) == result
+
+
+def test_long_model_error_leaves_room_for_other_models_and_failure_reasons():
+    failures = [
+        {"model_key": "a", "model": "A", "message": "HTTP 503\n" + "x" * MAX_ERROR_LENGTH},
+        {"model_key": "a", "model": "A", "message": "有效增量间隔超时"},
+        {"model_key": "b", "model": "B", "message": "HTTP 403 password=fixture-secret"},
+    ]
+    result = error_detail(model_error_details(failures))
+    assert len(result) <= MAX_ERROR_LENGTH
+    assert "A（本次失败2次）" in result and "HTTP 503" in result
+    assert "有效增量间隔超时" in result
+    assert "B（本次失败1次）" in result and "HTTP 403" in result
+    assert "fixture-secret" not in result and "已截断" in result
 
 
 @pytest.mark.parametrize(("body", "seconds"), [

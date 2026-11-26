@@ -5,12 +5,16 @@ from unittest.mock import Mock
 
 from tender.application.analysis.service import AnalysisService
 from tender.application.analysis.skills import MODULES
+from tender.application.knowledge.content import source_signature
 from tender.domain.analysis.contract import RUNTIME_VERSION
 
 
 class _RetryTx:
     def __init__(self, rows, previous):
-        self.rows, self.previous = rows, previous
+        self.rows, self.previous = rows, copy.deepcopy(previous)
+        # 真实执行入口冻结输入签名；默认夹具使用空来源，不能靠缺字段跳过补跑核验。
+        if self.previous:
+            self.previous.setdefault("quality_input_signature", source_signature([]))
         self.retry_call = None
         self.pending = None
         self.inserted = []
@@ -69,7 +73,24 @@ class _RetryStore:
             "runtime_version": RUNTIME_VERSION,
             "skill_snapshot": {"__analysis_flow_version__": "skill-agent-v1"},
             "coverage": {"mode": "agent_research"},
+            "source_snapshot": [], "reference_snapshot": [],
+            "category": "goods", "topics": [], "lot_settings": [], "derived_lot_ids": [],
         }
+
+    def analysis_settings(self, project_id):
+        return {"analysis_category": "goods", "analysis_topics": []}
+
+    def project_lots(self, project_id):
+        return []
+
+    def analysis_reports(self, project_id):
+        return []
+
+    def sources(self, collection_ids):
+        return []
+
+    def collections_for_project(self, project_id):
+        return []
 
     def transaction(self):
         return self.tx
@@ -85,7 +106,9 @@ def test_partial_report_retry_selects_partial_modules():
     approve(book, saved(book))
     previous = copy.deepcopy(book.state)
     tx = _RetryTx([{"id": 9, "status": "partial"}], previous)
-    service = AnalysisService(_RetryStore(tx), 1, Mock(), Mock())
+    service = AnalysisService(
+        _RetryStore(tx), 1, Mock(), Mock(public_sources=Mock(return_value=[])),
+    )
     result = service.retry_report(
         3, module_keys=[], max_output_tokens=None, timeout_seconds=None
     )

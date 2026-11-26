@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import UploadFile
+from http_client import api_request
 from sqlalchemy import text
 from test_knowledge_flow import add_source
 from test_llm_management import env as env
@@ -21,7 +22,6 @@ from tender.api.knowledge import routes as knowledge
 from tender.api.llm import routes as llm
 from tender.api.projects import files as project_files
 from tender.api.projects import routes as projects
-from tender.api.shared.errors import ApiProblem
 from tender.application.knowledge.content import encode
 from tender.application.knowledge.retrieval import retrieve_chunks
 from tender.application.llm.profiles import FEATURE_FIELDS, MODEL_FIELDS
@@ -63,17 +63,28 @@ def test_numeric_rules_drive_api_metadata_and_database_limits(runtime):
     assert entries["analysis.max_model_calls"]["minimum"] == 1
     assert "maximum" not in entries["analysis.max_model_calls"]
     assert "preprocess.denoise" not in entries
-    with pytest.raises(ApiProblem):
-        release(request, {"preprocess.denoise": False})
-    with pytest.raises(ApiProblem):
-        release(request, {"job.poll.max_interval_ms": 1})
+    response = api_request(
+        request,
+        config.router,
+        'POST',
+        '/api/v1/config/releases',
+        payload=config.ReleaseCreate(values={'preprocess.denoise': False}),
+    )
+    assert response.status_code == 400
+    response = api_request(
+        request,
+        config.router,
+        'POST',
+        '/api/v1/config/releases',
+        payload=config.ReleaseCreate(values={'job.poll.max_interval_ms': 1}),
+    )
+    assert response.status_code == 400
     p = provider(request)
     m = model(request, p["id"], extra_retries=99, max_tokens=262144, timeout_seconds=1200.5)
     assert m["extra_retries"] == 99
     feature = llm.update_feature("analysis", llm.FeaturePatch(
-        revision=1, failover_limit=10, max_total_requests=1000,
-    ), request)
-    assert feature["max_total_requests"] == 1000
+        revision=1, failover_limit=10, ), request)
+    assert "max_total_requests" not in feature
     assert "deadline_seconds" not in feature
     settings = llm.llm_settings()
     assert settings["model_fields"] == MODEL_FIELDS
@@ -98,8 +109,14 @@ def test_retrieval_config_metadata_bounds_and_migration_seed(runtime):
     }
     for patch in ({"analysis.similarity_threshold": 1.01},
                   {"analysis.similarity_threshold": -0.1}, {"analysis.max_search_results": 0}):
-        with pytest.raises(ApiProblem):
-            release(request, patch)
+        response = api_request(
+            request,
+            config.router,
+            'POST',
+            '/api/v1/config/releases',
+            payload=config.ReleaseCreate(values=patch),
+        )
+        assert response.status_code == 400
 
 
 
@@ -154,9 +171,15 @@ def test_upload_and_reparse_freeze_configured_defaults_with_explicit_override(ru
     active = connection.execute(
         text("SELECT id FROM config_release WHERE status='active'"),
     ).scalar_one()
-    with pytest.raises(ApiProblem) as denied:
-        config.activate_release(draft["id"], config.ActivateRequest(reason="准备发布"), request)
-    assert denied.value.status_code == 422
+    denied = api_request(
+        request,
+        config.router,
+        'POST',
+        f"/api/v1/config/releases/{draft['id']}/activate",
+        payload=config.ActivateRequest(reason='准备发布'),
+    )
+    assert denied.status_code >= 400
+    assert denied.status_code == 422
     assert config.get_release(draft["id"], request)["status"] == "draft"
     assert connection.execute(
         text("SELECT id FROM config_release WHERE status='active'"),

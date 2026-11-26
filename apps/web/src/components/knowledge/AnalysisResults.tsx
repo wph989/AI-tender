@@ -268,7 +268,7 @@ export function AnalysisResults({ report, reports, activeModuleId, activeItem, l
                   : isActive(run.status) ? "尚未结束" : "未记录"}</dd></div>
               </dl>
               {/* 每次尝试独立保留原因，后续成功不能覆盖此前失败或取消的信息。 */}
-                {(run.stop_reason?.message || run.error_message || ["failed", "canceled"].includes(run.status)) && <p className="run-error" data-status={run.status}>
+              {(run.stop_reason?.message || run.error_message || ["failed", "canceled"].includes(run.status)) && <p className="run-error" data-status={run.status}>
                 <strong>{run.status === "canceled" ? "停止原因" : run.status === "failed" ? "失败原因" : "运行说明"}：</strong>
                 {run.stop_reason?.message || run.error_message || "未记录"}
               </p>}

@@ -52,14 +52,19 @@ interface Props {
   profiles: AdapterProfile[];
   fields?: Record<string, ParameterSchema>;
   onChanged: () => Promise<void>;
+  requestedModel?: number | null;
+  onEditHandled?: () => void;
 }
 
-export function ModelsPanel({ providers, models, profiles, fields = {}, onChanged }: Props) {
+export function ModelsPanel({
+  providers, models, profiles, fields = {}, onChanged, requestedModel, onEditHandled,
+}: Props) {
   const { modal, message: toast } = App.useApp();
   const [dirty, setDirty] = useState(false);
   const [page, setPage] = useState(1);
   const [keyword, setKeyword] = useState("");
   const [editing, setEditing] = useState<number | "new" | null>(null);
+  const [focusTimeout, setFocusTimeout] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedTests, setSelectedTests] = useState<Record<number, string>>(
@@ -73,10 +78,24 @@ export function ModelsPanel({ providers, models, profiles, fields = {}, onChange
   useFeedback(error, notice);
   const closeEditor = useUnsavedChanges(dirty, busy);
   const edit = (id: number | "new") => {
+    setFocusTimeout(false);
     setDirty(false);
     setError(null);
     setEditing(id);
   };
+  useEffect(() => {
+    if (requestedModel == null || busy) return;
+    // 候选列表复用同一模型表单和版本校验，不维护第二份超时配置。
+    if (models.some((model) => model.id === requestedModel)) {
+      setDirty(false);
+      setError(null);
+      setFocusTimeout(true);
+      setEditing(requestedModel);
+    } else {
+      setError("模型已不存在，请刷新后重新选择。");
+    }
+    onEditHandled?.();
+  }, [requestedModel, busy, models, onEditHandled]);
   const run = async (task: () => Promise<void>) => {
     if (busy) return;
     setBusy(true);
@@ -295,6 +314,7 @@ export function ModelsPanel({ providers, models, profiles, fields = {}, onChange
             busy={busy}
             onSubmit={save}
             onDirty={() => setDirty(true)}
+            focusTimeout={focusTimeout}
           />
         )}
       </Modal>
@@ -548,6 +568,7 @@ function ModelForm({
   busy,
   onSubmit,
   onDirty,
+  focusTimeout = false,
 }: {
   providers: LlmProvider[];
   model: LlmModel | null;
@@ -556,8 +577,15 @@ function ModelForm({
   busy: boolean;
   onSubmit: (input: ModelInput | ModelPatchInput) => void;
   onDirty: () => void;
+  focusTimeout?: boolean;
 }) {
   const [form] = Form.useForm();
+  useEffect(() => {
+    if (!focusTimeout) return;
+    // 从候选列表进入时直接定位等待时间，复用现有表单的保存和冲突处理。
+    const frame = requestAnimationFrame(() => form.scrollToField("timeout_seconds", { focus: true }));
+    return () => cancelAnimationFrame(frame);
+  }, [focusTimeout, form]);
   const [revision] = useState(model?.revision);
   const [providerId, setProviderId] = useState(
     model?.provider_id ?? providers[0]?.id ?? 0,
@@ -744,7 +772,7 @@ function ModelForm({
       )}
       <Form.Item
         label={kind === "language" ? "响应间隔超时（秒）" : "超时（秒）"}
-        extra={kind === "language" ? "从发送请求开始等待首个有效增量，之后每收到正文、推理或工具参数增量重新计时；心跳不续期。" : undefined}
+        extra={kind === "language" ? "首个有效响应与后续正文、推理、工具参数的间隔均使用此时限，心跳不续期。保存后新发起的调用使用新值。" : undefined}
         name="timeout_seconds"
         rules={[
           {
@@ -759,7 +787,8 @@ function ModelForm({
           },
         ]}
       >
-        <InputNumber min={fields.timeout_seconds?.min} max={fields.timeout_seconds?.max} />
+        <InputNumber aria-label={kind === "language" ? "响应间隔超时（秒）" : "超时（秒）"}
+          min={fields.timeout_seconds?.min} max={fields.timeout_seconds?.max} />
       </Form.Item>
       {kind === "language" && (
         <Form.Item

@@ -13,6 +13,7 @@ import { Button, Tabs } from "antd";
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { Icon } from "@/components/Icon";
 import { PageShell } from "@/components/PageShell";
 import { ConfigWorkspace } from "@/components/config/ConfigCenter";
 import {
@@ -38,6 +39,8 @@ type LoadState = "loading" | "ready" | "error";
 
 export function ModelSettings() {
   const [section, setSection] = useState("providers");
+  const [requestedModel, setRequestedModel] = useState<number | null>(null);
+  const clearRequestedModel = useCallback(() => setRequestedModel(null), []);
   const [providers, setProviders] = useState<LlmProvider[]>([]);
   const [models, setModels] = useState<LlmModel[]>([]);
   const [features, setFeatures] = useState<LlmFeature[]>([]);
@@ -138,10 +141,19 @@ export function ModelSettings() {
 
       {state === "ready" && settings && (
         <Tabs
-          className="page-tabs"
+          className="page-tabs model-settings-tabs"
           activeKey={section}
           onChange={setSection}
           destroyOnHidden={false}
+          // 窄屏收起的标签支持鼠标点击打开，也能通过按钮名称定位。
+          more={{
+            trigger: ["click"],
+            icon: (
+              <span role="img" aria-label="更多标签">
+                <Icon name="more" size={16} />
+              </span>
+            ),
+          }}
           items={[
             {
               key: "providers",
@@ -167,6 +179,8 @@ export function ModelSettings() {
                   profiles={settings.adapter_profiles}
                   fields={settings.model_fields}
                   onChanged={reload}
+                  requestedModel={requestedModel}
+                  onEditHandled={clearRequestedModel}
                 />
               ),
             },
@@ -178,6 +192,10 @@ export function ModelSettings() {
                 <FeatureBindingsPanel
                   features={features}
                   models={models}
+                  onEditModel={(id) => {
+                    setRequestedModel(id);
+                    setSection("models");
+                  }}
                   fields={settings.feature_fields}
                   maximumBindings={settings.max_bindings}
                   onChanged={reload}

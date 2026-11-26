@@ -10,7 +10,6 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from tender.api.shared.common import engine
-from tender.api.shared.errors import as_api_problem
 from tender.api.shared.logging import throttle_access_log
 from tender.api.shared.responses import JobResponse
 from tender.application.jobs.service import JobService
@@ -77,16 +76,10 @@ async def job_events(job_id: str, request: Request) -> StreamingResponse:
 
 
 def _payload_or_raise(request: Request, job_id: str) -> dict[str, object]:
-    try:
-        return _service(request).payload(job_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).payload(job_id)
 
 
 @router.post("/{job_id}/cancel", response_model=JobResponse)
 def cancel_job(job_id: str, request: Request) -> dict[str, object]:
     """取消任务；已终态的任务返回 409，避免给出「取消成功」的假象。"""
-    try:
-        return _service(request).cancel(job_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).cancel(job_id)

@@ -709,6 +709,11 @@
   position: sticky; top: 0; z-index: 12; background: var(--color-slate-50); padding-top: 8px;
 }
 .app-viewport .nested-page-tabs.ant-tabs > .ant-tabs-nav { top: 54px; z-index: 11; }
+/* 允许标签容器收窄，避免焦点滚动带动整个页面；标签位置由组件维护。 */
+.app-viewport .model-settings-tabs > .ant-tabs-nav > .ant-tabs-nav-wrap {
+  min-inline-size: 0;
+  overflow: clip;
+}
 .project-tools { position: sticky; top: 0; z-index: 10; background: var(--color-slate-50); padding-block: 12px; }
 .project-grid, .knowledge-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 340px)); align-items: start; gap: 16px; }
 .project-summary-card { height: auto; }

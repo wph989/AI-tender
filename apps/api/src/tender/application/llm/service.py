@@ -81,7 +81,6 @@ class LlmService:
             "max_bindings": MAX_BINDINGS,
             "model_fields": MODEL_FIELDS,
             "feature_fields": FEATURE_FIELDS,
-            "default_max_total_requests": 6,
         }
 
     def list_tests(self, model_id: int | None, limit: int) -> dict[str, Any]:
@@ -638,7 +637,6 @@ class LlmService:
                 {
                     "key": key,
                     "revision": configured["revision"] if configured else 1,
-                    "max_total_requests": configured["max_total_requests"] if configured else 6,
                     "required_kind": required_kind(key),
                     "name": name,
                     "failover_limit": int(configured["failover_limit"])
@@ -665,7 +663,6 @@ class LlmService:
                 feature_key,
                 {
                     "failover_limit": values["failover_limit"],
-                    "max_total_requests": values["max_total_requests"],
                 },
             )
             transaction.bump_feature_revision(feature_key)
@@ -693,7 +690,7 @@ class LlmService:
             transaction.replace_feature_models(feature_key, rows)
             limits = {
                 key: values[key]
-                for key in ("failover_limit", "max_total_requests")
+                for key in ("failover_limit",)
                 if values.get(key) is not None
             }
             if limits:

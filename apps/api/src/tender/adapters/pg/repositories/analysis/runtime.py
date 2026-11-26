@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, Engine, func, insert, literal, select, text, update
+from sqlalchemy import Connection, Engine, case, func, insert, literal, select, text, update
 from sqlalchemy.dialects.postgresql import INTERVAL
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.pool import NullPool
@@ -392,7 +392,8 @@ class AgentRunStore:
             )).scalar_one_or_none() or {}
 
     def save_invocation(self, key: str, value: dict) -> None:
-        self.guard()
+        # 请求发送前由 reserve 复核时限。已返回的回执在到期后仍须在有效所有权内落库。
+        self.guard_settlement()
         with self.engine.begin() as conn:
             self._lock_owned(conn)
             statement = pg_insert(AgentModelInvocation).values(
@@ -401,6 +402,21 @@ class AgentRunStore:
             conn.execute(statement.on_conflict_do_update(
                 index_elements=["run_id", "call_key"], set_={"progress": value},
             ))
+
+    def other_invocation_wait(self, key: str) -> float:
+        # 只取等待字段，避免每次逻辑调用重读其余窗口的对话和模型回执。
+        progress = AgentModelInvocation.progress
+        with self.engine.connect() as conn:
+            rows = conn.execute(select(
+                progress["rate_waited"],
+                case((progress["rate_waited"].astext.is_(None), progress["rate_state"])),
+            ).where(
+                AgentModelInvocation.run_id == self.run["id"],
+                AgentModelInvocation.call_key != key,
+            )).all()
+        return sum(float(waited) if waited is not None else sum(
+            candidate.get("waited", 0.0) for candidate in (legacy or {}).values()
+        ) for waited, legacy in rows)
 
     def _lock_owned(self, conn: Connection) -> dict:
         row = conn.execute(select(AgentModuleRun).where(

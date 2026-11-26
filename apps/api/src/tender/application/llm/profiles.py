@@ -35,7 +35,6 @@ MODEL_FIELDS = {
 }
 FEATURE_FIELDS = {
     "failover_limit": number("故障转移级数", 1, MAX_FAILOVER_LIMIT, integer=True),
-    "max_total_requests": number("总请求上限", 1, integer=True),
 }
 
 

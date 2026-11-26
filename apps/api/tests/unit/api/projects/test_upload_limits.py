@@ -5,10 +5,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from tender.api.projects import files as routes
-from tender.api.shared.errors import ApiProblem
+from tender.api.shared.errors import install_error_handlers
 from tender.application.projects import files as policy
+from tender.application.shared.errors import PayloadTooLarge
 
 
 class Upload:
@@ -41,9 +44,9 @@ def upload(files, archive=None):
 
 def test_too_many_files_are_rejected_without_reading(service):
     files = [Upload(size=1) for _ in range(101)]
-    with pytest.raises(ApiProblem) as caught:
+    with pytest.raises(PayloadTooLarge) as caught:
         upload(files)
-    assert (caught.value.status_code, caught.value.code) == (413, "too_many_files")
+    assert caught.value.code == "too_many_files"
     assert all(not file.read_sizes for file in files)
     service.upload.assert_not_awaited()
 
@@ -57,9 +60,9 @@ def test_known_total_is_rejected_without_reading(service, include_archive):
     archive = extra if include_archive else None
     if archive is None:
         files.append(extra)
-    with pytest.raises(ApiProblem) as caught:
+    with pytest.raises(PayloadTooLarge) as caught:
         upload(files, archive)
-    assert (caught.value.status_code, caught.value.code) == (413, "upload_too_large")
+    assert caught.value.code == "upload_too_large"
     assert all(not file.read_sizes for file in [*files, extra])
     service.upload.assert_not_awaited()
 
@@ -76,9 +79,9 @@ def test_reading_is_bounded_by_remaining_total(
     overflow = Upload(b"abcdef", size=declared_size)
     later = Upload(b"later", size=declared_size)
     files = [first] if include_archive else [first, overflow, later]
-    with pytest.raises(ApiProblem) as caught:
+    with pytest.raises(PayloadTooLarge) as caught:
         upload(files, overflow if include_archive else None)
-    assert (caught.value.status_code, caught.value.code) == (413, "upload_too_large")
+    assert caught.value.code == "upload_too_large"
     assert first.read_sizes == [11]
     assert overflow.read_sizes == [5]
     assert later.read_sizes == []
@@ -104,11 +107,14 @@ def test_single_file_errors_keep_http_mapping(
     monkeypatch, service, replace, content, status, code,
 ):
     monkeypatch.setattr(routes, "MAX_UPLOAD_BYTES", 3)
-    file = Upload(content)
-    with pytest.raises(ApiProblem) as caught:
-        if replace:
-            asyncio.run(routes.replace_file(1, 2, SimpleNamespace(headers={}), file))
-        else:
-            upload([file])
-    assert (caught.value.status_code, caught.value.code) == (status, code)
+    app = FastAPI()
+    app.include_router(routes.router)
+    install_error_handlers(app)
+    # HTTP错误通过真实上传入口检查；超大元数据的单测继续直接验证有界读取。
+    path = "/api/v1/projects/1/files" + ("/2/replace" if replace else "")
+    with TestClient(app) as client:
+        response = client.post(
+            path, files={"file" if replace else "files": ("sample.txt", content)},
+        )
+    assert (response.status_code, response.json()["error"]["code"]) == (status, code)
     service.upload.assert_not_awaited()

@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
+import type { Page } from "@playwright/test";
 import { calls, collections, mockApi, selectModule, models, profile } from "./fixtures";
-import type { KnowledgeSource } from "../src/types/knowledge";
+import type { KnowledgeAnswer, KnowledgeSource } from "../src/types/knowledge";
 
 let pageErrors: string[];
 test.beforeEach(async ({ page }) => {
@@ -79,6 +80,40 @@ test("模型超时允许小数并移除预算人工上限", async ({ page }) => 
   await dialog.getByRole("button", { name: "保存", exact: true }).click();
   await expect(dialog).not.toBeVisible();
   expect(saved).toMatchObject({ timeout_seconds: 0.01, extra_retries: 99, max_tokens: 262144 });
+});
+
+test("功能候选直达模型超时和重试配置，保存后显示新值并保留排序草稿", async ({ page }, testInfo) => {
+  let current = { ...models[0], timeout_seconds: 10, extra_retries: 1 };
+  let submitted: Record<string, unknown> | undefined;
+  await page.route("**/api/v1/llm/models", (route) => route.fulfill({ json: { items: [current] } }));
+  await page.route("**/api/v1/llm/features", (route) => route.fulfill({ json: { items: [{
+    key: "analysis", name: "招标专题解析", required_kind: "language", revision: 1,
+    failover_limit: 3, bindings: [{ model_row_id: 1, priority: 1 }],
+  }] } }));
+  await page.route("**/api/v1/llm/models/1", (route) => {
+    submitted = route.request().postDataJSON();
+    current = { ...current, ...submitted };
+    return route.fulfill({ json: current });
+  });
+  await page.goto("/settings/models");
+  await page.getByRole("tab", { name: "分配功能", exact: true }).click();
+  const candidates = page.getByRole("region", { name: "功能模型列表" });
+  await expect(candidates).toContainText("响应间隔 10 秒");
+  await page.getByLabel("不同候选上限", { exact: true }).fill("2");
+  await candidates.getByRole("button", { name: "测试模型 1配置超时和重试", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "编辑模型", exact: true });
+  const timeout = dialog.getByLabel("响应间隔超时（秒）", { exact: true });
+  await expect(timeout).toBeFocused();
+  await timeout.fill("60");
+  await dialog.getByLabel("失败后额外重试次数", { exact: true }).fill("2");
+  await dialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(submitted).toMatchObject({ timeout_seconds: 60, extra_retries: 2, revision: 7 });
+  await page.getByRole("tab", { name: "分配功能", exact: true }).click();
+  await expect(candidates).toContainText("响应间隔 60 秒");
+  await expect(candidates).toContainText("失败后额外重试 2 次");
+  await expect(page.getByLabel("不同候选上限", { exact: true })).toHaveValue("2");
+  await page.screenshot({ path: testInfo.outputPath("model-timeout-settings.png"), fullPage: true });
 });
 
 test("新增模型默认启用，编辑配置不改变启停状态", async ({ page }) => {
@@ -211,14 +246,13 @@ test("模型删除失败保留确认框，重试成功后移除模型", async ({
   expect(attempts).toBe(2);
 });
 
-test("功能大预算可保存，候选上限继续读取服务端规则", async ({ page }) => {
+test("候选上限读取服务端规则，重试不再被独立总请求上限截断", async ({ page }) => {
   let saved: unknown;
   await page.route("**/api/v1/llm/settings", (route) => route.fulfill({ json: {
     secret_key_ready: true, test_valid_seconds: 3600, adapter_profiles: [profile],
     max_bindings: 10,
     feature_fields: {
       failover_limit: { type: "integer", min: 1, max: 10 },
-      max_total_requests: { type: "integer", min: 1 },
     },
   } }));
   await page.route("**/api/v1/llm/features/analysis/models", async (route) => {
@@ -232,12 +266,13 @@ test("功能大预算可保存，候选上限继续读取服务端规则", async
   await candidates.fill("11");
   await expect(page.getByRole("button", { name: "保存", exact: true })).toBeDisabled();
   await candidates.fill("10");
-  await page.getByLabel("总请求上限", { exact: true }).fill("1000");
+  await expect(page.getByLabel("总请求上限", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("调用总时间", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect.poll(() => saved).toMatchObject({
-    failover_limit: 10, max_total_requests: 1000,
+    failover_limit: 10,
   });
+  expect(saved).not.toHaveProperty("max_total_requests");
 });
 
 test("功能顺序支持置顶、置底和直接选第10位，保存顺序与界面一致", async ({ page }) => {
@@ -245,7 +280,6 @@ test("功能顺序支持置顶、置底和直接选第10位，保存顺序与界
   await page.route("**/api/v1/llm/features", (route) => route.fulfill({ json: { items: [{
     key: "analysis", name: "招标专题解析", required_kind: "language", revision: 1,
     description: "指定专题重新解析也使用此绑定。", failover_limit: 3,
-    max_total_requests: 6,
     bindings: models.slice(0, 10).map((model, index) => ({
       model_row_id: model.id, priority: index + 1,
     })),
@@ -486,9 +520,9 @@ test("配置版本详情使用抽屉，切换版本不会沿用旧内容", async
   await expect(page.getByRole("dialog")).toContainText("配置版本 v3");
 });
 
-test("调用链抽屉读取全部分页，超过 25 次请求不会截断", async ({ page }) => {
+test("调用链抽屉读取全部分页，超过 25 次请求不会截断", async ({ page }, testInfo) => {
   await page.goto("/settings/models");
-  await page.getByRole("tab", { name: "调用记录" }).click();
+  await openCallLogs(page, testInfo.project.name === "mobile");
   await page.getByRole("button", { name: "查看调用链" }).first().click();
   const dialog = page.getByRole("dialog", { name: "完整调用链" });
   await expect(dialog).toBeVisible();
@@ -497,7 +531,7 @@ test("调用链抽屉读取全部分页，超过 25 次请求不会截断", asyn
   ).toBeAttached();
 });
 
-test("失败请求在记录详情和调用链中展示完整上游响应", async ({ page }) => {
+test("失败请求在记录详情和调用链中展示完整上游响应", async ({ page }, testInfo) => {
   const body = JSON.stringify({ error: {
     message: "账户余额不足" + "x".repeat(700),
     code: "insufficient_quota", request_id: "upstream-123",
@@ -508,7 +542,7 @@ test("失败请求在记录详情和调用链中展示完整上游响应", async
     total: 1, items: [{ ...calls[0], status: "error", http_status: 429, error_message: errorMessage }],
   } }));
   await page.goto("/settings/models");
-  await page.getByRole("tab", { name: "调用记录" }).click();
+  await openCallLogs(page, testInfo.project.name === "mobile");
   await page.getByRole("button", { name: "展开行" }).first().click();
   const detail = page.locator(".ant-table-expanded-row article");
   await expect(detail).toContainText("HTTP 429");
@@ -523,6 +557,18 @@ test("失败请求在记录详情和调用链中展示完整上游响应", async
   expect(await error.evaluate((node) => getComputedStyle(node).whiteSpace)).toBe("pre-wrap");
   expect(await dialog.evaluate((node) => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
 });
+
+async function openCallLogs(page: Page, useOverflowMenu: boolean) {
+  const callsTab = page.getByRole("tab", { name: "调用记录", exact: true });
+  // 窄屏末尾标签由组件裁切，覆盖用户实际使用的鼠标入口。
+  if (useOverflowMenu) {
+    await page.getByRole("button", { name: "更多标签", exact: true }).click();
+    await page.getByRole("option", { name: "调用记录", exact: true }).click();
+  } else {
+    await callsTab.click();
+  }
+  await expect(callsTab).toHaveAttribute("aria-selected", "true");
+}
 
 test("主要页面和长表单不撑破窄屏", async ({ page }) => {
   for (const path of [
@@ -547,7 +593,9 @@ test("主要页面和长表单不撑破窄屏", async ({ page }) => {
       .toBe(true);
   }
   await page.goto("/settings/models");
+  await expect(page.getByRole("tabpanel", { name: /连接供应商/ })).toBeVisible();
   await page.getByRole("tab", { name: /管理模型/ }).click();
+  await expect(page.getByRole("tab", { name: /管理模型/ })).toHaveAttribute("aria-selected", "true");
   await page.getByRole("button", { name: "新增模型", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "新增模型", exact: true });
   await expect(dialog).toBeVisible();
@@ -561,6 +609,20 @@ test("主要页面和长表单不撑破窄屏", async ({ page }) => {
       ),
     )
     .toBe(true);
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole("tab", { name: /管理模型/ }).focus();
+  await page.getByRole("tab", { name: /管理模型/ }).press("End");
+  const callsTab = page.getByRole("tab", { name: /调用记录/ });
+  await expect(callsTab).toBeFocused();
+  await expect(callsTab).toBeInViewport();
+  // 外框能裁切内容，须同时确认标签聚焦时内部内容区没有横向溢出或滚动。
+  await expect.poll(() => page.locator(".app-viewport").evaluate((viewport) => ({
+    left: viewport.scrollLeft,
+    overflow: viewport.scrollWidth - viewport.clientWidth,
+  }))).toEqual({ left: 0, overflow: 0 });
+  await callsTab.press("Enter");
+  await expect(callsTab).toHaveAttribute("aria-selected", "true");
 });
 
 test("导入模型的选择和提交位于弹窗，保留选中的模型 ID", async ({ page }) => {
@@ -692,90 +754,42 @@ test("切换报告与问答视图保留问题草稿", async ({ page }) => {
   );
 });
 
-test("标准 Markdown 表格与行内定位同时保留，重复引用只显示一个入口", async ({
-  page,
-}) => {
+test("问答 Markdown 表格与行内定位同时保留，重复引用只显示一个入口", async ({ page }) => {
   const citation = {
-    source_id: 1,
-    collection_id: 1,
-    project_id: 1,
-    project_file_id: 1,
-    version_id: 1,
-    parse_run_id: 1,
-    element_id: 1,
-    anchor: "p1b1",
-    page_no: 1,
-    bbox: null,
-    file_name: "招标原文.pdf",
-    purpose: "tender",
-    quote: "项目预算为 100 万元",
+    source_id: 1, collection_id: 1, project_id: 1, project_file_id: 1,
+    version_id: 1, parse_run_id: 1, element_id: 1, anchor: "p1b1", page_no: 1,
+    bbox: null, file_name: "招标原文.pdf", purpose: "tender", quote: "项目预算为 100 万元",
   };
-  await page.route("**/api/v1/projects/1/analysis", (route) =>
-    route.fulfill({
-      json: {
-        analysis_category: "goods",
-        analysis_topics: [],
-        lots: [],
-        sources: [],
-        reports: [{ id: 1, status: "completed" }],
-        categories: { goods: "货物" },
-        topics: {},
+  // 普通逐值Markdown由现行问答入口展示，报告正文已经使用独立records和输出声明。
+  const answer: KnowledgeAnswer = {
+    id: 1, status: "completed", question: "项目预算和设备清单", error_message: null,
+    snapshot: { mode: "keyword", graph_used: false, no_evidence: false }, relations: [],
+    items: [
+      {
+        id: "budget", field: "预算", group: "项目", sort_order: 1,
+        values: [{ value: "**100 万元**", citations: [citation, citation] }],
+        note: "需核对\n\n补充说明", verification: "supported",
       },
-    }),
-  );
-  await page.route("**/api/v1/analysis/reports/1", (route) =>
-    route.fulfill({
-      json: {
-        id: 1,
-        status: "completed",
-        category: "goods",
-        topics: [],
-        coverage: {},
-        modules: [
-          {
-            id: 1,
-            module_key: "base",
-            title: "基本信息",
-            status: "completed",
-            items: [
-              {
-                id: "budget",
-                field: "预算",
-                group: "项目",
-                sort_order: 1,
-                values: [
-                  { value: "**100 万元**", citations: [citation, citation] },
-                ],
-                note: "需核对\n\n补充说明",
-                verification: "supported",
-              },
-              {
-                id: "table",
-                field: "清单",
-                group: "项目",
-                sort_order: 2,
-                values: [
-                  {
-                    value: "| 名称 | 数量 |\n| --- | --- |\n| 设备 | 2 |",
-                    citations: [],
-                  },
-                ],
-                note: "",
-                verification: "supported",
-              },
-            ],
-          },
-        ],
+      {
+        id: "table", field: "清单", group: "项目", sort_order: 2,
+        values: [{ value: "| 名称 | 数量 |\n| --- | --- |\n| 设备 | 2 |",
+          citations: [{ ...citation, quote: "设备数量为 2" }] }],
+        note: "", verification: "supported",
       },
-    }),
-  );
+    ],
+  };
+  await page.route("**/api/v1/projects/1/knowledge/ask", (route) =>
+    route.fulfill({ json: { id: answer.id } }));
+  await page.route("**/api/v1/knowledge/answers/1", (route) =>
+    route.fulfill({ json: answer }));
   await page.goto("/projects/1");
+  await page.getByText("项目问答", { exact: true }).click();
+  await page.getByRole("textbox", { name: "输入资料问题" }).fill(answer.question);
+  await page.getByRole("button", { name: "提问", exact: true }).click();
   const row = page.locator('[data-report-item="budget"]');
   await expect(row.locator("strong")).toHaveText("100 万元");
   await expect(row.locator(".value-locates button")).toHaveCount(1);
   await expect(row.locator(".field-value > p > .value-locates")).toHaveCount(1);
-  await expect(
-    page.locator('[data-report-item="table"] td table'),
-  ).toContainText("设备");
+  await expect(page.locator('[data-report-item="table"] td table')).toContainText("设备");
   await expect(page.locator("p p")).toHaveCount(0);
 });

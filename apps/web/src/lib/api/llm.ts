@@ -112,7 +112,6 @@ export function replaceBindings(
   policy: {
     revision: number;
     failover_limit: number;
-    max_total_requests: number;
     },
 ): Promise<LlmFeature> {
   return sendJson<LlmFeature>(

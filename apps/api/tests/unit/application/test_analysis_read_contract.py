@@ -1,4 +1,4 @@
-"""解析补读兼容旧参数，实际常规邻域每侧最多一块，并如实报告读取范围。"""
+"""底层补读拒绝超范围和负数参数，工具层不能放宽证据窗口边界。"""
 
 import asyncio
 
@@ -14,14 +14,6 @@ def rows(count=15):
         | {"block_id": f"s1r1c{i}", "element_id": i + 1, "offset": i, "content": f"第{i}项条款"}
         for i in range(count)
     ]
-
-
-
-
-
-
-
-
 def test_lower_level_read_evidence_still_rejects_oversized_window():
     async def run():
         research = session(rows())

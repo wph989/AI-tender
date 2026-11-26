@@ -10,10 +10,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from http_client import api_request
 from sqlalchemy import create_engine, text
 
 from tender.api.llm import routes as llm
-from tender.api.shared.errors import ApiProblem
 from tender.core.settings import database_url
 from tender.domain.shared.errors import ModelInUse
 from tender.ports.llm.chat import Completion
@@ -85,14 +85,20 @@ def test_model_crud_binding_revision_and_history(env):
     feature = llm.replace_bindings(
         "analysis",
         llm.BindingsRequest(
-            model_ids=[m["id"]], revision=1, failover_limit=2, max_total_requests=4
+            model_ids=[m["id"]], revision=1, failover_limit=2
         ),
         request,
     )
     assert feature["revision"] == 2
-    with pytest.raises(ApiProblem) as conflict:
-        llm.replace_bindings("analysis", llm.BindingsRequest(model_ids=[], revision=1), request)
-    assert conflict.value.status_code == 412
+    conflict = api_request(
+        request,
+        llm.router,
+        'PUT',
+        "/api/v1/llm/features/analysis/models",
+        payload=llm.BindingsRequest(model_ids=[], revision=1),
+    )
+    assert conflict.status_code >= 400
+    assert conflict.status_code == 412
     analysis_feature = next(
         item for item in llm.list_features(request)["items"] if item["key"] == "analysis"
     )
@@ -102,11 +108,15 @@ def test_model_crud_binding_revision_and_history(env):
     llm.update_model(
         m["id"], llm.ModelPatch(display_name="新名称", revision=m["revision"]), request
     )
-    with pytest.raises(ApiProblem) as conflict:
-        llm.update_model(
-            m["id"], llm.ModelPatch(display_name="覆盖", revision=m["revision"]), request
-        )
-    assert conflict.value.status_code == 412
+    conflict = api_request(
+        request,
+        llm.router,
+        'PATCH',
+        f"/api/v1/llm/models/{m['id']}",
+        payload=llm.ModelPatch(display_name='覆盖', revision=m['revision']),
+    )
+    assert conflict.status_code >= 400
+    assert conflict.status_code == 412
     current = llm.list_models(request)["items"][0]
     assert current["test_validity"] == "valid"
     calls = llm.list_calls(request, limit=25, offset=0)
@@ -196,10 +206,14 @@ def test_import_is_enabled_deduplicated_and_requires_matching_kind(env):
     assert llm.import_models(p["id"], payload, request)["skipped"] == 2
     # 重复导入只跳过已有模型，不能覆盖用户手动停用的状态。
     assert llm.list_models(request)["items"][0]["enabled"] is False
-    with pytest.raises(ApiProblem):
-        llm.replace_bindings(
-            "analysis", llm.BindingsRequest(model_ids=[models[0]["id"]], revision=1), request
-        )
+    response = api_request(
+        request,
+        llm.router,
+        'PUT',
+        "/api/v1/llm/features/analysis/models",
+        payload=llm.BindingsRequest(model_ids=[models[0]['id']], revision=1),
+    )
+    assert response.status_code == 400
     analysis_feature = next(
         item for item in llm.list_features(request)["items"] if item["key"] == "analysis"
     )
@@ -365,17 +379,26 @@ def test_image_model_preview_history_and_cleanup_without_business_binding(env, m
         "analysis", "knowledge_ask", "embedding", "rerank",
     }
     for model_ids in ([m["id"]], []):
-        with pytest.raises(ApiProblem) as missing:
-            llm.replace_bindings(
-                "image_generation", llm.BindingsRequest(model_ids=model_ids, revision=1), request
-            )
-        assert missing.value.status_code == 404
+        missing = api_request(
+            request,
+            llm.router,
+            'PUT',
+            "/api/v1/llm/features/image_generation/models",
+            payload=llm.BindingsRequest(model_ids=model_ids, revision=1),
+        )
+        assert missing.status_code >= 400
+        assert missing.status_code == 404
     llm.update_model(
         m["id"], llm.ModelPatch(parameters={"quality": "medium"}, revision=m["revision"]), request
     )
-    with pytest.raises(ApiProblem) as expired:
-        llm.test_preview(result["test_id"], request)
-    assert expired.value.status_code == 410
+    expired = api_request(
+        request,
+        llm.router,
+        'GET',
+        f"/api/v1/llm/tests/{result['test_id']}/preview",
+    )
+    assert expired.status_code >= 400
+    assert expired.status_code == 410
     c.execute(
         text("UPDATE llm_test SET invalidated_at=now()-interval '25 hours' WHERE id=:id"),
         {"id": result["test_id"]},
@@ -393,9 +416,15 @@ def test_unconfigured_test_capability_is_rejected_before_a_request(env):
     request, c = env
     p = provider(request)
     m = model(request, p["id"])
-    with pytest.raises(ApiProblem) as unsupported:
-        asyncio.run(llm.test_model(m["id"], request, llm.TestRequest(capability="vision")))
-    assert unsupported.value.status_code == 422
+    unsupported = api_request(
+        request,
+        llm.router,
+        'POST',
+        f"/api/v1/llm/models/{m['id']}/test",
+        payload=llm.TestRequest(capability='vision'),
+    )
+    assert unsupported.status_code >= 400
+    assert unsupported.status_code == 422
     assert c.execute(text("SELECT count(*) FROM llm_test")).scalar() == 0
 
 
@@ -438,16 +467,57 @@ def test_optional_request_total_can_be_cleared_and_interval_stays_required(env):
         m["id"], llm.ModelPatch(total_timeout_seconds=None, revision=m["revision"]), request
     )
     assert m["total_timeout_seconds"] is None
-    with pytest.raises(ApiProblem) as invalid:
-        llm.update_model(
-            m["id"], llm.ModelPatch(timeout_seconds=None, revision=m["revision"]), request
-        )
-    assert invalid.value.status_code == 422
+    invalid = api_request(
+        request,
+        llm.router,
+        'PATCH',
+        f"/api/v1/llm/models/{m['id']}",
+        payload=llm.ModelPatch(timeout_seconds=None, revision=m['revision']),
+    )
+    assert invalid.status_code >= 400
+    assert invalid.status_code == 422
 
     m = llm.update_model(
         m["id"], llm.ModelPatch(timeout_seconds=0.01, revision=m["revision"]), request,
     )
     assert m["timeout_seconds"] == 0.01
+
+
+def test_saved_interval_is_used_by_new_calls_and_existing_call_keeps_its_snapshot(env):
+    from tender.adapters.pg.repositories.llm.runtime import ModelRuntimeRepository
+    from tender.application.llm.factory import RoutingModelFactory
+
+    request, _ = env
+    p = provider(request)
+    m = model(request, p["id"], timeout_seconds=10, extra_retries=1)
+    llm.replace_bindings("analysis", llm.BindingsRequest(
+        model_ids=[m["id"]], revision=1, failover_limit=1,
+    ), request)
+    timeouts = []
+
+    def gateway(*args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return Probe()
+
+    repository = ModelRuntimeRepository(request.app.state.components.engine)
+    factory = RoutingModelFactory(repository, SimpleNamespace(
+        remaining=lambda candidate: 0, defer=lambda candidate, seconds: None,
+    ), gateway)
+    async def run():
+        router = factory("analysis", "fixture")
+        try:
+            await router.complete("原调用")
+            updated = llm.update_model(m["id"], llm.ModelPatch(
+                timeout_seconds=60, extra_retries=2, revision=m["revision"],
+            ), request)
+            assert updated["timeout_seconds"] == 60 and updated["extra_retries"] == 2
+            # 专题会复用路由器，后续逻辑请求仍应读取新配置。
+            await router.complete("新调用")
+        finally:
+            await router.aclose()
+
+    asyncio.run(run())
+    assert timeouts == [10, 60]
 
 
 def test_healthy_long_test_is_not_stale_and_late_result_cannot_revive_expired_lease(env):
@@ -496,21 +566,29 @@ def test_json_consumers_reject_language_model_without_json_and_capability_remova
     request, _ = env
     p = provider(request)
     m = model(request, p["id"], capabilities=["text_input"])
-    with pytest.raises(ApiProblem):
-        llm.replace_bindings(
-            "analysis", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request
-        )
+    response = api_request(
+        request,
+        llm.router,
+        'PUT',
+        "/api/v1/llm/features/analysis/models",
+        payload=llm.BindingsRequest(model_ids=[m['id']], revision=1),
+    )
+    assert response.status_code == 400
     m = llm.update_model(
         m["id"],
         llm.ModelPatch(capabilities=["text_input", "json_output"], revision=m["revision"]),
         request,
     )
     llm.replace_bindings("analysis", llm.BindingsRequest(model_ids=[m["id"]], revision=1), request)
-    with pytest.raises(ApiProblem) as invalid:
-        llm.update_model(
-            m["id"], llm.ModelPatch(capabilities=["text_input"], revision=m["revision"]), request
-        )
-    assert invalid.value.status_code == 409
+    invalid = api_request(
+        request,
+        llm.router,
+        'PATCH',
+        f"/api/v1/llm/models/{m['id']}",
+        payload=llm.ModelPatch(capabilities=['text_input'], revision=m['revision']),
+    )
+    assert invalid.status_code >= 400
+    assert invalid.status_code == 409
 
 
 def test_form_expanding_default_parameters_does_not_invalidate_proof(env):

@@ -1,10 +1,14 @@
 """所有 JSON API 成功响应都进入 Pydantic/OpenAPI 契约。"""
 
 import pytest
+from fastapi import FastAPI
 from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
 from tender.api.app import app
+from tender.api.knowledge import routes as knowledge
+from tender.api.shared.errors import install_error_handlers
 from tender.api.shared.responses import AnalysisModuleRecordResponse, AnalysisRecordResponse
 
 BODYLESS_ROUTES = {
@@ -75,4 +79,51 @@ def test_snapshot_response_requires_resolved_scope_and_its_own_citations():
         AnalysisRecordResponse.model_validate(record)
     assert {issue["loc"] for issue in caught.value.errors()} >= {
         ("scope", "lot_ids"), ("citations",),
+    }
+
+
+@pytest.mark.parametrize("status", ["pending", "failed", "completed"])
+def test_answer_http_preserves_display_contract_and_excludes_execution_snapshot(
+    monkeypatch, status,
+):
+    from types import SimpleNamespace
+
+    source = {"source_id": 1, "collection_id": 1, "project_id": 1, "project_file_id": 1,
+              "version_id": 1, "parse_run_id": 1, "element_id": 1, "anchor": "p1b1",
+              "page_no": 1, "bbox": None, "file_name": "招标文件.pdf", "purpose": "tender",
+              "quote": "甲级资质", "block_id": "s1r1c0"}
+    payload = {
+        "id": 1, "status": status, "question": "资质要求", "company_id": 7,
+        "error_message": "模型不可用" if status == "failed" else None,
+        "snapshot": {"sources": [source], "mode": "hybrid", "warning": "部分资料无语义索引",
+                     "graph_used": True, "no_evidence": False, "retrieved_blocks": 40},
+        "items": [{"id": "r", "field": "资格", "group": "资质", "sort_order": 0,
+                   "note": "", "verification": "supported", "internal": "不属于展示契约",
+                   "values": [{"value": "甲级资质", "citations": [source]}]}],
+        "relations": [{"subject": "资格", "predicate": "requires", "object": "证明",
+                       "scope": "公共要求", "condition": "", "citations": [source]}],
+    }
+    monkeypatch.setattr(knowledge, "knowledge_service", lambda request: SimpleNamespace(
+        get_answer=lambda answer_id: payload,
+    ))
+    instance = FastAPI()
+    instance.include_router(knowledge.router)
+    install_error_handlers(instance)
+    with TestClient(instance) as client:
+        response = client.get("/api/v1/knowledge/answers/1")
+    assert response.status_code == 200
+    wire = response.json()
+    assert wire["error_message"] == payload["error_message"]
+    assert wire["snapshot"] == {
+        "mode": "hybrid", "warning": "部分资料无语义索引", "graph_used": True,
+        "no_evidence": False,
+    }
+    assert "company_id" not in wire and "internal" not in wire["items"][0]
+    assert wire["items"][0]["values"][0]["citations"][0]["block_id"] == "s1r1c0"
+    schemas = instance.openapi()["components"]["schemas"]
+    assert {"snapshot", "error_message", "items", "relations"} <= (
+        schemas["KnowledgeAnswerResponse"]["properties"].keys()
+    )
+    assert schemas["KnowledgeValueResponse"]["properties"]["citations"]["items"] == {
+        "$ref": "#/components/schemas/AnalysisEvidenceResponse",
     }

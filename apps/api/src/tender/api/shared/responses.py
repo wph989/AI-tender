@@ -1,4 +1,4 @@
-"""HTTP 成功响应的线格式模型；额外字段暂时透传，稳定字段由 OpenAPI 明确约束。"""
+"""HTTP成功响应契约；分析与知识库只序列化声明字段，其余接口沿用既有线格式。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ from tender.application.analysis.output import OutputSchema
 
 class ApiResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+
+class DeclaredResponse(BaseModel):
+    # 仓储状态与执行快照不属于展示契约，必须先声明字段再交付给浏览器。
+    model_config = ConfigDict(extra="ignore")
 
 
 class IdStatusResponse(ApiResponse):
@@ -194,7 +199,7 @@ class OutlineResponse(ApiResponse):
     items: list[dict[str, Any]]
 
 
-class KnowledgeSourceResponse(ApiResponse):
+class KnowledgeSourceResponse(DeclaredResponse):
     source_id: int
     collection_id: int
     project_id: int
@@ -212,23 +217,23 @@ class KnowledgeSourceResponse(ApiResponse):
     embedding_model_id: int | None = None
 
 
-class CollectionResponse(ApiResponse):
+class CollectionResponse(DeclaredResponse):
     id: int
     name: str
     purpose: str
-    upload_project_id: int | None = None
-    is_project: bool | None = None
+    upload_project_id: int
+    is_project: bool
     file_count: int | None = None
     sources: list[KnowledgeSourceResponse] | None = None
     embedding_configured: bool | None = None
     embedding_model: str | None = None
 
 
-class KnowledgeCollectionListResponse(ApiResponse):
+class KnowledgeCollectionListResponse(DeclaredResponse):
     items: list[CollectionResponse]
 
 
-class KnowledgeSourcesResponse(ApiResponse):
+class KnowledgeSourcesResponse(DeclaredResponse):
     collection_id: int
     linked_collection_ids: list[int]
     sources: list[KnowledgeSourceResponse]
@@ -239,12 +244,46 @@ class KnowledgeSearchResponse(ApiResponse):
     warning: str | None = None
 
 
-class KnowledgeAnswerResponse(ApiResponse):
+class KnowledgeValueResponse(DeclaredResponse):
+    value: str
+    citations: list[AnalysisEvidenceResponse]
+
+
+class KnowledgeItemResponse(DeclaredResponse):
+    id: str
+    field: str
+    group: str
+    sort_order: int
+    values: list[KnowledgeValueResponse]
+    note: str
+    verification: str
+
+
+class KnowledgeRelationResponse(DeclaredResponse):
+    subject: str
+    predicate: str
+    object: str
+    scope: str
+    condition: str
+    citations: list[AnalysisEvidenceResponse]
+
+
+class KnowledgeAnswerSnapshotResponse(DeclaredResponse):
+    # 排队与失败也返回展示快照；冻结来源和模型执行参数继续仅在服务端保存。
+    mode: str | None = None
+    warning: str | None = None
+    graph_used: bool = False
+    no_evidence: bool = False
+
+
+class KnowledgeAnswerResponse(DeclaredResponse):
     id: int
     status: str
     question: str
-    items: list[dict[str, Any]]
-    relations: list[dict[str, Any]]
+    items: list[KnowledgeItemResponse]
+    relations: list[KnowledgeRelationResponse]
+    error_message: str | None
+    snapshot: KnowledgeAnswerSnapshotResponse
 
 
 class CitationResolutionResponse(ApiResponse):
@@ -318,7 +357,7 @@ class ConfigAuditResponse(ApiResponse):
     items: list[dict[str, Any]]
 
 
-class AnalysisReportSummary(ApiResponse):
+class AnalysisReportSummary(DeclaredResponse):
     id: int
     status: str
     created_at: datetime
@@ -326,14 +365,21 @@ class AnalysisReportSummary(ApiResponse):
     allow_partial: bool = False
 
 
-class AnalysisStatusResponse(ApiResponse):
+class AnalysisLotSettingsResponse(DeclaredResponse):
+    id: int
+    name: str
+    category: str | None
+    topics: list[str] | None
+
+
+class AnalysisStatusResponse(DeclaredResponse):
     analysis_category: str | None
     analysis_topics: list[str]
-    lots: list[dict[str, Any]]
+    lots: list[AnalysisLotSettingsResponse]
     reports: list[AnalysisReportSummary]
     sources: list[KnowledgeSourceResponse]
-    categories: dict[str, Any]
-    topics: dict[str, Any]
+    categories: dict[str, str]
+    topics: dict[str, str]
 
 
 class AnalysisStartResponse(ApiResponse):
@@ -342,12 +388,7 @@ class AnalysisStartResponse(ApiResponse):
     status: str
 
 
-class AnalysisResponse(BaseModel):
-    # 响应只交付已声明的字段，仓储内部状态不再通过额外字段进入 HTTP。
-    model_config = ConfigDict(extra="ignore")
-
-
-class AnalysisEvidenceResponse(AnalysisResponse):
+class AnalysisEvidenceResponse(DeclaredResponse):
     source_id: int
     collection_id: int
     project_id: int
@@ -367,7 +408,7 @@ class AnalysisEvidenceResponse(AnalysisResponse):
     locations: list[dict[str, Any]] | None = None
 
 
-class AnalysisModuleScopeResponse(AnalysisResponse):
+class AnalysisModuleScopeResponse(DeclaredResponse):
     kind: Literal["common", "lots", "unknown"]
     lot_refs: list[str]
 
@@ -376,7 +417,7 @@ class AnalysisScopeResponse(AnalysisModuleScopeResponse):
     lot_ids: list[int]
 
 
-class AnalysisQualityIssueResponse(AnalysisResponse):
+class AnalysisQualityIssueResponse(DeclaredResponse):
     issue_id: str
     kind: str
     action: Literal["read", "repair", "provide_input"]
@@ -394,7 +435,7 @@ class AnalysisQualityIssueResponse(AnalysisResponse):
     module_key: str | None = None
 
 
-class AnalysisRecordContentResponse(AnalysisResponse):
+class AnalysisRecordContentResponse(DeclaredResponse):
     # 原始模块和正式快照共享内容，证据与标段身份分别由各自响应模型约束。
     id: str
     key: str
@@ -426,7 +467,7 @@ class AnalysisModuleRecordResponse(AnalysisRecordContentResponse):
     content_evidence: dict[str, list[list[str]]] | None = None
 
 
-class AnalysisRecordReviewResponse(AnalysisResponse):
+class AnalysisRecordReviewResponse(DeclaredResponse):
     id: int
     actor: str
     decision: Literal["confirmed", "corrected", "rejected"]
@@ -455,7 +496,7 @@ class AnalysisLotResponse(AnalysisRecordResponse):
     lot_id: int
 
 
-class AnalysisGapResponse(AnalysisResponse):
+class AnalysisGapResponse(DeclaredResponse):
     code: str
     detail: str
     scope: AnalysisScopeResponse
@@ -470,12 +511,12 @@ class AnalysisGapResponse(AnalysisResponse):
     missing_input: dict[str, Any] | None = None
 
 
-class AgentStopReasonResponse(AnalysisResponse):
+class AgentStopReasonResponse(DeclaredResponse):
     code: str
     message: str
 
 
-class AgentRunResponse(AnalysisResponse):
+class AgentRunResponse(DeclaredResponse):
     id: int
     attempt: int
     status: str
@@ -499,7 +540,7 @@ class AgentRunResponse(AnalysisResponse):
     agent_progress: AgentProgressResponse | None = None
 
 
-class AgentLimitsResponse(AnalysisResponse):
+class AgentLimitsResponse(DeclaredResponse):
     # 页面消费这四项，其余执行配额仍留在运行账，不重复暴露配置快照。
     max_model_calls: int
     max_tool_calls: int
@@ -507,7 +548,7 @@ class AgentLimitsResponse(AnalysisResponse):
     max_output_tokens: int
 
 
-class AgentProgressResponse(AnalysisResponse):
+class AgentProgressResponse(DeclaredResponse):
     protocol: Literal["skill-agent-v1"]
     activity: str | None = None
     draft_count: int
@@ -515,7 +556,7 @@ class AgentProgressResponse(AnalysisResponse):
     unresolved_issues: int
 
 
-class AnalysisModuleResponse(AnalysisResponse):
+class AnalysisModuleResponse(DeclaredResponse):
     id: int
     module_key: str
     title: str
@@ -531,19 +572,19 @@ class AnalysisModuleResponse(AnalysisResponse):
     research_summary: str = ""
 
 
-class AnalysisCoverageFileResponse(AnalysisResponse):
+class AnalysisCoverageFileResponse(DeclaredResponse):
     source_id: int
     name: str
     state: str
 
 
-class AnalysisCoverageResponse(AnalysisResponse):
+class AnalysisCoverageResponse(DeclaredResponse):
     mode: str | None = None
     partial: bool | None = None
     files: list[AnalysisCoverageFileResponse] = Field(default_factory=list)
 
 
-class AnalysisReportResponse(AnalysisResponse):
+class AnalysisReportResponse(DeclaredResponse):
     id: int
     project_id: int
     status: str
@@ -562,7 +603,7 @@ class AnalysisReportResponse(AnalysisResponse):
     error_message: str | None = None
 
 
-class ModuleRecordsResponse(AnalysisResponse):
+class ModuleRecordsResponse(DeclaredResponse):
     schema_version: str
     module_key: str
     status: str
@@ -573,18 +614,18 @@ class ModuleRecordsResponse(AnalysisResponse):
     output_schema: OutputSchema
 
 
-class ModuleRecordsUpdateResponse(AnalysisResponse):
+class ModuleRecordsUpdateResponse(DeclaredResponse):
     module_key: str
     version: str | None = None
     data: ModuleRecordsResponse | None = None
     error: str | None = None
 
 
-class ReportRecordsResponse(AnalysisResponse):
+class ReportRecordsResponse(DeclaredResponse):
     modules: list[ModuleRecordsUpdateResponse]
 
 
-class AnalysisDataResponse(AnalysisResponse):
+class AnalysisDataResponse(DeclaredResponse):
     report_id: int
     snapshot_id: int
     revision: int
@@ -593,7 +634,7 @@ class AnalysisDataResponse(AnalysisResponse):
     data: AnalysisDatasetResponse
 
 
-class AnalysisDatasetResponse(AnalysisResponse):
+class AnalysisDatasetResponse(DeclaredResponse):
     schema_version: str
     lots: list[AnalysisLotResponse]
     facts: list[AnalysisRecordResponse]
@@ -678,7 +719,6 @@ class LlmSettingsResponse(ApiResponse):
         alias="model_fields", serialization_alias="model_fields",
     )
     feature_fields: dict[str, Any]
-    default_max_total_requests: int
 
 
 class RemoteModelsResponse(ApiResponse):
@@ -691,7 +731,7 @@ class ModelImportResponse(ApiResponse):
     skipped: int
 
 
-class AnalysisContextResponse(AnalysisResponse):
+class AnalysisContextResponse(DeclaredResponse):
     schema_version: str
     snapshot_id: int
     purpose: Literal["outline", "content", "check"]
@@ -710,7 +750,7 @@ class AnalysisContextResponse(AnalysisResponse):
     next_offset: int | None
 
 
-class AnalysisReferenceResponse(AnalysisResponse):
+class AnalysisReferenceResponse(DeclaredResponse):
     purpose: Literal["company", "history"]
     text: str
     citation: AnalysisEvidenceResponse

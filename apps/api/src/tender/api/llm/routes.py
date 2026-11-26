@@ -11,7 +11,6 @@ from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from tender.api.shared.common import engine
-from tender.api.shared.errors import translate_service_errors
 from tender.api.shared.logging import throttle_access_log
 from tender.api.shared.responses import (
     CapabilityTestResponse,
@@ -171,18 +170,12 @@ class BindingsRequest(BaseModel):
     failover_limit: int | None = Field(
         default=None, strict=True, **field_bounds(FEATURE_FIELDS["failover_limit"])
     )
-    max_total_requests: int | None = Field(
-        default=None, strict=True, **field_bounds(FEATURE_FIELDS["max_total_requests"])
-    )
 
 
 class FeaturePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     failover_limit: int = Field(strict=True, **field_bounds(FEATURE_FIELDS["failover_limit"]))
-    max_total_requests: int = Field(
-        default=6, strict=True, **field_bounds(FEATURE_FIELDS["max_total_requests"])
-    )
     revision: int = Field(ge=1)
 
 
@@ -204,7 +197,6 @@ def llm_settings() -> dict[str, Any]:
 
 
 @router.get("/tests", response_model=LlmListResponse)
-@translate_service_errors
 def list_tests(
     request: Request,
     model_id: int | None = None,
@@ -215,13 +207,11 @@ def list_tests(
 
 @router.get("/tests/{test_id}", response_model=CapabilityTestResponse,
             response_model_exclude_unset=True)
-@translate_service_errors
 def get_test(test_id: int, request: Request) -> dict[str, Any]:
     return _service(request).get_test(test_id)
 
 
 @router.get("/tests/{test_id}/preview", response_model=None)
-@translate_service_errors
 def test_preview(test_id: int, request: Request) -> Response:
     content, media_type = _service(request).test_preview(test_id)
     return Response(
@@ -233,46 +223,39 @@ def test_preview(test_id: int, request: Request) -> Response:
 
 @router.get("/providers", response_model=LlmListResponse)
 @throttle_access_log()
-@translate_service_errors
 def list_providers(request: Request) -> dict[str, Any]:
     return _service(request).list_providers()
 
 
 @router.post("/providers", status_code=201, response_model=LlmEntityResponse,
              response_model_exclude_unset=True)
-@translate_service_errors
 def create_provider(payload: ProviderCreate, request: Request) -> dict[str, Any]:
     return _service(request).create_provider(payload.model_dump())
 
 
 @router.patch("/providers/{provider_id}", response_model=LlmEntityResponse,
               response_model_exclude_unset=True)
-@translate_service_errors
 def update_provider(provider_id: int, payload: ProviderPatch, request: Request) -> dict[str, Any]:
     return _service(request).update_provider(provider_id, payload.model_dump())
 
 
 @router.delete("/providers/{provider_id}", response_model=IdStatusResponse,
                response_model_exclude_unset=True)
-@translate_service_errors
 def delete_provider(provider_id: int, request: Request) -> dict[str, Any]:
     return _service(request).delete_provider(provider_id)
 
 
 @router.post("/providers/{provider_id}/test", response_model=ModelTestResponse)
-@translate_service_errors
 async def test_provider(provider_id: int, request: Request) -> dict[str, Any]:
     return await _service(request).test_provider(provider_id)
 
 
 @router.get("/providers/{provider_id}/remote-models", response_model=RemoteModelsResponse)
-@translate_service_errors
 async def remote_models(provider_id: int, request: Request) -> dict[str, Any]:
     return await _service(request).remote_models(provider_id)
 
 
 @router.post("/providers/{provider_id}/models/import", response_model=ModelImportResponse)
-@translate_service_errors
 def import_models(
     provider_id: int, payload: ImportRequest, request: Request
 ) -> dict[str, Any]:
@@ -281,21 +264,18 @@ def import_models(
 
 @router.get("/models", response_model=LlmListResponse)
 @throttle_access_log()
-@translate_service_errors
 def list_models(request: Request, provider_id: int | None = None) -> dict[str, Any]:
     return _service(request).list_models(provider_id)
 
 
 @router.post("/models", status_code=201, response_model=LlmEntityResponse,
              response_model_exclude_unset=True)
-@translate_service_errors
 def create_model(payload: ModelCreate, request: Request) -> dict[str, Any]:
     return _service(request).create_model(payload.model_dump())
 
 
 @router.patch("/models/{model_id}", response_model=LlmEntityResponse,
               response_model_exclude_unset=True)
-@translate_service_errors
 def update_model(model_id: int, payload: ModelPatch, request: Request) -> dict[str, Any]:
     values = payload.model_dump(exclude_unset=True, exclude={"revision"})
     values["revision"] = payload.revision
@@ -304,13 +284,11 @@ def update_model(model_id: int, payload: ModelPatch, request: Request) -> dict[s
 
 @router.delete("/models/{model_id}", response_model=IdStatusResponse,
                response_model_exclude_unset=True)
-@translate_service_errors
 def delete_model(model_id: int, request: Request) -> dict[str, Any]:
     return _service(request).delete_model(model_id)
 
 
 @router.post("/models/{model_id}/test", response_model=ModelTestResponse)
-@translate_service_errors
 async def test_model(
     model_id: int, request: Request, payload: TestRequest | None = None
 ) -> dict[str, Any]:
@@ -321,7 +299,6 @@ async def test_model(
 
 @router.post("/models/{model_id}/tests", status_code=202, response_model=IdStatusResponse,
              response_model_exclude_unset=True)
-@translate_service_errors
 async def start_model_test(
     model_id: int,
     request: Request,
@@ -339,14 +316,12 @@ async def start_model_test(
 
 @router.get("/features", response_model=LlmListResponse)
 @throttle_access_log()
-@translate_service_errors
 def list_features(request: Request) -> dict[str, Any]:
     return _service(request).list_features()
 
 
 @router.patch("/features/{feature_key}", response_model=LlmEntityResponse,
               response_model_exclude_unset=True)
-@translate_service_errors
 def update_feature(
     feature_key: str, payload: FeaturePatch, request: Request
 ) -> dict[str, Any]:
@@ -355,7 +330,6 @@ def update_feature(
 
 @router.put("/features/{feature_key}/models", response_model=LlmEntityResponse,
             response_model_exclude_unset=True)
-@translate_service_errors
 def replace_bindings(
     feature_key: str, payload: BindingsRequest, request: Request
 ) -> dict[str, Any]:
@@ -363,7 +337,6 @@ def replace_bindings(
 
 
 @router.get("/calls", response_model=LlmCallsResponse)
-@translate_service_errors
 def list_calls(
     request: Request,
     feature_key: str | None = None,

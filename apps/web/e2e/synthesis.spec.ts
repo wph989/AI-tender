@@ -785,13 +785,21 @@ test("无专题的失败报告显示原因，桌面原文可收起并由引用�
     await page.getByLabel("原文区域宽度").fill("45");
     await expect(page.locator(".analysis-split")).toHaveAttribute("style", /45%/);
   }
+  const detail = "模型甲（本次失败2次）：\nHTTP 429 上游限流：每分钟配额已用尽\n\n"
+    + "模型乙（本次失败2次）：\n首个有效增量等待超时（10秒） request_id=真实请求";
   await page.route("**/api/v1/analysis/reports/1", (route) => route.fulfill({ json: report(1, {
-    status: "failed", modules: [], error_message: "HTTP 429 上游限流", data_schema_version: null,
+    status: "failed", modules: [], error_message: detail, data_schema_version: null,
   }) }));
   await page.reload();
   await expect(page.getByText("模型服务暂时限流", { exact: true })).toBeVisible();
+  const error = page.locator(".analysis-failure-detail");
+  await expect(error).toHaveAttribute("open", "");
+  await expect(error.locator("p")).toHaveText(detail);
+  await expect(error.locator("p")).toHaveCSS("white-space", "pre-wrap");
+  await expect(error.locator("p")).toHaveCSS("overflow-wrap", "anywhere");
   await expect(page.getByRole("button", { name: "补跑未完成模块" })).toBeEnabled();
   await expect(page.getByRole("button", { name: "全部重新解析" })).toHaveCount(0);
+  await error.screenshot({ path: info.outputPath("model-actual-errors.png") });
 });
 
 test("未决关系保留正文与依据，但不按旧 key 连接已更新条款", async ({ page }) => {
@@ -1120,6 +1128,7 @@ test.describe("每次分析的时间与原因", () => {
     await expect(failed).toContainText("2026/10/19 09:01:01");
     await expect(failed).toContainText("2026/10/19 09:02:03");
     await expect(failed.locator(".run-error")).toHaveText("失败原因：HTTP 429：模型服务限流。 请稍后重试。");
+    await expect(failed.locator(".run-error")).toHaveCSS("white-space", "pre-wrap");
     await expect(history.getByRole("listitem", { name: "第 2 次分析", exact: true })).toContainText("停止原因：用户取消了本次分析。");
     const missing = history.getByRole("listitem", { name: "第 3 次分析", exact: true });
     await expect(missing.locator(".run-times dd")).toHaveText(["未记录", "未记录"]);

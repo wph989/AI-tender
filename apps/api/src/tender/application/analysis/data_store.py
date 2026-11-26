@@ -186,31 +186,39 @@ def citations_accessible(resolve: Callable[[dict], dict], citations: list[dict],
 
 def accessible_data(
     db: ReportRepository, data: dict, allowed: list[int], *, sources: list[dict] | None = None,
+    live_source_ids: set[int] | None = None,
 ) -> dict:
     """快照存储不可变不代表权限永久有效；读取时整条隐藏失去必要证据的记录。"""
-    result = copy.deepcopy(data)
+    buckets = ("lots", "facts", "requirements", "format_nodes", "relations")
+    visible_data = {key: value for key, value in data.items() if key not in buckets}
     unavailable = set()
     if sources:
         # gaps 可能只包含缺口说明而没有记录引用，仍需按整份输入快照检查来源撤销。
-        live_sources = {s["source_id"] for s in db.sources(allowed)}
-        if any(s["source_id"] not in live_sources for s in sources):
+        if live_source_ids is None:
+            live_source_ids = {s["source_id"] for s in db.sources(allowed)}
+        if any(s["source_id"] not in live_source_ids for s in sources):
             unavailable.add("input_source_unavailable")
     checked: dict[tuple, bool] = {}
-    for bucket in ("lots", "facts", "requirements", "format_nodes", "relations"):
+    for bucket in buckets:
         visible = []
-        for record in result[bucket]:
-            if citations_accessible(db.resolve, record.get("citations", []), allowed, checked):
+        for record in data[bucket]:
+            refs = record.get("citations", [])
+            if citations_accessible(db.resolve, refs, allowed, checked):
                 visible.append(record)
             else:
                 unavailable.add(record["id"])
-        result[bucket] = visible
+        visible_data[bucket] = visible
     if unavailable:
         # 缺口文本也可能重述撤销资料；此时仅保留访问状态，不泄露历史内容。
-        result["gaps"] = [data_gap("source_unavailable", "部分依据已删除或撤销访问，请更新分析")]
-        result["quality_issues"] = []
-        result["quality_status"] = "unknown"
-        result["relations"] = [r for r in result["relations"]
-                               if r.get("subject_id") not in unavailable
-                               and r.get("object_id") not in unavailable]
-        result["readiness"] = "unavailable"
-    return result
+        visible_data["gaps"] = [
+            data_gap("source_unavailable", "部分依据已删除或撤销访问，请更新分析"),
+        ]
+        visible_data["quality_issues"] = []
+        visible_data["quality_status"] = "unknown"
+        visible_data["relations"] = [
+            r for r in visible_data["relations"]
+            if r.get("subject_id") not in unavailable and r.get("object_id") not in unavailable
+        ]
+        visible_data["readiness"] = "unavailable"
+    # 只复制最终可见的数据；人工裁定会原地添加状态，返回值仍须与持久快照隔离。
+    return copy.deepcopy(visible_data)

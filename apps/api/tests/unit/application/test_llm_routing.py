@@ -273,24 +273,63 @@ def test_client_is_created_once_and_reused_across_calls() -> None:
     assert len(records) == 2
 
 
-def test_default_retries_try_a_a_b_b_c_c():
+@pytest.mark.parametrize("retries", [[1, 1, 1, 1, 1], [0, 2, 1, 3, 0]])
+def test_candidate_order_and_each_model_retry_count_are_preserved(retries):
     records = []
-    candidates = [replace(_candidate(name, i), extra_retries=1) for i, name in enumerate("abc", 1)]
+    candidates = [replace(_candidate(name, i), extra_retries=count)
+                  for i, (name, count) in enumerate(zip("abcde", retries, strict=True), 1)]
     gateway = _ScriptedGateway(
-        {name: [ModelUnavailable("忙", http_status=503)] * 2 for name in "abc"}
+        {c.model: [ModelUnavailable(f"{c.model}有效增量等待超时", http_status=504)]
+         * (1 + c.extra_retries) for c in candidates}
     )
     router = RoutingModel(
-        "analysis", "analysis", candidates, gateway, records.append, retry_base_seconds=0
+        "analysis", "analysis", candidates, gateway, records.append,
+        retry_base_seconds=0, failover_limit=5,
     )
-    with pytest.raises(ModelUnavailable):
+    with pytest.raises(ModelUnavailable) as failure:
         asyncio.run(router.complete("测试"))
-    assert [r.model_key_snapshot for r in records] == list("aabbcc")
-    assert [r.request_ordinal for r in records] == list(range(1, 7))
-    assert [r.retry_ordinal for r in records] == [0, 1, 0, 1, 0, 1]
+    assert [r.model_key_snapshot for r in records] == [
+        c.model for c in candidates for _ in range(1 + c.extra_retries)
+    ]
+    assert [r.request_ordinal for r in records] == list(range(1, len(records) + 1))
+    assert [r.retry_ordinal for r in records] == [
+        retry for count in retries for retry in range(count + 1)
+    ]
+    for c in candidates:
+        assert f"{c.model}（本次失败{c.extra_retries + 1}次）" in str(failure.value)
+        assert str(failure.value).count(f"{c.model}有效增量等待超时") == 1
     assert len({r.invocation_id for r in records}) == 1
 
 
-def test_total_budget_prevents_starting_next_candidate():
+def test_last_rate_limited_attempt_switches_in_order_without_waiting_or_bypassing_provider():
+    records = []
+    limited = ModelUnavailable("HTTP 429：每分钟配额已用尽", http_status=429)
+    limited.retry_after = 60
+    router = RoutingModel(
+        "analysis", "analysis",
+        [_candidate("a", 1), replace(_candidate("b", 2), provider_id=1), _candidate("c", 3)],
+        _ScriptedGateway({"a": [limited], "b": [None], "c": [None]}), records.append,
+        remaining_seconds=lambda: 5,
+    )
+    assert asyncio.run(router.complete("测试")).model == "c"
+    assert [r.model_key_snapshot for r in records] == ["a", "c"]
+
+
+def test_initial_cooldown_does_not_reorder_saved_candidates():
+    from time import monotonic
+
+    records, started = [], monotonic()
+    router = RoutingModel(
+        "analysis", "analysis", [_candidate("a", 1), _candidate("b", 2)],
+        _ScriptedGateway({"a": [ModelUnavailable("网关503")], "b": [None]}), records.append,
+        cooldown_remaining=lambda c: max(0, started + (0.03 if c.model == "a" else 0.01)
+                                         - monotonic()),
+    )
+    assert asyncio.run(router.complete("测试")).model == "b"
+    assert [r.model_key_snapshot for r in records] == ["a", "b"]
+
+
+def test_model_retry_budget_is_exhausted_before_next_candidate_without_six_request_cutoff():
     records = []
     gateway = _ScriptedGateway(
         {"a": [ModelUnavailable("忙", http_status=503)] * 11, "b": [None]}
@@ -303,10 +342,11 @@ def test_total_budget_prevents_starting_next_candidate():
         records.append,
         retry_base_seconds=0,
     )
-    with pytest.raises(ModelCallFailed, match="上限"):
-        asyncio.run(router.complete("测试"))
-    assert len(records) == 6
-    assert gateway.created == ["a"]
+    assert asyncio.run(router.complete("测试")).model == "b"
+    assert [r.model_key_snapshot for r in records] == list("a" * 11 + "b")
+    assert [r.retry_ordinal for r in records] == list(range(11)) + [0]
+    assert [r.request_ordinal for r in records] == list(range(1, 13))
+    assert gateway.created == ["a", "b"]
 
 
 def test_skipped_candidate_does_not_consume_failover_limit():
@@ -450,8 +490,9 @@ def test_retry_after_larger_than_deadline_stops_without_retry():
         records.append,
         remaining_seconds=lambda: 1,
     )
-    with pytest.raises(ModelCallFailed, match="时间预算"):
+    with pytest.raises(ModelCallFailed, match="上游限流需等待60.0秒，模块剩余") as failure:
         asyncio.run(router.complete("测试"))
+    assert "限流" in str(failure.value)
     assert len(records) == 1
 
 
@@ -495,10 +536,34 @@ def test_rate_limit_wait_stops_after_the_configured_budget():
                 await model.complete("分析")
         finally:
             await model.aclose()
-        # 额度用尽后不再重发；记录数等于实际发送次数减去被拒的那次之外的重试。
-        assert len(records) <= 2
+        assert len(records) == 1
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(("wait_budget", "module_time"), [(1, 100), (60, 5)])
+def test_429_cooldown_that_cannot_fit_switches_to_available_candidate(
+    wait_budget, module_time, monkeypatch,
+):
+    from tender.application.llm import routing as llm_routing
+
+    async def sleep(seconds):
+        pytest.fail(f"可用后备能立即处理，不应等待 {seconds} 秒")
+
+    monkeypatch.setattr(llm_routing.asyncio, "sleep", sleep)
+    error = ModelUnavailable("HTTP 429", http_status=429)
+    error.retry_after = 10
+    records, cooldowns = [], []
+    router = RoutingModel(
+        "analysis", "analysis",
+        [replace(_candidate("a", 1), extra_retries=1), _candidate("b", 2)],
+        _ScriptedGateway({"a": [error, None], "b": [None]}), records.append,
+        rate_limit_max_wait_seconds=wait_budget, remaining_seconds=lambda: module_time,
+        defer_provider=lambda candidate, seconds: cooldowns.append((candidate.model, seconds)),
+    )
+    assert asyncio.run(router.complete("测试")).model == "b"
+    assert [r.model_id for r in records] == [1, 2]
+    assert cooldowns == [("a", 10)]
 
 
 def test_rate_limit_backoff_grows_when_the_supplier_gives_no_reset_time():
@@ -780,23 +845,25 @@ def test_agent_module_window_is_a_continuous_budget_for_the_current_request(monk
         remaining_seconds=lambda: 60,
     )
     # 首次请求拿到完整的剩余 60 秒窗口；慢候选耗尽后按模块总时限结束，不再切片重发或换后备。
-    with pytest.raises(ModelCallFailed, match="总请求次数或模块时间上限"):
+    with pytest.raises(ModelCallFailed, match="模块总时限已到") as failure:
         asyncio.run(router.complete("测试"))
+    assert "a（本次失败1次）" in str(failure.value)
+    assert "供应商执行结果未知" in str(failure.value)
     assert timeouts == [60.0]
     assert [r.model_id for r in records] == [1]
 
 
-def test_recovery_uses_frozen_timeouts_without_resetting_attempts():
+def test_recovery_keeps_frozen_model_and_timeouts_even_after_reordering():
     from copy import deepcopy
 
     class Store:
         value = {
             "invocation_id": "retained-call",
             "requests": [{"model": 1, "ordinal": 1}], "candidate_order": [1],
-            "policy": {"failover_limit": 1, "max_total": 2, "rate_max_wait": 600,
+            "policy": {"failover_limit": 1, "rate_max_wait": 600,
                        "rate_backoff": 30, "candidates": {"1": {
                            "extra_retries": 1, "timeout": 1, "total_timeout": None,
-                       }}},
+                       }, "2": {"extra_retries": 0, "timeout": 1, "total_timeout": None}}},
         }
 
         def load_invocation(self, key):
@@ -805,10 +872,16 @@ def test_recovery_uses_frozen_timeouts_without_resetting_attempts():
         def save_invocation(self, key, value):
             self.value = deepcopy(value)
 
+        def other_invocation_wait(self, key):
+            return 0.0
+
     records, store = [], Store()
     gateway = _ScriptedGateway({"a": [None]})
-    router = RoutingModel("analysis", "test", [replace(_candidate("a", 1), total_timeout=0.01)],
-                          gateway, records.append, invocation_store=store)
+    router = RoutingModel(
+        "analysis", "test", [], gateway, records.append, invocation_store=store,
+        load_route=lambda: ([_candidate("b", 2), replace(_candidate("a", 1),
+                            timeout=60, extra_retries=0, total_timeout=0.01)], 2),
+    )
     messages = [{"type": "human", "data": {"id": "checkpoint-1", "content": "测试"}}]
     result = asyncio.run(router.chat(messages, []))
     assert result.model == "a"
@@ -822,3 +895,43 @@ def test_recovery_uses_frozen_timeouts_without_resetting_attempts():
     with pytest.raises(ModelCallFailed, match="原请求次数已耗尽"):
         asyncio.run(router.chat(messages, []))
     assert gateway.prompts == ["测试"]
+
+
+@pytest.mark.parametrize("unavailable", [True, False])
+def test_recovery_does_not_substitute_a_new_candidate_and_preserves_failure_kind(unavailable):
+    from copy import deepcopy
+
+    class Store:
+        value = {
+            "invocation_id": "retained-call", "requests": [{"model": 1, "ordinal": 1}],
+            "candidate_order": [1], "finished_candidates": [1],
+            "failures": [{"model_key": "1", "model": "a", "message": "原供应商错误",
+                          "unavailable": unavailable}],
+            "policy": {"failover_limit": 1, "rate_max_wait": 600, "rate_backoff": 30,
+                       "candidates": {str(i): {
+                           "extra_retries": 0, "timeout": 1, "total_timeout": None,
+                       } for i in (1, 2)}},
+        }
+
+        def load_invocation(self, key):
+            return deepcopy(self.value)
+
+        def save_invocation(self, key, value):
+            self.value = deepcopy(value)
+
+        def other_invocation_wait(self, key):
+            return 0.0
+
+    gateway, store = _ScriptedGateway({"b": [None]}), Store()
+    router = RoutingModel(
+        "analysis", "test", [_candidate("a", 1), _candidate("b", 2)], gateway,
+        lambda record: None, invocation_store=store,
+        recheck=lambda c: c if c.model == "b" else None,
+    )
+    failure_type = ModelUnavailable if unavailable else ModelCallFailed
+    with pytest.raises(failure_type, match="原供应商错误") as failure:
+        asyncio.run(router.complete("恢复"))
+    assert type(failure.value) is failure_type
+    assert gateway.created == []
+    assert store.value["candidate_order"] == [1]
+    assert store.value["requests"] == [{"model": 1, "ordinal": 1}]

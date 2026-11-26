@@ -160,7 +160,6 @@ export interface LlmBinding {
 
 export interface LlmFeature {
   revision: number;
-  max_total_requests: number;
   required_kind: ModelKind;
   key: string;
   name: string;

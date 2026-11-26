@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
-from collections.abc import Callable
-from functools import wraps
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -75,34 +72,6 @@ def as_api_problem(exc: ServiceError) -> ApiProblem:
         retryable=exc.retryable,
         detail=exc.detail,
     )
-
-
-def translate_service_errors(func: Callable[..., Any]) -> Callable[..., Any]:
-    """让直接调用路由函数的测试也看到统一的 HTTP 问题类型。
-
-    FastAPI 运行时本来会通过异常处理器转换；这里在入口边界再兜一层，
-    是为了保持“路由函数成功返回、失败抛 ApiProblem”的既有调用契约。
-    业务判断仍全部在服务层完成，不把状态码带下去。
-    """
-    if inspect.iscoroutinefunction(func):
-
-        @wraps(func)
-        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            try:
-                return await func(*args, **kwargs)
-            except ServiceError as exc:
-                raise as_api_problem(exc) from exc
-
-        return async_wrapper
-
-    @wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(*args, **kwargs)
-        except ServiceError as exc:
-            raise as_api_problem(exc) from exc
-
-    return wrapper
 
 
 def install_error_handlers(app: FastAPI) -> None:

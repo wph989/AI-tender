@@ -23,17 +23,19 @@ interface Props {
   fields?: Record<string, ParameterSchema>;
   maximumBindings?: number;
   onChanged: () => Promise<void>;
+  onEditModel?: (id: number) => void;
 }
 
 interface Draft {
   key: string;
   ids: number[];
   limit: number;
-  total: number;
   revision: number;
 }
 
-export function FeatureBindingsPanel({ features, models, fields = {}, maximumBindings, onChanged }: Props) {
+export function FeatureBindingsPanel({
+  features, models, fields = {}, maximumBindings, onChanged, onEditModel,
+}: Props) {
   const { message: toast } = App.useApp();
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
@@ -74,24 +76,19 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
     draft !== null && draft.key === active.key
       ? draft.limit
       : active.failover_limit;
-  const total =
-    draft?.key === active.key ? draft.total : active.max_total_requests;
   const revision = draft?.key === active.key ? draft.revision : active.revision;
   const dirty =
-    total !== active.max_total_requests ||
     ids.join(",") !== serverIds.join(",") ||
     limit !== active.failover_limit;
 
   const update = (
     nextIds: number[],
     nextLimit: number = limit,
-    nextTotal: number = total,
   ) =>
     setDraft({
       key: active.key,
       ids: nextIds,
       limit: nextLimit,
-      total: nextTotal,
       revision,
     });
 
@@ -115,7 +112,6 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
       await replaceBindings(active.key, ids, {
         revision,
         failover_limit: limit,
-        max_total_requests: total,
       });
       setDraft(null);
       void toast.success("功能绑定已保存");
@@ -167,7 +163,7 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
                 功能绑定
               </h2>
               <p className="mt-1 text-[13px] leading-5 text-slate-500">
-                暂时故障按模型的额外次数重试，再尝试后续候选；请求总量与时间预算始终优先。
+                按保存的顺序调用模型；暂时故障按当前模型的额外重试次数重试，用完后进入下一候选。
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-2 whitespace-nowrap text-[13px] text-slate-600">
@@ -186,21 +182,6 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
             </div>
           </div>
 
-          <div className="mt-3 flex flex-wrap gap-3 text-sm">
-            <label>
-              总请求上限{" "}
-              <Input
-                aria-label="总请求上限"
-                disabled={!languageRouting}
-                type="number"
-                min={fields.max_total_requests?.min}
-                max={fields.max_total_requests?.max}
-                className={" w-20"}
-                value={total}
-                onChange={(e) => update(ids, limit, Number(e.target.value))}
-              />
-            </label>
-          </div>
           {!languageRouting && (
             <p className="mt-2 text-xs text-slate-500">
               嵌入与重排当前为单次请求；上述转移与重试预算仅用于语言模型调用。
@@ -232,8 +213,8 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
           )}
 
           <p className="mt-3 text-[13px] text-slate-500" hidden={!languageRouting}>
-            共 {ids.length} 个候选，最多实际尝试 {effective} 个可用模型、{total}{" "}
-            次请求。前面的模型可能耗尽预算，后续模型不保证执行。
+            共 {ids.length} 个候选，最多实际尝试 {effective} 个可用模型。
+            每个模型最多发送首次请求加额外重试次数，模块预算继续生效。
           </p>
 
           {ids.length === 0 ? (
@@ -261,6 +242,9 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
                     </th>
                     <th className="border-b border-slate-200 py-2 pr-3 font-normal">
                       状态
+                    </th>
+                    <th className="border-b border-slate-200 py-2 text-right font-normal">
+                      调用设置
                     </th>
                     <th className="border-b border-slate-200 py-2 text-right font-normal">
                       调整
@@ -324,6 +308,19 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
                               停用
                             </span>
                           )}
+                        </td>
+                        <td className="border-b border-slate-100 py-2 text-right">
+                          {model ? <>
+                            <p className="whitespace-nowrap text-sm">
+                              {languageRouting ? "响应间隔" : "超时"} {model.timeout_seconds} 秒
+                            </p>
+                            <p className="whitespace-nowrap text-xs text-slate-500">
+                              {languageRouting ? `失败后额外重试 ${model.extra_retries} 次` : "每次只请求一次"}
+                            </p>
+                            {onEditModel && <Button type="link" size="small"
+                              aria-label={`${model.display_name}配置超时和重试`}
+                              onClick={() => onEditModel(model.id)}>配置超时和重试</Button>}
+                          </> : "模型配置尚未加载"}
                         </td>
                         <td className="border-b border-slate-100 py-2 text-right whitespace-nowrap">
                           <Button
@@ -417,8 +414,7 @@ export function FeatureBindingsPanel({ features, models, fields = {}, maximumBin
                 disabled={
                   busy ||
                   !dirty ||
-                  !withinNumericRule(limit, fields.failover_limit) ||
-                  !withinNumericRule(total, fields.max_total_requests)
+                  !withinNumericRule(limit, fields.failover_limit)
                 }
                 onClick={save}
               >

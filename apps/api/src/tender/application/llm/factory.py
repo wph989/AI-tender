@@ -99,8 +99,10 @@ class RoutingModelFactory:
     ) -> RoutingModel:
 
         cooldown = self.cooldown
-        candidates = self._load_candidates(feature_key, purpose)
-        policy = self.repository.policy(feature_key)
+        def load_route() -> tuple[list[ModelCandidate], int]:
+            candidates = self._load_candidates(feature_key, purpose)
+            policy = self.repository.policy(feature_key)
+            return candidates, policy["failover_limit"] if policy else 3
 
         def recheck(snapshot: ModelCandidate) -> ModelCandidate | None:
             current = next(
@@ -127,11 +129,10 @@ class RoutingModelFactory:
         return RoutingModel(
             feature_key,
             purpose,
-            candidates,
+            (),
             self.gateway,
             record_call,
-            failover_limit=policy["failover_limit"] if policy else 3,
-            max_total_requests=policy["max_total_requests"] if policy else 6,
+            load_route=load_route,
             recheck=recheck,
             reserve=self._log_call,
             before_request=before_request,

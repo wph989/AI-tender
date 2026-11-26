@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from data_schema import install_data_schema
+from http_client import api_request
 from langchain_core.messages import AIMessage, ToolMessage, message_to_dict
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.conninfo import make_conninfo
@@ -21,7 +22,6 @@ from tender.adapters.pg.repositories.analysis import runtime as run_store
 from tender.adapters.pg.repositories.llm.provider_cooldown import ProviderCooldown
 from tender.api.analysis import routes as analysis_api
 from tender.api.projects import routes as projects
-from tender.api.shared.errors import ApiProblem
 from tender.application.analysis import execution as worker
 from tender.application.analysis import runtime as agent_runtime
 from tender.application.analysis.skills import MODULES
@@ -173,14 +173,15 @@ def test_retired_protocol_is_hidden_and_preserved(env):
                    "status='failed' WHERE id=:id",
                    {"snapshot": json.dumps(frozen), "id": row["id"]})
     before = env.db.report(row["id"])
-    for call in (
-        lambda: analysis_api.get_report(row["id"], env.request),
-        lambda: analysis_api.retry_report(row["id"], analysis_api.RetryInput(), env.request),
+    for method, suffix, payload in (
+        ("GET", "", None), ("POST", "/retry", analysis_api.RetryInput()),
     ):
-        with pytest.raises(ApiProblem) as caught:
-            call()
-        assert caught.value.status_code == 409
-        assert caught.value.code == "runtime_retired"
+        caught = api_request(
+            env.request, analysis_api.router, method,
+            f"/api/v1/analysis/reports/{row['id']}{suffix}", payload=payload,
+        )
+        assert caught.status_code == 409
+        assert caught.json()["error"]["code"] == "runtime_retired"
     run_async(env.executor.execute(row["id"]))
     assert env.db.report(row["id"]) == before
     assert env.db.report_runs(row["id"]) == []
@@ -496,6 +497,76 @@ def test_new_run_success_counts_start_at_zero_without_result_events(env):
     assert current["successful_model_calls"] == 0
     assert current["successful_tool_calls"] == 0
     assert current["model_calls"] == current["tool_calls"] == 99
+
+
+def test_legacy_generic_error_is_reconstructed_from_calls_without_changing_audit(env):
+    from tender.adapters.pg.repositories.llm.runtime import ModelRuntimeRepository
+
+    runtime = prepared_runtime(env)
+    generic = "模型调用已达到总请求次数或模块时间上限，请查看调用记录"
+    invocation = str(uuid4())
+    progress = {"invocation_id": invocation, "policy": {"max_total": 6},
+                "requests": [{"ordinal": i} for i in range(1, 7)], "exhausted": True}
+    assert runtime.claim()
+    try:
+        runtime.store.save_invocation("legacy-call", progress)
+    finally:
+        runtime.release()
+    env.db.execute("""UPDATE agent_module_run SET error_message=:message,
+        state=CAST(:state AS JSONB),status='partial' WHERE id=:id""",
+        {"message": generic, "state": json.dumps({"stop_reason": {
+            "code": "agent_interrupted", "message": generic,
+        }}), "id": runtime.run["id"]})
+    # 删除模型后只有快照名称；两个不同模型的失败必须分别展示，不能合并为同一个空ID。
+    logs = ModelRuntimeRepository(env.engine)
+    for ordinal in range(1, 7):
+        model_name = "模型甲" if ordinal <= 2 else "模型乙" if ordinal <= 4 else "模型丙"
+        logs.record_call({"invocation_id": invocation, "request_ordinal": ordinal,
+            "purpose": "analysis", "status": "unknown", "latency_ms": 10000,
+            "model_name_snapshot": model_name, "model_key_snapshot": model_name,
+            "provider_name_snapshot": "测试供应商",
+            "error_message": "有效增量间隔超时（10秒） api_key=fixture-secret"})
+    before = env.db.rows("SELECT * FROM agent_module_run WHERE id=:id",
+                         {"id": runtime.run["id"]})[0]
+    current = next(run for run in env.db.report_runs(runtime.report["id"])
+                   if run["id"] == runtime.run["id"])
+    detail = current["error_message"]
+    assert "已尝试6次，达到当时配置的6次请求上限" in detail
+    for name in ("模型甲", "模型乙", "模型丙"):
+        assert f"测试供应商 / {name}（本次失败2次）" in detail
+    assert "有效增量间隔超时（10秒）" in detail and "fixture-secret" not in detail
+    assert current["stop_reason"]["message"] == detail
+    assert env.db.rows("SELECT * FROM agent_module_run WHERE id=:id",
+                       {"id": runtime.run["id"]})[0] == before
+
+
+def test_rate_limit_wait_reads_other_requests_including_legacy_windows(env):
+    runtime = prepared_runtime(env)
+    assert runtime.claim()
+    try:
+        runtime.store.save_invocation("first", {"rate_waited": 2.5})
+        runtime.store.save_invocation("legacy", {"rate_state": {"1": {"waited": 1.5}}})
+        runtime.store.save_invocation("current", {"rate_waited": 2})
+        # 当前窗口在路由中另计，只有同一运行的其余窗口计入此处。
+        assert runtime.store.other_invocation_wait("current") == 4
+    finally:
+        runtime.release()
+
+
+def test_expired_run_can_save_received_failure_but_cannot_reserve_another_request(env):
+    from tender.domain.shared.errors import BudgetExhausted
+
+    runtime = prepared_runtime(env)
+    assert runtime.claim()
+    try:
+        env.db.execute("UPDATE agent_module_run SET deadline_at=now() WHERE id=:id",
+                       {"id": runtime.run["id"]})
+        runtime.store.save_invocation("received", {"failures": [{"message": "HTTP 503"}]})
+        assert runtime.store.load_invocation("received")["failures"] == [{"message": "HTTP 503"}]
+        with pytest.raises((TimeoutError, BudgetExhausted)):
+            runtime.store.reserve("model", "late")
+    finally:
+        runtime.release()
 
 
 def test_success_budget_serializes_pending_and_deduplicates_settlement(env):
@@ -932,10 +1003,14 @@ def test_retry_creates_one_new_attempt_and_preserves_completed_modules(env, stag
     assert rows[1]["state"]["agent_workspace"]["reviews"] == book.book["reviews"]
     assert "draft" not in rows[1]["state"]
     assert not rows[1]["state"]["agent_workspace"]["finalized"]
-    with pytest.raises(ApiProblem):
-        analysis_api.retry_report(
-            runtime.report["id"], analysis_api.RetryInput(module_keys=[key]), env.request
-        )
+    response = api_request(
+        env.request,
+        analysis_api.router,
+        'POST',
+        f"/api/v1/analysis/reports/{runtime.report['id']}/retry",
+        payload=analysis_api.RetryInput(module_keys=[key]),
+    )
+    assert response.status_code == 409
 
 
 def test_canceled_report_retries_failed_and_canceled_modules(env):
@@ -1114,7 +1189,6 @@ def test_retry_before_modules_created_persists_new_limits(env):
 
 
 def test_retry_waits_for_canceled_controller_to_exit(env):
-    from tender.api.shared.errors import ApiProblem
 
     runtime = prepared_runtime(env)
     report_id = runtime.report["id"]
@@ -1124,9 +1198,15 @@ def test_retry_waits_for_canceled_controller_to_exit(env):
         try:
             assert analysis_api.cancel_report(report_id, env.request)["canceling"]
             assert analysis_api.get_report(report_id, env.request)["canceling"]
-            with pytest.raises(ApiProblem) as caught:
-                analysis_api.retry_report(report_id, analysis_api.RetryInput(), env.request)
-            assert caught.value.code == "cancellation_pending"
+            caught = api_request(
+                env.request,
+                analysis_api.router,
+                'POST',
+                f"/api/v1/analysis/reports/{report_id}/retry",
+                payload=analysis_api.RetryInput(),
+            )
+            assert caught.status_code >= 400
+            assert caught.json()["error"]["code"] == "cancellation_pending"
         finally:
             controller.execute(text("SELECT pg_advisory_unlock(hashtextextended(:key,0))"),
                                {"key": f"analysis_report:{report_id}"})

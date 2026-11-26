@@ -90,7 +90,6 @@ class LlmFeature(Base):
     failover_limit: Mapped[int] = mapped_column(Integer)
     description: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    max_total_requests: Mapped[int] = mapped_column(Integer)
     revision: Mapped[int] = mapped_column(Integer)
 
 

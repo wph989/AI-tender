@@ -7,11 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import Response
 
 from tender.api.shared.common import engine
-from tender.api.shared.errors import as_api_problem
 from tender.api.shared.logging import throttle_access_log
 from tender.api.shared.responses import ProjectDetailResponse, ProjectListResponse, ProjectResponse
 from tender.application.projects.service import ProjectService
-from tender.application.shared.errors import ServiceError
 from tender.core import settings
 from tender.core.di import create_project_service
 
@@ -40,14 +38,11 @@ def _service(request: Request) -> ProjectService:
 
 @router.post("", status_code=201, response_model=ProjectResponse)
 def create_project(payload: ProjectCreate, request: Request) -> dict[str, object]:
-    try:
-        return _service(request).create(
-            name=payload.name,
-            project_no=payload.project_no,
-            owner=payload.owner,
-        )
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).create(
+        name=payload.name,
+        project_no=payload.project_no,
+        owner=payload.owner,
+    )
 
 
 @router.get("", response_model=ProjectListResponse)
@@ -57,20 +52,14 @@ def list_projects(
     limit: int = Query(default=50, ge=1, le=100),
     keyword: str | None = None,
 ) -> dict[str, object]:
-    try:
-        return _service(request).list(offset=offset, limit=limit, keyword=keyword)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).list(offset=offset, limit=limit, keyword=keyword)
 
 
 @router.get("/{project_id}", response_model=ProjectDetailResponse)
 # 文件管理和文档预览会轮询项目详情，跟进转换与解析进度。
 @throttle_access_log()
 def get_project(project_id: int, request: Request) -> dict[str, object]:
-    try:
-        return _service(request).detail(project_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).detail(project_id)
 
 
 @router.patch("/{project_id}", response_model=ProjectDetailResponse)
@@ -80,16 +69,10 @@ def patch_project(
     request: Request,
 ) -> dict[str, object]:
     changes = {field: getattr(payload, field) for field in payload.model_fields_set}
-    try:
-        return _service(request).patch(project_id, changes)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).patch(project_id, changes)
 
 
 @router.delete("/{project_id}", status_code=204, response_model=None)
 def delete_project(project_id: int, request: Request) -> Response:
-    try:
-        _service(request).delete(project_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    _service(request).delete(project_id)
     return Response(status_code=204)

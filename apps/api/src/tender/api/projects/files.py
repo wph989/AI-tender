@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import Response
 
 from tender.api.shared.common import blobs, configs, engine
-from tender.api.shared.errors import as_api_problem
 from tender.api.shared.responses import ProjectFileResponse, ReplaceFileResponse, UploadResponse
 from tender.api.shared.storage import stream_object
 from tender.application.projects.files import (
@@ -21,7 +20,7 @@ from tender.application.projects.files import (
     safe_filename,
     validate_upload_limits,
 )
-from tender.application.shared.errors import InvalidArgument, PayloadTooLarge, ServiceError
+from tender.application.shared.errors import InvalidArgument, PayloadTooLarge
 from tender.core import settings
 from tender.core.di import create_project_file_service
 
@@ -55,33 +54,30 @@ async def upload_files(
     ocr_mode: Annotated[str | None, Form()] = None,
     role: Annotated[str | None, Form()] = None,
 ) -> dict[str, object]:
-    try:
-        incoming = files or []
-        known_total = sum(upload.size or 0 for upload in incoming)
-        if archive is not None:
-            known_total += archive.size or 0
-        validate_upload_limits(len(incoming), known_total)
-        uploads = []
-        total_bytes = 0
-        for upload in incoming:
-            item = await _read_upload(upload, MAX_UPLOAD_BYTES, total_bytes=total_bytes)
-            uploads.append(item)
-            total_bytes += len(item.content)
-        archive_input = (
-            await _read_upload(archive, MAX_ARCHIVE_BYTES, total_bytes=total_bytes)
-            if archive is not None else None
-        )
-        return await _service(request).upload(
-            project_id=project_id,
-            files=uploads,
-            archive=archive_input,
-            auto_parse=auto_parse,
-            tier=tier,
-            ocr_mode=ocr_mode,
-            role=role,
-        )
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    incoming = files or []
+    known_total = sum(upload.size or 0 for upload in incoming)
+    if archive is not None:
+        known_total += archive.size or 0
+    validate_upload_limits(len(incoming), known_total)
+    uploads = []
+    total_bytes = 0
+    for upload in incoming:
+        item = await _read_upload(upload, MAX_UPLOAD_BYTES, total_bytes=total_bytes)
+        uploads.append(item)
+        total_bytes += len(item.content)
+    archive_input = (
+        await _read_upload(archive, MAX_ARCHIVE_BYTES, total_bytes=total_bytes)
+        if archive is not None else None
+    )
+    return await _service(request).upload(
+        project_id=project_id,
+        files=uploads,
+        archive=archive_input,
+        auto_parse=auto_parse,
+        tier=tier,
+        ocr_mode=ocr_mode,
+        role=role,
+    )
 
 @router.patch("/{file_id}", response_model=ProjectFileResponse)
 def patch_file(
@@ -91,10 +87,7 @@ def patch_file(
     request: Request,
 ) -> dict[str, object]:
     changes = {field: getattr(payload, field) for field in payload.model_fields_set}
-    try:
-        return _service(request).patch(project_id, file_id, changes)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).patch(project_id, file_id, changes)
 
 
 @router.post("/{file_id}/replace", status_code=202, response_model=ReplaceFileResponse)
@@ -107,35 +100,26 @@ async def replace_file(
     tier: Annotated[str | None, Form()] = None,
     ocr_mode: Annotated[str | None, Form()] = None,
 ) -> dict[str, object]:
-    try:
-        item = await _read_upload(file, MAX_UPLOAD_BYTES)
-        return await _service(request).replace(
-            project_id=project_id,
-            file_id=file_id,
-            item=item,
-            auto_parse=auto_parse,
-            tier=tier,
-            ocr_mode=ocr_mode,
-        )
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    item = await _read_upload(file, MAX_UPLOAD_BYTES)
+    return await _service(request).replace(
+        project_id=project_id,
+        file_id=file_id,
+        item=item,
+        auto_parse=auto_parse,
+        tier=tier,
+        ocr_mode=ocr_mode,
+    )
 
 
 @router.delete("/{file_id}", status_code=204, response_model=None)
 def delete_file(project_id: int, file_id: int, request: Request) -> Response:
-    try:
-        _service(request).delete(project_id, file_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    _service(request).delete(project_id, file_id)
     return Response(status_code=204)
 
 
 @router.get("/{file_id}/original", response_model=None)
 def get_original(project_id: int, file_id: int, request: Request) -> Response:
-    try:
-        original = _service(request).original(project_id, file_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    original = _service(request).original(project_id, file_id)
     return stream_object(
         blobs(request),
         original["key"],

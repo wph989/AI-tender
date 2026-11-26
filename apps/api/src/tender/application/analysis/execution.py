@@ -81,6 +81,7 @@ async def invoke_module(
                 )
                 if state is None or save is None or not recoverable:
                     raise
+                # 检查点恢复次数持久化在同一工作区，进程恢复不能重新获得这份预算。
                 attempts = state.get("subagent_retries", 0)
                 if attempts >= max_retries:
                     raise RuntimeError("Agent检查点恢复次数已耗尽") from exc
@@ -497,7 +498,8 @@ class AnalysisExecutor:
                 else "".join(traceback.format_exception(exc, chain=False)),
             )
             # 尚在排队的任务也必须形成终态，避免被取消后仍显示等待配额。
-            await asyncio.to_thread(runtime.abandon, status, str(exc)[:1000])
+            # 已汇总的模型错误包含后备候选，收尾统一限长以保留这些原因。
+            await asyncio.to_thread(runtime.abandon, status, error_detail(str(exc)))
             if isinstance(exc, asyncio.CancelledError):
                 raise
 
@@ -526,7 +528,7 @@ class AnalysisExecutor:
         queue_ms: int = 0,
     ) -> None:
         """模型不可用时保留工作区并标记 partial，等待同一 Agent 后续补跑。"""
-        reason = str(exc)
+        reason = error_detail(str(exc)) or type(exc).__name__
         state["quality_status"] = "needs_review"
         if task and not task.done():
             task.cancel()
@@ -534,10 +536,11 @@ class AnalysisExecutor:
                 await task
         if state.get("agent_workspace"):
             # 未明确提交的草稿只留在检查点；硬预算或上游失败不能代替Agent选择最终结果。
-            state["stop_reason"] = {"code": "agent_interrupted", "message": reason[:2000]}
-            await asyncio.to_thread(runtime.finish, "partial", reason[:1000], state=state)
+            # 上游错误已统一脱敏和限长，不再把各候选的真实原因截成半条摘要。
+            state["stop_reason"] = {"code": "agent_interrupted", "message": reason}
+            await asyncio.to_thread(runtime.finish, "partial", reason, state=state)
             return
-        await asyncio.to_thread(runtime.abandon, "failed", reason[:1000])
+        await asyncio.to_thread(runtime.abandon, "failed", reason)
         logger.error(
             "module.fail",
             duration_ms=int((time.monotonic() - started) * 1000),

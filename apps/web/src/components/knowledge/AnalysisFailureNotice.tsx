@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 import { Alert } from "antd";
 
-// 仅识别已知错误特征；未知错误不猜原因，完整响应始终可展开排查。
+// 仅识别已知错误特征；未知错误不猜原因，真实响应默认展开供排查。
 function failureHint(detail: string): [string, string] {
   if (/RateLimitError|HTTP 429|上游限流/.test(detail))
     return ["模型服务暂时限流", "请稍后重试；若持续出现，请检查模型服务的可用额度。"];
@@ -31,7 +31,7 @@ export function AnalysisFailureNotice({ message, canceled = false, action }: {
   return <Alert className="analysis-failure my-3" showIcon type={canceled ? "info" : "error"}
     title={title} action={action} description={<>
       <p>{hint}</p>
-      {message && <details className="analysis-failure-detail">
+      {message && <details className="analysis-failure-detail" open>
         <summary>{canceled ? "查看停止详情" : "查看错误详情"}</summary>
         <p>{message}</p>
       </details>}

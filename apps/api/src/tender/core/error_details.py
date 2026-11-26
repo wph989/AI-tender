@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
@@ -12,10 +13,54 @@ from tender.core.redaction import redact_text
 from tender.domain.shared.errors import ModelCallFailed, ModelUnavailable
 
 MAX_ERROR_LENGTH = 16000
+_TRUNCATED = "\n[上游响应过长，已截断]"
 
 _WINDOW_PATTERN = re.compile(
     r"\b(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b", re.IGNORECASE
 )
+
+
+def model_error_details(failures: Iterable[Mapping], *, limit: int = MAX_ERROR_LENGTH) -> str:
+    """按模型保留实际失败次数与去重后的错误正文，运行和展示使用同一说明。"""
+    groups: dict[str, list[Mapping]] = {}
+    for failure in failures:
+        groups.setdefault(str(failure["model_key"]), []).append(failure)
+    details: list[tuple[str, list[str]]] = []
+    for items in groups.values():
+        messages = list(dict.fromkeys(
+            redact_text(item["message"]) for item in items if item.get("message")
+        ))
+        name, provider = items[-1]["model"], items[-1].get("provider")
+        label = f"{provider} / {name}" if provider else name
+        details.append((f"{redact_text(label)}（本次失败{len(items)}次）：\n", messages))
+    if not details:
+        return ""
+    full = "\n\n".join(title + "\n".join(messages) for title, messages in details)
+    if len(full) <= limit:
+        return full
+    # 先给每个不同原因留出摘要，再把剩余额度分给长正文，避免前面的响应占满全文。
+    budget = limit - len(_TRUNCATED) - 2 * (len(details) - 1)
+    title_budget = max(1, budget // (2 * len(details)))
+    titles = [_shorten(title.rstrip(), title_budget) + "\n" for title, _ in details]
+    message_budget = budget - sum(map(len, titles))
+    sizes = [len(message) for _, messages in details for message in messages]
+    message_budget -= sum(max(0, len(messages) - 1) for _, messages in details)
+    caps: dict[int, int] = {}
+    # 短原因只消耗自身长度，让较长条目平分余下的空间。
+    for index, size in sorted(enumerate(sizes), key=lambda entry: entry[1]):
+        caps[index] = min(size, max(0, message_budget // (len(sizes) - len(caps))))
+        message_budget -= caps[index]
+    lengths = iter(caps[index] for index in range(len(sizes)))
+    return "\n\n".join(
+        title + "\n".join(_shorten(message, next(lengths)) for message in messages)
+        for title, (_, messages) in zip(titles, details, strict=True)
+    ) + _TRUNCATED
+
+
+def _shorten(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit - 1] + "…" if limit > 0 else ""
 
 
 def retry_after(response: object) -> float:
@@ -44,9 +89,8 @@ def error_detail(value: str | None, *, api_key: str | None = None) -> str | None
     # 部分网关会在错误消息里原样引用密钥；先替换已知凭证，再处理常见凭证字段。
     value = redact_text(value, secrets=(api_key,) if api_key else ())
     # 截断需要明确标记，避免把半截响应当成供应商返回的全部内容。
-    suffix = "\n[上游响应过长，已截断]"
     if len(value) > MAX_ERROR_LENGTH:
-        value = value[: MAX_ERROR_LENGTH - len(suffix)] + suffix
+        value = value[: MAX_ERROR_LENGTH - len(_TRUNCATED)] + _TRUNCATED
     return value
 
 

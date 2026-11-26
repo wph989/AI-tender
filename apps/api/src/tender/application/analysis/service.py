@@ -203,11 +203,26 @@ class AnalysisService:
             )
         return report
 
+    def _report_inputs(self, report: dict) -> tuple[list[int], dict[int, dict]]:
+        # 页面与正式数据共用当前输入判断；正式数据不必读取页面摘要和展示运行账。
+        project_id = report["project_id"]
+        settings = self.store.analysis_settings(project_id)
+        if settings is None:
+            raise NotFound("项目不存在")
+        lots = self.store.project_lots(project_id)
+        allowed = self.store.collections_for_project(project_id)
+        live = {source["source_id"]: source for source in self.store.sources(allowed)}
+        report["stale"] = report_inputs_changed(
+            report, settings, lots,
+            [source for source in live.values() if source["project_id"] == project_id],
+            [source for source in live.values() if source["project_id"] != project_id],
+        )
+        return allowed, live
+
     def get_report(self, report_id: int) -> dict[str, Any]:
         report = self._view_report(report_id)
         report.pop("skill_snapshot", None)
         modules = self.store.report_module_summaries(report_id)
-        allowed = self.store.collections_for_project(report["project_id"])
         module_signatures = {}
         for module in modules:
             # 正文由独立记录接口读取，详情仅提取质量与运行信息。
@@ -220,10 +235,14 @@ class AnalysisService:
         for module in modules:
             module["runs"] = [run for run in runs if run["module_id"] == module["id"]]
             latest = module["runs"][-1] if module["runs"] else {}
+            if latest.get("error_message"):
+                # 最新运行的真实错误优先于模块上保留的旧摘要。
+                module["error_message"] = latest["error_message"]
             progress = latest.get("agent_progress")
             if progress and progress.get("protocol") == FLOW_VERSION:
                 module["progress"] = progress
-        live = {source["source_id"]: source for source in self.store.sources(allowed)}
+        # 先取得展示数据再复核当前来源，缩短权限核验到返回之间的间隔。
+        _allowed, live = self._report_inputs(report)
         current_sources = [source for source in live.values()
                            if source["project_id"] == report["project_id"]]
         current_references = [source for source in live.values()
@@ -249,25 +268,21 @@ class AnalysisService:
                 module.pop("progress", None)
                 for run in module["runs"]:
                     run.pop("agent_progress", None)
-        settings = self.store.analysis_settings(report["project_id"])
-        if settings is None:
-            raise NotFound("项目不存在")
-        stale = report_inputs_changed(
-            report, settings, self.store.project_lots(report["project_id"]),
-            current_sources, current_references,
-        )
         canceling = report["status"] == "canceled" and self.store.execution_active(report_id)
         return {
             **report,
             "canceling": canceling,
             "modules": modules,
             "quality_status": aggregate_quality([m["quality_status"] for m in modules]),
-            "stale": stale,
             "data_schema_version": DATA_VERSION,
         }
 
     def data_snapshot(self, report_id: int, snapshot_id: int | None = None) -> dict:
         self._view_report(report_id)
+        return self._data_snapshot(report_id, snapshot_id)
+
+    def _data_snapshot(self, report_id: int, snapshot_id: int | None) -> dict:
+        # 调用方已经核对报告身份；独立快照入口和汇总读取共用实际读取与未就绪错误。
         snapshot = self.store.data_snapshot(report_id, snapshot_id)
         if snapshot is None:
             raise Conflict("正式业务数据快照尚未就绪", code="data_not_ready")
@@ -386,62 +401,66 @@ class AnalysisService:
         report_id: int,
         snapshot_id: int | None = None,
     ) -> dict[str, Any]:
-        snapshot = self.data_snapshot(report_id, snapshot_id)
-        report = self.get_report(report_id)
-        state = self._current_snapshot_state(report, snapshot)
-        data = self._review_data(report, snapshot, state)
+        report = self._view_report(report_id)
+        snapshot = self._data_snapshot(report_id, snapshot_id)
+        data, current = self._review_data(report, snapshot)
         return {
             "report_id": report_id,
             "snapshot_id": snapshot["id"],
             "revision": snapshot["revision"],
             "schema_version": snapshot["schema_version"],
-            "stale": state is None,
+            "stale": not current,
             "data": data,
         }
 
-    def _current_snapshot_state(self, report: dict, snapshot: dict) -> dict | None:
-        if report["stale"] or report["status"] in {"waiting", "pending", "running"}:
-            return None
-        latest_id = self.store.latest_snapshot_id(report["id"])
-        if latest_id is None:
+    def _review_data(self, report: dict, snapshot: dict) -> tuple[dict, bool]:
+        terminal = report["status"] not in {"waiting", "pending", "running"}
+        latest_id = self.store.latest_snapshot_id(report["id"]) if terminal else None
+        state = (matching_snapshot_state(self.store.snapshot_state, snapshot)
+                 if latest_id == snapshot["id"] else None)
+        reviews = self.store.record_reviews(snapshot["id"])
+        # 版本和裁定读取可能与解除关联重叠，正式投影要用之后读取的项目授权。
+        allowed, live = self._report_inputs(report)
+        if terminal and latest_id is None and not report["stale"]:
             raise Conflict("正式业务数据快照尚未就绪", code="data_not_ready")
-        if latest_id != snapshot["id"]:
-            return None
-        return matching_snapshot_state(self.store.snapshot_state, snapshot)
-
-    def _review_data(self, report: dict, snapshot: dict, state: dict | None) -> dict:
         inputs = snapshot["input_snapshot"]
         sources = inputs["source_snapshot"] + inputs["reference_snapshot"]
         signature = source_signature(sources)
         signatures = inputs["module_input_signatures"]
         data = accessible_data(
-            self.store, snapshot["data"], self.store.collections_for_project(report["project_id"]),
-            sources=sources,
+            self.store, snapshot["data"], allowed, sources=sources, live_source_ids=set(live),
         )
+        # 原文定位会逐条读取；若其间撤销关联，按仍授权的范围重新投影。
+        latest_allowed = set(self.store.collections_for_project(report["project_id"]))
+        if set(allowed) - latest_allowed:
+            report["stale"] = True
+            data = accessible_data(
+                self.store, snapshot["data"], [cid for cid in allowed if cid in latest_allowed],
+                sources=sources, live_source_ids={
+                    sid for sid, source in live.items() if source["collection_id"] in latest_allowed
+                },
+            )
         data["quality_status"] = quality_status({"quality_status": data.get("quality_status")})
         # 来源撤销后不回显可能含原文的人工备注或修正结果。
         if any(gap["code"] == "source_unavailable" for gap in data["gaps"]):
-            return review_projection(data, signatures, signature, {}, current=False)
-        return review_projection(
-            data, signatures, signature, self.store.record_reviews(snapshot["id"]),
-            current=state is not None,
-        )
+            return review_projection(data, signatures, signature, {}, current=False), False
+        current = state is not None and not report["stale"]
+        return review_projection(data, signatures, signature, reviews, current=current), current
 
     def context_data(self, report_id: int, snapshot: dict) -> tuple[dict, dict]:
-        report = self.get_report(report_id)
+        report = self._view_report(report_id)
         if report["status"] in {"waiting", "pending", "running"}:
             raise Conflict(
                 "报告正在更新，请在本轮分析结束后获取编制依据",
                 code="report_running",
             )
-        state = self._current_snapshot_state(report, snapshot)
-        data = self._review_data(report, snapshot, state)
+        data, current = self._review_data(report, snapshot)
         if any(gap["code"] == "source_unavailable" for gap in data["gaps"]):
             raise Conflict(
                 "部分来源已删除或撤销访问，请更新分析",
                 code="source_unavailable",
             )
-        if state is None:
+        if not current:
             raise Conflict("依据已更新，请使用当前有效分析快照", code="data_stale")
         return report, data
 
@@ -619,26 +638,23 @@ class AnalysisService:
                 raise Conflict("项目已有其它分析任务", code="analysis_in_flight")
             # 完成状态不能证明已处理当前资料；统一取回后按专题输入和质量筛选。
             rows = tx.modules_for_retry(report_id, keys)
-            changed = False
-            current_sources = report.get("source_snapshot", [])
-            current_references = report.get("reference_snapshot", [])
-            if "source_snapshot" in report:
-                current_sources = self.analysis_status(report["project_id"])["sources"]
-                current_references = [source for source in self.store.sources(
-                    self.store.collections_for_project(report["project_id"]))
-                    if source["project_id"] != report["project_id"]]
-                changed = (source_signature(current_sources)
-                           != source_signature(report["source_snapshot"])
-                           or source_signature(current_references)
-                           != source_signature(report.get("reference_snapshot", [])))
-                if changed:
-                    tx.update_report(report_id, {"source_snapshot": current_sources,
-                                                 "reference_snapshot": current_references})
+            # 真实报告始终包含冻结输入；夹具也按同一契约提供，不保留跳过输入核验的分支。
+            current_sources = self.analysis_status(report["project_id"])["sources"]
+            current_references = [source for source in self.store.sources(
+                self.store.collections_for_project(report["project_id"]))
+                if source["project_id"] != report["project_id"]]
+            changed = (source_signature(current_sources)
+                       != source_signature(report["source_snapshot"])
+                       or source_signature(current_references)
+                       != source_signature(report["reference_snapshot"]))
+            if changed:
+                tx.update_report(report_id, {"source_snapshot": current_sources,
+                                             "reference_snapshot": current_references})
             # 草稿尚未发布时，已消费输入记在工作区；不能用旧正式成果让有效自查失效。
             previous_states = {row["id"]: tx.previous_run_state(row["id"])
                                for row in rows} if mode == "resume" else {}
             current_signature = source_signature(current_sources + current_references)
-            changed_modules = {row["id"] for row in rows if "source_snapshot" in report and (
+            changed_modules = {row["id"] for row in rows if (
                 previous_states.get(row["id"], {}).get("quality_input_signature")
                 or (row.get("business_data") or {}).get("quality_input_signature")
             ) != current_signature}

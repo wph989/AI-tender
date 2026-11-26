@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from data_schema import install_data_schema
+from http_client import api_request
 from langchain_core.messages import AIMessage, message_to_dict
 from sqlalchemy import create_engine, text
 
@@ -16,7 +17,6 @@ from tender.adapters.pg.repositories.knowledge.store import KnowledgeStore, sync
 from tender.api.analysis import routes as analysis_api
 from tender.api.knowledge import routes as knowledge
 from tender.api.projects import routes as projects
-from tender.api.shared.errors import ApiProblem
 from tender.application.analysis.data_store import publish_data_snapshot
 from tender.application.analysis.drafts import DraftWorkspace
 from tender.application.analysis.execution import prepare_report
@@ -277,9 +277,14 @@ def test_retired_report_is_hidden_from_application_but_history_is_preserved(envi
     assert version and run
     status = analysis_api.analysis_status(pid, request)
     assert all(item["id"] != report["id"] for item in status["reports"])
-    with pytest.raises(ApiProblem) as exc:
-        analysis_api.get_report(report["id"], request)
-    assert exc.value.status_code == 409 and exc.value.code == "runtime_retired"
+    exc = api_request(
+        request,
+        analysis_api.router,
+        'GET',
+        f"/api/v1/analysis/reports/{report['id']}",
+    )
+    assert exc.status_code >= 400
+    assert exc.status_code == 409 and exc.json()["error"]["code"] == "runtime_retired"
     stored = conn.execute(
         text("SELECT id, runtime_version FROM analysis_report WHERE id=:id"),
         {"id": report["id"]},
@@ -361,12 +366,23 @@ def test_retired_runtime_report_cannot_run_or_retry(environment):
         text("SELECT status FROM analysis_report WHERE id=:id"), {"id": report["id"]}
     ).scalar_one()
     assert stored == "waiting"
-    with pytest.raises(ApiProblem) as read_error:
-        analysis_api.get_report(report["id"], request)
-    assert read_error.value.status_code == 409 and read_error.value.code == "runtime_retired"
-    with pytest.raises(ApiProblem) as exc:
-        analysis_api.retry_report(report["id"], analysis_api.RetryInput(), request)
-    assert exc.value.status_code == 409 and exc.value.code == "runtime_retired"
+    read_error = api_request(
+        request,
+        analysis_api.router,
+        'GET',
+        f"/api/v1/analysis/reports/{report['id']}",
+    )
+    assert read_error.status_code >= 400
+    assert read_error.status_code == 409 and read_error.json()["error"]["code"] == "runtime_retired"
+    exc = api_request(
+        request,
+        analysis_api.router,
+        'POST',
+        f"/api/v1/analysis/reports/{report['id']}/retry",
+        payload=analysis_api.RetryInput(),
+    )
+    assert exc.status_code >= 400
+    assert exc.status_code == 409 and exc.json()["error"]["code"] == "runtime_retired"
 
 
 def test_reference_snapshot_change_marks_current_runtime_reports_stale(environment):
@@ -392,9 +408,14 @@ def test_reference_snapshot_change_marks_current_runtime_reports_stale(environme
         text("UPDATE analysis_report SET runtime_version='legacy' WHERE id=:id"),
         {"id": report["id"]},
     )
-    with pytest.raises(ApiProblem) as exc:
-        analysis_api.get_report(report["id"], request)
-    assert exc.value.code == "runtime_retired"
+    exc = api_request(
+        request,
+        analysis_api.router,
+        'GET',
+        f"/api/v1/analysis/reports/{report['id']}",
+    )
+    assert exc.status_code >= 400
+    assert exc.json()["error"]["code"] == "runtime_retired"
 
 
 def test_wait_for_missing_sources_or_explicit_partial_analysis(environment):
@@ -474,11 +495,15 @@ def test_collections_isolate_retrieval_and_answers(environment):
     own_id = knowledge.project_knowledge(pid, request)["collection_id"]
     hits = asyncio.run(knowledge.search_collection(own_id, request, "资质"))["items"]
     assert len(hits) == 1 and "本项目" in hits[0]["content"]
-    with pytest.raises(ApiProblem) as exc:
-        knowledge.ask_project(
-            pid, knowledge.AskInput(question="资质", collection_ids=[library["id"]]), request
-        )
-    assert exc.value.status_code == 403
+    exc = api_request(
+        request,
+        knowledge.router,
+        'POST',
+        f"/api/v1/projects/{pid}/knowledge/ask",
+        payload=knowledge.AskInput(question='资质', collection_ids=[library['id']]),
+    )
+    assert exc.status_code >= 400
+    assert exc.status_code == 403
     question = knowledge.ask_project(pid, knowledge.AskInput(question="资质"), request)
     asyncio.run(worker._answer_question(question["id"]))
     answer = knowledge.get_answer(question["id"], request)

@@ -582,10 +582,8 @@ CREATE TABLE llm_feature (
     failover_limit integer DEFAULT 3 NOT NULL,
     description text DEFAULT ''::text NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    max_total_requests integer DEFAULT 6 NOT NULL,
     revision integer DEFAULT 1 NOT NULL,
-    CONSTRAINT llm_feature_failover_limit_check CHECK (((failover_limit >= 1) AND (failover_limit <= 10))),
-    CONSTRAINT llm_feature_max_total_requests_check CHECK ((max_total_requests >= 1))
+    CONSTRAINT llm_feature_failover_limit_check CHECK (((failover_limit >= 1) AND (failover_limit <= 10)))
 );
     """.strip(),
     """
@@ -1062,16 +1060,16 @@ INSERT INTO config_item (key, layer, value_type, default_value, description, req
 INSERT INTO config_release (id, company_id, version_no, "values", status, based_on, note, created_by, created_at) VALUES (1, 1, 1, '{}', 'active', NULL, '初始化基线（全部取默认值）', 'system:seed', now());
     """.strip(),
     """
-INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, max_total_requests, revision) VALUES ('analysis', '智能分析', 3, '', now(), 6, 1);
+INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, revision) VALUES ('analysis', '智能分析', 3, '', now(), 1);
     """.strip(),
     """
-INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, max_total_requests, revision) VALUES ('knowledge_ask', '知识问答', 3, '', now(), 6, 1);
+INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, revision) VALUES ('knowledge_ask', '知识问答', 3, '', now(), 1);
     """.strip(),
     """
-INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, max_total_requests, revision) VALUES ('embedding', '语义检索向量', 3, '', now(), 6, 1);
+INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, revision) VALUES ('embedding', '语义检索向量', 3, '', now(), 1);
     """.strip(),
     """
-INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, max_total_requests, revision) VALUES ('rerank', '检索重排', 3, '对检索候选进行专用重排；未配置时保留混合检索顺序', now(), 6, 1);
+INSERT INTO llm_feature (key, name, failover_limit, description, updated_at, revision) VALUES ('rerank', '检索重排', 3, '对检索候选进行专用重排；未配置时保留混合检索顺序', now(), 1);
     """.strip(),
     """
 SELECT pg_catalog.setval('agent_module_run_id_seq', 1, false);

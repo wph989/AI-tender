@@ -43,6 +43,7 @@ class AgentLimits:
     max_output_tokens: int = 8192
     rate_limit_backoff_seconds: int = 30
     rate_limit_max_wait_seconds: int = 600
+    # 该配置键沿用现有名称，实际限制当前专题图的检查点连接恢复，不启动递归子Agent。
     max_subagent_retries: int = 2
     # 供应商不可用时在同一 thread/attempt 内的有界恢复次数。
     max_model_recoveries: int = 2

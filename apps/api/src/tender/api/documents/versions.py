@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import Response
 
 from tender.api.shared.common import blobs, engine
-from tender.api.shared.errors import as_api_problem
 from tender.api.shared.responses import (
     AnchorResponse,
     AnchorsResponse,
@@ -18,7 +17,6 @@ from tender.api.shared.responses import (
 )
 from tender.api.shared.storage import stream_object
 from tender.application.documents.versions import VersionService
-from tender.application.shared.errors import ServiceError
 from tender.core import settings
 from tender.core.di import create_version_service
 
@@ -31,10 +29,7 @@ def _service(request: Request) -> VersionService:
 
 @router.get("/{version_id}/file", response_model=None)
 def get_pdf(version_id: int, request: Request) -> Response:
-    try:
-        target = _service(request).pdf(version_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    target = _service(request).pdf(version_id)
     return stream_object(
         blobs(request),
         target["key"],
@@ -47,10 +42,7 @@ def get_pdf(version_id: int, request: Request) -> Response:
 
 @router.get("/{version_id}/original", response_model=None)
 def get_original(version_id: int, request: Request) -> Response:
-    try:
-        target = _service(request).original(version_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    target = _service(request).original(version_id)
     return stream_object(
         blobs(request),
         target["key"],
@@ -68,10 +60,7 @@ def get_pages(
     from_page: int = Query(default=1, alias="from", ge=1),
     to_page: int | None = Query(default=None, alias="to", ge=1),
 ) -> dict[str, object]:
-    try:
-        return _service(request).pages(version_id, from_page=from_page, to_page=to_page)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).pages(version_id, from_page=from_page, to_page=to_page)
 
 @router.get("/{version_id}/elements", response_model=ElementsResponse)
 def get_elements(
@@ -79,10 +68,7 @@ def get_elements(
     request: Request,
     parse_run_id: int | None = None,
 ) -> dict[str, object]:
-    try:
-        return _service(request).elements(version_id, parse_run_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).elements(version_id, parse_run_id)
 
 
 @router.get("/{version_id}/pages/{page_no}/elements", response_model=ElementsResponse)
@@ -92,10 +78,7 @@ def get_page_elements(
     request: Request,
     parse_run_id: int | None = None,
 ) -> dict[str, object]:
-    try:
-        return _service(request).page_elements(version_id, page_no, parse_run_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).page_elements(version_id, page_no, parse_run_id)
 
 
 @router.get("/{version_id}/anchors/{anchor}", response_model=AnchorResponse)
@@ -105,19 +88,13 @@ def resolve_anchor(
     request: Request,
     parse_run_id: int | None = None,
 ) -> dict[str, object]:
-    try:
-        return _service(request).anchor(version_id, anchor, parse_run_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).anchor(version_id, anchor, parse_run_id)
 
 
 @router.get("/{version_id}", response_model=VersionResponse)
 def get_version(version_id: int, request: Request) -> dict[str, object]:
     """版本详情保留解析批次和失败原因，供文档预览判断可读状态。"""
-    try:
-        return _service(request).detail(version_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).detail(version_id)
 
 
 @router.get("/{version_id}/outline", response_model=OutlineResponse)
@@ -126,10 +103,7 @@ def get_outline(
     request: Request,
     parse_run_id: int | None = None,
 ) -> dict[str, object]:
-    try:
-        return _service(request).outline(version_id, parse_run_id)
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).outline(version_id, parse_run_id)
 
 
 class AnchorResolveRequest(BaseModel):
@@ -147,11 +121,8 @@ def resolve_anchors(
     request: Request,
 ) -> dict[str, object]:
     """批量锚点反查；查不到的锚点列进 missing，不整批 404。"""
-    try:
-        return _service(request).resolve_anchors(
-            version_id,
-            payload.anchors,
-            payload.parse_run_id,
-        )
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).resolve_anchors(
+        version_id,
+        payload.anchors,
+        payload.parse_run_id,
+    )

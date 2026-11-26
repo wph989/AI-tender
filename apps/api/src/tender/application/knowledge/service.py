@@ -46,6 +46,10 @@ def visible_items(
                         raise LookupError("已解除知识库关联")
                     with_content = not item.get("output")
                     element_key = (fingerprint(ref), with_content)
+                    # 完整定位已核验同一引文，可供纯可见性判断复用；反向复用会缺少定位正文。
+                    full_key = (element_key[0], True)
+                    if not with_content and full_key in resolved_elements:
+                        element_key = full_key
                     if element_key not in resolved_elements:
                         # 只判可见性时不需要正文，避免为被丢弃的文本渲染全文。
                         try:
@@ -369,14 +373,21 @@ class KnowledgeService:
             if answer["project_id"]
             else answer["collection_ids"]
         )
-        answer["items"] = visible_items(self.store, answer["items"], allowed)
+        # 正文与关系共用一次请求的核验结果，下一次读取仍从当前权限重新计算。
+        resolved: dict[tuple[str, bool], dict | None] = {}
+        answer["items"] = visible_items(
+            self.store, answer["items"], allowed, resolved_elements=resolved,
+        )
         relations = []
         for relation in answer["relations"]:
             candidate = {
                 "id": str(relation.get("id", "relation")),
+                "output": True,
                 "values": [{"value": "", "citations": relation["citations"]}],
             }
-            visible = visible_items(self.store, [candidate], allowed)[0]
+            visible = visible_items(
+                self.store, [candidate], allowed, resolved_elements=resolved,
+            )[0]
             if visible.get("verification") != "unavailable":
                 relations.append(relation)
         answer["relations"] = relations

@@ -44,6 +44,10 @@ class ModelInvocationStore(Protocol):
 
     def save_invocation(self, key: str, value: dict) -> None: ...
 
+    def other_invocation_wait(self, key: str) -> float:
+        """读取同一运行其余请求已使用的限流等待秒数。"""
+        ...
+
 
 class ChatGateway(StructuredTextModel, Protocol):
     """管理页与抽取共用的完整能力：补全 + 远端模型列表。"""

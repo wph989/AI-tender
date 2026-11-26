@@ -6,10 +6,8 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from tender.api.shared.common import actor, configs, engine
-from tender.api.shared.errors import as_api_problem
 from tender.api.shared.responses import ParseJobCreatedResponse
 from tender.application.documents.parsing import ParseService
-from tender.application.shared.errors import ServiceError
 from tender.core import settings
 from tender.core.di import create_parse_service
 
@@ -30,15 +28,12 @@ def _service(request: Request) -> ParseService:
 
 
 def _validate(payload: ParseRequest) -> None:
-    try:
-        ParseService.validate(
-            tier=payload.tier,
-            ocr_mode=payload.ocr_mode,
-            force=payload.force,
-            reason=payload.reason,
-        )
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    ParseService.validate(
+        tier=payload.tier,
+        ocr_mode=payload.ocr_mode,
+        force=payload.force,
+        reason=payload.reason,
+    )
 
 
 def _create_parse_job(
@@ -48,17 +43,14 @@ def _create_parse_job(
     *,
     force: bool,
 ) -> dict[str, object]:
-    try:
-        return _service(request).create_job(
-            version_id,
-            tier=payload.tier,
-            ocr_mode=payload.ocr_mode,
-            force=force,
-            reason=payload.reason,
-            actor=actor(request),
-        )
-    except ServiceError as exc:
-        raise as_api_problem(exc) from exc
+    return _service(request).create_job(
+        version_id,
+        tier=payload.tier,
+        ocr_mode=payload.ocr_mode,
+        force=force,
+        reason=payload.reason,
+        actor=actor(request),
+    )
 
 
 @router.post("/{version_id}/parse", status_code=202, response_model=ParseJobCreatedResponse)

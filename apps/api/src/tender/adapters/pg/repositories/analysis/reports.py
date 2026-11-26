@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import Any
 
-from sqlalchemy import Connection, Engine, Text, column, exists, func, literal, select, true
+from sqlalchemy import Connection, Engine, Text, cast, column, exists, func, literal, select, true
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import aliased
 
@@ -15,10 +15,12 @@ from tender.adapters.pg.models import (
     AnalysisDataSnapshot,
     AnalysisModule,
     AnalysisReport,
+    LlmCallLog,
     Lot,
     Project,
 )
-from tender.adapters.pg.models.analysis import AnalysisRecordReview
+from tender.adapters.pg.models.analysis import AgentModelInvocation, AnalysisRecordReview
+from tender.core.error_details import MAX_ERROR_LENGTH, error_detail, model_error_details
 from tender.domain.analysis.contract import FLOW_VERSION, FLOW_VERSION_KEY, RUNTIME_VERSION
 
 
@@ -257,7 +259,58 @@ class ReportQueries:
                 )
                 .order_by(AgentModuleRun.attempt, AgentModuleRun.id)
             ).mappings()
-            return [dict(row) for row in rows]
+            runs = [dict(row) for row in rows]
+            self._actual_run_errors(connection, runs)
+            return runs
+
+    @staticmethod
+    def _actual_run_errors(connection: Connection, runs: list[dict]) -> None:
+        generic = "模型调用已达到总请求次数或模块时间上限，请查看调用记录"
+        affected = {run["id"]: run for run in runs if run.get("error_message") == generic}
+        if not affected:
+            return
+        # 已保存的旧提示同样从真实调用账恢复原因，只改变读取投影，不改写运行审计。
+        statement = select(
+            AgentModelInvocation.run_id,
+            AgentModelInvocation.progress["policy"]["max_total"].astext.label("request_limit"),
+            func.jsonb_array_length(AgentModelInvocation.progress["requests"]).label("request_count"),
+            LlmCallLog.model_id, LlmCallLog.model_name_snapshot, LlmCallLog.model_key_snapshot,
+            LlmCallLog.provider_name_snapshot, LlmCallLog.error_message,
+        ).select_from(AgentModelInvocation).join(
+            LlmCallLog,
+            cast(LlmCallLog.invocation_id, Text)
+            == AgentModelInvocation.progress["invocation_id"].astext,
+        ).where(
+            AgentModelInvocation.run_id.in_(affected),
+            AgentModelInvocation.progress["result"].is_(None),
+            LlmCallLog.status.in_(["error", "unknown"]),
+            LlmCallLog.error_message.is_not(None),
+        ).order_by(AgentModelInvocation.run_id, AgentModelInvocation.call_key,
+                   LlmCallLog.request_ordinal, LlmCallLog.id)
+        failures: dict[int, list[dict]] = {}
+        limits = {}
+        for row in connection.execute(statement).mappings():
+            failures.setdefault(row["run_id"], []).append({
+                # 模型删除后外键为空，仍使用保存的模型与供应商身份，避免合并不同模型的错误。
+                "model_key": str(row["model_id"]) if row["model_id"] is not None
+                else f"{row['provider_name_snapshot']}/{row['model_key_snapshot']}",
+                "model": (row["model_name_snapshot"] or row["model_key_snapshot"]
+                          or "未记录模型名称"),
+                "provider": row["provider_name_snapshot"], "message": row["error_message"],
+            })
+            limits[row["run_id"]] = (row["request_count"], row["request_limit"])
+        for run_id, items in failures.items():
+            count, limit = limits[run_id]
+            prefix = (f"本次模型调用已尝试{count}次，达到当时配置的{limit}次请求上限\n\n"
+                      if limit and count is not None and str(limit).isdigit()
+                      and count >= int(limit) else "")
+            detail = error_detail(prefix + model_error_details(
+                items, limit=MAX_ERROR_LENGTH - len(prefix),
+            ))
+            run = affected[run_id]
+            run["error_message"] = detail
+            if run.get("stop_reason"):
+                run["stop_reason"] = {**run["stop_reason"], "message": detail}
 
     def report_active_modules(self, report_id: int) -> list[dict[str, Any]]:
         """各模块最新一个 attempt 中仍处于等待/运行的行（含 ``module_key``）。"""

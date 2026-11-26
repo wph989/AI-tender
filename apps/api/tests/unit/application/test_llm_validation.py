@@ -108,9 +108,9 @@ def test_model_timeout_rejects_nonfinite_and_zero(value):
 
 def test_feature_budgets_keep_positive_semantics_without_old_maximum():
     payload = FeaturePatch(
-        revision=1, failover_limit=10, max_total_requests=1000
+        revision=1, failover_limit=10
     )
-    assert payload.max_total_requests == 1000
+    assert payload.failover_limit == 10
     model = ModelCreate(provider_id=1, model_id="fixture", max_tokens=262144).model_dump()
     selected = validate_model("openai", model)
     assert "max" not in selected["parameter_schema"]["max_tokens"]
